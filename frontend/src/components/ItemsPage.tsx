@@ -81,11 +81,13 @@ interface ItemsPageProps {
   ipc: LightKeyIpc;
   /** 顶栏搜索词（由 VaultApp 持有） */
   search: string;
-  /** 顶栏搜索框回车 → 新建（spec §6.2 空态引导） */
-  newItemSignal: number;
+  /** 顶栏搜索框回车 → 新建（spec §6.2 空态引导）；消费式信号 */
+  newItemSignal: boolean;
+  /** 消费信号后回调置零（防重挂载幽灵重开，review M1） */
+  onAckNewItem?: () => void;
 }
 
-export function ItemsPage({ ipc, search, newItemSignal }: ItemsPageProps) {
+export function ItemsPage({ ipc, search, newItemSignal, onAckNewItem }: ItemsPageProps) {
   const { toast } = useToast();
   const copy = useCopy();
 
@@ -125,8 +127,11 @@ export function ItemsPage({ ipc, search, newItemSignal }: ItemsPageProps) {
   }, [ipc, reloadTick]);
 
   useEffect(() => {
-    if (newItemSignal > 0) setModal({ mode: "create" });
-  }, [newItemSignal]);
+    if (newItemSignal) {
+      setModal({ mode: "create" });
+      onAckNewItem?.();
+    }
+  }, [newItemSignal, onAckNewItem]);
 
   /* ---------- 列表 ---------- */
   const filtered = useMemo(() => {

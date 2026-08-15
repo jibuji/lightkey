@@ -89,13 +89,23 @@ input, select, textarea { font-family: inherit; }
 .field { display: flex; flex-direction: column; gap: 6px; text-align: left; }
 .field-label { font-size: var(--fs-sm); color: var(--fg-1); font-weight: 600; }
 .input-wrap { position: relative; display: block; }
-.input-wrap input {
+.input-wrap input,
+.custom-field-row input {
   width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--r-sm);
   background: var(--bg-3); color: var(--fg-0); font-size: var(--fs-md);
   transition: border-color 150ms ease, box-shadow 150ms ease;
 }
-.input-wrap input:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 2px rgba(240, 138, 60, 0.25); }
-.input-wrap input::placeholder { color: var(--fg-2); }
+.input-wrap input:focus,
+.custom-field-row input:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 2px rgba(240, 138, 60, 0.25); }
+.input-wrap input::placeholder,
+.custom-field-row input::placeholder { color: var(--fg-2); }
+.input-wrap input.has-affix { padding-right: 40px; }
+/* 自定义字段行（spec §6.3 字段增删） */
+.custom-field-row {
+  display: flex; gap: var(--sp-2); align-items: center;
+}
+.custom-field-row .custom-field-name { flex: 0 0 34%; }
+.custom-field-row .icon-btn { flex: none; }
 .input-affix { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); }
 .field-error { margin: 0; color: var(--danger); font-size: var(--fs-sm); text-align: left; }
 
@@ -129,6 +139,20 @@ input, select, textarea { font-family: inherit; }
 .unlock-form { display: flex; flex-direction: column; gap: var(--sp-4); }
 .unlock-actions { display: flex; gap: var(--sp-2); justify-content: center; }
 .unlock-hint { margin: 0; color: var(--fg-2); font-size: var(--fs-xs); }
+
+/* 恢复码（spec §6.6 等宽大字、可全选；规则自验收原型 styles.css 补回） */
+.recovery-code {
+  font-family: var(--font-mono); font-size: var(--fs-xl); font-weight: 700;
+  letter-spacing: 0.08em; line-height: 1.7; text-align: center;
+  background: var(--bg-0); border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: var(--sp-4); color: var(--warning);
+  user-select: all;
+}
+.recovery-warn {
+  display: flex; gap: var(--sp-2); align-items: flex-start;
+  background: rgba(251, 191, 36, 0.08); border: 1px solid rgba(251, 191, 36, 0.25);
+  border-radius: var(--r-sm); padding: var(--sp-3); font-size: var(--fs-sm); color: var(--fg-1);
+}
 
 /* ---------- 主界面布局 ---------- */
 .app { display: flex; height: 100%; }
