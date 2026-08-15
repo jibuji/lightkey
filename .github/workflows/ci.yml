@@ -7,13 +7,20 @@
 #     的 Windows 资源生成）
 #   - frontend：ubuntu 上构建 React + TS 前端（保留）
 # Linux 冒烟由本地承担，不再占 CI 矩阵。
+# 纯文档修改不触发 CI（船长 2026-08-16 定）：仅 docs/ 与 *.md 变更时跳过整个工作流。
 
 name: CI
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
 
 env:
   CARGO_TERM_COLOR: always
