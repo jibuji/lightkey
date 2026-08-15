@@ -20,6 +20,7 @@
 | 墓碑 tombstone | `{uuid}.tomb.lk` | K_data | 软删除标记，含删除时间 |
 | 附件元数据 | `{uuid}.attach.lk` | K_data | 附件清单 + 每附件密钥（**加密的**）与分块引用 |
 | 附件分块 | `{uuid}.{i}.chunk.lk` | 每附件独立密钥 | 1 MiB/块（见 §5） |
+| 规则 rule | `{uuid}.rule.lk` | K_data | 授权门白名单规则（M2，见 authorization-gate.md） |
 | 恢复信封 | `recovery.envelope` | K_recovery | 主密钥副本（见 recovery.md） |
 
 - 文件名中的对象 id 为 UUID v4；时间戳后缀仅用于同步排序，不含内容信息。

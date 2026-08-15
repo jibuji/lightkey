@@ -16,7 +16,7 @@ needs-decision，不得自行变更。
 | # | 决议（原文要点） | 落盘位置 |
 |---|------------------|----------|
 | D1 | V1 MVP 交付 = 核心库 + CLI（`lk`）+ 桌面应用；浏览器扩展是 M3（V1 之后）；本任务产出可开工实施 spec（含前端设计） | [architecture.md](architecture.md)、[milestones.md](milestones.md) |
-| D2 | 技术栈：Tauri 2（Rust 核心 + React）；CLI 复用同一 Rust 核心；Windows + macOS 为验收平台，Linux 冒烟不阻塞 | [architecture.md](architecture.md)、[testing.md](testing.md) |
+| D2 | 技术栈：Tauri 2（Rust 核心 + React）；CLI 复用同一 Rust 核心；验收平台 = Windows（原「Windows + macOS 双验收」的 CI 部分被补充拍板 #4 替代，见下文） | [architecture.md](architecture.md)、[testing.md](testing.md) |
 | D3 | 里程碑：M0 骨架+单机闭环 → M1 同步（BYO 变更发现 + CAS + 墓碑）→ M2 Agent 授权门 + 桌面端 → M3 浏览器填充 | [milestones.md](milestones.md) |
 | D4 | 加密：vault 头随机 16B salt + KDF 参数 + 密文格式类型/版本号；Argon2id(m=64MiB,t=3,p=4) 派生主密钥；HKDF-SHA256 分叉数据加密/审计 HMAC 两密钥互不复用，恢复信封密钥由恢复码 + Argon2id 独立派生（2026-08-15 grilling 后补充拍板，见下文）；原语刻意不同于 Bitwarden（AES-256-GCM，不用 CBC+HMAC） | [crypto.md](crypto.md) |
 | D5 | 数据模型：条目级密文 blob + 加密索引 + revisionDate 增量同步 + 软删除墓碑（30 天延迟硬删）+ 乐观并发（CAS，整条目 last-write-wins）；条目 schema 参照 Bitwarden login/secureNote 映射；附件每附件独立密钥 + 1 MiB 流式分块；自描述密文格式（含类型版本号） | [data-model.md](data-model.md) |
