@@ -27,3 +27,6 @@ desktop.ini
 .env
 .env.*
 !.env.example
+
+# Design Pilot annotation rounds (dp-loop worker)
+.annotations/
