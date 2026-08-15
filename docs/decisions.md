@@ -54,5 +54,12 @@ needs-decision，不得自行变更。
    删除 macOS 与 Linux 桌面构建以加速。已修订 `.github/workflows/ci.yml`、
    [architecture.md](architecture.md) §2/§4 与 [testing.md](testing.md) §3
    （原 D2 的「Windows + macOS 双验收」CI 部分不再适用；验收平台 = Windows）。
+5. **加密索引范围扩展（裁定：选项 A，来源：no-mistakes document 阶段发现）**：
+   加密索引从「条目最小索引」扩展为「vault 对象最小索引，覆盖条目与规则」
+   （`id`/`revisionDate`/`type`，`type ∈ item/rule`，`deleted` 仅条目）；规则
+   经同一索引/轮询路径发现与增量同步，与
+   [authorization-gate.md](authorization-gate.md) §4「规则随库同步」声明一致。
+   已修订 [data-model.md](data-model.md) §6 与
+   [authorization-gate.md](authorization-gate.md) §4（原 D5/D8 其余内容仍然有效）。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

@@ -16,7 +16,7 @@
 | 对象 | 文件 | 加密 | 说明 |
 |------|------|------|------|
 | 条目 item | `{uuid}.item.lk` | K_data | 见 §3 |
-| 索引 index | `index.lk` | K_data | 条目清单（id、revisionDate、类型标签等最小可索引字段，全部在密文内） |
+| 索引 index | `index.lk` | K_data | vault 对象清单，覆盖条目与规则（id、revisionDate、type 等最小可索引字段，全部在密文内，见 §6） |
 | 墓碑 tombstone | `{uuid}.tomb.lk` | K_data | 软删除标记，含删除时间 |
 | 附件元数据 | `{uuid}.attach.lk` | K_data | 附件清单 + 每附件密钥（**加密的**）与分块引用 |
 | 附件分块 | `{uuid}.{i}.chunk.lk` | 每附件独立密钥 | 1 MiB/块（见 §5） |
@@ -90,11 +90,14 @@
 
 ## 6. 加密索引
 
-- `index.lk` 整体加密（K_data），内容为条目最小索引：`id`、`revisionDate`、
-  `type`、`deleted`（供列表/增量/墓碑判断）。
+- `index.lk` 整体加密（K_data），内容为 **vault 对象最小索引，覆盖条目与规则**：
+  `id`、`revisionDate`、`type`（`type ∈ item/rule`）；`deleted` 仅条目
+  （供列表/增量/墓碑判断）。
+- 规则对象经**同一索引/轮询路径**发现与增量同步（与条目同路径，见
+  [authorization-gate.md](authorization-gate.md) §4、[sync.md](sync.md)）。
 - 客户端本地始终有解密态索引缓存；索引用于变更发现与增量拉取（[sync.md](sync.md)），
   **不**向存储端暴露任何明文。
-- 索引损坏 → 全量重建（扫描本地条目密文重建），不阻塞解锁。
+- 索引损坏 → 全量重建（扫描本地条目与规则密文重建），不阻塞解锁。
 
 ## 7. 实施注意（M0 起）
 
