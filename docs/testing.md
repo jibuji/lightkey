@@ -39,17 +39,15 @@
 
 ## 3. CI（GitHub Actions，骨架已建）
 
-`.github/workflows/ci.yml`：
+`.github/workflows/ci.yml`（船长裁定收敛为 Windows 优先，替代原 D2 CI 部分）：
 
 | Job | 平台 | 内容 |
 |-----|------|------|
-| core + cli | ubuntu-latest | fmt / clippy(-D warnings) / test（仅 `lk-core` `lk-cli`） |
+| desktop-windows | windows-latest | fmt / clippy(-D warnings) / test（`lk-core` `lk-cli`）/ `cargo check --workspace`（含 Tauri 壳与 Windows 资源生成） |
 | frontend | ubuntu-latest | `npm ci` + `npm run build`（tsc + vite） |
-| desktop | windows-latest / macos-latest | `cargo check --workspace`（含 Tauri 壳） |
 
-- **验收平台 Windows + macOS；Linux 冒烟不阻塞**（D2）：Linux 覆盖核心与前端；
-  Tauri 壳在 Win/mac 显式检查。Linux 全构建需 webkit2gtk，M2 接入桌面壳时
-  补充 Linux 冒烟 job。
+- **Windows 是主开发测试平台**（船长本机 Windows WSL）；macOS/Linux 桌面构建
+  不再占 CI 矩阵（Linux 冒烟由本地承担）。
 - 工具链固定：`rust-toolchain.toml`（1.94）+ `dtolnay/rust-toolchain@stable` 对齐，
   `Swatinem/rust-cache` 缓存。
 - 属性测试在 CI 跑固定种子（回归可复现）+ 每日/PR 随机种子抽查（可选后续）。

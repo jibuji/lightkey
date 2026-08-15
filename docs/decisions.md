@@ -48,5 +48,11 @@ needs-decision，不得自行变更。
 3. **BYO 存储凭据输入形态（裁定）**：`lk config sync set` 改为交互式提示输入
    （不回显），并支持从文件/stdin 导入；命令行位置参数只接受存储 URL，不接受
    凭据明文。已修订 [cli.md](cli.md) §3 与 [sync.md](sync.md) §6。
+4. **CI 收敛为 Windows 优先（裁定，替代 D2 的 CI 部分）**：船长本机为
+   Windows WSL，Windows 是主开发测试平台；CI 只保留 Windows 全量检查
+   （fmt / clippy / test / `cargo check --workspace`）与 ubuntu 上的前端构建，
+   删除 macOS 与 Linux 桌面构建以加速。已修订 `.github/workflows/ci.yml`、
+   [architecture.md](architecture.md) §2/§4 与 [testing.md](testing.md) §3
+   （原 D2 的「Windows + macOS 双验收」CI 部分不再适用；验收平台 = Windows）。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

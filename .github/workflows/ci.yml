@@ -1,10 +1,12 @@
-# LightKey CI（骨架）
+# LightKey CI（船长裁定 2026-08-15：收敛为 Windows 优先）
 #
-# 验收平台：Windows + macOS 为验收平台，Linux 冒烟不阻塞。
-#   - Linux：核心 + CLI（fmt / clippy / test）+ 前端构建
-#   - Windows / macOS：全 workspace `cargo check`（含 Tauri 壳）
-# Tauri 应用在 Linux 的完整构建需要 webkit2gtk 系统依赖，M2 接入桌面壳时
-# 补充 Linux 冒烟 job（当前 Linux 已覆盖核心 + 前端，不阻塞）。
+# 船长本机为 Windows WSL，Windows 是主开发测试平台；省略 macOS/Linux
+# 双份构建以加速（替代原 D2「Windows + macOS 双验收」的 CI 部分）：
+#   - desktop-windows：Windows 上执行全部检查——fmt / clippy / test
+#     （core + cli）与全 workspace `cargo check`（含 Tauri 壳，含 icon.ico
+#     的 Windows 资源生成）
+#   - frontend：ubuntu 上构建 React + TS 前端（保留）
+# Linux 冒烟由本地承担，不再占 CI 矩阵。
 
 name: CI
 
@@ -17,9 +19,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  core-cli-linux:
-    name: core + cli (Linux)
-    runs-on: ubuntu-latest
+  desktop-windows:
+    name: desktop + core + cli (Windows)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +41,9 @@ jobs:
 
       - name: Test (core + cli)
         run: cargo test -p lk-core -p lk-cli
+
+      - name: Check workspace (incl. Tauri shell)
+        run: cargo check --workspace
 
   frontend:
     name: frontend (React + TS)
@@ -60,37 +65,3 @@ jobs:
       - name: Build
         run: npm run build
         working-directory: frontend
-
-  desktop-windows:
-    name: desktop (Windows)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check workspace
-        run: cargo check --workspace
-
-  desktop-macos:
-    name: desktop (macOS)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check workspace
-        run: cargo check --workspace

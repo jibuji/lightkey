@@ -20,7 +20,7 @@ V1 MVP 交付三样东西：
 | 语言 | Rust（1.94，workspace 固定，见 `rust-toolchain.toml`） | 核心 + CLI + 桌面壳 |
 | 桌面壳 | Tauri 2 | 系统 WebView + 原生壳 |
 | 前端 | React + TypeScript + Vite | 位于 `frontend/` |
-| 验收平台 | **Windows + macOS** | Linux 冒烟不阻塞（CI 见 [testing.md](testing.md)） |
+| 验收平台 | **Windows（主开发测试平台，船长裁定）**；前端构建在 ubuntu；macOS/Linux 桌面构建不再占 CI 矩阵（CI 见 [testing.md](testing.md)） |
 
 ## 3. 组件与边界
 
@@ -66,8 +66,8 @@ lightkey/
 
 **default-members 说明**：workspace 默认成员为 `lk-core` + `lk-cli`，因此在任何平台
 `cargo test`/`cargo check`/`cargo clippy` 默认只构建这两个 crate（Linux 上 Tauri 需
-webkit2gtk 系统库，不阻塞）；`lk-app` 由 CI 在 Windows/macOS 上以 `--workspace`
-显式检查。
+webkit2gtk 系统库，不阻塞）；`lk-app` 由 CI 在 Windows 上以 `--workspace`
+显式检查（船长裁定收敛为 Windows 优先，见 [decisions.md](decisions.md) 补充拍板 #4）。
 
 ## 5. 关键横切设计（速览，细节见各规格）
 
