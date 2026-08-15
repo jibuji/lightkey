@@ -72,5 +72,12 @@ needs-decision，不得自行变更。
    **已砍「收藏 favorite」字段**（用途模糊，V1 不提供）。
    已修订 [data-model.md](data-model.md) §3、[cli.md](cli.md) §2 与
    [design/spec.md](design/spec.md) §4（原 D5 其余数据模型内容仍然有效）。
+7. **存储端文件名无时间戳（裁定：选项 A，来源：A1 规格矛盾裁决）**：
+   D6 的「文件名时间戳」表述不适用于实现——文件名纯 UUID 无时间戳，
+   同步排序依据加密索引内 revisionDate（[data-model.md](data-model.md) §6），
+   文件名带时间戳会向存储端泄漏修改时间，违反零知识彻底。
+   已修订 [data-model.md](data-model.md) §2、[sync.md](sync.md) §1、
+   [crypto.md](crypto.md) §4.3 与 [milestones.md](milestones.md) M1
+   （原 D6 其余内容仍然有效）。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

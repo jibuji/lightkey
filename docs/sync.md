@@ -9,7 +9,7 @@
 - 同步目标是用户自备（BYO）的无服务器存储：**WebDAV / S3**（含兼容实现）。
 - 没有我们托管的中继/推送服务；这是 V1 形态（服务端能力推迟，见
   [architecture.md](architecture.md) 非目标）。
-- 存储端零知识：只见密文文件 + 文件名时间戳（D6，见 [data-model.md](data-model.md) §2）。
+- 存储端零知识：只见密文文件（文件名纯 UUID，无时间戳——排序依据索引内 revisionDate，见 [data-model.md](data-model.md) §2）。
 
 ## 2. 变更发现：加密索引 + 轮询（D7）
 

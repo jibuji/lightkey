@@ -39,7 +39,7 @@
 
 范围：
 
-- 存储端零知识布局（密文文件 + 文件名时间戳，见 [data-model.md](data-model.md)）
+- 存储端零知识布局（密文文件，文件名纯 UUID 无时间戳，见 [data-model.md](data-model.md)）
 - 加密索引 + 轮询变更发现（默认 60s，可配 15s~24h），静默、无中间态加载
 - CAS 上传 + 冲突收敛（last-write-wins）+ 墓碑同步与 30 天延迟硬删
 - `lk sync` / `lk config` 同步配置（[cli.md](cli.md)）
