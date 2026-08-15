@@ -30,6 +30,7 @@ needs-decision，不得自行变更。
 | D13 | 测试三层：Rust 核心单元+属性测试（加密往返/CAS 冲突/墓碑收敛）→ E2E 双客户端冲突合并 → 安全专项（授权门绕过尝试、审计篡改检测）；CI GitHub Actions；测试 fixture 密钥不进仓库 | [testing.md](testing.md) |
 | D14 | 前端设计（Q3 含）：两份 = ① 设计规范（tokens/色彩/组件库/解锁与条目交互流程）② 高保真单页原型（可交互、可预览截图评审）；工具链 = 自研 UI 设计工具 + agent_browser 预览截图 + doubao-seed-2.1-turbo 视觉评审 + lavish-axi 船长评审面（D1/D2 已定，不装第三方设计 skill） | [design/spec.md](design/spec.md)、[design/prototype](design/prototype/) |
 | D15 | 开源/商业：暂不考虑付费；免费版不做条目数限制；付费边界（官方签名构建/远程审批中继等）推迟到验证后再议 | [architecture.md](architecture.md)（非目标） |
+| D16 | 插件化落地 = 选项 A：TS/桌面/前端真 Cordis（@cordisjs/core 4.x）；Rust 核心保持单一 crate lk-core，按同一边界重组为 trait 服务 + 事件总线（模拟 Cordis 语义，不强行移植）；安全核心（加密/数据/同步/审计）留在 Rust 不重写为 TS；四层插件 A 数据平面 + B 能力域 + C 宿主 + D 前端 TS Cordis；事件总线 item.changed / session.unlocked / session.locked / authz.request / theme.changed / clipboard.copied（emit 为主，waterfall 仅用于 Rust 授权门三层短路，均硬编码安全流程）；数据驱动边界：应用数据（声明式装配契约）≠ 用户数据（严格分离），安全流程硬编码永不数据化，防 inner-platform；装配四层①存在②位置③数据源数据驱动、④组件内部 React 写死，槽位骨架宿主写死、槽位内组件有无/顺序数据驱动 | [plugin-architecture.md](plugin-architecture.md)、[milestones.md](milestones.md)、[architecture.md](architecture.md)、[design/spec.md](design/spec.md) |
 
 ## 需新决策的事项
 
