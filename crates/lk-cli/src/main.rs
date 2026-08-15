@@ -1455,7 +1455,14 @@ fn cmd_daemon(dir: &std::path::Path) -> i32 {
             let mut next_sleep = DEFAULT_SYNC_INTERVAL_SECS;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(next_sleep));
-                let mut guard = poller_state.lock().expect("daemon mutex poisoned");
+                // 让路给前台请求：有请求正在服务时跳过本轮（不打断用户操作）。
+                // 注意这仍是缓解而非根治——本轮拿到锁后若网络停滞，期间的
+                // 前台请求仍会等待（完整修复需同步引擎在网络 I/O 期间不持锁）。
+                let mut guard = match poller_state.try_lock() {
+                    Ok(g) => g,
+                    Err(std::sync::TryLockError::WouldBlock) => continue,
+                    Err(std::sync::TryLockError::Poisoned(_)) => break,
+                };
                 guard.reload_config();
                 let base = guard
                     .sync_config()

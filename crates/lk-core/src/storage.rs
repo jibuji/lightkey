@@ -738,9 +738,12 @@ impl S3Backend {
                 (canonical_uri, url)
             }
             None => {
+                // query 已由调用方经 [`s3_query_string`] 排序 + 编码；
+                // canonical 与 URL 同源，不二次编码。path-style 的 bucket 是
+                // 路径段而非 host，canonical URI 必须含 `/bucket/`。
                 let q = query.unwrap_or_default();
                 let url = format!("{}/?{}", self.endpoint, q);
-                ("/".to_string(), url)
+                (list_canonical_uri(&self.bucket, self.path_style), url)
             }
         };
 
@@ -768,12 +771,9 @@ impl S3Backend {
             .collect::<Vec<_>>()
             .join(";");
 
-        let (canonical_query, _) = match key {
-            Some(_) => (String::new(), String::new()),
-            None => (
-                canonical_query_string(query.unwrap_or_default()),
-                String::new(),
-            ),
+        let canonical_query = match key {
+            Some(_) => String::new(),
+            None => query.unwrap_or_default().to_string(),
         };
         let canonical_request = format!(
             "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_header_names}\nUNSIGNED-PAYLOAD"
@@ -871,19 +871,29 @@ fn uri_encode_path(s: &str) -> String {
     out
 }
 
-/// 规范化查询串（按 key 排序，URI 编码）。
-fn canonical_query_string(q: &str) -> String {
-    let mut pairs: Vec<(String, String)> = q
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (uri_encode_query(k), uri_encode_query(v))
-        })
+/// 桶级操作（list）的 canonical URI：path-style 含 bucket 段，虚拟主机风格为 `/`。
+fn list_canonical_uri(bucket: &str, path_style: bool) -> String {
+    if path_style {
+        format!("/{bucket}/")
+    } else {
+        "/".to_string()
+    }
+}
+
+/// 构建 S3 查询串：原始 (key, value) 参数 → 逐项 URI 编码 + 排序。
+///
+/// canonical request 与实际请求 URL 共用同一产出，编码恰好一次——此前
+/// `list()` 预先编码 prefix/token、`send()` 再二次编码，导致含特殊字符的
+/// prefix / 分页 continuation-token 签名与请求不一致
+/// （403 SignatureDoesNotMatch）。
+fn s3_query_string(params: &[(&str, &str)]) -> String {
+    let mut pairs: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (uri_encode_query(k), uri_encode_query(v)))
         .collect();
     pairs.sort();
     pairs
-        .iter()
+        .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&")
@@ -1039,12 +1049,12 @@ impl StorageBackend for S3Backend {
         let mut token: Option<String> = None;
         loop {
             let query = match &token {
-                Some(t) => format!(
-                    "list-type=2&prefix={}&continuation-token={}",
-                    uri_encode_query(&self.prefix),
-                    uri_encode_query(t)
-                ),
-                None => format!("list-type=2&prefix={}", uri_encode_query(&self.prefix)),
+                Some(t) => s3_query_string(&[
+                    ("list-type", "2"),
+                    ("prefix", &self.prefix),
+                    ("continuation-token", t),
+                ]),
+                None => s3_query_string(&[("list-type", "2"), ("prefix", &self.prefix)]),
             };
             let (status, _, body) = self.send("GET", None, Some(&query), &[], None)?;
             if status != 200 {
@@ -1705,6 +1715,32 @@ mod tests {
             signature,
             "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
         );
+    }
+
+    /// 回归：S3 列表查询串必须恰好编码一次并排序——含特殊字符的 prefix /
+    /// continuation-token 的 canonical 与 URL 同源，否则 SigV4 签名不一致。
+    #[test]
+    fn s3_query_string_encodes_once_and_sorts() {
+        assert_eq!(
+            s3_query_string(&[("list-type", "2"), ("prefix", "my folder/子")]),
+            "list-type=2&prefix=my%20folder%2F%E5%AD%90"
+        );
+        assert_eq!(
+            s3_query_string(&[
+                ("list-type", "2"),
+                ("prefix", "p"),
+                ("continuation-token", "abc+def/xyz="),
+            ]),
+            "continuation-token=abc%2Bdef%2Fxyz%3D&list-type=2&prefix=p"
+        );
+    }
+
+    /// 回归：path-style 列表的 canonical URI 必须含 `/bucket/`（bucket 是路径
+    /// 段而非 host），否则 SigV4 签名与请求路径不一致。
+    #[test]
+    fn list_canonical_uri_path_style() {
+        assert_eq!(list_canonical_uri("my-bucket", true), "/my-bucket/");
+        assert_eq!(list_canonical_uri("my-bucket", false), "/");
     }
 
     #[test]
