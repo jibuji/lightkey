@@ -1129,7 +1129,10 @@ pub(crate) mod mock_http {
         let addr = listener.local_addr().unwrap().to_string();
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { break };
+                let Ok(stream) = stream else {
+                    // 瞬时 accept 错误（Windows 上 RST 竞态常见）→ 继续而非退出
+                    continue;
+                };
                 let handler = handler.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_conn(stream, handler) {
@@ -1143,56 +1146,71 @@ pub(crate) mod mock_http {
 
     fn handle_conn(mut stream: TcpStream, handler: Arc<Handler>) -> std::io::Result<()> {
         let mut reader = BufReader::new(stream.try_clone()?);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line)?;
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or("").to_string();
-        let path = parts.next().unwrap_or("").to_string();
-        let mut headers = HashMap::new();
-        let mut content_length = 0usize;
+        // HTTP/1.1 keep-alive：同一连接循环处理多个请求（reqwest 复用连接；
+        // 单请求即关闭会让 Windows 上的 RST 竞态打挂客户端）。
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            let line = line.trim_end();
-            if line.is_empty() {
-                break;
+            let mut request_line = String::new();
+            let n = reader.read_line(&mut request_line)?;
+            if n == 0 {
+                return Ok(()); // 客户端关闭连接
             }
-            if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-                if k.trim().eq_ignore_ascii_case("content-length") {
-                    content_length = v.trim().parse().unwrap_or(0);
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let path = parts.next().unwrap_or("").to_string();
+            let mut headers = HashMap::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line)?;
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
                 }
             }
+            // Expect: 100-continue（大 body 时 hyper 会发）→ 先回 100 再读体
+            if headers
+                .get("expect")
+                .map(|v| v.contains("100-continue"))
+                .unwrap_or(false)
+            {
+                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                stream.flush()?;
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body)?;
+            let req = MockRequest {
+                method,
+                path,
+                headers,
+                body,
+            };
+            let resp = handler(&req);
+            let status_text = match resp.status {
+                200 => "OK",
+                201 => "Created",
+                204 => "No Content",
+                207 => "Multi-Status",
+                404 => "Not Found",
+                405 => "Method Not Allowed",
+                409 => "Conflict",
+                412 => "Precondition Failed",
+                _ => "OK",
+            };
+            let mut out = format!("HTTP/1.1 {} {}\r\n", resp.status, status_text);
+            for (k, v) in &resp.headers {
+                out.push_str(&format!("{k}: {v}\r\n"));
+            }
+            out.push_str(&format!("Content-Length: {}\r\n\r\n", resp.body.len()));
+            stream.write_all(out.as_bytes())?;
+            stream.write_all(&resp.body)?;
+            stream.flush()?;
         }
-        let mut body = vec![0u8; content_length];
-        reader.read_exact(&mut body)?;
-        let req = MockRequest {
-            method: method.clone(),
-            path: path.clone(),
-            headers: headers.clone(),
-            body,
-        };
-        let resp = handler(&req);
-        let status_text = match resp.status {
-            200 => "OK",
-            201 => "Created",
-            204 => "No Content",
-            207 => "Multi-Status",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            409 => "Conflict",
-            412 => "Precondition Failed",
-            _ => "OK",
-        };
-        let mut out = format!("HTTP/1.1 {} {}\r\n", resp.status, status_text);
-        for (k, v) in &resp.headers {
-            out.push_str(&format!("{k}: {v}\r\n"));
-        }
-        out.push_str(&format!("Content-Length: {}\r\n\r\n", resp.body.len()));
-        stream.write_all(out.as_bytes())?;
-        stream.write_all(&resp.body)?;
-        stream.flush()?;
-        Ok(())
     }
 
     /// 简易内存 WebDAV 服务器：GET/PUT(If-Match)/DELETE/PROPFIND/MKCOL/HEAD。
