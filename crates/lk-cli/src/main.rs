@@ -7,7 +7,10 @@
 //! - 审计：`lk audit`（只读；`--verify` 校验 HMAC 链）
 //! - 守护进程：`lk daemon`（持解锁态，密钥仅内存；客户端自动拉起）
 //!
-//! M1/M2 命令（sync/rule/inject/config）保持占位（退出码 2）。
+//! M1 已实现：`lk sync`（触发一轮：轮询 + CAS 上传）、`lk config sync set`
+//! （配置 BYO 存储与轮询间隔；凭据交互式输入不回显，或
+//! `--credentials-file` / `--stdin` 导入，存系统钥匙串）、`lk config get`。
+//! M2 命令（rule/inject）保持占位（退出码 2）。
 //!
 //! 约定：
 //! - 退出码 0 成功 / 1 业务失败（拒绝/超时/冲突）/ 2 用法错误或未实现。
@@ -86,14 +89,54 @@ enum Command {
     },
     /// 以守护进程方式常驻（持解锁态，密钥仅存内存；由客户端自动拉起）
     Daemon,
-    /// 同步到 BYO 存储（WebDAV / S3）【M1】
+    /// 触发一次同步（轮询 + CAS 上传）【M1】
     Sync,
     /// Agent 授权门规则管理（add / list / remove）【M2】
     Rule,
     /// 给具名命令注入被批准的环境变量【M2】
     Inject,
     /// 读写本地配置【M1】
-    Config,
+    Config(Box<ConfigArgs>),
+}
+
+/// `lk config` 参数。
+#[derive(clap::Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+/// `lk config` 子命令。
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// 配置 BYO 存储同步（WebDAV / S3）
+    Sync {
+        #[command(subcommand)]
+        command: ConfigSyncCommand,
+    },
+    /// 读取配置（sync.url / sync.interval / sync.enabled / autoLockMinutes）
+    Get { key: String },
+}
+
+/// `lk config sync` 子命令。
+#[derive(Subcommand)]
+enum ConfigSyncCommand {
+    /// 设置 BYO 存储 URL 与轮询间隔；凭据交互式输入（不回显），
+    /// 也可 --credentials-file / --stdin 导入；不接受凭据明文位置参数
+    Set {
+        /// 存储 URL：https://host/dav（WebDAV）/ s3://bucket/prefix（S3）
+        /// / file:///abs/path（本地模拟，无需凭据）
+        url: String,
+        /// 轮询间隔秒数（15~86400，默认 60）
+        #[arg(long)]
+        interval: Option<u64>,
+        /// 凭据从文件读取（第一行用户名，第二行密码）
+        #[arg(long)]
+        credentials_file: Option<PathBuf>,
+        /// 凭据从 stdin 读取（第一行用户名，第二行密码；脚本用）
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 /// `lk recover` 参数。
@@ -260,16 +303,16 @@ fn run(cli: &Cli) -> i32 {
         Command::Item(args) => cmd_item(out, &dir, &args.command, cli.json),
         Command::Audit { tail, verify } => cmd_audit(out, &dir, *tail, *verify, cli.json),
         Command::Daemon => cmd_daemon(&dir),
-        // M1/M2 占位
-        Command::Sync | Command::Rule | Command::Inject | Command::Config => {
+        Command::Sync => cmd_sync(out, &dir, cli.json),
+        Command::Config(args) => cmd_config(out, &dir, &args.command, cli.json),
+        // M2 占位
+        Command::Rule | Command::Inject => {
             let name = match &cli.command {
-                Command::Sync => "sync",
                 Command::Rule => "rule",
                 Command::Inject => "inject",
-                Command::Config => "config",
                 _ => unreachable!(),
             };
-            eprintln!("lk {name}: 该命令将在对应里程碑中实现（M1 同步 / M2 授权门）");
+            eprintln!("lk {name}: 该命令将在 M2（授权门）中实现");
             2
         }
     }
@@ -301,6 +344,19 @@ fn rpc_fail(msg: &str, code: i64, data: Option<&Value>) -> i32 {
         ERR_VAULT_EXISTS => {
             "库已存在（如需重置请使用 lk init --force，旧数据不可恢复）".to_string()
         }
+        ERR_SYNC_NOT_CONFIGURED => format!(
+            "未配置同步存储，请先运行 lk config sync set <url>{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("（{detail}）")
+            }
+        ),
+        ERR_SYNC_STORAGE => format!("同步失败（存储端错误）：{detail}"),
+        ERR_SYNC_ANOMALY => {
+            format!("同步数据异常：{detail}；已放弃本轮，未覆盖本地数据")
+        }
+        ERR_SYNC_CREDENTIALS => format!("同步凭据不可用：{detail}"),
         _ => format!(
             "{msg}{}",
             if detail.is_empty() {
@@ -472,18 +528,31 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
         Ok(res) => {
             let unlocked = res["unlocked"].as_bool().unwrap_or(false);
             let version = res["version"].as_str().unwrap_or_default().to_string();
+            let watermark = res["syncWatermark"].as_str().map(|s| s.to_string());
             if json_out {
                 let _ = writeln!(
                     out,
                     "{}",
-                    json!({ "unlocked": unlocked, "version": version, "syncWatermark": null })
+                    json!({ "unlocked": unlocked, "version": version, "syncWatermark": watermark })
                 );
             } else {
+                let sync_line = match daemon::read_config(dir).sync {
+                    Some(cfg) => format!(
+                        "已配置 {}（每 {}s 轮询）{}",
+                        cfg.url,
+                        cfg.interval_secs,
+                        watermark
+                            .map(|w| format!("，水位 {w}"))
+                            .unwrap_or_else(|| "，尚未同步".to_string())
+                    ),
+                    None => "未配置（lk config sync set <url> 启用）".to_string(),
+                };
                 let _ = writeln!(
                     out,
-                    "状态: {} | 版本: {} | 同步: 未配置（M1）",
+                    "状态: {} | 版本: {} | 同步: {}",
                     if unlocked { "已解锁" } else { "已锁定" },
-                    version
+                    version,
+                    sync_line
                 );
             }
             0
@@ -1137,6 +1206,218 @@ fn cmd_audit(
 }
 
 // ---------------------------------------------------------------------------
+// 同步 / 配置（M1）
+// ---------------------------------------------------------------------------
+
+/// `lk sync`：触发一轮同步（轮询 + CAS 上传），返回变更摘要。
+fn cmd_sync(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
+    match rpc(dir, M_SYNC_TRIGGER, json!({})) {
+        Ok(res) => {
+            let summary: lk_core::sync::SyncSummary =
+                serde_json::from_value(res).unwrap_or_default();
+            if json_out {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "已同步：拉取 {} · 推送 {} · CAS 冲突 {} · 硬删 {}",
+                    summary.pulled, summary.pushed, summary.conflicts, summary.purged
+                );
+            }
+            for w in &summary.warnings {
+                eprintln!("lk: 提示：{w}");
+            }
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+/// `lk config` 入口。
+fn cmd_config(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    cmd: &ConfigCommand,
+    json_out: bool,
+) -> i32 {
+    match cmd {
+        ConfigCommand::Sync { command } => match command {
+            ConfigSyncCommand::Set {
+                url,
+                interval,
+                credentials_file,
+                stdin,
+            } => cmd_config_sync_set(
+                out,
+                dir,
+                url,
+                *interval,
+                credentials_file.as_deref(),
+                *stdin,
+                json_out,
+            ),
+        },
+        ConfigCommand::Get { key } => cmd_config_get(out, dir, key, json_out),
+    }
+}
+
+/// `lk config sync set <url>`：配置 BYO 存储 + 轮询间隔 + 凭据（钥匙串）。
+fn cmd_config_sync_set(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    url: &str,
+    interval: Option<u64>,
+    credentials_file: Option<&std::path::Path>,
+    stdin: bool,
+    json_out: bool,
+) -> i32 {
+    use lk_core::sync::{SyncConfig, DEFAULT_SYNC_INTERVAL_SECS};
+    let interval_secs = interval.unwrap_or(DEFAULT_SYNC_INTERVAL_SECS);
+    let cfg = SyncConfig {
+        url: url.to_string(),
+        interval_secs,
+    };
+    if let Err(e) = cfg.validate() {
+        eprintln!("lk config: {e}");
+        return 2;
+    }
+    // 凭据：仅 WebDAV/S3 需要；交互式输入（不回显）或文件/stdin 导入。
+    // 位置参数只接受存储 URL，不接受凭据明文（cli.md §3 / 补充拍板 #3）。
+    let scheme = url.split_once("://").map(|(s, _)| s).unwrap_or("");
+    if !matches!(scheme, "file") {
+        match read_sync_credentials(url, credentials_file, stdin) {
+            Ok(Some((user, pass))) => {
+                if let Err(e) = daemon::store_sync_credentials(url, &user, &pass) {
+                    eprintln!("lk config: {e}");
+                    return 1;
+                }
+            }
+            Ok(None) => {
+                eprintln!("lk config: 未提供凭据（交互式输入 / --credentials-file / --stdin）");
+                return 1;
+            }
+            Err(code) => return code,
+        }
+    } else if credentials_file.is_some() || stdin {
+        eprintln!("lk config: 提示：file:// 本地模拟无需凭据，已忽略凭据输入");
+    }
+    // 写配置（原子；守护进程下一轮自动热更新）
+    let mut config = daemon::read_config(dir);
+    config.sync = Some(cfg.clone());
+    if let Err(e) = daemon::write_config(dir, &config) {
+        eprintln!("lk config: 写入配置失败：{e}");
+        return 1;
+    }
+    if json_out {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::json!({ "url": cfg.url, "intervalSecs": cfg.interval_secs })
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "已配置同步：{}（每 {}s 轮询）",
+            cfg.url, cfg.interval_secs
+        );
+    }
+    0
+}
+
+/// 读取同步凭据（username/password）：交互式（不回显）/ 文件 / stdin。
+fn read_sync_credentials(
+    url: &str,
+    credentials_file: Option<&std::path::Path>,
+    stdin: bool,
+) -> Result<Option<(String, String)>, i32> {
+    use std::io::BufRead;
+    let read_lines =
+        |mut lines: Box<dyn Iterator<Item = std::io::Result<String>>>| -> Option<(String, String)> {
+            let user = lines.next()?.ok()?;
+            let pass = lines.next()?.ok()?;
+            Some((user.trim().to_string(), pass.trim().to_string()))
+        };
+    let creds = if let Some(path) = credentials_file {
+        match std::fs::File::open(path) {
+            Ok(f) => read_lines(Box::new(std::io::BufReader::new(f).lines())),
+            Err(e) => {
+                eprintln!("lk config: 读取凭据文件失败：{e}");
+                return Err(1);
+            }
+        }
+    } else if stdin {
+        read_lines(Box::new(std::io::stdin().lock().lines()))
+    } else {
+        let user = match rpassword::prompt_password("存储用户名: ") {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("lk config: 无法读取输入：{e}");
+                return Err(1);
+            }
+        };
+        let pass = match rpassword::prompt_password("存储密码: ") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("lk config: 无法读取输入：{e}");
+                return Err(1);
+            }
+        };
+        Some((user.trim().to_string(), pass.trim().to_string()))
+    };
+    let Some((user, pass)) = creds else {
+        eprintln!("lk config: 凭据需要两行：用户名 + 密码（目标：{url}）");
+        return Err(2);
+    };
+    if user.is_empty() {
+        eprintln!("lk config: 用户名不能为空");
+        return Err(2);
+    }
+    Ok(Some((user, pass)))
+}
+
+/// `lk config get <key>`：读取配置。
+fn cmd_config_get(out: &mut impl Write, dir: &std::path::Path, key: &str, json_out: bool) -> i32 {
+    let config = daemon::read_config(dir);
+    let value: Option<String> = match key {
+        "sync.url" => config.sync.as_ref().map(|c| c.url.clone()),
+        "sync.interval" => config.sync.as_ref().map(|c| c.interval_secs.to_string()),
+        "sync.enabled" => Some(
+            if config.sync.is_some() {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ),
+        "autoLockMinutes" => Some(config.auto_lock_minutes.to_string()),
+        _ => {
+            eprintln!(
+                "lk config: 未知配置键 {key}（可用：sync.url / sync.interval / sync.enabled / autoLockMinutes）"
+            );
+            return 2;
+        }
+    };
+    match value {
+        Some(v) => {
+            if json_out {
+                let _ = writeln!(out, "{}", json!({ key: v }));
+            } else {
+                let _ = writeln!(out, "{v}");
+            }
+            0
+        }
+        None => {
+            eprintln!("lk config: 未配置 {key}");
+            1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 守护进程
 // ---------------------------------------------------------------------------
 
@@ -1164,6 +1445,33 @@ fn cmd_daemon(dir: &std::path::Path) -> i32 {
     };
     // 请求 → 响应（逐行 JSON）；状态互斥保护
     let state = std::sync::Arc::new(std::sync::Mutex::new(daemon));
+    // 后台同步轮询线程（M1）：只在解锁态 + 已配置时执行一轮；锁定即停止
+    // （不执行任何同步活动）。间隔 = 配置值 × 2^风暴等级（封顶 24h）；
+    // 失败静默（本轮放弃，下一轮重试）；配置由 CLI 直接写盘，每轮热更新。
+    {
+        use lk_core::sync::{next_poll_interval, DEFAULT_SYNC_INTERVAL_SECS};
+        let poller_state = state.clone();
+        std::thread::spawn(move || {
+            let mut next_sleep = DEFAULT_SYNC_INTERVAL_SECS;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(next_sleep));
+                let mut guard = poller_state.lock().expect("daemon mutex poisoned");
+                guard.reload_config();
+                let base = guard
+                    .sync_config()
+                    .map(|c| c.interval_secs)
+                    .unwrap_or(DEFAULT_SYNC_INTERVAL_SECS);
+                if guard.is_unlocked() && guard.sync_configured() {
+                    if let Err(e) = guard.sync_round() {
+                        eprintln!("lk daemon: 同步失败（下一轮重试）：{}", e.message());
+                    }
+                    next_sleep = next_poll_interval(base, guard.storm_level());
+                } else {
+                    next_sleep = next_poll_interval(base, 0);
+                }
+            }
+        });
+    }
     let handler_state = state.clone();
     let handler = std::sync::Arc::new(move |line: &str| -> String {
         let mut guard = handler_state.lock().expect("daemon mutex poisoned");

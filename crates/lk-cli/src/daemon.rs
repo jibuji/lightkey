@@ -7,6 +7,12 @@
 //! - 空闲超时自动锁定（默认 5 分钟，`config.json` 可配；0 = 下次请求即锁）。
 //! - 审计：守护进程是唯一写入方；未解锁态无法派生 K_audit → 失败解锁不落
 //!   审计（限流兜底），解锁成功与之后的一切敏感操作签名留痕。
+//! - M1 同步：`config.json` 的 `sync` 段（`lk config sync set` 写入）驱动
+//!   后台轮询线程——只在解锁态轮询（锁定即停止）；`sync.trigger` 同步执行
+//!   一轮并返回变更摘要，`sync.poll` 返回最近一轮摘要与水位；轮询间隔受
+//!   冲突风暴退避（指数 ×2 至 24h 上限）；同步状态持久化 `sync-state.json`。
+//! - 凭据（WebDAV/S3）存系统钥匙串（service=`lightkey-sync`），不进
+//!   vault 密文、不进审计明文、不落日志；`file://` 本地模拟无需凭据。
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -32,12 +38,122 @@ pub const CONFIG_FILE: &str = "config.json";
 pub struct Config {
     /// 空闲自动锁定分钟数（0 = 下次请求即锁；默认 5）。
     pub auto_lock_minutes: u64,
+    /// M1 同步配置（`lk config sync set` 写入；缺省 = 未配置同步）。
+    #[serde(default)]
+    pub sync: Option<lk_core::sync::SyncConfig>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             auto_lock_minutes: 5,
+            sync: None,
+        }
+    }
+}
+
+/// 同步状态文件名（水位 / 最近摘要 / 风暴等级）。
+pub const SYNC_STATE_FILE: &str = "sync-state.json";
+/// 钥匙串 service 名（凭据 = `{username, password}` JSON；user = 存储 URL）。
+const SYNC_KEYRING_SERVICE: &str = "lightkey-sync";
+
+/// 同步运行状态（持久化到 `sync-state.json`；风暴等级与摘要跨重启保留）。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncRuntime {
+    pub state: lk_core::sync::SyncState,
+}
+
+impl SyncRuntime {
+    fn load(dir: &std::path::Path) -> SyncRuntime {
+        match std::fs::read(dir.join(SYNC_STATE_FILE)) {
+            Ok(bytes) => serde_json::from_slice::<SyncRuntime>(&bytes).unwrap_or_default(),
+            Err(_) => SyncRuntime::default(),
+        }
+    }
+
+    fn save(&self, dir: &std::path::Path) {
+        let path = dir.join(SYNC_STATE_FILE);
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(bytes) = serde_json::to_vec(&self) {
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+}
+
+/// 读配置（守护进程内热更新 / CLI `lk config` 共用）。
+pub fn read_config(dir: &std::path::Path) -> Config {
+    match std::fs::read(dir.join(CONFIG_FILE)) {
+        Ok(bytes) => serde_json::from_slice::<Config>(&bytes).unwrap_or_default(),
+        Err(_) => Config::default(),
+    }
+}
+
+/// 写配置（原子：tmp + rename）。
+pub fn write_config(dir: &std::path::Path, config: &Config) -> std::io::Result<()> {
+    let path = dir.join(CONFIG_FILE);
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(config).unwrap_or_default())?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// 存同步凭据到系统钥匙串（service=`lightkey-sync`，user=存储 URL）。
+pub fn store_sync_credentials(url: &str, username: &str, password: &str) -> Result<(), String> {
+    use zeroize::Zeroizing;
+    let json = serde_json::json!({ "username": username, "password": password }).to_string();
+    let entry = keyring::Entry::new(SYNC_KEYRING_SERVICE, url)
+        .map_err(|e| format!("无法访问系统钥匙串：{e}"))?;
+    let _ = Zeroizing::new(json.clone());
+    entry
+        .set_password(&json)
+        .map_err(|e| format!("无法写入系统钥匙串：{e}"))
+}
+
+/// 读同步凭据（守护进程轮询/触发时用）。`file://` 无需凭据 → `Ok(None)`。
+pub fn load_sync_credentials(url: &str) -> Result<Option<lk_core::storage::Credentials>, String> {
+    use zeroize::Zeroizing;
+    if url.starts_with("file://") {
+        return Ok(None);
+    }
+    let entry = keyring::Entry::new(SYNC_KEYRING_SERVICE, url)
+        .map_err(|e| format!("无法访问系统钥匙串：{e}"))?;
+    let json = entry
+        .get_password()
+        .map_err(|e| format!("钥匙串中无 {url} 的凭据（{e}）；请运行 lk config sync set"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("钥匙串凭据格式损坏：{e}"))?;
+    let username = v
+        .get("username")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| "钥匙串凭据缺 username".to_string())?
+        .to_string();
+    let password = v
+        .get("password")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| "钥匙串凭据缺 password".to_string())?
+        .to_string();
+    Ok(Some(lk_core::storage::Credentials {
+        username,
+        password: Zeroizing::new(password),
+    }))
+}
+
+/// 同步轮次的失败分类（IPC 错误码映射用）。
+pub enum SyncFail {
+    NotConfigured,
+    Credentials(String),
+    Engine(lk_core::Error),
+}
+
+impl SyncFail {
+    pub fn message(&self) -> String {
+        match self {
+            SyncFail::NotConfigured => "未配置同步存储".into(),
+            SyncFail::Credentials(m) => m.clone(),
+            SyncFail::Engine(e) => e.to_string(),
         }
     }
 }
@@ -84,6 +200,7 @@ pub struct Daemon {
     unlock_guard: AuthGuard,
     recover_guard: AuthGuard,
     last_activity: Instant,
+    sync: SyncRuntime,
 }
 
 /// 信号处理标志（unix：SIGINT/SIGTERM 优雅退出）。
@@ -95,6 +212,7 @@ impl Daemon {
         let dir = dir.to_path_buf();
         let audit = AuditLog::open(&dir).map_err(|e| e.to_string())?;
         let config = load_config(&dir);
+        let sync = SyncRuntime::load(&dir);
         install_shutdown_handlers();
         Ok(Daemon {
             dir,
@@ -105,6 +223,7 @@ impl Daemon {
             unlock_guard: AuthGuard::default(),
             recover_guard: AuthGuard::default(),
             last_activity: Instant::now(),
+            sync,
         })
     }
 
@@ -159,8 +278,12 @@ impl Daemon {
             M_AUDIT_VERIFY => {
                 self.require_session(id.clone(), token, |me| me.audit_verify(id.clone()))
             }
-            // M1/M2 占位
-            M_SYNC_TRIGGER | M_SYNC_POLL | M_AUTHZ_EVALUATE | M_APPROVAL_REQUEST => {
+            M_SYNC_TRIGGER => {
+                self.require_session(id.clone(), token, |me| me.sync_trigger(id.clone()))
+            }
+            M_SYNC_POLL => self.require_session(id.clone(), token, |me| me.sync_poll(id.clone())),
+            // M2 占位
+            M_AUTHZ_EVALUATE | M_APPROVAL_REQUEST => {
                 RpcResponse::err(id.clone(), ERR_METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None)
             }
             _ => RpcResponse::err(id.clone(), ERR_METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None),
@@ -189,7 +312,7 @@ impl Daemon {
         let result = StatusResult {
             unlocked: self.vault.is_some(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            sync_watermark: None,
+            sync_watermark: self.sync.state.watermark.clone(),
         };
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
@@ -239,8 +362,11 @@ impl Daemon {
         let unlocked = UnlockedVault::unlock(&self.dir, &p.master_password);
         match unlocked {
             Ok(mut vault) => {
-                // 过期墓碑清理（30 天延迟硬删）
-                let _ = vault.purge_expired(&lk_core::crypto::now_iso());
+                // 过期墓碑清理（30 天延迟硬删）。同步已配置时跳过：硬删
+                // 需「≥30 天且已同步确认」，由同步引擎裁决（sync.md §4）。
+                if self.config.sync.is_none() {
+                    let _ = vault.purge_expired(&lk_core::crypto::now_iso());
+                }
                 self.unlock_guard.on_success();
                 self.vault = Some(vault);
                 let token = self.sessions.issue();
@@ -360,6 +486,7 @@ impl Daemon {
 
     /// 退出清理：删令牌 + 删端点文件（socket 由 OS 回收）。
     pub fn shutdown(&mut self) {
+        self.sync.save(&self.dir);
         self.remove_session_token();
         if let Some(ep) = super::transport::read_endpoint(&self.dir) {
             super::transport::cleanup(&self.dir, &ep);
@@ -515,6 +642,100 @@ impl Daemon {
                 Some(json!({ "detail": e.to_string() })),
             ),
         }
+    }
+
+    // -- 同步（M1）---------------------------------------------------------
+
+    /// 当前生效的同步配置（校验 + 夹取间隔）；未配置 → None。
+    pub fn sync_config(&self) -> Option<lk_core::sync::SyncConfig> {
+        let cfg = self.config.sync.as_ref()?;
+        if cfg.validate().is_err() {
+            return None;
+        }
+        Some(cfg.clone())
+    }
+
+    /// 重读 config.json（CLI 直接写配置，守护进程热更新）。
+    pub fn reload_config(&mut self) {
+        let fresh = load_config(&self.dir);
+        // 保留运行期仅内存的字段（无）；直接替换
+        self.config = fresh;
+    }
+
+    /// 当前风暴等级（轮询线程计算下次间隔用）。
+    pub fn storm_level(&self) -> u32 {
+        self.sync.state.storm_level
+    }
+
+    /// 是否处于解锁态（轮询线程判定「解锁才同步」）。
+    pub fn is_unlocked(&self) -> bool {
+        self.vault.is_some()
+    }
+
+    /// 是否已配置同步（轮询线程判定）。
+    pub fn sync_configured(&self) -> bool {
+        self.config.sync.is_some()
+    }
+
+    /// 执行一轮同步（解锁态调用方保证）。失败分类见 [`SyncFail`]。
+    pub fn sync_round(&mut self) -> std::result::Result<lk_core::sync::SyncSummary, SyncFail> {
+        use lk_core::storage::{backend_from_url, StorageBackend};
+        use lk_core::sync::{storm_level_after, SyncEngine};
+        let cfg = self.sync_config().ok_or(SyncFail::NotConfigured)?;
+        let vault = self
+            .vault
+            .as_mut()
+            .ok_or(SyncFail::Engine(Error::SessionInvalid))?;
+        let creds = load_sync_credentials(&cfg.url).map_err(SyncFail::Credentials)?;
+        let backend: Box<dyn StorageBackend> =
+            backend_from_url(&cfg.url, creds).map_err(SyncFail::Engine)?;
+        let summary = SyncEngine::new(vault, backend.as_ref())
+            .run_round(&lk_core::crypto::now_iso())
+            .map_err(SyncFail::Engine)?;
+        // 水位 / 摘要 / 风暴等级 + 持久化
+        let diff = summary.pulled + summary.pushed;
+        self.sync.state.watermark = Some(lk_core::crypto::now_iso());
+        self.sync.state.last_summary = Some(summary.clone());
+        self.sync.state.storm_level = storm_level_after(diff, self.sync.state.storm_level);
+        self.sync.save(&self.dir);
+        Ok(summary)
+    }
+
+    fn sync_trigger(&mut self, id: Value) -> RpcResponse {
+        self.reload_config();
+        match self.sync_round() {
+            Ok(summary) => {
+                RpcResponse::ok(id, serde_json::to_value(summary).unwrap_or(Value::Null))
+            }
+            Err(SyncFail::NotConfigured) => {
+                RpcResponse::err(id, ERR_SYNC_NOT_CONFIGURED, MSG_SYNC_NOT_CONFIGURED, None)
+            }
+            Err(SyncFail::Credentials(msg)) => RpcResponse::err(
+                id,
+                ERR_SYNC_CREDENTIALS,
+                MSG_SYNC_CREDENTIALS,
+                Some(json!({ "detail": msg })),
+            ),
+            Err(SyncFail::Engine(e)) => self.sync_err_response(id, &e),
+        }
+    }
+
+    fn sync_poll(&mut self, id: Value) -> RpcResponse {
+        let result = SyncPollResult {
+            summary: self.sync.state.last_summary.clone(),
+            watermark: self.sync.state.watermark.clone(),
+        };
+        RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
+    }
+
+    fn sync_err_response(&self, id: Value, e: &Error) -> RpcResponse {
+        let (code, msg) = match e {
+            Error::SyncStorage(_) => (ERR_SYNC_STORAGE, MSG_SYNC_STORAGE),
+            Error::SyncAnomaly(_) => (ERR_SYNC_ANOMALY, MSG_SYNC_ANOMALY),
+            Error::SyncConfig(_) => (ERR_SYNC_NOT_CONFIGURED, MSG_SYNC_NOT_CONFIGURED),
+            _ => (ERR_SYNC_STORAGE, MSG_SYNC_STORAGE),
+        };
+        RpcResponse::err(id, code, msg, Some(json!({ "detail": e.to_string() })))
     }
 
     fn err_response(&self, id: Value, e: &Error) -> RpcResponse {

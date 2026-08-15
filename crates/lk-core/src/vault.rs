@@ -250,6 +250,130 @@ impl UnlockedVault {
         &self.keys
     }
 
+    // -- 同步引擎接口（M1；密文 blob 原样导入/导出，revision 不 bump）-----
+
+    /// 索引快照（同步引擎对比用；含 kind=Rule 的透传条目）。
+    pub(crate) fn index_snapshot(&self) -> Vec<IndexEntry> {
+        let mut v: Vec<IndexEntry> = self.index.values().cloned().collect();
+        v.sort_by_key(|e| e.id);
+        v
+    }
+
+    /// 条目密文原文（同步上传用，不重加密）。
+    pub(crate) fn item_blob(&self, id: uuid::Uuid) -> Result<Vec<u8>> {
+        let path = item_file(&self.dir, id);
+        std::fs::read(&path).map_err(|_| Error::ItemNotFound(id))
+    }
+
+    /// 墓碑密文原文（可能不存在——远端墓碑缺失时由引擎合成）。
+    pub(crate) fn tomb_blob(&self, id: uuid::Uuid) -> Result<Vec<u8>> {
+        let path = tomb_file(&self.dir, id);
+        std::fs::read(&path).map_err(|_| Error::ItemNotFound(id))
+    }
+
+    /// 附件元数据密文原文。
+    pub(crate) fn attach_meta_blob(&self, attach_id: uuid::Uuid) -> Result<Vec<u8>> {
+        let path = attach_meta_file(&self.dir, attach_id);
+        std::fs::read(&path).map_err(|_| Error::ItemNotFound(attach_id))
+    }
+
+    /// 附件分块密文原文。
+    pub(crate) fn chunk_blob(&self, attach_id: uuid::Uuid, i: u32) -> Result<Vec<u8>> {
+        let path = chunk_file(&self.dir, attach_id, i);
+        std::fs::read(&path).map_err(|_| Error::ItemNotFound(attach_id))
+    }
+
+    /// 拉取条目落盘：**原样写远程密文 blob**（不重加密）+ 更新内存索引。
+    /// revision 不 bump；`last_revision` 提升到导入值（本地后续写入保持严格递增）。
+    pub(crate) fn import_item(&mut self, blob: &[u8], item: &Item) -> Result<()> {
+        let id = item.id();
+        write_atomic(&item_file(&self.dir, id), blob)?;
+        self.index.insert(
+            id,
+            IndexEntry {
+                id,
+                revision: item.revision().to_string(),
+                kind: ObjectKind::Item,
+                deleted: item.deleted(),
+            },
+        );
+        if let Some(last) = &self.last_revision {
+            if item.revision() > last.as_str() {
+                self.last_revision = Some(item.revision().to_string());
+            }
+        } else {
+            self.last_revision = Some(item.revision().to_string());
+        }
+        // 立即持久化索引：守护进程重启后从磁盘解锁，索引必须反映导入
+        // （否则重启后拉取条目不可见，直到下一次同步——S1 同款语义）
+        self.save_index()
+    }
+
+    /// 拉取墓碑落盘（原样密文）。
+    pub(crate) fn import_tomb(&self, blob: &[u8], tomb: &Tombstone) -> Result<()> {
+        write_atomic(&tomb_file(&self.dir, tomb.id), blob)
+    }
+
+    /// 拉取附件落盘（元数据 + 全部分块，原样密文）。
+    pub(crate) fn import_attachment(
+        &self,
+        meta_blob: &[u8],
+        meta: &AttachmentMeta,
+        chunks: &[(u32, Vec<u8>)],
+    ) -> Result<()> {
+        write_atomic(&attach_meta_file(&self.dir, meta.id), meta_blob)?;
+        for (i, blob) in chunks {
+            write_atomic(&chunk_file(&self.dir, meta.id, *i), blob)?;
+        }
+        Ok(())
+    }
+
+    /// 硬删（同步确认后）：条目 + 墓碑 + 附件密文 + 索引条目。
+    /// 不做 30 天检查（由同步引擎按「已同步确认」语义裁决后调用）。
+    pub(crate) fn hard_delete(&mut self, id: uuid::Uuid) -> Result<()> {
+        // 先读条目取附件 id（file 条目）：删掉 .item.lk 后即无从获取（G1 同款顺序）
+        let attach_id = self.read_item_file(id).ok().and_then(|i| i.attach_id());
+        fs::remove_file(item_file(&self.dir, id)).ok();
+        fs::remove_file(tomb_file(&self.dir, id)).ok();
+        self.remove_attachment(attach_id)?;
+        self.index.remove(&id);
+        self.save_index()
+    }
+
+    /// 全部本地墓碑（id + 载荷；同步引擎 30 天/确认裁决用）。
+    pub(crate) fn tombstones(&self) -> Vec<(uuid::Uuid, Tombstone)> {
+        let mut v = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return v;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".tomb.lk") {
+                continue;
+            }
+            if let Ok(t) = Self::read_tomb(&self.dir, &self.keys, &name) {
+                v.push((t.id, t));
+            }
+        }
+        v
+    }
+
+    /// 附件元数据（解密态）。
+    pub(crate) fn attachment_meta(&self, attach_id: uuid::Uuid) -> Result<AttachmentMeta> {
+        self.read_attachment_meta(attach_id)
+    }
+
+    /// 附件远端文件键列表（{attach_id}.attach.lk + {attach_id}.{i}.chunk.lk）。
+    pub(crate) fn attachment_keys(&self, attach_id: uuid::Uuid) -> Vec<String> {
+        let mut keys = vec![format!("{attach_id}.attach.lk")];
+        if let Ok(meta) = self.read_attachment_meta(attach_id) {
+            for i in 0..meta.chunks {
+                keys.push(format!("{attach_id}.{i}.chunk.lk"));
+            }
+        }
+        keys
+    }
+
     /// 索引加载；`index.lk` 缺失或损坏 → 全量重建（不阻塞解锁）。
     fn load_index(dir: &Path, keys: &Keys) -> Result<HashMap<uuid::Uuid, IndexEntry>> {
         let path = index_file(dir);
@@ -654,7 +778,7 @@ impl UnlockedVault {
     }
 
     /// 删除附件（元数据 + 全部分块）。
-    fn remove_attachment(&self, attach_id: Option<uuid::Uuid>) -> Result<()> {
+    pub(crate) fn remove_attachment(&self, attach_id: Option<uuid::Uuid>) -> Result<()> {
         let Some(attach_id) = attach_id else {
             return Ok(());
         };

@@ -454,6 +454,12 @@ pub fn parse_iso(iso: &str) -> Option<time::OffsetDateTime> {
     time::OffsetDateTime::parse(iso, &Rfc3339).ok()
 }
 
+/// 测试注时用：以与 [`now_iso`] 相同的固定格式格式化时间（仅测试）。
+#[doc(hidden)]
+pub fn iso_fmt_for_tests() -> &'static [BorrowedFormatItem<'static>] {
+    iso_fmt()
+}
+
 /// 随机 `N` 字节（CSPRNG）。
 pub fn random_array<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
