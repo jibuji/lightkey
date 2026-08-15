@@ -31,6 +31,13 @@ needs-decision，不得自行变更。
 | D14 | 前端设计（Q3 含）：两份 = ① 设计规范（tokens/色彩/组件库/解锁与条目交互流程）② 高保真单页原型（可交互、可预览截图评审）；工具链 = 自研 UI 设计工具 + agent_browser 预览截图 + doubao-seed-2.1-turbo 视觉评审 + lavish-axi 船长评审面（D1/D2 已定，不装第三方设计 skill） | [design/spec.md](design/spec.md)、[design/prototype](design/prototype/) |
 | D15 | 开源/商业：暂不考虑付费；免费版不做条目数限制；付费边界（官方签名构建/远程审批中继等）推迟到验证后再议 | [architecture.md](architecture.md)（非目标） |
 
-## 需新决策的事项（当前为空）
+## 需新决策的事项
 
-无。如实现中发现规格空白或矛盾，在本节登记并上报 needs-decision。
+1. **恢复信封密钥的派生来源矛盾（待船长拍板）**：D4 与 [crypto.md](crypto.md) §2
+   称「恢复信封密钥」为 MK 经 HKDF-SHA256 分叉的三密钥之一，信封用其加密；
+   而 D9 与 [recovery.md](recovery.md) §3 称信封密钥由**恢复码**经 Argon2id 派生
+   （恢复流程仅需恢复码 + 新主密码）。若信封密钥派生自 MK，仅凭恢复码无法解密
+   信封，与恢复流程矛盾。需裁决：恢复信封密钥仅由恢复码派生（并修订
+   crypto.md §2 分叉图），或另定「恢复信封密钥」的用途。
+
+> 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

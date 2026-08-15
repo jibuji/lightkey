@@ -18,7 +18,7 @@
 | 条目 item | `{uuid}.item.lk` | K_data | 见 §3 |
 | 索引 index | `index.lk` | K_data | 条目清单（id、revisionDate、类型标签等最小可索引字段，全部在密文内） |
 | 墓碑 tombstone | `{uuid}.tomb.lk` | K_data | 软删除标记，含删除时间 |
-| 附件附件元数据 | `{uuid}.attach.lk` | K_data | 附件清单 + 每附件密钥（**加密的**）与分块引用 |
+| 附件元数据 | `{uuid}.attach.lk` | K_data | 附件清单 + 每附件密钥（**加密的**）与分块引用 |
 | 附件分块 | `{uuid}.{i}.chunk.lk` | 每附件独立密钥 | 1 MiB/块（见 §5） |
 | 恢复信封 | `recovery.envelope` | K_recovery | 主密钥副本（见 recovery.md） |
 

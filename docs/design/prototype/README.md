@@ -1,6 +1,7 @@
 # 高保真单页原型（设计评审用）
 
-LightKey V1 前端的高保真可交互原型：单文件 HTML + CSS + JS（零构建依赖）。
+LightKey V1 前端的高保真可交互原型：单页静态 HTML/CSS/JS 三文件
+（`index.html` + `styles.css` + `app.js`，零构建依赖）。
 
 ## 预览
 
