@@ -1,75 +1,1188 @@
 //! LightKey 命令行工具（`lk`）。
 //!
-//! 命令树与完整语义见 `docs/cli.md`；命令清单：
+//! 命令树与完整语义见 `docs/cli.md`。M0 已实现：
 //!
-//! - `lk init` / `lk unlock` / `lk lock` —— 库生命周期与解锁态
-//! - `lk item` —— 条目 CRUD（M0）
-//! - `lk sync` —— 同步（M1）
-//! - `lk rule` / `lk inject` —— Agent 授权门（M2）
-//! - `lk audit` —— 审计日志
-//! - `lk daemon` —— 常驻守护进程（持解锁态，密钥仅存内存）
-//! - `lk status` / `lk config` —— 状态与配置
+//! - 库生命周期：`lk init` / `lk unlock` / `lk lock` / `lk status` / `lk recover`
+//! - 条目（四类 v2）：`lk item list/get/add/edit/delete/copy/export`
+//! - 审计：`lk audit`（只读；`--verify` 校验 HMAC 链）
+//! - 守护进程：`lk daemon`（持解锁态，密钥仅内存；客户端自动拉起）
 //!
-//! 骨架占位：命令树已声明，全部子命令暂以“未实现”退出；
-//! M0 起按 `docs/milestones.md` 逐项实现。CLI 与桌面共享 `lk-core`，
-//! 两者都通过守护进程的本地 IPC 访问已解锁库。
+//! M1/M2 命令（sync/rule/inject/config）保持占位（退出码 2）。
+//!
+//! 约定：
+//! - 退出码 0 成功 / 1 业务失败（拒绝/超时/冲突）/ 2 用法错误或未实现。
+//! - 敏感输入（主密码/恢复码）不回显（TTY 用 rpassword，脚本用 --stdin）。
+//! - 所有命令经守护进程执行（自动拉起）；会话令牌由守护进程签发，
+//!   经 0600 文件在进程间传递（锁定即删除）。
+//! - 错误信息不区分「未解锁/令牌错」（ipc.md §3 语义）。
+
+mod clipboard;
+mod daemon;
+mod dirs;
+mod transport;
+
+use std::io::Write;
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use lk_core::ipc::*;
+use lk_core::model::{CustomField, ItemDraft, ItemSummary};
+use serde_json::{json, Value};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
 #[command(
     name = "lk",
-    version,
+    version = VERSION,
     about = "轻钥 LightKey 命令行工具",
-    long_about = "轻钥 LightKey：个人密钥 / 私密信息管理工具。\n\
-                  本版本为 M0 骨架占位：命令树已声明，行为将在里程碑中实现（见 docs/milestones.md）。"
+    long_about = "轻钥 LightKey：个人密钥 / 私密信息管理工具（零知识，单机闭环 M0）。\n\
+                  所有命令经本地守护进程执行（自动拉起，密钥仅存守护进程内存）。"
 )]
 struct Cli {
+    /// 数据目录（默认：$LIGHTKEY_HOME 或平台用户数据目录）
+    #[arg(long, global = true)]
+    dir: Option<PathBuf>,
+    /// 机器可读 JSON 输出（最小字段）
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// 初始化一个新库（设置主密码、生成恢复码/恢复信封）
-    Init,
-    /// 解锁库并连接守护进程
-    Unlock,
-    /// 锁定库
+    /// 初始化一个新库（设置主密码、生成恢复码【仅展示一次】与恢复信封）
+    Init {
+        /// 已存在库时强制重置（旧数据不可恢复，需二次确认）
+        #[arg(long)]
+        force: bool,
+        /// 主密码从 stdin 读取（脚本用；交互式默认不回显）
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// 解锁库（连接守护进程，签发会话令牌）
+    Unlock {
+        /// 主密码从 stdin 读取（脚本用）
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// 锁定库（擦除内存密钥，失效令牌）
     Lock,
-    /// 条目管理（增删改查、复制、附件）
-    Item,
-    /// 同步到 BYO 存储（WebDAV / S3）
-    Sync,
-    /// Agent 授权门规则管理（add / list / remove）
-    Rule,
-    /// 给具名命令注入被批准的环境变量（如 `lk inject -- npm publish`）
-    Inject,
-    /// 查看审计日志
-    Audit,
-    /// 以守护进程方式常驻（持解锁态，密钥仅存内存）
-    Daemon,
-    /// 显示守护进程与同步状态
+    /// 显示解锁态、同步水位、版本
     Status,
-    /// 读写本地配置
+    /// 恢复：恢复码 + 新主密码（重置主密码，数据保留）
+    Recover(Box<RecoverArgs>),
+    /// 条目管理（增删改查、复制、附件导出）
+    Item(Box<ItemArgs>),
+    /// 查看审计日志（只读；无密钥值）
+    Audit {
+        /// 最近 N 条
+        #[arg(long)]
+        tail: Option<usize>,
+        /// 校验审计 HMAC 链（需解锁）
+        #[arg(long)]
+        verify: bool,
+    },
+    /// 以守护进程方式常驻（持解锁态，密钥仅存内存；由客户端自动拉起）
+    Daemon,
+    /// 同步到 BYO 存储（WebDAV / S3）【M1】
+    Sync,
+    /// Agent 授权门规则管理（add / list / remove）【M2】
+    Rule,
+    /// 给具名命令注入被批准的环境变量【M2】
+    Inject,
+    /// 读写本地配置【M1】
     Config,
+}
+
+/// `lk recover` 参数。
+#[derive(clap::Args)]
+struct RecoverArgs {
+    /// 恢复码（不传则交互式输入）
+    #[arg(long)]
+    code: Option<String>,
+    /// 新主密码从 stdin 读取（脚本用）
+    #[arg(long)]
+    stdin: bool,
+}
+
+/// `lk item` 参数。
+#[derive(clap::Args)]
+struct ItemArgs {
+    #[command(subcommand)]
+    command: ItemCommand,
+}
+
+/// `lk item edit` 参数。
+#[derive(clap::Args)]
+struct EditArgs {
+    id: String,
+    /// 显式指定 base revision（缺省 = 先读当前值；用于演示/脚本化 CAS 冲突）
+    #[arg(long)]
+    expected_revision: Option<String>,
+    #[command(flatten)]
+    fields: EditFields,
+}
+
+#[derive(Subcommand)]
+enum ItemCommand {
+    /// 列出条目（最小字段）
+    List,
+    /// 取单条（完整解密字段）
+    Get { id: String },
+    /// 新建条目（四类：login / note / secret / file）
+    Add {
+        #[command(subcommand)]
+        kind: Box<AddKind>,
+    },
+    /// 编辑条目（CAS：base revision 必须与当前一致）
+    Edit(Box<EditArgs>),
+    /// 软删除（墓碑，30 天延迟硬删）
+    Delete { id: String },
+    /// 复制字段到剪贴板（30s 自动清除）
+    Copy { id: String, field: String },
+    /// 导出 file 条目附件到本地文件
+    Export {
+        id: String,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum AddKind {
+    /// 登录：账号 + 密码 + 网址 + 自定义字段
+    Login {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        username: String,
+        /// 密码（不传则交互式输入，不回显）
+        #[arg(long)]
+        password: Option<String>,
+        /// 密码从 stdin 读取（脚本用）
+        #[arg(long)]
+        stdin: bool,
+        /// 网址列表，逗号分隔
+        #[arg(long)]
+        uris: Option<String>,
+    },
+    /// 笔记：Markdown 内容
+    Note {
+        #[arg(long)]
+        name: String,
+        /// 内容（与 --content-file 二选一）
+        #[arg(long)]
+        content: Option<String>,
+        /// 从文件读内容
+        #[arg(long)]
+        content_file: Option<PathBuf>,
+    },
+    /// 密钥：密钥值 + 用途/备注（可选）+ 过期时间（可选）
+    Secret {
+        #[arg(long)]
+        name: String,
+        /// 密钥值（不传则交互式输入，不回显）
+        #[arg(long)]
+        value: Option<String>,
+        /// 密钥值从 stdin 读取（脚本用）
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        purpose: Option<String>,
+        /// 过期时间 YYYY-MM-DD（可选）
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    /// 文件：元数据 + 加密附件（≤50MB，1 MiB 分块）
+    File {
+        #[arg(long)]
+        name: Option<String>,
+        /// 附件源文件（必填）
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        note: Option<String>,
+        /// MIME 类型（默认按扩展名推断，兜底 application/octet-stream）
+        #[arg(long)]
+        mime: Option<String>,
+    },
+}
+
+/// 编辑字段（按条目类型取子集；未提供的字段保持不变）。
+#[derive(clap::Args, Default)]
+struct EditFields {
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    username: Option<String>,
+    /// 密码（不传则保持不变；--stdin 从 stdin 读）
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long)]
+    uris: Option<String>,
+    #[arg(long)]
+    content: Option<String>,
+    #[arg(long)]
+    value: Option<String>,
+    #[arg(long)]
+    purpose: Option<String>,
+    #[arg(long)]
+    expires_at: Option<String>,
+    #[arg(long)]
+    note: Option<String>,
+    /// 替换附件（file 类型）
+    #[arg(long)]
+    file: Option<PathBuf>,
+    /// MIME 类型（替换附件时可选）
+    #[arg(long)]
+    mime: Option<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
-    let name = match &cli.command {
-        Command::Init => "init",
-        Command::Unlock => "unlock",
-        Command::Lock => "lock",
-        Command::Item => "item",
-        Command::Sync => "sync",
-        Command::Rule => "rule",
-        Command::Inject => "inject",
-        Command::Audit => "audit",
-        Command::Daemon => "daemon",
-        Command::Status => "status",
-        Command::Config => "config",
+    let code = run(&cli);
+    std::process::exit(code);
+}
+
+fn run(cli: &Cli) -> i32 {
+    let dir = dirs::data_dir(cli.dir.as_deref());
+    let out = &mut std::io::stdout();
+    match &cli.command {
+        Command::Init { force, stdin } => cmd_init(out, &dir, *force, *stdin, cli.json),
+        Command::Unlock { stdin } => cmd_unlock(out, &dir, *stdin),
+        Command::Lock => cmd_lock(out, &dir),
+        Command::Status => cmd_status(out, &dir, cli.json),
+        Command::Recover(args) => {
+            cmd_recover(out, &dir, args.code.as_deref(), args.stdin, cli.json)
+        }
+        Command::Item(args) => cmd_item(out, &dir, &args.command, cli.json),
+        Command::Audit { tail, verify } => cmd_audit(out, &dir, *tail, *verify, cli.json),
+        Command::Daemon => cmd_daemon(&dir),
+        // M1/M2 占位
+        Command::Sync | Command::Rule | Command::Inject | Command::Config => {
+            let name = match &cli.command {
+                Command::Sync => "sync",
+                Command::Rule => "rule",
+                Command::Inject => "inject",
+                Command::Config => "config",
+                _ => unreachable!(),
+            };
+            eprintln!("lk {name}: 该命令将在对应里程碑中实现（M1 同步 / M2 授权门）");
+            2
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RPC 客户端辅助
+// ---------------------------------------------------------------------------
+
+/// 业务错误 → 退出码 1 的统一文案映射。
+fn rpc_fail(msg: &str, code: i64, data: Option<&Value>) -> i32 {
+    let detail = data
+        .and_then(|d| d.get("detail"))
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+    let text = match code {
+        ERR_VAULT_INVALID => "解锁失败：主密码错误或库未初始化".to_string(),
+        ERR_SESSION_INVALID => "库未解锁或会话已失效，请先运行 lk unlock".to_string(),
+        ERR_ITEM_CONFLICT => "条目已被其他设备修改（CAS 冲突），请刷新后重试".to_string(),
+        ERR_ITEM_NOT_FOUND => "条目不存在".to_string(),
+        ERR_LIMIT => format!("超出限制：{detail}"),
+        ERR_RATE_LIMITED => {
+            let secs = data
+                .and_then(|d| d.get("retryAfterSeconds"))
+                .and_then(|d| d.as_u64())
+                .unwrap_or(0);
+            format!("尝试过于频繁，请在 {secs} 秒后重试")
+        }
+        ERR_VAULT_EXISTS => {
+            "库已存在（如需重置请使用 lk init --force，旧数据不可恢复）".to_string()
+        }
+        _ => format!(
+            "{msg}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("（{detail}）")
+            }
+        ),
     };
-    eprintln!("lk {name}: 骨架占位——该命令将在对应里程碑中实现（见 docs/milestones.md）");
-    std::process::exit(2);
+    eprintln!("lk: {text}");
+    1
+}
+
+/// 发送 RPC（自动拉起守护进程；附带会话令牌）。
+fn rpc(dir: &std::path::Path, method: &str, params: Value) -> Result<Value, i32> {
+    let ep = transport::ensure_daemon(dir).map_err(|e| {
+        eprintln!("lk: 无法连接守护进程：{e}");
+        1
+    })?;
+    // 会话令牌：CLI 进程间经 0600 文件传递（守护进程锁定即删除）
+    let token_path = dir.join(daemon::SESSION_TOKEN_FILE);
+    let token = std::fs::read_to_string(&token_path).ok();
+    let mut params = params;
+    if let Some(t) = token {
+        params["token"] = json!(t.trim());
+    }
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let line = transport::request(&ep, &req.to_string()).map_err(|e| {
+        eprintln!("lk: 守护进程通信失败：{e}");
+        1
+    })?;
+    let resp: RpcResponse = serde_json::from_str(&line).unwrap_or(RpcResponse {
+        jsonrpc: "2.0".into(),
+        id: Value::Null,
+        result: None,
+        error: Some(RpcError {
+            code: ERR_PARSE,
+            message: "响应解析失败".into(),
+            data: None,
+        }),
+    });
+    match (resp.result, resp.error) {
+        (Some(result), _) => Ok(result),
+        (None, Some(err)) => Err(rpc_fail(&err.message, err.code, err.data.as_ref())),
+        (None, None) => {
+            eprintln!("lk: 空响应");
+            Err(1)
+        }
+    }
+}
+
+/// 读取一行敏感输入（不回显；`--stdin` 时从 stdin 读）。
+fn read_secret(prompt: &str, stdin: bool) -> Result<String, i32> {
+    if stdin {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map_err(|e| {
+            eprintln!("lk: 读取 stdin 失败：{e}");
+            1
+        })?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    rpassword::prompt_password(format!("{prompt}: ")).map_err(|e| {
+        eprintln!("lk: 无法读取输入：{e}");
+        1
+    })
+}
+
+/// 交互式确认（重置等破坏性操作）。
+fn confirm(prompt: &str) -> bool {
+    use std::io::BufRead;
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes")
+}
+
+// ---------------------------------------------------------------------------
+// 库生命周期
+// ---------------------------------------------------------------------------
+
+fn cmd_init(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    force: bool,
+    stdin: bool,
+    json_out: bool,
+) -> i32 {
+    if force && !confirm("警告：将清空当前库并重建（旧数据不可恢复）。继续？")
+    {
+        eprintln!("lk: 已取消");
+        return 1;
+    }
+    let pw1 = match read_secret("设置主密码", stdin) {
+        Ok(p) => p,
+        Err(c) => return c,
+    };
+    if pw1.is_empty() {
+        eprintln!("lk: 主密码不能为空");
+        return 1;
+    }
+    if !stdin {
+        let pw2 = match read_secret("确认主密码", false) {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        if pw1 != pw2 {
+            eprintln!("lk: 两次输入的主密码不一致");
+            return 1;
+        }
+    }
+    match rpc(
+        dir,
+        M_VAULT_INIT,
+        json!({ "masterPassword": pw1, "force": force }),
+    ) {
+        Ok(res) => {
+            let code = res["recoveryCode"].as_str().unwrap_or_default().to_string();
+            if json_out {
+                let _ = writeln!(out, "{}", json!({ "recoveryCode": code }));
+            } else {
+                let _ = writeln!(out, "库已初始化。");
+                let _ = writeln!(out);
+                let _ = writeln!(out, "⚠ 恢复码（仅展示这一次，请立即抄存到安全位置）：");
+                let _ = writeln!(out, "  {code}");
+                let _ = writeln!(out);
+                let _ = writeln!(
+                    out,
+                    "恢复码 + 主密码是数据恢复的唯一凭证；两者全丢则数据不可恢复。"
+                );
+            }
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+fn cmd_unlock(out: &mut impl Write, dir: &std::path::Path, stdin: bool) -> i32 {
+    let pw = match read_secret("主密码", stdin) {
+        Ok(p) => p,
+        Err(c) => return c,
+    };
+    match rpc(dir, M_VAULT_UNLOCK, json!({ "masterPassword": pw })) {
+        Ok(_) => {
+            let _ = writeln!(out, "已解锁");
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+fn cmd_lock(out: &mut impl Write, dir: &std::path::Path) -> i32 {
+    match rpc(dir, M_VAULT_LOCK, json!({})) {
+        Ok(_) => {
+            let _ = writeln!(out, "已锁定（内存密钥已擦除）");
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
+    match rpc(dir, M_VAULT_STATUS, json!({})) {
+        Ok(res) => {
+            let unlocked = res["unlocked"].as_bool().unwrap_or(false);
+            let version = res["version"].as_str().unwrap_or_default().to_string();
+            if json_out {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    json!({ "unlocked": unlocked, "version": version, "syncWatermark": null })
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "状态: {} | 版本: {} | 同步: 未配置（M1）",
+                    if unlocked { "已解锁" } else { "已锁定" },
+                    version
+                );
+            }
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+fn cmd_recover(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    code: Option<&str>,
+    stdin: bool,
+    json_out: bool,
+) -> i32 {
+    // --stdin 模式：第一行恢复码、第二行新主密码（脚本用）
+    use std::io::BufRead;
+    let mut code_lines = std::io::stdin().lock().lines();
+    let code = match code {
+        Some(c) => c.to_string(),
+        None if stdin => match code_lines.next() {
+            Some(Ok(c)) => c.trim().to_string(),
+            _ => {
+                eprintln!("lk: 读取恢复码失败");
+                return 1;
+            }
+        },
+        None => match read_secret("恢复码（仅输入字符，无需分隔符）", false) {
+            Ok(c) => c,
+            Err(e) => return e,
+        },
+    };
+    let pw1 = if stdin {
+        match code_lines.next() {
+            Some(Ok(p)) => p.trim().to_string(),
+            _ => {
+                eprintln!("lk: 读取新主密码失败");
+                return 1;
+            }
+        }
+    } else {
+        match read_secret("设置新主密码", false) {
+            Ok(p) => p,
+            Err(c) => return c,
+        }
+    };
+    if !stdin {
+        let pw2 = match read_secret("确认新主密码", false) {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        if pw1 != pw2 {
+            eprintln!("lk: 两次输入的新主密码不一致");
+            return 1;
+        }
+    }
+    match rpc(
+        dir,
+        M_VAULT_RECOVER,
+        json!({ "recoveryCode": code, "newPassword": pw1 }),
+    ) {
+        Ok(res) => {
+            let new_code = res["recoveryCode"].as_str().unwrap_or_default().to_string();
+            if json_out {
+                let _ = writeln!(out, "{}", json!({ "recoveryCode": new_code }));
+            } else {
+                let _ = writeln!(out, "恢复完成。");
+                let _ = writeln!(out);
+                let _ = writeln!(out, "⚠ 新恢复码（仅展示这一次，请立即抄存）：");
+                let _ = writeln!(out, "  {new_code}");
+                let _ = writeln!(out);
+                let _ = writeln!(out, "请用新主密码解锁：lk unlock");
+            }
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 条目
+// ---------------------------------------------------------------------------
+
+fn cmd_item(out: &mut impl Write, dir: &std::path::Path, cmd: &ItemCommand, json_out: bool) -> i32 {
+    match cmd {
+        ItemCommand::List => match rpc(dir, M_ITEM_LIST, json!({})) {
+            Ok(res) => {
+                let items: Vec<ItemSummary> =
+                    serde_json::from_value(res["items"].clone()).unwrap_or_default();
+                if json_out {
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        serde_json::to_string_pretty(&items).unwrap_or_default()
+                    );
+                } else {
+                    if items.is_empty() {
+                        let _ =
+                            writeln!(out, "（无条目。lk item add login --name ... 添加第一条）");
+                    }
+                    for it in &items {
+                        let _ = writeln!(
+                            out,
+                            "{}\t{}\t{}\t{}\t{}",
+                            it.id,
+                            it.kind.as_str(),
+                            it.name,
+                            it.revision,
+                            if it.deleted { "[deleted]" } else { "" }
+                        );
+                    }
+                }
+                0
+            }
+            Err(c) => c,
+        },
+        ItemCommand::Get { id } => match rpc(dir, M_ITEM_GET, json!({ "id": id })) {
+            Ok(item) => print_item(out, &item, json_out),
+            Err(c) => c,
+        },
+        ItemCommand::Add { kind } => cmd_item_add(out, dir, kind),
+        ItemCommand::Edit(args) => cmd_item_edit(
+            out,
+            dir,
+            &args.id,
+            &args.fields,
+            args.expected_revision.as_deref(),
+        ),
+        ItemCommand::Delete { id } => match rpc(dir, M_ITEM_DELETE, json!({ "id": id })) {
+            Ok(_) => {
+                let _ = writeln!(out, "已删除（软删除，30 天后硬删）");
+                0
+            }
+            Err(c) => c,
+        },
+        ItemCommand::Copy { id, field } => cmd_item_copy(out, dir, id, field),
+        ItemCommand::Export { id, output } => match rpc(dir, M_ITEM_EXPORT, json!({ "id": id })) {
+            Ok(res) => {
+                use base64::Engine as _;
+                let data = match res["data"].as_str() {
+                    Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!("lk: 附件数据解码失败：{e}");
+                            return 1;
+                        }
+                    },
+                    None => {
+                        eprintln!("lk: 附件数据缺失");
+                        return 1;
+                    }
+                };
+                match std::fs::write(output, &data) {
+                    Ok(_) => {
+                        let _ =
+                            writeln!(out, "已导出到 {}（{} 字节）", output.display(), data.len());
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("lk: 写入失败：{e}");
+                        1
+                    }
+                }
+            }
+            Err(c) => c,
+        },
+    }
+}
+
+fn print_item(out: &mut impl Write, item: &Value, json_out: bool) -> i32 {
+    if json_out {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(item).unwrap_or_default()
+        );
+        return 0;
+    }
+    let id = item["id"].as_str().unwrap_or_default();
+    let ty = item["type"].as_str().unwrap_or_default();
+    let name = item["name"].as_str().unwrap_or_default();
+    let revision = item["revision"].as_str().unwrap_or_default();
+    let deleted = item["deleted"].as_bool().unwrap_or(false);
+    let _ = writeln!(
+        out,
+        "{id}  [{ty}] {name}{}",
+        if deleted { " [deleted]" } else { "" }
+    );
+    let _ = writeln!(out, "  revision: {revision}");
+    match ty {
+        "login" => {
+            let _ = writeln!(
+                out,
+                "  username: {}",
+                item["username"].as_str().unwrap_or("")
+            );
+            let _ = writeln!(
+                out,
+                "  password: {}",
+                item["password"].as_str().unwrap_or("")
+            );
+            for u in item["uris"].as_array().unwrap_or(&vec![]) {
+                let _ = writeln!(out, "  uri: {}", u.as_str().unwrap_or(""));
+            }
+            for f in item["custom"].as_array().unwrap_or(&vec![]) {
+                let _ = writeln!(
+                    out,
+                    "  custom: {} = {}{}",
+                    f["name"].as_str().unwrap_or(""),
+                    f["value"].as_str().unwrap_or(""),
+                    if f["hidden"].as_bool().unwrap_or(false) {
+                        " (hidden)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        "note" => {
+            let _ = writeln!(out, "  content: {}", item["content"].as_str().unwrap_or(""));
+        }
+        "secret" => {
+            let _ = writeln!(out, "  value: {}", item["value"].as_str().unwrap_or(""));
+            let _ = writeln!(out, "  purpose: {}", item["purpose"].as_str().unwrap_or(""));
+            let _ = writeln!(
+                out,
+                "  expiresAt: {}",
+                item["expiresAt"].as_str().unwrap_or("")
+            );
+        }
+        "file" => {
+            let _ = writeln!(out, "  note: {}", item["note"].as_str().unwrap_or(""));
+            let _ = writeln!(out, "  size: {} bytes", item["size"].as_u64().unwrap_or(0));
+            let _ = writeln!(
+                out,
+                "  fileType: {}",
+                item["fileType"].as_str().unwrap_or("")
+            );
+            let _ = writeln!(
+                out,
+                "  attachment: {}",
+                item["attachment"].as_str().unwrap_or("")
+            );
+        }
+        _ => {}
+    }
+    0
+}
+
+fn cmd_item_add(out: &mut impl Write, dir: &std::path::Path, kind: &AddKind) -> i32 {
+    let draft = match kind {
+        AddKind::Login {
+            name,
+            username,
+            password,
+            stdin,
+            uris,
+        } => {
+            let password = match password {
+                Some(p) => p.clone(),
+                None => match read_secret("密码", *stdin) {
+                    Ok(p) => p,
+                    Err(c) => return c,
+                },
+            };
+            let uris = uris
+                .as_deref()
+                .map(|u| {
+                    u.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            ItemDraft::Login {
+                name: name.clone(),
+                username: username.clone(),
+                password,
+                uris,
+                custom: vec![],
+            }
+        }
+        AddKind::Note {
+            name,
+            content,
+            content_file,
+        } => {
+            let content = match (content, content_file) {
+                (Some(c), _) => c.clone(),
+                (None, Some(f)) => match std::fs::read_to_string(f) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("lk: 读取内容文件失败：{e}");
+                        return 1;
+                    }
+                },
+                (None, None) => {
+                    eprintln!("lk: note 需要 --content 或 --content-file");
+                    return 2;
+                }
+            };
+            ItemDraft::Note {
+                name: name.clone(),
+                content,
+            }
+        }
+        AddKind::Secret {
+            name,
+            value,
+            stdin,
+            purpose,
+            expires_at,
+        } => {
+            let value = match value {
+                Some(v) => v.clone(),
+                None => match read_secret("密钥值", *stdin) {
+                    Ok(v) => v,
+                    Err(c) => return c,
+                },
+            };
+            ItemDraft::Secret {
+                name: name.clone(),
+                value,
+                purpose: purpose.clone().unwrap_or_default(),
+                expires_at: expires_at.clone(),
+            }
+        }
+        AddKind::File {
+            name,
+            file,
+            note,
+            mime,
+        } => {
+            let data = match std::fs::read(file) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("lk: 读取附件失败：{e}");
+                    return 1;
+                }
+            };
+            if data.len() as u64 > 50 * 1024 * 1024 {
+                eprintln!("lk: 附件超过 50MB 上限");
+                return 1;
+            }
+            let file_name = file
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let mime = mime
+                .clone()
+                .or_else(|| guess_mime(&file_name))
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            use base64::Engine as _;
+            ItemDraft::File {
+                name: name.clone().unwrap_or_else(|| file_name.clone()),
+                note: note.clone().unwrap_or_default(),
+                size: 0,
+                file_type: mime,
+                attachment: file_name,
+                attach_id: None,
+                file_data: Some(base64::engine::general_purpose::STANDARD.encode(data)),
+            }
+        }
+    };
+    match rpc(dir, M_ITEM_PUT, json!({ "item": draft })) {
+        Ok(res) => {
+            let item: Value = res["item"].clone();
+            let id = item["id"].as_str().unwrap_or_default().to_string();
+            let _ = writeln!(out, "已创建: {id}");
+            if std::env::var("LK_ECHO_ITEM").is_ok() {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&item).unwrap_or_default()
+                );
+            }
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+fn guess_mime(name: &str) -> Option<String> {
+    let ext = name.rsplit('.').next()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "txt" | "md" | "markdown" => "text/plain",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "zip" => "application/zip",
+        "json" => "application/json",
+        "doc" | "docx" => "application/msword",
+        "xls" | "xlsx" => "application/vnd.ms-excel",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+fn cmd_item_edit(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    id: &str,
+    fields: &EditFields,
+    expected_revision: Option<&str>,
+) -> i32 {
+    let any = fields.name.is_some()
+        || fields.username.is_some()
+        || fields.password.is_some()
+        || fields.uris.is_some()
+        || fields.content.is_some()
+        || fields.value.is_some()
+        || fields.purpose.is_some()
+        || fields.expires_at.is_some()
+        || fields.note.is_some()
+        || fields.file.is_some();
+    if !any {
+        eprintln!("lk: edit 至少需要一个变更字段（如 --name / --username / --content）");
+        return 2;
+    }
+    // CAS：缺省先取当前条目（base revision），再整条替换
+    let current = match rpc(dir, M_ITEM_GET, json!({ "id": id })) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    let ty = current["type"].as_str().unwrap_or_default().to_string();
+    let mut draft =
+        match ty.as_str() {
+            "login" => {
+                let custom: Vec<CustomField> =
+                    serde_json::from_value(current["custom"].clone()).unwrap_or_default();
+                ItemDraft::Login {
+                    name: fields.name.clone().unwrap_or_else(|| {
+                        current["name"].as_str().unwrap_or_default().to_string()
+                    }),
+                    username: fields.username.clone().unwrap_or_else(|| {
+                        current["username"].as_str().unwrap_or_default().to_string()
+                    }),
+                    password: fields.password.clone().unwrap_or_else(|| {
+                        current["password"].as_str().unwrap_or_default().to_string()
+                    }),
+                    uris: fields
+                        .uris
+                        .clone()
+                        .map(|u| {
+                            u.split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_else(|| {
+                            serde_json::from_value(current["uris"].clone()).unwrap_or_default()
+                        }),
+                    custom,
+                }
+            }
+            "note" => {
+                ItemDraft::Note {
+                    name: fields.name.clone().unwrap_or_else(|| {
+                        current["name"].as_str().unwrap_or_default().to_string()
+                    }),
+                    content: fields.content.clone().unwrap_or_else(|| {
+                        current["content"].as_str().unwrap_or_default().to_string()
+                    }),
+                }
+            }
+            "secret" => {
+                ItemDraft::Secret {
+                    name: fields.name.clone().unwrap_or_else(|| {
+                        current["name"].as_str().unwrap_or_default().to_string()
+                    }),
+                    value: fields.value.clone().unwrap_or_else(|| {
+                        current["value"].as_str().unwrap_or_default().to_string()
+                    }),
+                    purpose: fields.purpose.clone().unwrap_or_else(|| {
+                        current["purpose"].as_str().unwrap_or_default().to_string()
+                    }),
+                    expires_at: fields.expires_at.clone().or_else(|| {
+                        serde_json::from_value(current["expiresAt"].clone()).unwrap_or(None)
+                    }),
+                }
+            }
+            "file" => {
+                let file_data = match &fields.file {
+                    Some(path) => match std::fs::read(path) {
+                        Ok(d) => {
+                            if d.len() as u64 > 50 * 1024 * 1024 {
+                                eprintln!("lk: 附件超过 50MB 上限");
+                                return 1;
+                            }
+                            use base64::Engine as _;
+                            Some(base64::engine::general_purpose::STANDARD.encode(d))
+                        }
+                        Err(e) => {
+                            eprintln!("lk: 读取附件失败：{e}");
+                            return 1;
+                        }
+                    },
+                    None => None,
+                };
+                let attach_id: Option<uuid::Uuid> =
+                    serde_json::from_value(current["attachmentId"].clone()).unwrap_or(None);
+                ItemDraft::File {
+                    name: fields.name.clone().unwrap_or_else(|| {
+                        current["name"].as_str().unwrap_or_default().to_string()
+                    }),
+                    note: fields.note.clone().unwrap_or_else(|| {
+                        current["note"].as_str().unwrap_or_default().to_string()
+                    }),
+                    size: current["size"].as_u64().unwrap_or(0),
+                    file_type: current["fileType"].as_str().unwrap_or_default().to_string(),
+                    attachment: current["attachment"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    attach_id,
+                    file_data,
+                }
+            }
+            _ => {
+                eprintln!("lk: 未知条目类型：{ty}");
+                return 1;
+            }
+        };
+    // file 替换附件时更新文件名/MIME
+    if ty == "file" {
+        if let (
+            Some(path),
+            ItemDraft::File {
+                attachment,
+                file_type,
+                ..
+            },
+        ) = (&fields.file, &mut draft)
+        {
+            if let Some(name) = path.file_name() {
+                *attachment = name.to_string_lossy().to_string();
+            }
+            if fields.mime.is_none() {
+                if let Some(m) = guess_mime(&path.to_string_lossy()) {
+                    *file_type = m;
+                }
+            }
+        }
+    }
+    let base_revision = expected_revision
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| current["revision"].as_str().unwrap_or_default().to_string());
+    match rpc(
+        dir,
+        M_ITEM_PUT,
+        json!({ "id": id, "item": draft, "expectedRevision": base_revision }),
+    ) {
+        Ok(res) => {
+            let item: Value = res["item"].clone();
+            let _ = writeln!(
+                out,
+                "已更新: {} (revision {})",
+                item["id"].as_str().unwrap_or_default(),
+                item["revision"].as_str().unwrap_or_default()
+            );
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+fn cmd_item_copy(out: &mut impl Write, dir: &std::path::Path, id: &str, field: &str) -> i32 {
+    let item = match rpc(dir, M_ITEM_GET, json!({ "id": id })) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    let ty = item["type"].as_str().unwrap_or_default();
+    let value = match (ty, field) {
+        ("login", "username") => item["username"].as_str(),
+        ("login", "password") => item["password"].as_str(),
+        ("note", "content") => item["content"].as_str(),
+        ("secret", "value") => item["value"].as_str(),
+        _ => None,
+    };
+    let Some(value) = value else {
+        eprintln!(
+            "lk: 字段 {field} 不适用于 {ty} 类型条目（可用: username/password/content/value）"
+        );
+        return 2;
+    };
+    if let Err(e) = clipboard::copy_and_schedule_clear(value.to_string()) {
+        eprintln!("lk: {e}");
+        return 1;
+    }
+    let _ = writeln!(out, "已复制，30 秒后自动清除（期间请勿复制其他内容）");
+    // 进程驻留 30s 保证清除线程存活
+    std::thread::sleep(std::time::Duration::from_secs(clipboard::CLEAR_AFTER_SECS));
+    0
+}
+
+// ---------------------------------------------------------------------------
+// 审计
+// ---------------------------------------------------------------------------
+
+fn cmd_audit(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    tail: Option<usize>,
+    verify: bool,
+    json_out: bool,
+) -> i32 {
+    let res = match rpc(dir, M_AUDIT_LIST, json!({ "limit": tail })) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    let events: Vec<lk_core::audit::AuditEvent> =
+        serde_json::from_value(res["events"].clone()).unwrap_or_default();
+    let total = res["total"].as_u64().unwrap_or(0);
+    if json_out {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&events).unwrap_or_default()
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "审计事件（共 {total} 条{}）",
+            tail.map(|t| format!("，显示最近 {t}")).unwrap_or_default()
+        );
+        for e in &events {
+            let result = serde_json::to_string(&e.result).unwrap_or_default();
+            let _ = writeln!(out, "{}  {}  {}  {}", e.ts, e.command, result, e.starter);
+        }
+    }
+    if verify {
+        match rpc(dir, M_AUDIT_VERIFY, json!({})) {
+            Ok(res) => {
+                let verified = res["verified"].as_u64().unwrap_or(0);
+                if json_out {
+                    let _ = writeln!(out, "{}", json!({ "verified": verified }));
+                } else {
+                    let _ = writeln!(out, "HMAC 链校验：{} 条事件验证通过", verified);
+                }
+            }
+            Err(c) => return c,
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// 守护进程
+// ---------------------------------------------------------------------------
+
+fn cmd_daemon(dir: &std::path::Path) -> i32 {
+    let bind = transport::bind_server(dir);
+    #[cfg(unix)]
+    let listener = match bind {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("lk daemon: 绑定失败：{e}");
+            return 1;
+        }
+    };
+    #[cfg(windows)]
+    if let Err(e) = bind {
+        eprintln!("lk daemon: 绑定失败：{e}");
+        return 1;
+    }
+    let daemon = match daemon::Daemon::start(dir) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("lk daemon: 启动失败：{e}");
+            return 1;
+        }
+    };
+    // 请求 → 响应（逐行 JSON）；状态互斥保护
+    let state = std::sync::Arc::new(std::sync::Mutex::new(daemon));
+    let handler_state = state.clone();
+    let handler = std::sync::Arc::new(move |line: &str| -> String {
+        let mut guard = handler_state.lock().expect("daemon mutex poisoned");
+        guard.handle(line)
+    });
+    eprintln!(
+        "lk daemon: 监听于 {}（pid {}）",
+        dir.display(),
+        std::process::id()
+    );
+    #[cfg(unix)]
+    let result = transport::serve(listener, handler, daemon::global_shutdown());
+    #[cfg(windows)]
+    let result = transport::serve(dir, handler, daemon::global_shutdown());
+    // 优雅退出清理：删令牌 + 端点
+    if let Ok(mut guard) = state.lock() {
+        guard.shutdown();
+    }
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("lk daemon: {e}");
+            1
+        }
+    }
 }
