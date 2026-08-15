@@ -251,34 +251,36 @@ impl UnlockedVault {
     }
 
     // -- 同步引擎接口（M1；密文 blob 原样导入/导出，revision 不 bump）-----
+    // 只读方法（`pub`）供守护进程的 [`VaultRead`](crate::sync::VaultRead) 视图
+    // 按需短锁读取；写入方法仅供同步引擎在应用阶段（守护进程持写锁）调用。
 
     /// 索引快照（同步引擎对比用；含 kind=Rule 的透传条目）。
-    pub(crate) fn index_snapshot(&self) -> Vec<IndexEntry> {
+    pub fn index_snapshot(&self) -> Vec<IndexEntry> {
         let mut v: Vec<IndexEntry> = self.index.values().cloned().collect();
         v.sort_by_key(|e| e.id);
         v
     }
 
     /// 条目密文原文（同步上传用，不重加密）。
-    pub(crate) fn item_blob(&self, id: uuid::Uuid) -> Result<Vec<u8>> {
+    pub fn item_blob(&self, id: uuid::Uuid) -> Result<Vec<u8>> {
         let path = item_file(&self.dir, id);
         std::fs::read(&path).map_err(|_| Error::ItemNotFound(id))
     }
 
     /// 墓碑密文原文（可能不存在——远端墓碑缺失时由引擎合成）。
-    pub(crate) fn tomb_blob(&self, id: uuid::Uuid) -> Result<Vec<u8>> {
+    pub fn tomb_blob(&self, id: uuid::Uuid) -> Result<Vec<u8>> {
         let path = tomb_file(&self.dir, id);
         std::fs::read(&path).map_err(|_| Error::ItemNotFound(id))
     }
 
     /// 附件元数据密文原文。
-    pub(crate) fn attach_meta_blob(&self, attach_id: uuid::Uuid) -> Result<Vec<u8>> {
+    pub fn attach_meta_blob(&self, attach_id: uuid::Uuid) -> Result<Vec<u8>> {
         let path = attach_meta_file(&self.dir, attach_id);
         std::fs::read(&path).map_err(|_| Error::ItemNotFound(attach_id))
     }
 
     /// 附件分块密文原文。
-    pub(crate) fn chunk_blob(&self, attach_id: uuid::Uuid, i: u32) -> Result<Vec<u8>> {
+    pub fn chunk_blob(&self, attach_id: uuid::Uuid, i: u32) -> Result<Vec<u8>> {
         let path = chunk_file(&self.dir, attach_id, i);
         std::fs::read(&path).map_err(|_| Error::ItemNotFound(attach_id))
     }
@@ -341,7 +343,7 @@ impl UnlockedVault {
     }
 
     /// 全部本地墓碑（id + 载荷；同步引擎 30 天/确认裁决用）。
-    pub(crate) fn tombstones(&self) -> Vec<(uuid::Uuid, Tombstone)> {
+    pub fn tombstones(&self) -> Vec<(uuid::Uuid, Tombstone)> {
         let mut v = Vec::new();
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return v;
@@ -359,12 +361,12 @@ impl UnlockedVault {
     }
 
     /// 附件元数据（解密态）。
-    pub(crate) fn attachment_meta(&self, attach_id: uuid::Uuid) -> Result<AttachmentMeta> {
+    pub fn attachment_meta(&self, attach_id: uuid::Uuid) -> Result<AttachmentMeta> {
         self.read_attachment_meta(attach_id)
     }
 
     /// 附件远端文件键列表（{attach_id}.attach.lk + {attach_id}.{i}.chunk.lk）。
-    pub(crate) fn attachment_keys(&self, attach_id: uuid::Uuid) -> Vec<String> {
+    pub fn attachment_keys(&self, attach_id: uuid::Uuid) -> Vec<String> {
         let mut keys = vec![format!("{attach_id}.attach.lk")];
         if let Ok(meta) = self.read_attachment_meta(attach_id) {
             for i in 0..meta.chunks {

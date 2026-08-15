@@ -13,9 +13,15 @@
 //!   冲突风暴退避（指数 ×2 至 24h 上限）；同步状态持久化 `sync-state.json`。
 //! - 凭据（WebDAV/S3）存系统钥匙串（service=`lightkey-sync`），不进
 //!   vault 密文、不进审计明文、不落日志；`file://` 本地模拟无需凭据。
+//! - **并发结构（G1 根治，船长 2026-08-15 定案）**：权限层（`unlock`/会话
+//!   令牌）只表达访问资格，不承担互斥；守护进程内部命令与后台同步是自己人，
+//!   并发执行；锁只剩数据层内存一致性保护（`SharedDaemon`）：vault 读写锁
+//!   （命令读多写少；同步只在应用阶段短时写），同步轮次的网络 I/O 全程
+//!   不持锁（`run_sync_round` 两阶段：抓取无锁 → 应用短锁）。
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -142,6 +148,7 @@ pub fn load_sync_credentials(url: &str) -> Result<Option<lk_core::storage::Crede
 }
 
 /// 同步轮次的失败分类（IPC 错误码映射用）。
+#[derive(Debug)]
 pub enum SyncFail {
     NotConfigured,
     Credentials(String),
@@ -190,17 +197,30 @@ impl AuthGuard {
     }
 }
 
-/// 守护进程状态。
+/// 跨线程共享状态：命令线程（每连接一线程，经命令互斥锁串行）与后台
+/// 同步轮询线程并发访问。锁只承担**数据层内存一致性保护**，同步轮次的
+/// 网络 I/O 期间不持任何锁（权限语义见模块文档「并发结构」）。
+pub struct SharedDaemon {
+    /// 数据目录（配置 / 同步状态持久化）。
+    pub dir: std::path::PathBuf,
+    /// 数据层：解锁态 vault。命令读多写少（读锁）；同步仅在应用阶段短写。
+    /// （Arc：同步视图 `LockedVaultView` 与命令侧共用同一把锁。）
+    pub vault: Arc<RwLock<Option<UnlockedVault>>>,
+    /// 配置（CLI 直接写盘；轮询线程每轮重读热更新）。
+    pub config: RwLock<Config>,
+    /// 同步运行状态（水位 / 最近摘要 / 风暴等级）。
+    pub sync: Mutex<SyncRuntime>,
+}
+
+/// 守护进程状态（命令侧；多连接线程经 `Mutex<Daemon>` 串行访问）。
 pub struct Daemon {
-    dir: std::path::PathBuf,
-    config: Config,
-    vault: Option<UnlockedVault>,
     sessions: SessionManager,
     audit: AuditLog,
     unlock_guard: AuthGuard,
     recover_guard: AuthGuard,
     last_activity: Instant,
-    sync: SyncRuntime,
+    /// 跨线程共享状态（命令线程与同步轮询线程并发访问）。
+    shared: Arc<SharedDaemon>,
 }
 
 /// 信号处理标志（unix：SIGINT/SIGTERM 优雅退出）。
@@ -214,17 +234,25 @@ impl Daemon {
         let config = load_config(&dir);
         let sync = SyncRuntime::load(&dir);
         install_shutdown_handlers();
+        let shared = Arc::new(SharedDaemon {
+            dir: dir.clone(),
+            vault: Arc::new(RwLock::new(None)),
+            config: RwLock::new(config),
+            sync: Mutex::new(sync),
+        });
         Ok(Daemon {
-            dir,
-            config,
-            vault: None,
             sessions: SessionManager::new(),
             audit,
             unlock_guard: AuthGuard::default(),
             recover_guard: AuthGuard::default(),
             last_activity: Instant::now(),
-            sync,
+            shared,
         })
+    }
+
+    /// 跨线程共享状态引用（命令线程 / 轮询线程共用）。
+    pub fn shared(&self) -> Arc<SharedDaemon> {
+        Arc::clone(&self.shared)
     }
 
     /// 处理一行 JSON-RPC 请求，返回一行响应（永不 panic）。
@@ -279,7 +307,19 @@ impl Daemon {
                 self.require_session(id.clone(), token, |me| me.audit_verify(id.clone()))
             }
             M_SYNC_TRIGGER => {
-                self.require_session(id.clone(), token, |me| me.sync_trigger(id.clone()))
+                // 生产路径走 main.rs 的 try_sync_trigger（命令锁外执行轮次）；
+                // 此处为直接 handle() 调用（测试等）的等价回退
+                if self.vault_peek() && self.sessions.validate(token.as_deref().unwrap_or(&[])) {
+                    match run_sync_round(&self.shared) {
+                        Ok(summary) => RpcResponse::ok(
+                            id.clone(),
+                            serde_json::to_value(summary).unwrap_or(Value::Null),
+                        ),
+                        Err(e) => sync_fail_response(id.clone(), &e),
+                    }
+                } else {
+                    session_invalid(id.clone())
+                }
             }
             M_SYNC_POLL => self.require_session(id.clone(), token, |me| me.sync_poll(id.clone())),
             // M2 占位
@@ -301,18 +341,25 @@ impl Daemon {
         token: Option<Vec<u8>>,
         f: impl FnOnce(&mut Self) -> RpcResponse,
     ) -> RpcResponse {
-        if self.vault.is_some() && self.sessions.validate(token.as_deref().unwrap_or(&[])) {
+        if self.vault_peek() && self.sessions.validate(token.as_deref().unwrap_or(&[])) {
             f(self)
         } else {
             session_invalid(id)
         }
     }
 
+    /// 解锁态（共享 vault 短读；锁只保护内存一致性）。
+    fn vault_peek(&self) -> bool {
+        self.shared.vault.read().unwrap().is_some()
+    }
+
     fn vault_status(&self, id: Value) -> RpcResponse {
+        let unlocked = self.vault_peek();
+        let watermark = self.shared.sync.lock().unwrap().state.watermark.clone();
         let result = StatusResult {
-            unlocked: self.vault.is_some(),
+            unlocked,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            sync_watermark: self.sync.state.watermark.clone(),
+            sync_watermark: watermark,
         };
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
@@ -322,11 +369,19 @@ impl Daemon {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        // 重置会清空当前解锁态（若强制重置）
-        if p.force {
-            self.lock_internal();
-        }
-        match vault::init_vault(&self.dir, &p.master_password, p.force, &mut self.audit) {
+        // 重置会清空当前解锁态 + 重写全部密文：写锁排除同步应用阶段
+        // （避免与文件重写竞态；锁只保护数据层内存一致性）
+        let result = if p.force {
+            let shared = Arc::clone(&self.shared);
+            let mut vault_guard = shared.vault.write().unwrap();
+            self.lock_internal_locked(&mut vault_guard);
+            let r = vault::init_vault(&shared.dir, &p.master_password, true, &mut self.audit);
+            drop(vault_guard);
+            r
+        } else {
+            vault::init_vault(&self.shared.dir, &p.master_password, false, &mut self.audit)
+        };
+        match result {
             Ok((_header, code)) => {
                 let result = InitResult {
                     recovery_code: code.display(),
@@ -359,22 +414,22 @@ impl Daemon {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        let unlocked = UnlockedVault::unlock(&self.dir, &p.master_password);
+        let unlocked = UnlockedVault::unlock(&self.shared.dir, &p.master_password);
         match unlocked {
             Ok(mut vault) => {
                 // 过期墓碑清理（30 天延迟硬删）。同步已配置时跳过：硬删
                 // 需「≥30 天且已同步确认」，由同步引擎裁决（sync.md §4）。
-                if self.config.sync.is_none() {
+                if self.shared.config.read().unwrap().sync.is_none() {
                     let _ = vault.purge_expired(&lk_core::crypto::now_iso());
                 }
                 self.unlock_guard.on_success();
-                self.vault = Some(vault);
-                let token = self.sessions.issue();
-                self.write_session_token(&token);
                 let _ = self.audit.append(
-                    self.vault.as_ref().unwrap().keys(),
+                    vault.keys(),
                     &EventInput::new("lk", "vault.unlock", AuditResult::Allowed),
                 );
+                *self.shared.vault.write().unwrap() = Some(vault);
+                let token = self.sessions.issue();
+                self.write_session_token(&token);
                 let result = UnlockResult {
                     token: hex::encode(token),
                 };
@@ -396,19 +451,26 @@ impl Daemon {
 
     /// 锁定：先签名审计事件（用当前 K_audit），再擦除密钥 + 失效令牌 + 删令牌文件。
     fn lock_internal(&mut self) {
-        if let Some(vault) = &self.vault {
+        let shared = Arc::clone(&self.shared);
+        let mut vault = shared.vault.write().unwrap();
+        self.lock_internal_locked(&mut vault);
+    }
+
+    /// 锁定（调用方已持 vault 写锁；供锁定/恢复/强制重置共用）。
+    fn lock_internal_locked(&mut self, vault: &mut Option<UnlockedVault>) {
+        if let Some(v) = vault {
             let _ = self.audit.append(
-                vault.keys(),
+                v.keys(),
                 &EventInput::new("lk", "vault.lock", AuditResult::Allowed),
             );
         }
-        self.vault = None;
+        *vault = None;
         self.sessions.invalidate();
         self.remove_session_token();
     }
 
     fn vault_recover(&mut self, id: Value, params: Value) -> RpcResponse {
-        // 限流（失败计数 + 退避，与 vault.unlock 对称；A4）
+        // 限流（失败计数 + 指数退避，与 vault.unlock 对称；A4）
         if let Some(retry) = self.recover_guard.check() {
             return RpcResponse::err(
                 id,
@@ -421,8 +483,11 @@ impl Daemon {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
+        // 恢复会更换全部密钥并重写全部密文：写锁排除同步应用阶段
+        let shared = Arc::clone(&self.shared);
+        let mut vault_guard = shared.vault.write().unwrap();
         // 恢复会更换全部密钥：现有解锁态（旧钥）立即作废
-        self.lock_internal();
+        self.lock_internal_locked(&mut vault_guard);
         let code = match RecoveryCode::parse(&p.recovery_code) {
             Ok(c) => c,
             Err(_) => {
@@ -430,7 +495,7 @@ impl Daemon {
                 return RpcResponse::err(id, ERR_VAULT_INVALID, MSG_VAULT_INVALID, None);
             }
         };
-        match vault::recover_vault(&self.dir, &code, &p.new_password, &mut self.audit) {
+        match vault::recover_vault(&shared.dir, &code, &p.new_password, &mut self.audit) {
             Ok(new_code) => {
                 self.recover_guard.on_success();
                 let result = RecoverResult {
@@ -447,16 +512,16 @@ impl Daemon {
     }
 
     fn auto_lock_if_idle(&mut self) {
-        let idle = self.config.auto_lock_minutes;
+        let idle = self.shared.config.read().unwrap().auto_lock_minutes;
         let elapsed = self.last_activity.elapsed();
         let timeout = Duration::from_secs(idle * 60);
-        if self.vault.is_some() && elapsed >= timeout {
+        if self.vault_peek() && elapsed >= timeout {
             self.lock_internal();
         }
     }
 
     fn session_token_path(&self) -> std::path::PathBuf {
-        self.dir.join(SESSION_TOKEN_FILE)
+        self.shared.dir.join(SESSION_TOKEN_FILE)
     }
 
     fn write_session_token(&self, token: &[u8; 32]) {
@@ -486,17 +551,21 @@ impl Daemon {
 
     /// 退出清理：删令牌 + 删端点文件（socket 由 OS 回收）。
     pub fn shutdown(&mut self) {
-        self.sync.save(&self.dir);
+        let saved = { self.shared.sync.lock().unwrap().clone() };
+        saved.save(&self.shared.dir);
         self.remove_session_token();
-        if let Some(ep) = super::transport::read_endpoint(&self.dir) {
-            super::transport::cleanup(&self.dir, &ep);
+        if let Some(ep) = super::transport::read_endpoint(&self.shared.dir) {
+            super::transport::cleanup(&self.shared.dir, &ep);
         }
     }
 
     // -- 条目 / 审计 -----------------------------------------------------
 
     fn item_list(&mut self, id: Value) -> RpcResponse {
-        let me = self.vault.as_mut().unwrap();
+        // list() 需 &mut（索引自愈）→ 写锁；锁只保护内存一致性，本地操作
+        let shared = Arc::clone(&self.shared);
+        let mut guard = shared.vault.write().unwrap();
+        let me = guard.as_mut().unwrap();
         match me.list() {
             Ok(items) => {
                 let _ = self.audit.append(
@@ -515,7 +584,9 @@ impl Daemon {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        let me = self.vault.as_mut().unwrap();
+        let shared = Arc::clone(&self.shared);
+        let guard = shared.vault.read().unwrap();
+        let me = guard.as_ref().unwrap();
         match me.get(p.id) {
             Ok(item) => {
                 let _ = self.audit.append(
@@ -534,7 +605,9 @@ impl Daemon {
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
         let kind = p.item.kind().as_str();
-        let me = self.vault.as_mut().unwrap();
+        let shared = Arc::clone(&self.shared);
+        let mut guard = shared.vault.write().unwrap();
+        let me = guard.as_mut().unwrap();
         match me.put(p.id, p.item, p.expected_revision) {
             Ok(item) => {
                 let _ = self.audit.append(
@@ -557,7 +630,9 @@ impl Daemon {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        let me = self.vault.as_mut().unwrap();
+        let shared = Arc::clone(&self.shared);
+        let mut guard = shared.vault.write().unwrap();
+        let me = guard.as_mut().unwrap();
         match me.delete(p.id) {
             Ok(_tomb) => {
                 let _ = self.audit.append(
@@ -575,7 +650,9 @@ impl Daemon {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        let me = self.vault.as_mut().unwrap();
+        let shared = Arc::clone(&self.shared);
+        let guard = shared.vault.read().unwrap();
+        let me = guard.as_ref().unwrap();
         match me.export(p.id) {
             Ok(bundle) => {
                 let _ = self.audit.append(
@@ -599,7 +676,9 @@ impl Daemon {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        let me = self.vault.as_mut().unwrap();
+        let shared = Arc::clone(&self.shared);
+        let guard = shared.vault.read().unwrap();
+        let me = guard.as_ref().unwrap();
         let events = self.audit.read();
         let _ = self.audit.append(
             me.keys(),
@@ -627,7 +706,9 @@ impl Daemon {
     }
 
     fn audit_verify(&mut self, id: Value) -> RpcResponse {
-        let me = self.vault.as_mut().unwrap();
+        let shared = Arc::clone(&self.shared);
+        let guard = shared.vault.read().unwrap();
+        let me = guard.as_ref().unwrap();
         let keys = me.keys();
         // 仅当前密钥可验证的部分（轮换点前事件需旧钥，M0 如实报告）
         match self.audit.verify(keys, &|_| None) {
@@ -646,96 +727,18 @@ impl Daemon {
 
     // -- 同步（M1）---------------------------------------------------------
 
-    /// 当前生效的同步配置（校验 + 夹取间隔）；未配置 → None。
-    pub fn sync_config(&self) -> Option<lk_core::sync::SyncConfig> {
-        let cfg = self.config.sync.as_ref()?;
-        if cfg.validate().is_err() {
-            return None;
-        }
-        Some(cfg.clone())
-    }
-
-    /// 重读 config.json（CLI 直接写配置，守护进程热更新）。
-    pub fn reload_config(&mut self) {
-        let fresh = load_config(&self.dir);
-        // 保留运行期仅内存的字段（无）；直接替换
-        self.config = fresh;
-    }
-
-    /// 当前风暴等级（轮询线程计算下次间隔用）。
-    pub fn storm_level(&self) -> u32 {
-        self.sync.state.storm_level
-    }
-
-    /// 是否处于解锁态（轮询线程判定「解锁才同步」）。
-    pub fn is_unlocked(&self) -> bool {
-        self.vault.is_some()
-    }
-
-    /// 是否已配置同步（轮询线程判定）。
-    pub fn sync_configured(&self) -> bool {
-        self.config.sync.is_some()
-    }
-
-    /// 执行一轮同步（解锁态调用方保证）。失败分类见 [`SyncFail`]。
-    pub fn sync_round(&mut self) -> std::result::Result<lk_core::sync::SyncSummary, SyncFail> {
-        use lk_core::storage::{backend_from_url, StorageBackend};
-        use lk_core::sync::{storm_level_after, SyncEngine};
-        let cfg = self.sync_config().ok_or(SyncFail::NotConfigured)?;
-        let vault = self
-            .vault
-            .as_mut()
-            .ok_or(SyncFail::Engine(Error::SessionInvalid))?;
-        let creds = load_sync_credentials(&cfg.url).map_err(SyncFail::Credentials)?;
-        let backend: Box<dyn StorageBackend> =
-            backend_from_url(&cfg.url, creds).map_err(SyncFail::Engine)?;
-        let summary = SyncEngine::new(vault, backend.as_ref())
-            .run_round(&lk_core::crypto::now_iso())
-            .map_err(SyncFail::Engine)?;
-        // 水位 / 摘要 / 风暴等级 + 持久化
-        let diff = summary.pulled + summary.pushed;
-        self.sync.state.watermark = Some(lk_core::crypto::now_iso());
-        self.sync.state.last_summary = Some(summary.clone());
-        self.sync.state.storm_level = storm_level_after(diff, self.sync.state.storm_level);
-        self.sync.save(&self.dir);
-        Ok(summary)
-    }
-
-    fn sync_trigger(&mut self, id: Value) -> RpcResponse {
-        self.reload_config();
-        match self.sync_round() {
-            Ok(summary) => {
-                RpcResponse::ok(id, serde_json::to_value(summary).unwrap_or(Value::Null))
-            }
-            Err(SyncFail::NotConfigured) => {
-                RpcResponse::err(id, ERR_SYNC_NOT_CONFIGURED, MSG_SYNC_NOT_CONFIGURED, None)
-            }
-            Err(SyncFail::Credentials(msg)) => RpcResponse::err(
-                id,
-                ERR_SYNC_CREDENTIALS,
-                MSG_SYNC_CREDENTIALS,
-                Some(json!({ "detail": msg })),
-            ),
-            Err(SyncFail::Engine(e)) => self.sync_err_response(id, &e),
-        }
-    }
-
     fn sync_poll(&mut self, id: Value) -> RpcResponse {
+        let sync = self.shared.sync.lock().unwrap();
         let result = SyncPollResult {
-            summary: self.sync.state.last_summary.clone(),
-            watermark: self.sync.state.watermark.clone(),
+            summary: sync.state.last_summary.clone(),
+            watermark: sync.state.watermark.clone(),
         };
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
 
-    fn sync_err_response(&self, id: Value, e: &Error) -> RpcResponse {
-        let (code, msg) = match e {
-            Error::SyncStorage(_) => (ERR_SYNC_STORAGE, MSG_SYNC_STORAGE),
-            Error::SyncAnomaly(_) => (ERR_SYNC_ANOMALY, MSG_SYNC_ANOMALY),
-            Error::SyncConfig(_) => (ERR_SYNC_NOT_CONFIGURED, MSG_SYNC_NOT_CONFIGURED),
-            _ => (ERR_SYNC_STORAGE, MSG_SYNC_STORAGE),
-        };
-        RpcResponse::err(id, code, msg, Some(json!({ "detail": e.to_string() })))
+    /// `sync.trigger` 无锁路径的会话预检（命令锁内调用）：解锁态 + 令牌有效。
+    pub fn trigger_precheck(&self, token: Option<&[u8]>) -> bool {
+        self.vault_peek() && self.sessions.validate(token.unwrap_or(&[]))
     }
 
     fn err_response(&self, id: Value, e: &Error) -> RpcResponse {
@@ -756,6 +759,215 @@ impl Daemon {
                 MSG_VAULT_INVALID,
                 Some(json!({ "detail": e.to_string() })),
             ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 同步轮次（两阶段：抓取无锁 → 应用短锁）与无锁 trigger 路径
+// ---------------------------------------------------------------------------
+
+/// [`VaultRead`] 的守护进程侧实现：每次方法调用独立获取**短读锁**（仅本地
+/// 内存/磁盘访问），网络 I/O 期间不持任何锁。`keys` 为轮次开始时的快照
+/// （应用阶段复核其仍与解锁态一致；锁定/恢复竞态 → 本轮放弃）。
+struct LockedVaultView {
+    vault: Arc<RwLock<Option<UnlockedVault>>>,
+    keys: lk_core::crypto::Keys,
+}
+
+impl lk_core::sync::VaultRead for LockedVaultView {
+    fn keys(&self) -> lk_core::crypto::Keys {
+        self.keys.clone()
+    }
+
+    fn index_snapshot(&self) -> lk_core::Result<Vec<lk_core::model::IndexEntry>> {
+        let v = self.vault.read().unwrap();
+        v.as_ref()
+            .map(|v| v.index_snapshot())
+            .ok_or(Error::SessionInvalid)
+    }
+
+    fn item(&self, id: uuid::Uuid) -> lk_core::Result<lk_core::model::Item> {
+        let v = self.vault.read().unwrap();
+        v.as_ref().ok_or(Error::SessionInvalid)?.get(id)
+    }
+
+    fn item_with_blob(&self, id: uuid::Uuid) -> lk_core::Result<(lk_core::model::Item, Vec<u8>)> {
+        let v = self.vault.read().unwrap();
+        let v = v.as_ref().ok_or(Error::SessionInvalid)?;
+        let item = v.get(id)?;
+        let blob = v.item_blob(id)?;
+        Ok((item, blob))
+    }
+
+    fn tomb_blob(&self, id: uuid::Uuid) -> lk_core::Result<Vec<u8>> {
+        let v = self.vault.read().unwrap();
+        v.as_ref().ok_or(Error::SessionInvalid)?.tomb_blob(id)
+    }
+
+    fn attachment_blobs(
+        &self,
+        attach_id: uuid::Uuid,
+    ) -> lk_core::Result<(lk_core::model::AttachmentMeta, Vec<u8>, Vec<(u32, Vec<u8>)>)> {
+        let v = self.vault.read().unwrap();
+        let v = v.as_ref().ok_or(Error::SessionInvalid)?;
+        let meta = v.attachment_meta(attach_id)?;
+        let meta_blob = v.attach_meta_blob(attach_id)?;
+        let mut chunks = Vec::with_capacity(meta.chunks as usize);
+        for i in 0..meta.chunks {
+            chunks.push((i, v.chunk_blob(attach_id, i)?));
+        }
+        Ok((meta, meta_blob, chunks))
+    }
+
+    fn attachment_keys(&self, attach_id: uuid::Uuid) -> Vec<String> {
+        self.vault
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|v| v.attachment_keys(attach_id))
+            .unwrap_or_default()
+    }
+
+    fn tombstones(&self) -> lk_core::Result<Vec<(uuid::Uuid, lk_core::model::Tombstone)>> {
+        let v = self.vault.read().unwrap();
+        Ok(v.as_ref().map(|v| v.tombstones()).unwrap_or_default())
+    }
+}
+
+/// 执行一轮同步（守护进程侧；轮询线程与 `sync.trigger` 共用）。
+///
+/// 两阶段（网络 I/O 全程不持任何守护进程锁）：
+///
+/// 1. 抓取：密钥/索引等经 [`LockedVaultView`] 短读锁读取 + 全部网络 I/O；
+/// 2. 应用：vault 短写锁内按当前状态复核后落盘（CAS 兜底，见引擎文档）。
+///
+/// 锁/恢复竞态（密钥已变）→ 本轮放弃（Err），下一轮重试。
+/// 水位/摘要/风暴等级在锁外持久化。
+pub fn run_sync_round(
+    shared: &SharedDaemon,
+) -> std::result::Result<lk_core::sync::SyncSummary, SyncFail> {
+    use lk_core::storage::{backend_from_url, StorageBackend};
+    // 配置热更新（CLI 直接写盘；每轮重读）
+    let fresh = read_config(&shared.dir);
+    *shared.config.write().unwrap() = fresh.clone();
+    let cfg = fresh.sync.clone().ok_or(SyncFail::NotConfigured)?;
+    if cfg.validate().is_err() {
+        return Err(SyncFail::NotConfigured);
+    }
+    let creds = load_sync_credentials(&cfg.url).map_err(SyncFail::Credentials)?;
+    let backend: Box<dyn StorageBackend> =
+        backend_from_url(&cfg.url, creds).map_err(SyncFail::Engine)?;
+    run_sync_round_with(shared, backend)
+}
+
+/// 执行一轮同步（后端注入；并发回归测试用）。
+pub fn run_sync_round_with(
+    shared: &SharedDaemon,
+    backend: Box<dyn lk_core::storage::StorageBackend>,
+) -> std::result::Result<lk_core::sync::SyncSummary, SyncFail> {
+    use lk_core::sync::{storm_level_after, SyncEngine};
+    // 密钥快照（短读锁；视图其余读取按需短锁）
+    let keys = {
+        let vault = shared.vault.read().unwrap();
+        let v = vault
+            .as_ref()
+            .ok_or(SyncFail::Engine(Error::SessionInvalid))?;
+        v.keys().clone()
+    };
+    let view = LockedVaultView {
+        vault: Arc::clone(&shared.vault),
+        keys: keys.clone(),
+    };
+    // 阶段 1：抓取（只读本地 + 全部网络 I/O；不持锁）
+    let engine = SyncEngine::new(backend.as_ref());
+    let mut plan = engine
+        .fetch_round(&view, &lk_core::crypto::now_iso())
+        .map_err(SyncFail::Engine)?;
+    // 阶段 2：应用（短写锁；网络已完成）
+    {
+        let mut guard = shared.vault.write().unwrap();
+        let vault = guard
+            .as_mut()
+            .ok_or(SyncFail::Engine(Error::SessionInvalid))?;
+        // 锁/恢复竞态：密钥已变 → 本轮放弃（下轮以新钥重试）
+        if vault.keys().k_data.as_ref() != keys.k_data.as_ref() {
+            return Err(SyncFail::Engine(Error::SessionInvalid));
+        }
+        engine
+            .apply_round(vault, &mut plan)
+            .map_err(SyncFail::Engine)?;
+    }
+    // 水位 / 摘要 / 风暴等级（小锁；锁外持久化）
+    let saved = {
+        let mut sync = shared.sync.lock().unwrap();
+        sync.state.watermark = Some(lk_core::crypto::now_iso());
+        sync.state.last_summary = Some(plan.summary.clone());
+        sync.state.storm_level = storm_level_after(
+            plan.summary.pulled + plan.summary.pushed,
+            sync.state.storm_level,
+        );
+        sync.clone()
+    };
+    saved.save(&shared.dir);
+    Ok(plan.summary)
+}
+
+/// `sync.trigger` 的无锁路径：会话预检（短暂持命令锁）→ 轮次主体在命令锁
+/// 外执行（网络 I/O 不阻塞其他命令；与后台轮询并发安全——数据层 CAS +
+/// vault 短写锁兜底）。非 trigger 请求 → `None`（走常规命令路径）。
+pub fn try_sync_trigger(
+    state: &Mutex<Daemon>,
+    shared: &SharedDaemon,
+    line: &str,
+) -> Option<String> {
+    let req: RpcRequest = serde_json::from_str(line).ok()?;
+    if req.method != M_SYNC_TRIGGER {
+        return None;
+    }
+    let id = req.id;
+    let token = extract_token(&req.params);
+    // 会话预检（短暂持命令锁；含空闲超时检查）
+    let session_ok = {
+        let mut guard = state.lock().expect("daemon mutex poisoned");
+        guard.auto_lock_if_idle();
+        guard.trigger_precheck(token.as_deref())
+    };
+    if !session_ok {
+        return Some(serde_json::to_string(&session_invalid(id)).unwrap_or_else(|_| "{}".into()));
+    }
+    // 轮次：命令锁外执行（网络 I/O 期间其他命令照常服务）
+    let resp = match run_sync_round(shared) {
+        Ok(summary) => RpcResponse::ok(id, serde_json::to_value(summary).unwrap_or(Value::Null)),
+        Err(e) => sync_fail_response(id, &e),
+    };
+    // 活动时间戳（命令锁内；与常规路径的 last_activity 语义一致）
+    if let Ok(mut guard) = state.lock() {
+        guard.last_activity = Instant::now();
+    }
+    Some(serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()))
+}
+
+/// 同步失败分类 → IPC 错误响应（与 M1 原有映射一致）。
+fn sync_fail_response(id: Value, e: &SyncFail) -> RpcResponse {
+    match e {
+        SyncFail::NotConfigured => {
+            RpcResponse::err(id, ERR_SYNC_NOT_CONFIGURED, MSG_SYNC_NOT_CONFIGURED, None)
+        }
+        SyncFail::Credentials(msg) => RpcResponse::err(
+            id,
+            ERR_SYNC_CREDENTIALS,
+            MSG_SYNC_CREDENTIALS,
+            Some(json!({ "detail": msg })),
+        ),
+        SyncFail::Engine(e) => {
+            let (code, msg) = match e {
+                Error::SyncStorage(_) => (ERR_SYNC_STORAGE, MSG_SYNC_STORAGE),
+                Error::SyncAnomaly(_) => (ERR_SYNC_ANOMALY, MSG_SYNC_ANOMALY),
+                Error::SyncConfig(_) => (ERR_SYNC_NOT_CONFIGURED, MSG_SYNC_NOT_CONFIGURED),
+                _ => (ERR_SYNC_STORAGE, MSG_SYNC_STORAGE),
+            };
+            RpcResponse::err(id, code, msg, Some(json!({ "detail": e.to_string() })))
         }
     }
 }
@@ -806,4 +1018,234 @@ extern "C" fn handle_signal(_: libc::c_int) {
 /// 全局信号标志的引用（供 transport 主循环轮询）。
 pub fn global_shutdown() -> &'static AtomicBool {
     &SHUTDOWN
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lk_core::audit::AuditLog;
+    use lk_core::crypto::test_kdf_params;
+    use lk_core::storage::{GetResult, LocalStorage, PutOutcome, RemoteObject};
+    use lk_core::sync::SyncConfig;
+    use lk_core::vault::init_vault_with_params;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// 慢网络后端：get/put 注入固定延迟，并在每次慢调用开始时发信号
+    /// （测试借此确定同步线程正处在网络 I/O 中——即「持锁窗口」）。
+    struct SlowBackend {
+        inner: LocalStorage,
+        delay: Duration,
+        signals: mpsc::Sender<()>,
+    }
+
+    impl lk_core::storage::StorageBackend for SlowBackend {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn get(&self, key: &str) -> lk_core::Result<Option<GetResult>> {
+            let _ = self.signals.send(());
+            std::thread::sleep(self.delay);
+            self.inner.get(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&str>,
+        ) -> lk_core::Result<PutOutcome> {
+            let _ = self.signals.send(());
+            std::thread::sleep(self.delay);
+            self.inner.put(key, data, expected)
+        }
+        fn delete(&self, key: &str) -> lk_core::Result<()> {
+            let _ = self.signals.send(());
+            std::thread::sleep(self.delay);
+            self.inner.delete(key)
+        }
+        fn list(&self) -> lk_core::Result<Vec<RemoteObject>> {
+            let _ = self.signals.send(());
+            std::thread::sleep(self.delay);
+            self.inner.list()
+        }
+        fn etag(&self, key: &str) -> lk_core::Result<Option<String>> {
+            let _ = self.signals.send(());
+            std::thread::sleep(self.delay);
+            self.inner.etag(key)
+        }
+    }
+
+    /// 构造 JSON-RPC 请求行。
+    fn rpc_line(method: &str, token: Option<&str>, params: Value) -> String {
+        let mut p = params;
+        if let Some(t) = token {
+            p["token"] = json!(t);
+        }
+        serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": p
+        }))
+        .unwrap()
+    }
+
+    fn rpc_result(resp: &str) -> Value {
+        serde_json::from_str::<Value>(resp).unwrap()["result"].clone()
+    }
+
+    /// G1 根治回归：同步轮次进行中（慢网络后端持网络 I/O 窗口），
+    /// 前台命令不被阻塞；且轮次应用阶段不覆盖同步期间命令的更新。
+    ///
+    /// 场景：远端有较新 X（拉取）+ 本地新增 Y（推送）→ 轮次含 3 个慢
+    /// 网络窗口（拉 X / 推 Y / 写索引）。在每个窗口内发命令：
+    /// 1. 拉 X 窗口 → `item.list` 必须及时返回（不等待网络）；
+    /// 2. 推 Y 窗口 → `item.put` 更新 X（本地 rev 前进，CAS 通过）
+    ///    ——轮次应用阶段 LWW 复核后跳过旧快照导入，X 不被覆盖；
+    /// 3. 写索引窗口 → 轮次完成，摘要 pulled=0（复核跳过）、pushed=1。
+    #[test]
+    fn sync_round_does_not_block_commands_and_apply_respects_races() {
+        // 夹具：真实守护进程（快速 KDF）+ 双端远端布局
+        let dir = tempfile::tempdir().unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        {
+            let mut audit = AuditLog::open(dir.path()).unwrap();
+            init_vault_with_params(dir.path(), "pw", false, &mut audit, &test_kdf_params())
+                .unwrap();
+        }
+        let mut daemon = Daemon::start(dir.path()).unwrap();
+        // 解锁
+        let unlock = rpc_result(&daemon.handle(&rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw" }),
+        )));
+        let token = unlock["token"].as_str().unwrap().to_string();
+        // 配置同步（file://；后端注入，URL 仅用于校验）
+        {
+            let cfg = Config {
+                auto_lock_minutes: 60,
+                sync: Some(SyncConfig {
+                    url: "file:///unused".into(),
+                    interval_secs: 60,
+                }),
+            };
+            *daemon.shared().config.write().unwrap() = cfg;
+        }
+        // 建条目 X
+        let put_x = rpc_result(&daemon.handle(&rpc_line(
+            M_ITEM_PUT,
+            Some(&token),
+            json!({ "item": {
+                "type": "login", "name": "X", "username": "u1",
+                "password": "p1", "uris": [], "custom": []
+            } }),
+        )));
+        let x_id = put_x["item"]["id"].as_str().unwrap().to_string();
+        let x_rev1 = put_x["item"]["revision"].as_str().unwrap().to_string();
+        // 基线轮（正常速度）：远端建立 index + X rev1
+        let shared = daemon.shared();
+        run_sync_round_with(
+            &shared,
+            Box::new(LocalStorage::new(remote_dir.path().to_path_buf())),
+        )
+        .unwrap();
+        // 远端较新 X（rev2）：用第二个客户端（同钥拷贝）编辑并同步
+        {
+            let b_dir = tempfile::tempdir().unwrap();
+            for name in ["vault.json", "index.lk", "audit.log", "recovery.envelope"] {
+                std::fs::copy(dir.path().join(name), b_dir.path().join(name)).unwrap();
+            }
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().to_string();
+                if name.ends_with(".item.lk") {
+                    std::fs::copy(dir.path().join(&name), b_dir.path().join(&name)).unwrap();
+                }
+            }
+            let mut b = UnlockedVault::unlock(b_dir.path(), "pw").unwrap();
+            b.put(
+                Some(uuid::Uuid::parse_str(&x_id).unwrap()),
+                lk_core::model::ItemDraft::Login {
+                    name: "X".into(),
+                    username: "remote-new".into(),
+                    password: "p1".into(),
+                    uris: vec![],
+                    custom: vec![],
+                },
+                Some(x_rev1.clone()),
+            )
+            .unwrap();
+            use lk_core::sync::SyncEngine;
+            SyncEngine::new(&LocalStorage::new(remote_dir.path().to_path_buf()))
+                .run_round(&mut b, &lk_core::crypto::now_iso())
+                .unwrap();
+        }
+        // 本地新增 Y（推送候选）；慢后端注入
+        daemon.handle(&rpc_line(
+            M_ITEM_PUT,
+            Some(&token),
+            json!({ "item": {
+                    "type": "login", "name": "Y", "username": "u2",
+                    "password": "p2", "uris": [], "custom": []
+                } }),
+        ));
+        let (tx, rx) = mpsc::channel();
+        let slow = Box::new(SlowBackend {
+            inner: LocalStorage::new(remote_dir.path().to_path_buf()),
+            delay: Duration::from_millis(400),
+            signals: tx,
+        });
+        // 同步线程：轮次（抓取无锁 → 应用短锁）
+        let round_shared = Arc::clone(&shared);
+        let round = std::thread::spawn(move || run_sync_round_with(&round_shared, slow));
+
+        // 窗口 1：拉 X 的网络 I/O 中 → 前台命令及时返回（不等待网络）
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let t0 = Instant::now();
+        let list = daemon.handle(&rpc_line(M_ITEM_LIST, Some(&token), json!({})));
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "item.list 在同步网络 I/O 中被阻塞 {elapsed:?}"
+        );
+        assert_eq!(rpc_result(&list)["items"].as_array().unwrap().len(), 2);
+
+        // 窗口 2：推 Y 的网络 I/O 中 → 命令更新 X（CAS rev1 → rev2'）
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let put = daemon.handle(&rpc_line(
+            M_ITEM_PUT,
+            Some(&token),
+            json!({
+                "id": x_id,
+                "expectedRevision": x_rev1,
+                "item": {
+                    "type": "login", "name": "X", "username": "local-race",
+                    "password": "p1", "uris": [], "custom": []
+                }
+            }),
+        ));
+        let put_result = rpc_result(&put);
+        assert!(
+            put_result["item"]["id"].as_str().is_some(),
+            "命令更新在同步网络 I/O 中被阻塞或被拒绝：{put}"
+        );
+
+        // 窗口 3：写索引的网络 I/O 中（轮次将完成）
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // 轮次完成：应用阶段 LWW 复核 → 跳过旧快照导入（X 不被覆盖）
+        let summary = round.join().unwrap().unwrap();
+        assert_eq!(summary.pulled, 0, "应用复核跳过旧快照导入");
+        assert_eq!(summary.pushed, 1, "Y 已推送");
+        let x =
+            rpc_result(&daemon.handle(&rpc_line(M_ITEM_GET, Some(&token), json!({ "id": x_id }))));
+        assert_eq!(
+            x["username"].as_str().unwrap(),
+            "local-race",
+            "同步期间命令的更新不被轮次覆盖"
+        );
+        // 水位已推进（轮次成功）
+        let status = rpc_result(&daemon.handle(&rpc_line(M_VAULT_STATUS, None, json!({}))));
+        assert!(status["syncWatermark"].as_str().is_some());
+    }
 }

@@ -195,6 +195,8 @@ impl MasterKey {
 }
 
 /// 两把功能密钥（K_data / K_audit），`Zeroizing` 内存擦除。
+/// `Clone`：同步引擎阶段 1 以密钥快照工作（守护进程侧网络 I/O 不持锁）。
+#[derive(Clone)]
 pub struct Keys {
     pub k_data: Zeroizing<[u8; MK_LEN]>,
     pub k_audit: Zeroizing<[u8; MK_LEN]>,
