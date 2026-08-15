@@ -26,7 +26,7 @@
 |------|------|--------|
 | `lk item list` | 列出条目（最小字段） | M0 |
 | `lk item get <id>` | 取单条（完整解密字段） | M0 |
-| `lk item add` | 新建条目（login / secureNote；交互或 flag） | M0 |
+| `lk item add` | 新建条目（四类：login / note / secret / file；交互或 flag，见 [design/spec.md](design/spec.md) §4） | M0 |
 | `lk item edit <id>` | 编辑条目（CAS，见 [data-model.md](data-model.md) §4） | M0 |
 | `lk item delete <id>` | 软删除（墓碑，30 天硬删） | M0 |
 | `lk item copy <id> <field>` | 复制字段到剪贴板（30s 自动清除，见 [browser-fill.md](browser-fill.md) §2 同款行为） | M0 |

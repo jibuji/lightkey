@@ -25,32 +25,43 @@
 
 - 文件名中的对象 id 为 UUID v4；时间戳后缀仅用于同步排序，不含内容信息。
 
-## 3. 条目 schema（参照 Bitwarden login/secureNote 映射，D5）
+## 3. 条目 schema（四类存储类型定案 v2，见 [design/spec.md](design/spec.md) §4）
 
-条目密文内部为 JSON（JSON-RPC 同款 serde），`type` 决定字段集：
+条目密文内部为 JSON（JSON-RPC 同款 serde），`type` 决定字段集；四类类型
+**一律真加密存储**（零知识，含笔记、文件），字段集与 spec §4 一致：
 
 ```jsonc
 {
   "id": "<uuid>",
-  "type": "login | secureNote",          // V1 只做这两类（Bitwarden 映射）
+  "type": "login | note | secret | file",  // 四类存储类型（v2，见 design/spec.md §4）
   "name": "示例",
   "revisionDate": "<ISO-8601>",
   "deleted": false,                       // true = 墓碑态（见 §4）
-  "favorite": false,
   "login": {                              // type=login 时
     "username": "user@example.com",
     "password": "s3cr3t",                 // 条目密文内，明文字段仅存在于解密态
-    "uris": ["https://example.com"],      // 可多个
-    "totp": null                          // V1 不实现 TOTP，字段保留 null
+    "uris": ["https://example.com"]      // 可多个
   },
-  "secureNote": { "note": "..." },        // type=secureNote 时
+  "note": { "content": "## Markdown" },  // type=note 时（Markdown 文本；轻量编辑+语法高亮，无预览）
+  "secret": {                             // type=secret 时
+    "value": "sk-live-...",              // 明文短文本（key / API key / token）
+    "purpose": "生产环境 API key",        // 用途/备注，可选
+    "expiresAt": null                     // 可选过期时间；V1 不实现到期校验，字段保留 null
+  },
+  "file": {                               // type=file 时
+    "note": "备注",                       // 备注，可选
+    "size": 12345678,                     // 大小（字节）
+    "fileType": "application/pdf"        // MIME 类型
+  },
   "customFields": [ { "name": "...", "value": "...", "hidden": true } ],
-  "attachments": [ /* 附件元数据引用，见 §5 */ ]
+  "attachments": [ /* 附件元数据引用；file 类型对应一个加密附件，见 §5 */ ]
 }
 ```
 
-- **映射依据**：Bitwarden 的 `login`（username/password/uris/totp）与
-  `secureNote`（notes）为 V1 字段集；`card`/`identity` 等类型 V1 不做。
+- **已砍字段**：原「收藏 favorite」已随存储类型定案 v2 移除（用途模糊，V1 不提供）。
+- **映射依据**：四类字段集直接对应 spec §4 定案（登录=账号+密码+网址；
+  笔记=名称+Markdown；密钥=值+用途+可选过期；文件=元数据+加密附件）。
+  不再参照 Bitwarden login/secureNote 两类型映射。
 - 自定义字段（customFields）保留，hidden 字段在 UI 中遮罩。
 
 ## 4. 修订、墓碑与并发（D5）

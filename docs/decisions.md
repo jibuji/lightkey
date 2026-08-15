@@ -19,7 +19,7 @@ needs-decision，不得自行变更。
 | D2 | 技术栈：Tauri 2（Rust 核心 + React）；CLI 复用同一 Rust 核心；验收平台 = Windows（原「Windows + macOS 双验收」的 CI 部分被补充拍板 #4 替代，见下文） | [architecture.md](architecture.md)、[testing.md](testing.md) |
 | D3 | 里程碑：M0 骨架+单机闭环 → M1 同步（BYO 变更发现 + CAS + 墓碑）→ M2 Agent 授权门 + 桌面端 → M3 浏览器填充 | [milestones.md](milestones.md) |
 | D4 | 加密：vault 头随机 16B salt + KDF 参数 + 密文格式类型/版本号；Argon2id(m=64MiB,t=3,p=4) 派生主密钥；HKDF-SHA256 分叉数据加密/审计 HMAC 两密钥互不复用，恢复信封密钥由恢复码 + Argon2id 独立派生（2026-08-15 grilling 后补充拍板，见下文）；原语刻意不同于 Bitwarden（AES-256-GCM，不用 CBC+HMAC） | [crypto.md](crypto.md) |
-| D5 | 数据模型：条目级密文 blob + 加密索引 + revisionDate 增量同步 + 软删除墓碑（30 天延迟硬删）+ 乐观并发（CAS，整条目 last-write-wins）；条目 schema 参照 Bitwarden login/secureNote 映射；附件每附件独立密钥 + 1 MiB 流式分块；自描述密文格式（含类型版本号） | [data-model.md](data-model.md) |
+| D5 | 数据模型：条目级密文 blob + 加密索引 + revisionDate 增量同步 + 软删除墓碑（30 天延迟硬删）+ 乐观并发（CAS，整条目 last-write-wins）；条目 schema 见四类存储类型定案（登录/笔记/密钥/文件，v2，补充拍板 #6）；附件每附件独立密钥 + 1 MiB 流式分块；自描述密文格式（含类型版本号） | [data-model.md](data-model.md) |
 | D6 | 元数据可见性：条目 blob 与索引/清单文件全部加密；存储端只见密文文件 + 文件名时间戳（零知识彻底） | [data-model.md](data-model.md)、[sync.md](sync.md) |
 | D7 | 变更发现：加密索引 + 轮询（默认 60s，可配 15s~24h）；无推送、无中间态加载、静默轮询；发现变更才下载条目；BYO（WebDAV/S3 无服务器）无推送下的变更发现是方案 A 在 BYO 场景的真实代价，写入文档 | [sync.md](sync.md) |
 | D8 | Agent 授权门：三层 = 默认拒绝 → 规则白名单（规则入库、按项目目录绑定，agent 只能看到被授权 key 名）→ 弹窗审批（30 秒超时默认拒绝）；启动者判定 = 进程链回溯 + 工作目录；规则库写入 = `lk rule add` CLI + 桌面规则管理页；规则文件 vault 内加密、按项目目录绑定；不开放手动改加密文件；审批通道抽象成接口（本地/远程可切换，远程=未来服务端付费点，P1 不做）；`lk inject` = 给具名命令注入环境变量；密钥只注入被批准具名命令的进程环境，不进模型对话环境 | [authorization-gate.md](authorization-gate.md) |
@@ -61,5 +61,15 @@ needs-decision，不得自行变更。
    [authorization-gate.md](authorization-gate.md) §4「规则随库同步」声明一致。
    已修订 [data-model.md](data-model.md) §6 与
    [authorization-gate.md](authorization-gate.md) §4（原 D5/D8 其余内容仍然有效）。
+6. **存储类型定案 v2（船长 2026-08-15 定案，四类）**：
+   原 D5 的「条目 schema 参照 Bitwarden login/secureNote 映射」不再适用，
+   改为四类存储类型：**登录 login**（账号+密码+网址）、**笔记 note**
+   （名称+Markdown 文本，轻量编辑+语法高亮、无预览，非旧版「名称+备注」空壳）、
+   **密钥 secret**（值+用途/备注+可选过期时间）、**文件 file**
+   （名称+备注+大小+类型+加密附件，元数据+附件独立加密存储，单文件 ≤50MB）。
+   统一原则：所有类型（含笔记、文件）一律**真加密存储**（零知识）；
+   **已砍「收藏 favorite」字段**（用途模糊，V1 不提供）。
+   已修订 [data-model.md](data-model.md) §3、[cli.md](cli.md) §2 与
+   [design/spec.md](design/spec.md) §4（原 D5 其余数据模型内容仍然有效）。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
