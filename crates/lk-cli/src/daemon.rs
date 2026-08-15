@@ -3,7 +3,7 @@
 //! - 持解锁态：密钥只存在于守护进程内存（`UnlockedVault`），锁定即擦除。
 //! - 会话令牌随每次解锁轮换（`session.token` 文件 0600 供 CLI 进程间传递，
 //!   锁定即删除）；令牌错误/过期 → 统一 `session.invalid`（防探测）。
-//! - `vault.unlock` 失败计数 + 指数退避（防暴力）。
+//! - `vault.unlock` / `vault.recover` 失败计数 + 指数退避（防暴力）。
 //! - 空闲超时自动锁定（默认 5 分钟，`config.json` 可配；0 = 下次请求即锁）。
 //! - 审计：守护进程是唯一写入方；未解锁态无法派生 K_audit → 失败解锁不落
 //!   审计（限流兜底），解锁成功与之后的一切敏感操作签名留痕。
@@ -42,14 +42,14 @@ impl Default for Config {
     }
 }
 
-/// `vault.unlock` 限流：失败计数 + 指数退避（5 次后 2^(n-5) 秒，封顶 300s）。
+/// `vault.unlock` / `vault.recover` 限流：失败计数 + 指数退避（5 次后 2^(n-5) 秒，封顶 300s）。
 #[derive(Debug, Default)]
-struct UnlockGuard {
+struct AuthGuard {
     failures: u32,
     blocked_until: Option<Instant>,
 }
 
-impl UnlockGuard {
+impl AuthGuard {
     fn retry_after(&self) -> Option<u64> {
         self.blocked_until
             .and_then(|t| t.checked_duration_since(Instant::now()))
@@ -81,7 +81,8 @@ pub struct Daemon {
     vault: Option<UnlockedVault>,
     sessions: SessionManager,
     audit: AuditLog,
-    unlock_guard: UnlockGuard,
+    unlock_guard: AuthGuard,
+    recover_guard: AuthGuard,
     last_activity: Instant,
 }
 
@@ -101,7 +102,8 @@ impl Daemon {
             vault: None,
             sessions: SessionManager::new(),
             audit,
-            unlock_guard: UnlockGuard::default(),
+            unlock_guard: AuthGuard::default(),
+            recover_guard: AuthGuard::default(),
             last_activity: Instant::now(),
         })
     }
@@ -280,6 +282,15 @@ impl Daemon {
     }
 
     fn vault_recover(&mut self, id: Value, params: Value) -> RpcResponse {
+        // 限流（失败计数 + 退避，与 vault.unlock 对称；A4）
+        if let Some(retry) = self.recover_guard.check() {
+            return RpcResponse::err(
+                id,
+                ERR_RATE_LIMITED,
+                MSG_RATE_LIMITED,
+                Some(json!({ "retryAfterSeconds": retry })),
+            );
+        }
         let p: RecoverParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
@@ -288,10 +299,14 @@ impl Daemon {
         self.lock_internal();
         let code = match RecoveryCode::parse(&p.recovery_code) {
             Ok(c) => c,
-            Err(_) => return RpcResponse::err(id, ERR_VAULT_INVALID, MSG_VAULT_INVALID, None),
+            Err(_) => {
+                self.recover_guard.on_failure();
+                return RpcResponse::err(id, ERR_VAULT_INVALID, MSG_VAULT_INVALID, None);
+            }
         };
         match vault::recover_vault(&self.dir, &code, &p.new_password, &mut self.audit) {
             Ok(new_code) => {
+                self.recover_guard.on_success();
                 let result = RecoverResult {
                     recovery_code: new_code.display(),
                 };
@@ -299,6 +314,7 @@ impl Daemon {
             }
             Err(_) => {
                 // 统一：恢复码错误 / 信封损坏 / 未初始化
+                self.recover_guard.on_failure();
                 RpcResponse::err(id, ERR_VAULT_INVALID, MSG_VAULT_INVALID, None)
             }
         }
@@ -319,6 +335,10 @@ impl Daemon {
 
     fn write_session_token(&self, token: &[u8; 32]) {
         let path = self.session_token_path();
+        // 取舍说明（A1）：CLI 每次调用是独立进程，令牌须经进程间传递才能
+        // 跨命令复用解锁态；ipc.md §3「令牌不落盘」以桌面/浏览器进程常驻为
+        // 前提，CLI 落地方式与规格字面冲突（文档修订另走 docs 同步）。
+        // 风险面收窄到同用户：文件 0600 + 用户私有目录 + 锁定/退出即删除。
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
