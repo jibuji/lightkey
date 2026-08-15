@@ -209,7 +209,7 @@ pub struct UnlockedVault {
 }
 
 impl UnlockedVault {
-    /// 解锁：主密码 → MK → K_data/K_audit；加载加密索引（损坏 → 全量重建）。
+    /// 解锁：主密码 → MK → K_data/K_audit；加载加密索引（缺失/损坏 → 全量重建）。
     ///
     /// 密钥正确性验证：若索引为空但存在条目密文（全部无法解密），判定
     /// 密钥错误（统一 [`Error::Decrypt`]）——避免「错误密码解锁出空库」。
@@ -250,13 +250,15 @@ impl UnlockedVault {
         &self.keys
     }
 
-    /// 索引加载；`index.lk` 缺失 → 空；解密失败 → 全量重建（不阻塞解锁）。
+    /// 索引加载；`index.lk` 缺失或损坏 → 全量重建（不阻塞解锁）。
     fn load_index(dir: &Path, keys: &Keys) -> Result<HashMap<uuid::Uuid, IndexEntry>> {
         let path = index_file(dir);
         let bytes = match fs::read(&path) {
             Ok(b) => b,
+            // 缺失与损坏同语义（data-model.md §6「索引损坏 → 全量重建」）：
+            // 否则恢复/解锁会以空索引密封，条目对用户不可见（S1 缺失子场景）。
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(HashMap::new());
+                return Self::rebuild_index(dir, keys);
             }
             Err(e) => return Err(e.into()),
         };
@@ -574,9 +576,12 @@ impl UnlockedVault {
             if !expired {
                 continue;
             }
+            // 先读条目取附件 id（file 条目）：attach_id 只能从条目密文得知，
+            // 删掉 `.item.lk` 后即无从获取——顺序不可颠倒（G1）。
+            let attach_id = self.read_item_file(id).ok().and_then(|i| i.attach_id());
             fs::remove_file(item_file(&self.dir, id)).ok();
             fs::remove_file(tomb_file(&self.dir, id)).ok();
-            self.remove_attachment(Some(id))?;
+            self.remove_attachment(attach_id)?;
             self.index.remove(&id);
             purged += 1;
         }
@@ -761,6 +766,16 @@ pub fn recover_vault_with_params(
         &EventInput::rotation(&old_keys.audit_key_id(), &new_keys.audit_key_id()),
     )?;
 
+    // 索引先于重加密循环处理：以旧钥加载（缺失/损坏 → 用旧钥重建）。
+    // 顺序不可颠倒——若先重加密条目，索引损坏时按旧钥重建会全部解密失败，
+    // 产出空索引并以新钥密封，下次解锁不再触发重建，条目将从 list() 消失（S1）。
+    let index_entries: Vec<IndexEntry> = {
+        let idx = UnlockedVault::load_index(dir, &old_keys)?;
+        let mut v: Vec<IndexEntry> = idx.values().cloned().collect();
+        v.sort_by_key(|e| e.id);
+        v
+    };
+
     // 重加密：条目 / 墓碑 / 附件元数据（分块不动——K_attach 未变）
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -800,18 +815,12 @@ pub fn recover_vault_with_params(
         write_atomic(&path, &new_blob)?;
     }
 
-    // 索引重密封（缺失/损坏则以旧钥重建后再密封）
-    let entries: Vec<IndexEntry> = {
-        let idx = UnlockedVault::load_index(dir, &old_keys)?;
-        let mut v: Vec<IndexEntry> = idx.values().cloned().collect();
-        v.sort_by_key(|e| e.id);
-        v
-    };
+    // 索引重密封（重建结果可能已由 load_index 以旧钥写盘，此处统一换新钥）
     let sealed = seal(
         new_keys.k_data.as_ref(),
         SealType::Index,
         INDEX_FILE,
-        &serde_json::to_vec(&entries)?,
+        &serde_json::to_vec(&index_entries)?,
     );
     write_atomic(&index_file(dir), &sealed)?;
 
@@ -1017,6 +1026,60 @@ mod tests {
         assert!(!dir.path().join(format!("{}.tomb.lk", item.id())).exists());
     }
 
+    /// G1 回归：file 条目删除 + 过期 → 附件元数据与全部分块必须一并删除。
+    #[test]
+    fn purge_removes_file_attachment() {
+        let (dir, _audit, _code) = temp_vault("purge-attach");
+        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        // 1 MiB + 123 B → 2 块
+        let data: Vec<u8> = (0..(CHUNK_BYTES as usize + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let item = v
+            .put(
+                None,
+                ItemDraft::File {
+                    name: "f.bin".into(),
+                    note: String::new(),
+                    size: 0,
+                    file_type: "application/octet-stream".into(),
+                    attachment: "f.bin".into(),
+                    attach_id: None,
+                    file_data: Some(base64::engine::general_purpose::STANDARD.encode(&data)),
+                },
+                None,
+            )
+            .unwrap();
+        let Item::File { attach_id, .. } = &item else {
+            panic!("file")
+        };
+        let attach_id = attach_id.unwrap();
+        assert_ne!(attach_id, item.id(), "附件 id 与条目 id 独立");
+        assert!(dir.path().join(format!("{attach_id}.attach.lk")).exists());
+        assert!(dir.path().join(format!("{attach_id}.0.chunk.lk")).exists());
+        assert!(dir.path().join(format!("{attach_id}.1.chunk.lk")).exists());
+        v.delete(item.id()).unwrap();
+        // 已过期（now = 删除后 31 天）→ 硬删条目 + 墓碑 + 附件密文
+        let future = (time::OffsetDateTime::now_utc() + time::Duration::days(31))
+            .format(&time::macros::format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z"
+            ))
+            .unwrap();
+        assert_eq!(v.purge_expired(&future).unwrap(), 1);
+        assert!(
+            !dir.path().join(format!("{attach_id}.attach.lk")).exists(),
+            "附件元数据应随硬删删除"
+        );
+        assert!(
+            !dir.path().join(format!("{attach_id}.0.chunk.lk")).exists(),
+            "附件分块应随硬删删除"
+        );
+        assert!(
+            !dir.path().join(format!("{attach_id}.1.chunk.lk")).exists(),
+            "附件分块应随硬删删除"
+        );
+    }
+
     #[test]
     fn attachment_chunking_and_export() {
         let (dir, _audit, _code) = temp_vault("attach");
@@ -1198,6 +1261,121 @@ mod tests {
         };
         let verified = log.verify(&old_keys, &resolve).unwrap();
         assert!(verified >= 3, "init + 轮换 + recover + ... 至少 3 条");
+    }
+
+    /// S1 回归：恢复 + index.lk 损坏 → 索引须以旧钥重建，条目数与恢复前一致。
+    #[test]
+    fn recover_with_corrupt_index_keeps_items() {
+        let (dir, mut audit, code) = temp_vault("recover-idx");
+        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let item = v.put(None, login_draft("keep-me"), None).unwrap();
+        v.put(
+            None,
+            ItemDraft::File {
+                name: "f.bin".into(),
+                note: String::new(),
+                size: 0,
+                file_type: "application/octet-stream".into(),
+                attachment: "f.bin".into(),
+                attach_id: None,
+                file_data: Some(
+                    base64::engine::general_purpose::STANDARD.encode(b"attachment-data"),
+                ),
+            },
+            None,
+        )
+        .unwrap();
+        let n_before = v.list().unwrap().len();
+        assert_eq!(n_before, 2);
+        drop(v);
+        // 破坏 index.lk（同 corrupted_index_rebuilds 手法）
+        let idx = dir.path().join(INDEX_FILE);
+        let mut bytes = std::fs::read(&idx).unwrap();
+        bytes[10] ^= 0xFF;
+        std::fs::write(&idx, &bytes).unwrap();
+        // 恢复：索引损坏时必须以旧钥重建（此刻条目密文仍是旧钥），
+        // 不能产出空索引
+        let new_code = recover_vault_with_params(
+            dir.path(),
+            &RecoveryCode::parse(&code).unwrap(),
+            "newpw",
+            &mut audit,
+            &crypto::test_kdf_params(),
+        )
+        .unwrap();
+        assert_ne!(new_code.display(), code);
+        // 新密码解锁：条目数与恢复前一致，条目可读
+        let mut v2 = unlock_vault(dir.path(), "newpw").unwrap();
+        assert_eq!(
+            v2.list().unwrap().len(),
+            n_before,
+            "恢复后索引不得为空（S1）"
+        );
+        assert_eq!(v2.get(item.id()).unwrap().name(), "keep-me");
+        // 二次解锁不重建（索引合法），条目仍可见
+        drop(v2);
+        let mut v3 = unlock_vault(dir.path(), "newpw").unwrap();
+        assert_eq!(v3.list().unwrap().len(), n_before);
+    }
+
+    /// S1 回归（缺失子场景）：恢复 + index.lk 缺失 → 与损坏同语义全量重建，
+    /// 条目数与恢复前一致（缺失时恢复若产出空索引，用户视角数据丢失）。
+    #[test]
+    fn recover_with_missing_index_keeps_items() {
+        let (dir, mut audit, code) = temp_vault("recover-idx-missing");
+        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let item = v.put(None, login_draft("keep-me"), None).unwrap();
+        let n_before = v.list().unwrap().len();
+        assert_eq!(n_before, 1);
+        drop(v);
+        // 删除 index.lk（磁盘/同步损坏、手动删除）
+        std::fs::remove_file(dir.path().join(INDEX_FILE)).unwrap();
+        // 恢复：索引缺失时必须重建（此刻条目密文仍是旧钥），不能产出空索引
+        let new_code = recover_vault_with_params(
+            dir.path(),
+            &RecoveryCode::parse(&code).unwrap(),
+            "newpw",
+            &mut audit,
+            &crypto::test_kdf_params(),
+        )
+        .unwrap();
+        assert_ne!(new_code.display(), code);
+        // 新密码解锁：条目数与恢复前一致，条目可读
+        let mut v2 = unlock_vault(dir.path(), "newpw").unwrap();
+        assert_eq!(
+            v2.list().unwrap().len(),
+            n_before,
+            "恢复后索引不得为空（S1 缺失子场景）"
+        );
+        assert_eq!(v2.get(item.id()).unwrap().name(), "keep-me");
+    }
+
+    /// S1 回归（缺失子场景，正常解锁路径）：index.lk 缺失 → 条目仍可见。
+    #[test]
+    fn unlock_with_missing_index_keeps_items() {
+        let (dir, _audit, _code) = temp_vault("unlock-idx-missing");
+        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let item = v.put(None, login_draft("keep-me"), None).unwrap();
+        let n_before = v.list().unwrap().len();
+        assert_eq!(n_before, 1);
+        drop(v);
+        // 删除 index.lk 后正常解锁：不得出现空列表
+        std::fs::remove_file(dir.path().join(INDEX_FILE)).unwrap();
+        let mut v2 = unlock_vault(dir.path(), "pw").unwrap();
+        assert_eq!(
+            v2.list().unwrap().len(),
+            n_before,
+            "解锁后索引不得为空（S1 缺失子场景）"
+        );
+        assert_eq!(v2.get(item.id()).unwrap().name(), "keep-me");
+        // 重建的索引已落盘：再次解锁不重建，条目仍可见
+        assert!(
+            dir.path().join(INDEX_FILE).exists(),
+            "解锁后应重建并落盘索引"
+        );
+        drop(v2);
+        let mut v3 = unlock_vault(dir.path(), "pw").unwrap();
+        assert_eq!(v3.list().unwrap().len(), n_before);
     }
 
     #[test]

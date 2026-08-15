@@ -468,9 +468,9 @@ pub fn random_bytes(len: usize) -> Vec<u8> {
     buf
 }
 
-/// 随机 UUID v4。
+/// 随机 UUID v4（`Uuid::new_v4()` 设置 version/variant 位，符合 data-model.md）。
 pub fn random_uuid() -> uuid::Uuid {
-    uuid::Uuid::from_bytes(random_array())
+    uuid::Uuid::new_v4()
 }
 
 #[cfg(test)]
