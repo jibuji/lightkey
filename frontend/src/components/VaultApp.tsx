@@ -25,11 +25,15 @@ interface VaultAppProps {
   onLock: () => void;
   /** 搜索框 ref（回车 → 新建条目） */
   searchRef?: RefObject<HTMLInputElement>;
+  /** 搜索框回车 → 新建（仅条目页触发，避免其它页累计信号） */
   onSearchEnter?: () => void;
-  newItemSignal?: number;
+  /** 回车新建信号（消费式：ItemsPage 处理即 ack 置零，防重挂载幽灵重开） */
+  newItemSignal?: boolean;
+  /** ItemsPage 消费信号后回调置零（review M1） */
+  onAckNewItem?: () => void;
 }
 
-export function VaultApp({ ipc, onLock, searchRef, onSearchEnter, newItemSignal = 0 }: VaultAppProps) {
+export function VaultApp({ ipc, onLock, searchRef, onSearchEnter, newItemSignal = false, onAckNewItem }: VaultAppProps) {
   const { toast } = useToast();
   const [page, setPage] = useState<PageId>("items");
   const [search, setSearch] = useState("");
@@ -92,7 +96,7 @@ export function VaultApp({ ipc, onLock, searchRef, onSearchEnter, newItemSignal 
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") onSearchEnter?.();
+                if (e.key === "Enter" && page === "items") onSearchEnter?.();
               }}
             />
           </div>
@@ -109,7 +113,12 @@ export function VaultApp({ ipc, onLock, searchRef, onSearchEnter, newItemSignal 
 
         <div className="content">
           {page === "items" ? (
-            <ItemsPage ipc={ipc} search={search} newItemSignal={newItemSignal} />
+            <ItemsPage
+              ipc={ipc}
+              search={search}
+              newItemSignal={newItemSignal}
+              onAckNewItem={onAckNewItem}
+            />
           ) : page === "rules" ? (
             <RulesPage ipc={ipc} />
           ) : page === "settings" ? (

@@ -77,13 +77,13 @@ export function useCopy(): (text: string) => void {
         navigator.clipboard
           .writeText(text)
           .then(() => {
+            done();
             // 30 秒后自动清除剪贴板（产品承诺行为）
             setTimeout(() => {
               navigator.clipboard.writeText("").catch(() => undefined);
             }, 30000);
           })
           .catch(() => done());
-        done();
       } else {
         done();
       }

@@ -7,8 +7,13 @@
  *
  * 覆盖语法子集：# 标题 / **粗** / *斜* / `行内码` / ```围栏 / > 引用 /
  * 无序与有序列表 / [链接](url)。输出 HTML 片段由调用方以
- * dangerouslySetInnerHTML 注入（输入先 esc，无 XSS 面）。
+ * dangerouslySetInnerHTML 注入（输入先 esc + 链接 scheme 白名单 → 无 XSS 面）。
  */
+
+/** 链接匹配：URL 允许一层圆括号（如 Wikipedia 条目名），避免 `)` 截断（review B2） */
+const LINK_RE = /\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g;
+/** 链接 scheme 白名单：仅 http/https/mailto 渲染为链接，其余（javascript: 等）转纯文本（review M3） */
+const SAFE_LINK_RE = /^(https?:|mailto:)/i;
 
 function esc(s: string): string {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -43,7 +48,7 @@ function mdInline(s: string): string {
   let l = esc(s);
   l = l.replace(/`([^`]+)`/g, '<span class="tk-i">`$1`</span>');
   l = l.replace(/\*\*([^*]+)\*\*/g, '<span class="tk-b">**$1**</span>');
-  l = l.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<span class="tk-l">[$1]($2)</span>');
+  l = l.replace(LINK_RE, '<span class="tk-l">[$1]($2)</span>');
   return l;
 }
 
@@ -110,7 +115,11 @@ function mdRenderInline(s: string): string {
   l = l.replace(/`([^`]+)`/g, "<code>$1</code>");
   l = l.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   l = l.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-  l = l.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  l = l.replace(LINK_RE, (_m, label, url) =>
+    SAFE_LINK_RE.test(url)
+      ? `<a href="${url}" target="_blank" rel="noreferrer">${label}</a>`
+      : `[${label}](${url})`,
+  );
   return l;
 }
 

@@ -7,7 +7,7 @@
 
 import { useRef, useState } from "react";
 import type { LightKeyIpc } from "../ipc";
-import type { Item, ItemDraft, ItemType } from "../types";
+import type { CustomField, Item, ItemDraft, ItemType } from "../types";
 import { Icon } from "./Icons";
 import { MdEditor } from "./MdEditor";
 import { Modal } from "./Modal";
@@ -50,6 +50,10 @@ export function ItemModal({ ipc, item, onClose, onSaved, onConflict }: ItemModal
   const [username, setUsername] = useState(item?.type === "login" ? item.username : "");
   const [password, setPassword] = useState(item?.type === "login" ? item.password : "");
   const [uri, setUri] = useState(item?.type === "login" ? item.uris.join(", ") : "");
+  // login 自定义字段（spec §6.3 字段增删）
+  const [custom, setCustom] = useState<CustomField[]>(
+    item?.type === "login" ? item.custom.map((c) => ({ ...c })) : [],
+  );
 
   // note
   const [content, setContent] = useState(item?.type === "note" ? item.content : "");
@@ -66,6 +70,13 @@ export function ItemModal({ ipc, item, onClose, onSaved, onConflict }: ItemModal
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  /** M4：密码字段圆点遮罩 + 眼睛切换明文（spec §3 组件库） */
+  const [showPwd, setShowPwd] = useState(false);
+
+  const setCustomAt = (i: number, key: "name" | "value", v: string) =>
+    setCustom((list) => list.map((f, idx) => (idx === i ? { ...f, [key]: v } : f)));
+  const removeCustomAt = (i: number) => setCustom((list) => list.filter((_, idx) => idx !== i));
+  const addCustom = () => setCustom((list) => [...list, { name: "", value: "", hidden: false }]);
 
   const pickFile = () => {
     const input = fileInputRef.current;
@@ -116,7 +127,10 @@ export function ItemModal({ ipc, item, onClose, onSaved, onConflict }: ItemModal
         username: u,
         password: p,
         uris: uri.split(",").map((s) => s.trim()).filter(Boolean),
-        custom: item?.type === "login" ? item.custom : [],
+        // 空行（名称与值皆空）不入库；hidden 标志编辑时保留
+        custom: custom
+          .map((f) => ({ ...f, name: f.name.trim(), value: f.value.trim() }))
+          .filter((f) => f.name || f.value),
       } as ItemDraft;
     } else if (type === "note") {
       if (!content.trim()) {
@@ -222,7 +236,21 @@ export function ItemModal({ ipc, item, onClose, onSaved, onConflict }: ItemModal
             <label className="field">
               <span className="field-label">密码</span>
               <span className="input-wrap">
-                <input value={password} onChange={(e) => setPassword(e.target.value)} />
+                <input
+                  type={showPwd ? "text" : "password"}
+                  className="mono has-affix"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="icon-btn input-affix"
+                  title={showPwd ? "隐藏密码" : "显示密码"}
+                  aria-label={showPwd ? "隐藏密码" : "显示密码"}
+                  onClick={() => setShowPwd((v) => !v)}
+                >
+                  <Icon name="eye" size={15} />
+                </button>
               </span>
             </label>
             <label className="field">
@@ -231,6 +259,41 @@ export function ItemModal({ ipc, item, onClose, onSaved, onConflict }: ItemModal
                 <input value={uri} placeholder="example.com" onChange={(e) => setUri(e.target.value)} />
               </span>
             </label>
+            <div className="field">
+              <span className="field-label">自定义字段（可选）</span>
+              {custom.map((f, i) => (
+                <div className="custom-field-row" key={i}>
+                  <input
+                    className="custom-field-name"
+                    value={f.name}
+                    placeholder="字段名"
+                    aria-label={`自定义字段 ${i + 1} 名称`}
+                    onChange={(e) => setCustomAt(i, "name", e.target.value)}
+                  />
+                  <input
+                    value={f.value}
+                    placeholder="值"
+                    aria-label={`自定义字段 ${i + 1} 值`}
+                    onChange={(e) => setCustomAt(i, "value", e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title="删除字段"
+                    aria-label={`删除自定义字段 ${i + 1}`}
+                    onClick={() => removeCustomAt(i)}
+                  >
+                    <Icon name="trash" size={15} />
+                  </button>
+                </div>
+              ))}
+              <div>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={addCustom}>
+                  <Icon name="plus" size={14} strokeWidth={2.5} />
+                  添加字段
+                </button>
+              </div>
+            </div>
           </>
         ) : null}
 
