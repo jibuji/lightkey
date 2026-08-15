@@ -2,8 +2,9 @@
 //!
 //! - 协议：**JSON-RPC 2.0**（`jsonrpc`/`method`/`params`/`id`/`result`/`error`），
 //!   serde 序列化；版本前缀方法名（`vault.unlock`、`item.get`…）。
-//! - 方法表见模块内常量；M1/M2 方法（`sync.*`/`authz.evaluate`/`approval.request`
-//!   /`rule.*`）返回 `-32601 Method not found`（占位，不实现）。
+//! - 方法表见模块内常量；M1 已实现 `sync.trigger` / `sync.poll`；M2 方法
+//!   （`authz.evaluate`/`approval.request`/`rule.*`）返回 `-32601 Method not found`
+//!   （占位，不实现）。
 //! - 会话令牌随每次解锁轮换；除 `vault.status`/`vault.init`/`vault.unlock` 外的
 //!   请求必须携带 `token`；令牌错误/过期 → 统一 `session.invalid`（防探测）。
 //! - 最小字段原则：响应只含调用方被授权的最小已解密字段。
@@ -95,6 +96,14 @@ pub const ERR_RATE_LIMITED: i64 = -32006;
 pub const ERR_VAULT_EXISTS: i64 = -32007;
 /// 审计 HMAC 链校验失败。
 pub const ERR_AUDIT_VERIFY: i64 = -32008;
+/// 同步：未配置 BYO 存储（`lk sync` 前需 `lk config sync set`）。
+pub const ERR_SYNC_NOT_CONFIGURED: i64 = -32009;
+/// 同步：存储端错误（网络 / 4xx / 5xx）→ 本轮放弃，下一轮重试。
+pub const ERR_SYNC_STORAGE: i64 = -32010;
+/// 同步：远端密文被篡改/无法解密 → 报「同步数据异常」，不自动覆盖。
+pub const ERR_SYNC_ANOMALY: i64 = -32011;
+/// 同步：凭据缺失/钥匙串不可用。
+pub const ERR_SYNC_CREDENTIALS: i64 = -32012;
 
 pub const MSG_VAULT_INVALID: &str = "vault.invalid";
 pub const MSG_SESSION_INVALID: &str = "session.invalid";
@@ -105,6 +114,10 @@ pub const MSG_RATE_LIMITED: &str = "rate.limited";
 pub const MSG_VAULT_EXISTS: &str = "vault.exists";
 pub const MSG_AUDIT_VERIFY: &str = "audit.verify_failed";
 pub const MSG_METHOD_NOT_FOUND: &str = "method not found";
+pub const MSG_SYNC_NOT_CONFIGURED: &str = "sync.not_configured";
+pub const MSG_SYNC_STORAGE: &str = "sync.storage";
+pub const MSG_SYNC_ANOMALY: &str = "sync.data_anomaly";
+pub const MSG_SYNC_CREDENTIALS: &str = "sync.credentials";
 
 // ---------------------------------------------------------------------------
 // 方法名
@@ -264,6 +277,20 @@ pub struct RecoverResult {
 #[serde(rename_all = "camelCase")]
 pub struct AuditVerifyResult {
     pub verified: usize,
+}
+
+/// `sync.trigger` 参数（空；触发一轮同步并阻塞至完成）。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncTriggerParams {}
+
+/// `sync.poll` 结果：最近一轮已完成同步的变更摘要与水位（不触发新轮次）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPollResult {
+    pub summary: Option<crate::sync::SyncSummary>,
+    /// 同步水位（最近成功轮询时间，ISO-8601 UTC）。
+    pub watermark: Option<String>,
 }
 
 /// 统一「会话无效」错误响应。

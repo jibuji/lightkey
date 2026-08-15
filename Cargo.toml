@@ -46,6 +46,12 @@ serde_json = "1"
 base64 = "0.22"
 time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
 hex = "0.4"                                     # 密钥指纹 / 会话令牌十六进制表示
+# --- M1 同步（BYO 存储：WebDAV / S3）---
+# --- M1 同步（BYO 存储：WebDAV / S3）---
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }  # 阻塞 HTTP 客户端（支持 PROPFIND/MKCOL 等扩展方法；rustls TLS）
+quick-xml = "0.37"                             # PROPFIND / ListObjectsV2 响应解析
+# --- M1 同步凭据（lk-cli：系统钥匙串）---
+keyring = "4"                                  # WebDAV/S3 凭据入系统钥匙串（不进 vault/审计/日志）
 # --- 基础设施 ---
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }  # 密钥内存擦除（守护进程内存约束）

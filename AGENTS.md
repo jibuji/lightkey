@@ -5,7 +5,7 @@
 ## 项目一句话
 
 轻钥 LightKey：个人密钥/私密信息管理工具，从零自研（不 fork Bitwarden），
-客户端全开源（MIT）。当前为 **M0 骨架 + V1 实施 spec** 阶段。
+客户端全开源（MIT）。当前为 **M1（同步）完成 + M2 授权门/桌面** 阶段。
 
 ## 规格是唯一权威
 
@@ -19,6 +19,8 @@
 - 核心+CLI 测试/检查（Linux 上 Tauri 壳需 webkit2gtk，CI 在 Windows 检查；
   Windows 优先，补充拍板 #4）：
   `cargo test` / `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`
+- 同步 E2E（M1 双客户端）：`bash scripts/e2e_m1.sh [lk-binary-path]`；
+  单机回归：`bash scripts/e2e_m0.sh`（都用 `file://` 本地模拟存储，无需凭据）。
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
   `crates/lk-app/tauri.conf.json` 的 devUrl 一致）。
 - CI 骨架：`.github/workflows/ci.yml`。
@@ -34,9 +36,11 @@
 
 ## 里程碑状态
 
-- [x] M0 骨架 + spec（本阶段）：workspace、CI、LICENSE、docs/、设计规范 + 原型
-- [ ] M0 功能实现（核心库 + CLI 单机闭环）
-- [ ] M1 同步 · [ ] M2 授权门 + 桌面 · [ ] M3 浏览器填充
+- [x] M0 骨架 + spec：workspace、CI、LICENSE、docs/、设计规范 + 原型
+- [x] M0 功能实现（核心库 + CLI 单机闭环）
+- [x] M1 同步（BYO 变更发现 + CAS + 墓碑；`lk sync` / `lk config`；存储后端
+  trait + 本地模拟/WebDAV/S3 实现；E2E `scripts/e2e_m1.sh`）
+- [ ] M2 授权门 + 桌面 · [ ] M3 浏览器填充
 
 ## Maintaining this file
 

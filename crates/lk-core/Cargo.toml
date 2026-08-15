@@ -23,6 +23,8 @@ time.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 hex.workspace = true
+reqwest.workspace = true
+quick-xml.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

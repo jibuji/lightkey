@@ -18,12 +18,14 @@
 //! | [`audit`] | 追加式审计日志 + HMAC 防篡改、密钥轮换验证链 | `docs/audit.md` |
 //! | [`ipc`] | JSON-RPC 2.0 协议类型、会话令牌、错误码 | `docs/ipc.md` |
 //! | [`sync`] | BYO 变更发现、轮询、冲突收敛（M1） | `docs/sync.md` |
+//! | [`storage`] | BYO 存储后端抽象：本地模拟 / WebDAV / S3（M1） | `docs/sync.md` |
 //! | [`authz`] | Agent 授权门三层模型、规则库、启动者判定（M2） | `docs/authorization-gate.md` |
 //!
 //! ## 里程碑状态
 //!
-//! M0（单机闭环）已实现：加密、四类条目 CRUD、CAS、墓碑、会话、恢复信封、
-//! 审计、IPC 协议类型。M1 同步 / M2 授权门为占位模块。
+//! M0（单机闭环）+ M1（同步）已实现：加密、四类条目 CRUD、CAS、墓碑、会话、
+//! 恢复信封、审计、IPC 协议类型、BYO 变更发现（轮询 + CAS 上传 + 墓碑收敛）。
+//! M2 授权门为占位模块。
 
 pub mod audit;
 pub mod authz;
@@ -32,6 +34,7 @@ pub mod ipc;
 pub mod model;
 pub mod recovery;
 pub mod session;
+pub mod storage;
 pub mod sync;
 pub mod vault;
 
@@ -89,6 +92,15 @@ pub enum Error {
     /// 审计验证失败
     #[error("审计验证失败: {0}")]
     Audit(String),
+    /// 同步：存储端错误（网络 / 4xx / 5xx）→ 本轮放弃，下一轮重试
+    #[error("同步存储端错误: {0}")]
+    SyncStorage(String),
+    /// 同步：远端密文被篡改/无法解密 → 报「同步数据异常」，不自动覆盖本地
+    #[error("同步数据异常: {0}")]
+    SyncAnomaly(String),
+    /// 同步：配置无效（URL 解析 / 后端选择）
+    #[error("同步配置无效: {0}")]
+    SyncConfig(String),
     /// 其他业务错误
     #[error("{0}")]
     Other(String),
