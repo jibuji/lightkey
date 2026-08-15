@@ -1,7 +1,8 @@
 # 总体架构（V1 MVP）
 
-- 状态：已拍板（D1/D2/D15）
+- 状态：已拍板（D1/D2/D15）；插件化边界见 [plugin-architecture.md](plugin-architecture.md)
 - 关联：[milestones.md](milestones.md)（范围）· [decisions.md](decisions.md)（决议）
+  · [plugin-architecture.md](plugin-architecture.md)（M1.5 插件化落地层）
 
 ## 1. 定位与交付范围
 
@@ -48,6 +49,17 @@ V1 MVP 交付三样东西：
 - 密钥等敏感内存仅在守护进程内存中（[ipc.md](ipc.md)）；任何进程内不落盘明文。
 - 前端不直接接触加密层——一切经桌面壳 → 本地 IPC → 守护进程 → `lk-core`。
 - 未来服务端（若做）不在此仓库/不开源；CLI 与桌面不依赖任何服务端能力。
+
+**插件化落地（M1.5 起，见 [plugin-architecture.md](plugin-architecture.md)）**：
+
+- `lk-core` 保持**单一 crate**，内部按插件边界重组为 **A 层数据平面**（crypto/
+vault-store/recovery/audit/session）与 **B 层能力域**（storage-backend/sync-engine/
+authz-gate），trait 服务 + 事件总线**模拟** Cordis 语义（不移植 Cordis）。
+- **C 层宿主 daemon**（现位于 `lk-cli`）：装配 A/B、IPC 路由、空闲自动锁定、config.json。
+- **D 层桌面/前端**用**真 Cordis**（`@cordisjs/core` 4.x）+ 薄 React 宿主；插件清单与
+  inject 依赖图见 plugin-architecture.md §3/§4。
+- 安全核心（加密/数据/同步/审计）留在 Rust，不重写为 TS；CLI 与 Tauri 壳只做
+  编排与呈现（与本节纪律一致，插件化不放松此边界）。
 
 ## 4. Workspace 布局
 
