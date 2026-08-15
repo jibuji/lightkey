@@ -1,0 +1,4 @@
+# 固定 Rust 工具链：本地与 CI 同版本，保证可复现构建。
+[toolchain]
+channel = "1.94"
+components = ["rustfmt", "clippy"]

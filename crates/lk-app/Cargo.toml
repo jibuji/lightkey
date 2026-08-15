@@ -1,0 +1,21 @@
+[package]
+name = "lk-app"
+description = "LightKey 桌面应用（Tauri 2 壳）：宿主前端并复用 lk-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+lk-core = { path = "../lk-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+# 骨架占位：Tauri 壳在 M2 里程碑接入（窗口、IPC 桥、托盘、审批弹窗）。
+# 图标为占位图形，M2 补正式 ico / icns。

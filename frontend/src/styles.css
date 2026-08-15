@@ -1,0 +1,75 @@
+/* LightKey 前端骨架样式（M0 占位页）。
+   完整设计 tokens 见 docs/design/spec.md —— 本文件仅是占位页最小样式，
+   M2 实现界面时以设计规范为准。 */
+
+:root {
+  --bg: #0f141a;
+  --fg: #e6e9ee;
+  --brand: #2dd4bf;
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.shell {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+}
+
+.brand-mark {
+  width: 64px;
+  height: 64px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #2dd4bf, #38bdf8);
+  color: #0f141a;
+  font-weight: 800;
+  font-size: 24px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 8px;
+}
+
+.brand-name {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: 0.5px;
+}
+
+.tagline {
+  margin: 0;
+  color: #98a2b0;
+}
+
+.skeleton-note {
+  margin: 24px 0 0;
+  max-width: 480px;
+  font-size: 13px;
+  color: #5c6672;
+  line-height: 1.7;
+}
+
+.skeleton-note code {
+  color: #98a2b0;
+}

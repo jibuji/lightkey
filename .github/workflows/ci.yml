@@ -1,0 +1,67 @@
+# LightKey CI（船长裁定 2026-08-15：收敛为 Windows 优先）
+#
+# 船长本机为 Windows WSL，Windows 是主开发测试平台；省略 macOS/Linux
+# 双份构建以加速（替代原 D2「Windows + macOS 双验收」的 CI 部分）：
+#   - desktop-windows：Windows 上执行全部检查——fmt / clippy / test
+#     （core + cli）与全 workspace `cargo check`（含 Tauri 壳，含 icon.ico
+#     的 Windows 资源生成）
+#   - frontend：ubuntu 上构建 React + TS 前端（保留）
+# Linux 冒烟由本地承担，不再占 CI 矩阵。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop-windows:
+    name: desktop + core + cli (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (core + cli)
+        run: cargo clippy -p lk-core -p lk-cli --all-targets -- -D warnings
+
+      - name: Test (core + cli)
+        run: cargo test -p lk-core -p lk-cli
+
+      - name: Check workspace (incl. Tauri shell)
+        run: cargo check --workspace
+
+  frontend:
+    name: frontend (React + TS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Build
+        run: npm run build
+        working-directory: frontend

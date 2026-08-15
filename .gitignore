@@ -1,4 +1,29 @@
+# Rust
 target/
+
+# Node / 前端
 node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Tauri 本地缓存
+.tauri/
+.cargo/
+
+# Tauri 构建产物（gen/schemas 由 tauri-build 每次构建生成）
+crates/lk-app/gen/
+
+# 日志
 *.log
+
+# OS
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# 密钥 / 本地状态——永不入库
+*.key
+*.pem
+.env
+.env.*
+!.env.example
