@@ -209,7 +209,7 @@ pub struct UnlockedVault {
 }
 
 impl UnlockedVault {
-    /// 解锁：主密码 → MK → K_data/K_audit；加载加密索引（损坏 → 全量重建）。
+    /// 解锁：主密码 → MK → K_data/K_audit；加载加密索引（缺失/损坏 → 全量重建）。
     ///
     /// 密钥正确性验证：若索引为空但存在条目密文（全部无法解密），判定
     /// 密钥错误（统一 [`Error::Decrypt`]）——避免「错误密码解锁出空库」。
@@ -250,13 +250,15 @@ impl UnlockedVault {
         &self.keys
     }
 
-    /// 索引加载；`index.lk` 缺失 → 空；解密失败 → 全量重建（不阻塞解锁）。
+    /// 索引加载；`index.lk` 缺失或损坏 → 全量重建（不阻塞解锁）。
     fn load_index(dir: &Path, keys: &Keys) -> Result<HashMap<uuid::Uuid, IndexEntry>> {
         let path = index_file(dir);
         let bytes = match fs::read(&path) {
             Ok(b) => b,
+            // 缺失与损坏同语义（data-model.md §6「索引损坏 → 全量重建」）：
+            // 否则恢复/解锁会以空索引密封，条目对用户不可见（S1 缺失子场景）。
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(HashMap::new());
+                return Self::rebuild_index(dir, keys);
             }
             Err(e) => return Err(e.into()),
         };
@@ -1313,6 +1315,66 @@ mod tests {
         // 二次解锁不重建（索引合法），条目仍可见
         drop(v2);
         let mut v3 = unlock_vault(dir.path(), "newpw").unwrap();
+        assert_eq!(v3.list().unwrap().len(), n_before);
+    }
+
+    /// S1 回归（缺失子场景）：恢复 + index.lk 缺失 → 与损坏同语义全量重建，
+    /// 条目数与恢复前一致（缺失时恢复若产出空索引，用户视角数据丢失）。
+    #[test]
+    fn recover_with_missing_index_keeps_items() {
+        let (dir, mut audit, code) = temp_vault("recover-idx-missing");
+        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let item = v.put(None, login_draft("keep-me"), None).unwrap();
+        let n_before = v.list().unwrap().len();
+        assert_eq!(n_before, 1);
+        drop(v);
+        // 删除 index.lk（磁盘/同步损坏、手动删除）
+        std::fs::remove_file(dir.path().join(INDEX_FILE)).unwrap();
+        // 恢复：索引缺失时必须重建（此刻条目密文仍是旧钥），不能产出空索引
+        let new_code = recover_vault_with_params(
+            dir.path(),
+            &RecoveryCode::parse(&code).unwrap(),
+            "newpw",
+            &mut audit,
+            &crypto::test_kdf_params(),
+        )
+        .unwrap();
+        assert_ne!(new_code.display(), code);
+        // 新密码解锁：条目数与恢复前一致，条目可读
+        let mut v2 = unlock_vault(dir.path(), "newpw").unwrap();
+        assert_eq!(
+            v2.list().unwrap().len(),
+            n_before,
+            "恢复后索引不得为空（S1 缺失子场景）"
+        );
+        assert_eq!(v2.get(item.id()).unwrap().name(), "keep-me");
+    }
+
+    /// S1 回归（缺失子场景，正常解锁路径）：index.lk 缺失 → 条目仍可见。
+    #[test]
+    fn unlock_with_missing_index_keeps_items() {
+        let (dir, _audit, _code) = temp_vault("unlock-idx-missing");
+        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let item = v.put(None, login_draft("keep-me"), None).unwrap();
+        let n_before = v.list().unwrap().len();
+        assert_eq!(n_before, 1);
+        drop(v);
+        // 删除 index.lk 后正常解锁：不得出现空列表
+        std::fs::remove_file(dir.path().join(INDEX_FILE)).unwrap();
+        let mut v2 = unlock_vault(dir.path(), "pw").unwrap();
+        assert_eq!(
+            v2.list().unwrap().len(),
+            n_before,
+            "解锁后索引不得为空（S1 缺失子场景）"
+        );
+        assert_eq!(v2.get(item.id()).unwrap().name(), "keep-me");
+        // 重建的索引已落盘：再次解锁不重建，条目仍可见
+        assert!(
+            dir.path().join(INDEX_FILE).exists(),
+            "解锁后应重建并落盘索引"
+        );
+        drop(v2);
+        let mut v3 = unlock_vault(dir.path(), "pw").unwrap();
         assert_eq!(v3.list().unwrap().len(), n_before);
     }
 

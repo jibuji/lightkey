@@ -212,9 +212,10 @@ mod imp {
     /// 仅授予当前进程用户 SID 完全访问权（SYSTEM/Administrators 亦不放行），
     /// 配合随机 pipe 名实现「仅本用户可访问」（Linux 侧 UDS 0600 的对应补齐）。
     /// 描述符与 ACL 缓冲随结构体存活，保证 CreateNamedPipeW 调用期间有效。
+    /// `_sd` 为 Box：`attrs.lpSecurityDescriptor` 指向堆上地址，结构体移动不搬堆内容。
     struct UserOnlySa {
         attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-        _sd: windows_sys::Win32::Security::SECURITY_DESCRIPTOR,
+        _sd: Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>,
         _acl: Vec<u8>,
     }
 
@@ -265,13 +266,15 @@ mod imp {
             }
 
             // 3) 自包含安全描述符：DACL 指针指向上面的 ACL 缓冲区。
-            let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();
+            // Box 堆分配：`attrs.lpSecurityDescriptor` 指向的地址不随 UserOnlySa
+            // move 而变（栈上局部变量地址在函数返回后悬垂，见 A2 复核）。
+            let mut sd: Box<SECURITY_DESCRIPTOR> = Box::new(std::mem::zeroed());
             if InitializeSecurityDescriptor(
-                &mut sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
+                sd.as_mut() as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
                 SECURITY_DESCRIPTOR_REVISION,
             ) == 0
                 || SetSecurityDescriptorDacl(
-                    &mut sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
+                    sd.as_mut() as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
                     1, /* bDaclPresent */
                     acl,
                     0, /* bDaclDefaulted */
@@ -282,7 +285,8 @@ mod imp {
 
             let attrs = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: &mut sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
+                lpSecurityDescriptor: sd.as_mut() as *mut SECURITY_DESCRIPTOR
+                    as *mut core::ffi::c_void,
                 bInheritHandle: 0,
             };
             Ok(UserOnlySa {
