@@ -16,7 +16,8 @@
 
 ## 常用命令
 
-- 核心+CLI 测试/检查（Linux 上 Tauri 壳需 webkit2gtk，CI 在 Win/mac 检查）：
+- 核心+CLI 测试/检查（Linux 上 Tauri 壳需 webkit2gtk，CI 在 Windows 检查；
+  Windows 优先，补充拍板 #4）：
   `cargo test` / `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
   `crates/lk-app/tauri.conf.json` 的 devUrl 一致）。

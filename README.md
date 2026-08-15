@@ -8,9 +8,9 @@
 
 ## 设计要点（详见 docs/）
 
-- **加密**：Argon2id(m=64MiB,t=3,p=4) 派生主密钥 → HKDF-SHA256 分叉
-  数据加密 / 恢复信封 / 审计 HMAC 三密钥；AES-256-GCM（刻意不同于
-  Bitwarden 的 CBC+HMAC）。
+- **加密**：Argon2id(m=64MiB,t=3,p=4) 派生主密钥 → HKDF-SHA256 仅分叉
+  K_data（数据加密）/ K_audit（审计 HMAC）两把密钥；K_recovery 由恢复码 +
+  Argon2id 独立派生；AES-256-GCM（刻意不同于 Bitwarden 的 CBC+HMAC）。
 - **零知识彻底**：条目/索引全加密；BYO 存储（WebDAV/S3）只见密文文件
   与文件名时间戳。
 - **同步**：加密索引 + 轮询（默认 60s，可配 15s~24h）；CAS + 墓碑，
@@ -32,7 +32,7 @@ docs/              实施规格集（docs/README.md 为索引；含前端设计�
 ## 构建与测试
 
 ```bash
-# 核心 + CLI（任意平台，Linux 上 Tauri 壳需要 webkit2gtk，由 CI 在 Win/mac 检查）
+# 核心 + CLI（任意平台，Linux 上 Tauri 壳需要 webkit2gtk，由 CI 在 Windows 检查）
 cargo test                      # 默认成员 = lk-core + lk-cli
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
 
@@ -40,7 +40,8 @@ cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
 cd frontend && npm install && npm run build
 ```
 
-验收平台：Windows + macOS；Linux 冒烟不阻塞。CI 见 `.github/workflows/ci.yml`。
+验收平台：Windows（优先，主开发测试平台）；macOS/Linux 桌面构建不占 CI
+矩阵。CI 见 `.github/workflows/ci.yml`。
 
 ## 文档索引
 

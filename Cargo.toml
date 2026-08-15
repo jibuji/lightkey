@@ -17,7 +17,7 @@ members = ["crates/lk-core", "crates/lk-cli", "crates/lk-app"]
 
 # 默认成员 = 核心 + CLI（在任意平台可直接 `cargo test` / `cargo check`）。
 # `lk-app`（Tauri）需要平台系统依赖（Linux 需 webkit2gtk），由 CI 在
-# Windows / macOS 上以 `--workspace` 显式检查；Linux 冒烟不阻塞。
+# Windows 上以 `--workspace` 显式检查（补充拍板 #4）。
 default-members = ["crates/lk-core", "crates/lk-cli"]
 
 [workspace.package]
@@ -33,7 +33,8 @@ authors = ["jibuji"]
 [workspace.dependencies]
 # --- 加密 / KDF ---
 argon2 = "0.5"                                  # Argon2id(m=64MiB, t=3, p=4) 派生主密钥 / 信封密钥
-hkdf = "0.12"                                   # HKDF-SHA256 分叉三把密钥
+hkdf = "0.12"                                   # HKDF-SHA256 仅分叉两把密钥（K_data 数据加密 / K_audit 审计 HMAC）
+                                                # K_recovery 由恢复码 + Argon2id 独立派生（见 docs/crypto.md 与补充拍板 #1）
 aes-gcm = "0.10"                                # AES-256-GCM（条目密文 / 附件分块）
 hmac = "0.12"                                   # 审计 HMAC-SHA256（防篡改）
 sha2 = "0.10"
