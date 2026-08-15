@@ -1,6 +1,6 @@
 [package]
 name = "lk-cli"
-description = "LightKey 命令行工具（`lk`）：条目管理、解锁/锁定、同步、规则、inject、守护进程"
+description = "LightKey 命令行工具（`lk`）：条目管理、解锁/锁定、恢复、审计、守护进程"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,16 @@ path = "src/main.rs"
 [dependencies]
 lk-core = { path = "../lk-core" }
 clap.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+rpassword.workspace = true
+arboard.workspace = true
+hex.workspace = true
 
-# 骨架占位：命令树已声明，行为在 M0 里程碑实现。
-# 后续里程碑按需补充：clap_complete、anyhow、tracing、serde_json 等。
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

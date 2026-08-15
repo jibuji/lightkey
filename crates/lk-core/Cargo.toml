@@ -22,6 +22,8 @@ base64.workspace = true
 time.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+hex.workspace = true
 
-# 占位模块当前不产出功能代码；M0 之后按 docs/ 各规格实施。
-# 依赖为决议拍板的加密/序列化原语，先声明以锁定版本基线。
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

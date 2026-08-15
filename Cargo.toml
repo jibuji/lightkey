@@ -44,8 +44,27 @@ uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-time = { version = "0.3", features = ["serde", "macros", "formatting"] }
+time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
+hex = "0.4"                                     # 密钥指纹 / 会话令牌十六进制表示
 # --- 基础设施 ---
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }  # 密钥内存擦除（守护进程内存约束）
 clap = { version = "4", features = ["derive"] }     # CLI 命令树
+# --- 仅 lk-cli（守护进程 / 传输 / 交互）---
+rpassword = "7"                                 # 敏感输入不回显（主密码 / 恢复码）
+arboard = "3"                                   # 剪贴板（lk item copy，30s 自动清除）
+libc = "0.2"                                    # Unix：socket 权限 / 守护进程信号 / 进程探测
+
+# --- 开发依赖（lk-core 测试）---
+proptest = "1"                                  # 属性测试：加密往返 / CAS / 恢复信封
+proptest-derive = "1"
+tempfile = "3"                                  # 测试用临时 vault 目录
+
+# --- Windows named pipe（lk-cli，cfg(windows)）---
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

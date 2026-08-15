@@ -5,7 +5,7 @@
  * 方法名对照 docs/ipc.md §4：
  *   status   → vault.status        unlock → vault.unlock        lock → vault.lock
  *   list     → item.list           get    → item.get
- *   create   → item.create         update → item.update         remove → item.delete
+ *   create/update → item.put（无 id 新建 / 带 expectedRevision 整条替换）   remove → item.delete
  *   syncStatus → sync.status       syncTrigger → sync.trigger
  *   auditList  → audit.list
  *   ruleList/ruleCreate/ruleRemove → rule.*（M2 骨架）

@@ -68,17 +68,19 @@ export class TauriAdapter implements LightKeyIpc {
     }
   }
 
+  /** 新建：item.put（ipc.md §4；无 id → 守护进程生成） */
   async create(draft: ItemDraft): Promise<Item> {
     try {
-      return await call("item.create", { item: draft });
+      return await call("item.put", { item: draft });
     } catch (e) {
       throw mapError(e);
     }
   }
 
+  /** 整条替换（CAS）：item.put，expectedRevision 必填 */
   async update(id: string, draft: ItemDraft, opts?: UpdateOptions): Promise<Item> {
     try {
-      return await call("item.update", {
+      return await call("item.put", {
         id,
         item: draft,
         expectedRevision: opts?.expectedRevision,
@@ -90,7 +92,7 @@ export class TauriAdapter implements LightKeyIpc {
 
   async remove(id: string): Promise<void> {
     try {
-      await call("item.delete", { id });
+      await call("item.delete", { id }); // ipc.md §4（软删除 → 墓碑）
     } catch (e) {
       throw mapError(e);
     }
