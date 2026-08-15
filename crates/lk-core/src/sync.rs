@@ -33,7 +33,7 @@
 //!   兜底（不削弱）。
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -276,6 +276,16 @@ pub struct SyncPlan {
     hard_delete: Vec<(Uuid, String)>,
 }
 
+impl SyncPlan {
+    /// 按 id upsert 待导入条目：同一条目在 CAS 重试间被再次缓冲（远端
+    /// revision 前进）时，以最新缓冲替换旧缓冲——保证合并索引（`pending`）
+    /// 与抓取阶段看到的远端 revision 恒一致，旧快照不得覆盖更新版本。
+    fn upsert_import(&mut self, imp: PendingImport) {
+        self.imports.retain(|i| i.id != imp.id);
+        self.imports.push(imp);
+    }
+}
+
 /// 待导入的远端条目。
 struct PendingImport {
     id: Uuid,
@@ -416,8 +426,9 @@ impl<'a> SyncEngine<'a> {
             imports: Vec::new(),
             hard_delete: Vec::new(),
         };
-        // 本轮已缓冲的拉取 id（CAS 重试去重：同一条目只下载一次）。
-        let mut pulled: HashSet<Uuid> = HashSet::new();
+        // 本轮已缓冲的拉取条目（id → 缓冲时的远端 revision）。CAS 重试间
+        // 远端若前进到更新 revision，须重新拉取（旧缓冲不得回写/覆盖远端索引）。
+        let mut pulled: HashMap<Uuid, String> = HashMap::new();
         let (mut remote_idx, mut remote_etag) = self.fetch_remote_index(view)?;
 
         for _attempt in 0..=MAX_INDEX_CAS_RETRIES {
@@ -427,11 +438,15 @@ impl<'a> SyncEngine<'a> {
             // 拉取：远端较新（或本地缺失）→ 下载密文缓冲（不落盘）
             let mut skipped = Vec::new();
             for id in &pull_ids {
-                if pulled.contains(id) {
-                    continue;
+                let remote_rev = match remote_idx.get(id) {
+                    Some(e) => e.revision.clone(),
+                    None => continue,
+                };
+                if pulled.get(id).map(String::as_str) == Some(remote_rev.as_str()) {
+                    continue; // 已按同一 revision 缓冲；远端未再前进
                 }
                 if self.pull_entry(view, *id, &mut plan, &mut skipped)? {
-                    pulled.insert(*id);
+                    pulled.insert(*id, remote_rev);
                 }
             }
 
@@ -568,7 +583,7 @@ impl<'a> SyncEngine<'a> {
         if let Some(aid) = remote_item.attach_id() {
             self.pull_attachment(view, aid, &mut pending.attachments, &mut plan.summary)?;
         }
-        plan.imports.push(pending);
+        plan.upsert_import(pending);
         Ok(true)
     }
 
@@ -712,7 +727,7 @@ impl<'a> SyncEngine<'a> {
                                             &mut plan.summary,
                                         )?;
                                     }
-                                    plan.imports.push(pending);
+                                    plan.upsert_import(pending);
                                     return Ok(PushResult::Adopted);
                                 }
                                 Lww::Local | Lww::Tie => {
@@ -1950,6 +1965,119 @@ mod tests {
         sync(&mut a, &remote, &now_iso());
         assert_eq!(a.get(item.id()).unwrap().name(), "rev3");
         assert_eq!(snapshot(&mut a), snapshot(&mut b));
+        drop(fx);
+    }
+
+    /// 回归：索引 CAS 冲突触发有界重试，且重试间远端把某条目推进到更新
+    /// revision → 引擎必须重新拉取该条目（旧缓冲不得回写覆盖远端索引），
+    /// 否则会把远端索引回退到旧 revision（索引/密文不一致，反复摇摆）。
+    #[test]
+    fn index_cas_retry_does_not_regress_remote_revision() {
+        use crate::storage::{GetResult, PutOutcome, RemoteObject};
+        struct IndexRaceBackend {
+            inner: LocalStorage,
+            race_once: std::sync::Mutex<bool>,
+            k_data: Vec<u8>,
+            race_key: String,
+            race_item: Item,
+            race_blob: Vec<u8>,
+        }
+        impl StorageBackend for IndexRaceBackend {
+            fn name(&self) -> &'static str {
+                "race"
+            }
+            fn get(&self, key: &str) -> Result<Option<GetResult>> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &str, data: &[u8], expected: Option<&str>) -> Result<PutOutcome> {
+                if key == INDEX_KEY && expected.is_some() && *self.race_once.lock().unwrap() {
+                    *self.race_once.lock().unwrap() = false;
+                    // 模拟并发客户端 C：条目推进到更新 revision + 重写索引 →
+                    // 使本轮索引 CAS 冲突（触发有界重试 + 重拉）
+                    let cur_obj = self.inner.etag(&self.race_key)?;
+                    self.inner
+                        .put(&self.race_key, &self.race_blob, cur_obj.as_deref())?;
+                    let idx = vec![IndexEntry {
+                        id: self.race_item.id(),
+                        revision: self.race_item.revision().to_string(),
+                        kind: ObjectKind::Item,
+                        deleted: self.race_item.deleted(),
+                    }];
+                    let idx_blob = seal(
+                        &self.k_data,
+                        SealType::Index,
+                        INDEX_KEY,
+                        &serde_json::to_vec(&idx).unwrap(),
+                    );
+                    let cur_idx = self.inner.etag(INDEX_KEY)?;
+                    self.inner.put(INDEX_KEY, &idx_blob, cur_idx.as_deref())?;
+                    return Ok(PutOutcome::Conflict);
+                }
+                self.inner.put(key, data, expected)
+            }
+            fn delete(&self, key: &str) -> Result<()> {
+                self.inner.delete(key)
+            }
+            fn list(&self) -> Result<Vec<RemoteObject>> {
+                self.inner.list()
+            }
+            fn etag(&self, key: &str) -> Result<Option<String>> {
+                self.inner.etag(key)
+            }
+        }
+
+        let (fx, mut a, mut b, remote) = fixture();
+        let item = a.put(None, login_draft("X"), None).unwrap();
+        sync(&mut a, &remote, &now_iso());
+        sync(&mut b, &remote, &now_iso());
+        // A 推进到 rev2 并同步（B 落后）
+        a.put(
+            Some(item.id()),
+            login_draft("A-v2"),
+            Some(item.revision().into()),
+        )
+        .unwrap();
+        sync(&mut a, &remote, &now_iso());
+        // A 再推进到 rev3（并发客户端 C 的新版本），但**不**同步
+        let race_item = a
+            .put(
+                Some(item.id()),
+                login_draft("C-v4"),
+                Some(a.get(item.id()).unwrap().revision().into()),
+            )
+            .unwrap();
+        let race_blob = a.item_blob(item.id()).unwrap();
+        // B 本地新建 Y：本轮合并索引必有变化 → 必写索引 → 触发 CAS 冲突 + 重试
+        b.put(None, login_draft("Y"), None).unwrap();
+        let race_backend = IndexRaceBackend {
+            inner: LocalStorage::new(fx.remote_dir.path().to_path_buf()),
+            race_once: std::sync::Mutex::new(true),
+            k_data: a.keys().k_data.clone().to_vec(),
+            race_key: format!("{}.item.lk", item.id()),
+            race_item: race_item.clone(),
+            race_blob,
+        };
+        let s = SyncEngine::new(&race_backend)
+            .run_round(&mut b, &now_iso())
+            .unwrap();
+        // 重试后必须采纳最新远端版本（不被旧缓冲回写覆盖）
+        assert_eq!(b.get(item.id()).unwrap().name(), "C-v4");
+        assert_eq!(b.get(item.id()).unwrap().revision(), race_item.revision());
+        assert_eq!(s.pulled, 1, "只应用最终（最新）远端版本");
+        // 远端索引未回退：仍引用最新 revision（索引与密文一致）
+        let idx = race_backend.inner.get(INDEX_KEY).unwrap().unwrap();
+        let parsed: Vec<IndexEntry> = serde_json::from_slice(
+            &open(
+                a.keys().k_data.as_ref(),
+                SealType::Index,
+                INDEX_KEY,
+                &idx.data,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let x_entry = parsed.iter().find(|e| e.id == item.id()).unwrap();
+        assert_eq!(x_entry.revision, race_item.revision().to_string());
         drop(fx);
     }
 }

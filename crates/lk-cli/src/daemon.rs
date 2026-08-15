@@ -831,7 +831,9 @@ impl lk_core::sync::VaultRead for LockedVaultView {
 
     fn tombstones(&self) -> lk_core::Result<Vec<(uuid::Uuid, lk_core::model::Tombstone)>> {
         let v = self.vault.read().unwrap();
-        Ok(v.as_ref().map(|v| v.tombstones()).unwrap_or_default())
+        v.as_ref()
+            .map(|v| v.tombstones())
+            .ok_or(Error::SessionInvalid)
     }
 }
 
