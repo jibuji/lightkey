@@ -1,0 +1,50 @@
+# LightKey workspace manifest
+#
+# 轻钥 LightKey：个人密钥 / 私密信息管理工具。
+# 从零自研路线（把 Bitwarden 当技术规格书照抄设计，不抄代码、不 fork、不以其为底座）。
+#
+# Crate 布局（决议集：核心 crate + CLI + Tauri 桌面壳 + React 前端）：
+#   crates/lk-core  核心库：加密、数据模型、同步、授权门、审计、IPC 协议类型
+#   crates/lk-cli   CLI（`lk`），复用 lk-core；`lk daemon` 宿主守护进程
+#   crates/lk-app   Tauri 2 桌面壳，复用 lk-core
+#   frontend/       React + TypeScript 前端（Vite 构建）
+#
+# 详细设计见 docs/（docs/README.md 是文档索引）。
+
+[workspace]
+resolver = "2"
+members = ["crates/lk-core", "crates/lk-cli", "crates/lk-app"]
+
+# 默认成员 = 核心 + CLI（在任意平台可直接 `cargo test` / `cargo check`）。
+# `lk-app`（Tauri）需要平台系统依赖（Linux 需 webkit2gtk），由 CI 在
+# Windows / macOS 上以 `--workspace` 显式检查；Linux 冒烟不阻塞。
+default-members = ["crates/lk-core", "crates/lk-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/jibuji/lightkey"
+authors = ["jibuji"]
+
+# 供各 crate 复用的依赖版本（M0 之后实现时按需启用）。
+# 加密栈为决议拍板的原语集，刻意与 Bitwarden 不同（AES-256-GCM，不用 CBC+HMAC）。
+[workspace.dependencies]
+# --- 加密 / KDF ---
+argon2 = "0.5"                                  # Argon2id(m=64MiB, t=3, p=4) 派生主密钥 / 信封密钥
+hkdf = "0.12"                                   # HKDF-SHA256 分叉三把密钥
+aes-gcm = "0.10"                                # AES-256-GCM（条目密文 / 附件分块）
+hmac = "0.12"                                   # 审计 HMAC-SHA256（防篡改）
+sha2 = "0.10"
+rand = "0.8"
+# --- 数据模型 / 序列化 ---
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+time = { version = "0.3", features = ["serde", "macros", "formatting"] }
+# --- 基础设施 ---
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }  # 密钥内存擦除（守护进程内存约束）
+clap = { version = "4", features = ["derive"] }     # CLI 命令树

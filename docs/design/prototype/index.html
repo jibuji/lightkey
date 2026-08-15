@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LightKey 高保真原型（设计评审用）</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- 解锁页 -->
+  <section id="screen-unlock" class="screen active">
+    <div class="unlock-card">
+      <div class="brand-mark brand-mark-lg" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4M18 5l2 2M15 8l2 2"/></svg>
+      </div>
+      <h1 class="unlock-title">LightKey</h1>
+      <p class="unlock-sub">轻钥 · 个人密钥管理</p>
+      <form id="unlock-form" class="unlock-form" autocomplete="off">
+        <label class="field">
+          <span class="field-label">主密码</span>
+          <span class="input-wrap">
+            <input id="unlock-password" type="password" placeholder="输入主密码" autofocus />
+            <button type="button" class="icon-btn input-affix" data-toggle-password="unlock-password" aria-label="显示/隐藏密码" tabindex="-1">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </span>
+        </label>
+        <button type="submit" class="btn btn-primary btn-block">解锁</button>
+      </form>
+      <div class="unlock-actions">
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-hello">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          Windows Hello 解锁
+        </button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-recovery">用恢复码恢复</button>
+      </div>
+      <p class="unlock-hint">密码仅用于本机解密 · 存储端看不到你的数据</p>
+    </div>
+  </section>
+
+  <!-- 主界面（解锁后） -->
+  <section id="screen-vault" class="screen">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="sidebar-brand" title="LightKey">
+          <div class="brand-mark">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4M18 5l2 2M15 8l2 2"/></svg>
+          </div>
+        </div>
+        <nav class="sidebar-nav" id="sidebar-nav">
+          <button class="nav-item active" data-page="items" title="全部条目"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>
+          <button class="nav-item" data-page="rules" title="授权规则"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z"/><path d="m9 12 2 2 4-4"/></svg></button>
+          <button class="nav-item" data-page="settings" title="设置"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+          <button class="nav-item" data-page="audit" title="审计日志"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg></button>
+        </nav>
+        <div class="sidebar-foot">
+          <button class="nav-item" id="btn-lock" title="锁定">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </button>
+        </div>
+      </aside>
+
+      <div class="main">
+        <header class="topbar">
+          <div class="search-wrap">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+            <input id="search-input" type="text" placeholder="搜索名称、用户名或站点…" />
+          </div>
+          <div class="topbar-right">
+            <span class="sync-state" title="已同步 · 轮询 60s"><span class="dot dot-ok"></span>已同步</span>
+            <button class="btn btn-ghost btn-sm" id="btn-sync">同步</button>
+          </div>
+        </header>
+
+        <div class="content">
+          <!-- 页面：条目 -->
+          <div id="page-items" class="page active">
+            <div class="pane-list">
+              <div class="pane-list-head">
+                <h2 class="pane-title" id="list-title">全部条目</h2>
+                <button class="btn btn-primary btn-sm" id="btn-add">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                  新建
+                </button>
+              </div>
+              <div id="item-filters" class="filters">
+                <button class="chip active" data-filter="all">全部</button>
+                <button class="chip" data-filter="login">登录</button>
+                <button class="chip" data-filter="secureNote">安全笔记</button>
+                <button class="chip" data-filter="favorite">收藏</button>
+              </div>
+              <div id="item-list" class="item-list"></div>
+            </div>
+            <div id="detail" class="pane-detail"></div>
+          </div>
+
+          <!-- 页面：规则 -->
+          <div id="page-rules" class="page">
+            <div class="page-head">
+              <h2 class="pane-title">Agent 授权规则</h2>
+              <button class="btn btn-primary btn-sm" id="btn-rule-add">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                新建规则
+              </button>
+            </div>
+            <p class="page-note">规则保存在加密库内、按项目目录绑定，随库同步；写入只经 CLI 或本页。</p>
+            <div id="rule-list" class="rule-list"></div>
+          </div>
+
+          <!-- 页面：设置 -->
+          <div id="page-settings" class="page">
+            <h2 class="pane-title">设置</h2>
+            <div id="settings-body" class="settings-body"></div>
+          </div>
+
+          <!-- 页面：审计 -->
+          <div id="page-audit" class="page">
+            <div class="page-head">
+              <h2 class="pane-title">审计日志</h2>
+              <div class="filters">
+                <button class="chip active" data-afilter="all">全部</button>
+                <button class="chip" data-afilter="allowed">允许</button>
+                <button class="chip" data-afilter="denied">拒绝</button>
+                <button class="chip" data-afilter="timeout">超时</button>
+              </div>
+            </div>
+            <p class="page-note">本地追加式存储 · 带 HMAC 防篡改 · 密钥值永不明文</p>
+            <div id="audit-list" class="audit-list"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toast-root"></div>
+  <div id="nav-root"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
