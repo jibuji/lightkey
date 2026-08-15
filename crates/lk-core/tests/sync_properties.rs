@@ -173,12 +173,12 @@ fn multi_client_sync_converges_any_order() {
         let mut order: Vec<usize> = (0..CLIENTS).collect();
         order.shuffle(&mut rng);
         for c in order {
-            SyncEngine::new(&mut vaults[c], &remote)
-                .run_round(&now_iso())
+            SyncEngine::new(&remote)
+                .run_round(&mut vaults[c], &now_iso())
                 .unwrap();
         }
         for v in vaults.iter_mut() {
-            SyncEngine::new(v, &remote).run_round(&now_iso()).unwrap();
+            SyncEngine::new(&remote).run_round(v, &now_iso()).unwrap();
         }
         // 收敛断言：所有端条目集合一致
         let base = snapshot(&mut vaults[0]);
@@ -195,8 +195,8 @@ fn multi_client_sync_converges_any_order() {
     assert!(tomb_count > 0, "随机操作应产生至少一个墓碑（硬删路径可测）");
     for _pass in 0..2 {
         for v in vaults.iter_mut() {
-            SyncEngine::new(v, &remote)
-                .run_round(&future_iso(31))
+            SyncEngine::new(&remote)
+                .run_round(v, &future_iso(31))
                 .unwrap();
         }
     }

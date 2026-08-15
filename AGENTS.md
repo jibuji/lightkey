@@ -40,6 +40,9 @@
 - [x] M0 功能实现（核心库 + CLI 单机闭环）
 - [x] M1 同步（BYO 变更发现 + CAS + 墓碑；`lk sync` / `lk config`；存储后端
   trait + 本地模拟/WebDAV/S3 实现；E2E `scripts/e2e_m1.sh`）
+- [x] M1 并发结构（G1 根治）：同步轮次 = 抓取无锁 + 应用短锁两阶段；命令与
+  后台同步并发，网络 I/O 不持守护进程锁；vault 内存用读写锁（权限层与数据层
+  互斥解耦，见 `crates/lk-cli/src/daemon.rs` 模块文档）
 - [ ] M2 授权门 + 桌面 · [ ] M3 浏览器填充
 
 ## Maintaining this file

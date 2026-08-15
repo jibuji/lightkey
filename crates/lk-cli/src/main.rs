@@ -1443,36 +1443,47 @@ fn cmd_daemon(dir: &std::path::Path) -> i32 {
             return 1;
         }
     };
-    // 请求 → 响应（逐行 JSON）；状态互斥保护
+    // 请求 → 响应（逐行 JSON）。命令互斥锁只保护命令侧内存状态一致性；
+    // 同步轮次（后台轮询 / sync.trigger）在命令锁外执行网络 I/O——
+    // 锁只剩数据层内存一致性保护（vault 读写锁，见 daemon.rs 模块文档）。
+    let shared = daemon.shared();
     let state = std::sync::Arc::new(std::sync::Mutex::new(daemon));
     // 后台同步轮询线程（M1）：只在解锁态 + 已配置时执行一轮；锁定即停止
     // （不执行任何同步活动）。间隔 = 配置值 × 2^风暴等级（封顶 24h）；
     // 失败静默（本轮放弃，下一轮重试）；配置由 CLI 直接写盘，每轮热更新。
+    // 轮次 = 抓取（无锁网络）→ 应用（短写锁）：与前台命令并发，不排队。
     {
         use lk_core::sync::{next_poll_interval, DEFAULT_SYNC_INTERVAL_SECS};
-        let poller_state = state.clone();
+        let poller = shared.clone();
         std::thread::spawn(move || {
             let mut next_sleep = DEFAULT_SYNC_INTERVAL_SECS;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(next_sleep));
-                // 让路给前台请求：有请求正在服务时跳过本轮（不打断用户操作）。
-                // 注意这仍是缓解而非根治——本轮拿到锁后若网络停滞，期间的
-                // 前台请求仍会等待（完整修复需同步引擎在网络 I/O 期间不持锁）。
-                let mut guard = match poller_state.try_lock() {
-                    Ok(g) => g,
-                    Err(std::sync::TryLockError::WouldBlock) => continue,
-                    Err(std::sync::TryLockError::Poisoned(_)) => break,
+                // 配置热更新（CLI 直接写盘；每轮重读）
+                {
+                    let mut cfg = poller.config.write().unwrap();
+                    *cfg = daemon::read_config(&poller.dir);
+                }
+                let (base, enabled, unlocked) = {
+                    let cfg = poller.config.read().unwrap();
+                    let base = cfg
+                        .sync
+                        .as_ref()
+                        .filter(|c| c.validate().is_ok())
+                        .map(|c| c.interval_secs)
+                        .unwrap_or(DEFAULT_SYNC_INTERVAL_SECS);
+                    (
+                        base,
+                        cfg.sync.is_some(),
+                        poller.vault.read().unwrap().is_some(),
+                    )
                 };
-                guard.reload_config();
-                let base = guard
-                    .sync_config()
-                    .map(|c| c.interval_secs)
-                    .unwrap_or(DEFAULT_SYNC_INTERVAL_SECS);
-                if guard.is_unlocked() && guard.sync_configured() {
-                    if let Err(e) = guard.sync_round() {
+                if unlocked && enabled {
+                    if let Err(e) = daemon::run_sync_round(&poller) {
                         eprintln!("lk daemon: 同步失败（下一轮重试）：{}", e.message());
                     }
-                    next_sleep = next_poll_interval(base, guard.storm_level());
+                    next_sleep =
+                        next_poll_interval(base, poller.sync.lock().unwrap().state.storm_level);
                 } else {
                     next_sleep = next_poll_interval(base, 0);
                 }
@@ -1480,7 +1491,13 @@ fn cmd_daemon(dir: &std::path::Path) -> i32 {
         });
     }
     let handler_state = state.clone();
+    let handler_shared = shared.clone();
     let handler = std::sync::Arc::new(move |line: &str| -> String {
+        // sync.trigger：命令锁外执行轮次（网络 I/O 不阻塞其他命令；
+        // 会话预检与活动时间戳短暂持锁）
+        if let Some(resp) = daemon::try_sync_trigger(&handler_state, &handler_shared, line) {
+            return resp;
+        }
         let mut guard = handler_state.lock().expect("daemon mutex poisoned");
         guard.handle(line)
     });
