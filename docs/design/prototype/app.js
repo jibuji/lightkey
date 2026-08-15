@@ -1,4 +1,5 @@
-/* LightKey 高保真原型交互 —— 演示用 mock 数据，非真实实现 */
+/* LightKey 高保真原型交互 —— 演示用 mock 数据，非真实实现
+   存储类型 v2（2026-08-15 定案）：login / note(Markdown) / secret / file */
 "use strict";
 
 /* ---------- 图标 ---------- */
@@ -10,8 +11,10 @@ const I = {
   trash: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>',
   globe: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
   file: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6"/></svg>',
+  fileText: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
+  key: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>',
+  download: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
   paperclip: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>',
-  star: '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
   folder: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
   check: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"/></svg>',
@@ -20,22 +23,23 @@ const I = {
 /* ---------- Mock 数据（全部为演示占位，不含真实密钥） ---------- */
 const DB = {
   items: [
-    { id: "github", type: "login", name: "GitHub", favorite: true, revision: "2026-08-15T10:12:00Z",
-      username: "dev@lightkey.dev", password: "ghp_demo_token_0000", uris: ["github.com"], notes: "工作用账号",
+    { id: "github", type: "login", name: "GitHub", revision: "2026-08-15T10:12:00Z",
+      username: "dev@lightkey.dev", password: "ghp_demo_token_0000", uris: ["github.com"],
       custom: [ { name: "登录方式", value: "SSH key", hidden: false } ] },
-    { id: "npm", type: "login", name: "npm registry", favorite: true, revision: "2026-08-15T09:40:00Z",
-      username: "jibuji", password: "npm_demo_token_0000", uris: ["npmjs.com", "registry.npmjs.org"], notes: "发布用令牌",
-      custom: [] },
-    { id: "mail", type: "login", name: "公司邮箱", favorite: false, revision: "2026-08-12T16:05:00Z",
-      username: "me@company.example", password: "demo_password_01", uris: ["mail.company.example"], notes: "",
-      custom: [] },
-    { id: "router", type: "login", name: "家庭路由器", favorite: false, revision: "2026-08-10T08:30:00Z",
-      username: "admin", password: "demo_password_02", uris: ["192.168.1.1"], notes: "WAN 口 PPPoE",
-      custom: [] },
-    { id: "wifi", type: "secureNote", name: "Wi-Fi 访客密码", favorite: false, revision: "2026-08-14T21:00:00Z",
-      note: "访客网络：LK-Guest / 8 位密码见路由器背面", custom: [] },
-    { id: "ssh", type: "secureNote", name: "SSH 私钥位置", favorite: false, revision: "2026-08-09T11:20:00Z",
-      note: "~/.ssh/id_ed25519（本机）\n服务器备份路径：nas:/backup/keys", custom: [] },
+    { id: "deploy-note", type: "note", name: "部署手册", revision: "2026-08-15T09:40:00Z",
+      content: "# 部署手册\n\n**发布前**检查：\n\n1. 构建 `cargo build --release`\n2. 运行 `cargo test`\n3. 打 tag 并推送\n\n> 生产环境禁止直接改库，走 PR。\n\n```bash\nsystemctl restart lk-daemon\n```\n\n示例：`lk vault unlock` 后执行 [发布脚本](https://example.com/release)。" },
+    { id: "ntoken", type: "secret", name: "NPM_TOKEN", revision: "2026-08-14T10:00:00Z",
+      value: "npm_demo_token_0000", purpose: "发布 npm 包（仅 rules 白名单命令注入）", expiresAt: "2027-01-01" },
+    { id: "awskey", type: "secret", name: "AWS 生产只读", revision: "2026-08-12T16:05:00Z",
+      value: "AKIAIOSFODNN7DEMO", purpose: "生产环境只读审计", expiresAt: "" },
+    { id: "mail", type: "login", name: "公司邮箱", revision: "2026-08-12T14:30:00Z",
+      username: "me@company.example", password: "demo_password_01", uris: ["mail.company.example"], custom: [] },
+    { id: "router", type: "login", name: "家庭路由器", revision: "2026-08-10T08:30:00Z",
+      username: "admin", password: "demo_password_02", uris: ["192.168.1.1"], custom: [] },
+    { id: "fapiao", type: "file", name: "发票扫描件 2026-08", revision: "2026-08-14T21:00:00Z",
+      note: "8 月报销用，原件在抽屉", size: "12.4 MB", fileType: "application/pdf", attachment: "fapiao-202608.pdf" },
+    { id: "sshcfg", type: "file", name: "ssh_config 备份", revision: "2026-08-09T11:20:00Z",
+      note: "2026-06 快照 · 含跳板机配置", size: "3.2 KB", fileType: "text/plain", attachment: "ssh_config.bak" },
   ],
   rules: [
     { id: "r1", projectDir: "~/work/proj-a", command: "npm publish", keys: ["NPM_TOKEN"], created: "2026-08-14T10:00:00Z" },
@@ -87,29 +91,105 @@ function setPage(page) {
   renderPage(page);
 }
 
+/* ---------- 存储类型 v2 元信息 ---------- */
+const TYPE_META = {
+  login:  { cls: "login",  icon: I.globe,    label: "登录", sub: (it) => it.username || "—" },
+  note:   { cls: "note",   icon: I.fileText, label: "笔记", sub: (it) => mdSnippet(it.content) },
+  secret: { cls: "secret", icon: I.key,      label: "密钥",
+            sub: (it) => it.purpose || (it.value ? `••••${it.value.slice(-4)}` : "—") },
+  file:   { cls: "file",   icon: I.file,     label: "文件",
+            sub: (it) => [it.size, it.fileType].filter(Boolean).join(" · ") || "—" },
+};
+
+/* ---------- Markdown：高亮 / 只读渲染 / 片段 ---------- */
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function mdHighlight(src) {
+  let inFence = false;
+  return String(src || "").split("\n").map((raw) => {
+    const fence = raw.match(/^```(\w*)/);
+    if (fence) { inFence = !inFence; return `<span class="tk-fence">${esc(raw)}</span>`; }
+    if (inFence) return `<span class="tk-code">${esc(raw)}</span>`;
+    const h = raw.match(/^(#{1,3})\s+(.*)$/);
+    if (h) return `<span class="tk-h">${h[1]} ${esc(h[2])}</span>`;
+    const q = raw.match(/^(>\s?)(.*)$/);
+    if (q) return `<span class="tk-q">${q[1]}${esc(q[2])}</span>`;
+    const ul = raw.match(/^([-*+]|\d+\.)\s+(.*)$/);
+    if (ul) return `<span class="tk-list">${ul[1]}</span> ${mdInline(ul[2])}`;
+    return mdInline(raw);
+  }).join("\n") + "\n";
+}
+
+function mdInline(s) {
+  let l = esc(s);
+  l = l.replace(/`([^`]+)`/g, '<span class="tk-i">`$1`</span>');
+  l = l.replace(/\*\*([^*]+)\*\*/g, '<span class="tk-b">**$1**</span>');
+  l = l.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<span class="tk-l">[$1]($2)</span>');
+  return l;
+}
+
+function mdRender(md) {
+  const lines = String(md || "").split("\n");
+  let html = "", inFence = false, fenceBuf = [], listBuf = [];
+  const flushList = () => { if (listBuf.length) { html += "<ul>" + listBuf.join("") + "</ul>"; listBuf = []; } };
+  for (const raw of lines) {
+    if (raw.trim() === "" && !inFence) { flushList(); continue; }
+    const fence = raw.match(/^```(\w*)/);
+    if (fence) {
+      if (inFence) { html += `<pre class="md-code"><code>${fenceBuf.join("\n")}</code></pre>`; fenceBuf = []; inFence = false; }
+      else inFence = true;
+      continue;
+    }
+    if (inFence) { fenceBuf.push(esc(raw)); continue; }
+    const h = raw.match(/^(#{1,3})\s+(.*)$/);
+    if (h) { flushList(); html += `<h${h[1].length}>${mdRenderInline(h[2])}</h${h[1].length}>`; continue; }
+    const q = raw.match(/^>\s?(.*)$/);
+    if (q) { flushList(); html += `<blockquote>${mdRenderInline(q[1])}</blockquote>`; continue; }
+    const ul = raw.match(/^[-*+]\s+(.*)$/);
+    if (ul) { listBuf.push(`<li>${mdRenderInline(ul[1])}</li>`); continue; }
+    flushList();
+    html += `<p>${mdRenderInline(raw)}</p>`;
+  }
+  if (inFence) html += `<pre class="md-code"><code>${fenceBuf.join("\n")}</code></pre>`;
+  flushList();
+  return html || `<p class="empty">（空笔记）</p>`;
+}
+
+function mdRenderInline(s) {
+  let l = esc(s);
+  l = l.replace(/`([^`]+)`/g, "<code>$1</code>");
+  l = l.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  l = l.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  l = l.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  return l;
+}
+
+function mdSnippet(md) {
+  return String(md || "").replace(/```[\w]*\n?/g, "").replace(/[#>*`\-\[\]()]/g, "")
+    .replace(/\s+/g, " ").trim().slice(0, 24);
+}
+
 /* ---------- 渲染：条目列表 ---------- */
 function filteredItems() {
   const q = state.search.trim().toLowerCase();
   return DB.items.filter((it) => {
-    if (state.filter === "login" && it.type !== "login") return false;
-    if (state.filter === "secureNote" && it.type !== "secureNote") return false;
-    if (state.filter === "favorite" && !it.favorite) return false;
+    if (state.filter !== "all" && it.type !== state.filter) return false;
     if (!q) return true;
-    const hay = `${it.name} ${it.username || ""} ${(it.uris || []).join(" ")}`.toLowerCase();
+    const hay = [
+      it.name, it.username || "", (it.uris || []).join(" "),
+      it.purpose || "", it.value || "", it.content || "", it.note || "",
+      it.attachment || "", it.fileType || "",
+    ].join(" ").toLowerCase();
     return hay.includes(q);
   });
-}
-
-function itemTypeMeta(t) {
-  return t === "login"
-    ? { cls: "login", icon: I.globe, sub: (it) => (it.uris || []).join(" · ") }
-    : { cls: "secureNote", icon: I.file, sub: (it) => (it.note || "").slice(0, 24) };
 }
 
 function renderList() {
   const wrap = $("#item-list");
   const items = filteredItems();
-  const meta = itemTypeMeta("login");
   if (!items.length) {
     wrap.innerHTML = `<div class="empty">
       <div style="color:var(--fg-2);font-size:32px">${state.search ? "🔍" : "🗝️"}</div>
@@ -119,14 +199,13 @@ function renderList() {
     return;
   }
   wrap.innerHTML = items.map((it) => {
-    const m = itemTypeMeta(it.type);
+    const m = TYPE_META[it.type] || TYPE_META.login;
     return `<button class="item ${it.id === state.selectedId ? "selected" : ""}" data-id="${it.id}">
       <span class="item-icon ${m.cls}">${m.icon}</span>
       <span class="item-body">
         <span class="item-name">${esc(it.name)}</span>
-        <span class="item-sub">${esc(it.username || m.sub(it) || "—")}</span>
+        <span class="item-sub">${esc(m.sub(it)) || "—"}</span>
       </span>
-      ${it.favorite ? `<span class="item-fav" title="收藏">${I.star}</span>` : ""}
     </button>`;
   }).join("");
   wrap.querySelectorAll(".item").forEach((el) =>
@@ -135,40 +214,105 @@ function renderList() {
   if (add) add.addEventListener("click", () => openItemModal());
 }
 
-/* ---------- 渲染：详情 ---------- */
+function selectItem(id) {
+  state.selectedId = id;
+  renderList();
+  renderDetail();
+  // 堆叠布局（≤900px）下详情在列表下方：点击条目后滚入视口，避免"详情不跟随"观感
+  if (window.innerWidth <= 900) {
+    const detailEl = $("#detail");
+    if (detailEl) detailEl.scrollIntoView({ behavior: "auto", block: "start" });
+  }
+}
+
+/* ---------- 渲染：详情（按类型分组字段） ---------- */
 function renderDetail() {
   const it = DB.items.find((x) => x.id === state.selectedId);
   const el = $("#detail");
   if (!it) { el.innerHTML = ""; return; }
-  const m = itemTypeMeta(it.type);
-  const passRow = it.type === "login" ? `
-    <div class="field-row">
-      <div><div class="field-row-label">密码</div>
-        <div class="field-row-value">
-          <span class="${state.revealed ? "mono" : "mask"}">${state.revealed ? esc(it.password) : "••••••••••••"}</span>
-          <button class="icon-btn" data-act="reveal" title="${state.revealed ? "隐藏" : "显示"}">${I.eye}</button>
-          <button class="icon-btn" data-act="copy-password" title="复制密码">${I.copy}</button>
+  const m = TYPE_META[it.type] || TYPE_META.login;
+  const maskValue = (v) => state.revealed ? esc(v) : "••••••••••••";
+  const revealBtn = `<button class="icon-btn" data-act="reveal" title="${state.revealed ? "隐藏" : "显示"}">${I.eye}</button>`;
+
+  let body = "";
+  if (it.type === "login") {
+    body = `
+      <div class="section-title">登录信息</div>
+      <div class="field-row">
+        <div><div class="field-row-label">用户名</div>
+          <div class="field-row-value"><span class="mono">${esc(it.username)}</span>
+          <button class="icon-btn" data-act="copy-username" title="复制用户名">${I.copy}</button></div>
         </div>
       </div>
-    </div>` : "";
-  const uriRow = it.uris?.length ? `
-    <div class="section-title">站点</div>
-    ${it.uris.map((u) => `<div class="uri-row">${I.globe} ${esc(u)}</div>`).join("")}` : "";
-  const customRow = it.custom?.length ? `
-    <div class="section-title">自定义字段</div>
-    ${it.custom.map((c) => `
       <div class="field-row">
-        <div><div class="field-row-label">${esc(c.name)}</div>
-          <div class="field-row-value"><span class="${c.hidden ? "mask" : ""}">${c.hidden ? "••••••••" : esc(c.value)}</span>
-          ${c.hidden ? `<button class="icon-btn" data-act="copy-custom">${I.copy}</button>` : ""}</div>
+        <div><div class="field-row-label">密码</div>
+          <div class="field-row-value">
+            <span class="${state.revealed ? "mono" : "mask"}">${maskValue(it.password)}</span>
+            ${revealBtn}
+            <button class="icon-btn" data-act="copy-password" title="复制密码">${I.copy}</button>
+          </div>
         </div>
-      </div>`).join("")}` : "";
-  const noteRow = (it.note || "") ? `
-    <div class="section-title">备注</div>
-    <div style="white-space:pre-wrap;color:var(--fg-1);font-size:var(--fs-sm)">${esc(it.note)}</div>` : "";
-  const attachRow = it.attachments?.length ? `
-    <div class="section-title">附件（每附件独立密钥 · 1 MiB 分块）</div>
-    ${it.attachments.map((a) => `<div class="attachment-row">${I.paperclip} ${esc(a.name)} <span style="color:var(--fg-2)">${a.size}</span></div>`).join("")}` : "";
+      </div>
+      ${it.uris?.length ? `<div class="section-title">站点</div>
+        ${it.uris.map((u) => `<div class="uri-row">${I.globe} ${esc(u)}</div>`).join("")}` : ""}
+      ${it.custom?.length ? `<div class="section-title">自定义字段</div>
+        ${it.custom.map((c) => `
+          <div class="field-row">
+            <div><div class="field-row-label">${esc(c.name)}</div>
+              <div class="field-row-value"><span class="${c.hidden ? "mask" : ""}">${c.hidden ? "••••••••" : esc(c.value)}</span>
+              ${c.hidden ? `<button class="icon-btn" data-act="copy-custom">${I.copy}</button>` : ""}</div>
+            </div>
+          </div>`).join("")}` : ""}`;
+  } else if (it.type === "note") {
+    body = `
+      <div class="section-title">笔记内容（Markdown）</div>
+      <div class="md-render">${mdRender(it.content)}</div>`;
+  } else if (it.type === "secret") {
+    body = `
+      <div class="section-title">密钥信息</div>
+      <div class="field-row">
+        <div><div class="field-row-label">密钥值</div>
+          <div class="field-row-value">
+            <span class="${state.revealed ? "mono" : "mask"}">${maskValue(it.value)}</span>
+            ${revealBtn}
+            <button class="icon-btn" data-act="copy-value" title="复制密钥值">${I.copy}</button>
+          </div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div><div class="field-row-label">用途</div>
+          <div class="field-row-value">${esc(it.purpose || "—")}</div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div><div class="field-row-label">过期时间</div>
+          <div class="field-row-value">${it.expiresAt ? `${esc(it.expiresAt)} <span style="color:var(--fg-2)">（到期后不再自动注入）</span>` : "无过期时间"}</div>
+        </div>
+      </div>`;
+  } else if (it.type === "file") {
+    body = `
+      <div class="section-title">文件信息</div>
+      <div class="field-row">
+        <div><div class="field-row-label">备注</div>
+          <div class="field-row-value">${esc(it.note || "—")}</div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div><div class="field-row-label">大小</div>
+          <div class="field-row-value">${esc(it.size || "—")}</div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div><div class="field-row-label">类型</div>
+          <div class="field-row-value"><span class="key-tag">${esc(it.fileType || "—")}</span></div>
+        </div>
+      </div>
+      <div class="section-title">附件（加密存储 · 上限 50MB）</div>
+      <div class="attachment-row">${I.paperclip} ${esc(it.attachment || "—")}
+        <span style="color:var(--fg-2)">${esc(it.size || "")}</span>
+        <button class="icon-btn" data-act="download" title="下载（原型为模拟）">${I.download}</button>
+      </div>`;
+  }
 
   el.innerHTML = `
     <div class="detail-card">
@@ -176,22 +320,14 @@ function renderDetail() {
         <span class="item-icon ${m.cls}">${m.icon}</span>
         <div>
           <h3 class="detail-title">${esc(it.name)}</h3>
-          <div class="detail-sub">${it.type === "login" ? "登录 · " : "安全笔记 · "}修订于 ${it.revision.slice(0, 10)} · 存储端仅见密文</div>
+          <div class="detail-sub">${m.label} · 修订于 ${it.revision.slice(0, 10)} · 存储端仅见密文</div>
         </div>
         <div class="detail-actions">
           <button class="icon-btn" data-act="edit" title="编辑">${I.edit}</button>
           <button class="icon-btn" data-act="delete" title="删除（软删除，30 天硬删）" style="color:var(--fg-1)">${I.trash}</button>
         </div>
       </div>
-      ${it.type === "login" ? `
-        <div class="field-row">
-          <div><div class="field-row-label">用户名</div>
-            <div class="field-row-value"><span class="mono">${esc(it.username)}</span>
-            <button class="icon-btn" data-act="copy-username" title="复制用户名">${I.copy}</button></div>
-          </div>
-        </div>` : ""}
-      ${passRow}
-      ${uriRow}${customRow}${noteRow}${attachRow}
+      ${body}
     </div>`;
 
   el.querySelector('[data-act="reveal"]')?.addEventListener("click", () => {
@@ -202,7 +338,10 @@ function renderDetail() {
   el.querySelector('[data-act="delete"]')?.addEventListener("click", () => confirmDelete(it.id));
   el.querySelector('[data-act="copy-username"]')?.addEventListener("click", () => copyText(it.username));
   el.querySelector('[data-act="copy-password"]')?.addEventListener("click", () => copyText(it.password));
+  el.querySelector('[data-act="copy-value"]')?.addEventListener("click", () => copyText(it.value));
   el.querySelector('[data-act="copy-custom"]')?.addEventListener("click", () => copyText(it.custom[0]?.value || ""));
+  el.querySelector('[data-act="download"]')?.addEventListener("click", () =>
+    toast("原型演示：附件下载为模拟行为", "ok"));
 }
 
 /* ---------- 渲染：规则 / 设置 / 审计 ---------- */
@@ -311,23 +450,35 @@ function openModal(html, onMount) {
 }
 function closeModal() { $("#modal-root").innerHTML = ""; }
 
-/* ---------- 新建 / 编辑条目 ---------- */
+/* ---------- 新建 / 编辑条目（v2：四类类型选择 → 类型对应表单） ---------- */
+const FILE_LIMIT = 50 * 1024 * 1024; // 50MB
+
+function fmtSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function openItemModal(id) {
   const it = id ? DB.items.find((x) => x.id === id) : null;
   const title = it ? "编辑条目" : "新建条目";
+  const typeOrder = ["login", "note", "secret", "file"];
+  const typeLabels = { login: "登录", note: "笔记", secret: "密钥", file: "文件" };
+  let selFile = null; // 本次选择的新附件（原型内存态）
+
   openModal(`
     <h3 class="modal-title">${title}</h3>
     <p class="modal-desc">保存后写入加密库 · 乐观并发（CAS）</p>
     <div class="form-grid">
       <label class="field"><span class="field-label">名称</span>
         <span class="input-wrap"><input id="f-name" value="${it ? esc(it.name) : ""}" placeholder="例如：GitHub" /></span></label>
-      <label class="field"><span class="field-label">类型</span>
-        <span class="input-wrap">
-          <select class="select-input" id="f-type" style="width:100%">
-            <option value="login" ${it?.type === "login" ? "selected" : ""}>登录（login）</option>
-            <option value="secureNote" ${it?.type === "secureNote" ? "selected" : ""}>安全笔记（secureNote）</option>
-          </select>
-        </span></label>
+      <div class="field">
+        <span class="field-label">类型</span>
+        <div class="filters" id="f-type-chips" style="margin-bottom:0">
+          ${typeOrder.map((t) => `<button type="button" class="chip ${it?.type === t ? "active" : (!it && t === "login" ? "active" : "")}" data-type="${t}" aria-label="类型：${typeLabels[t]}" title="类型：${typeLabels[t]}">${typeLabels[t]}</button>`).join("")}
+        </div>
+      </div>
+
       <div id="f-login-fields">
         <label class="field"><span class="field-label">用户名</span>
           <span class="input-wrap"><input id="f-username" value="${it?.username ? esc(it.username) : ""}" /></span></label>
@@ -336,51 +487,126 @@ function openItemModal(id) {
         <label class="field"><span class="field-label">站点（URI）</span>
           <span class="input-wrap"><input id="f-uri" value="${it?.uris?.join(", ") || ""}" placeholder="example.com" /></span></label>
       </div>
-      <label class="field"><span class="field-label">备注</span>
-        <span class="input-wrap"><input id="f-note" value="${it?.note ? esc(it.note) : ""}" /></span></label>
+
+      <div id="f-note-fields">
+        <label class="field"><span class="field-label">Markdown 内容（语法高亮 · 不做预览）</span>
+          <span class="md-wrap">
+            <span class="md-hl" aria-hidden="true"></span>
+            <textarea id="f-content" class="md-editor" spellcheck="false">${it?.content ? esc(it.content) : ""}</textarea>
+          </span></label>
+      </div>
+
+      <div id="f-secret-fields">
+        <label class="field"><span class="field-label">密钥值</span>
+          <span class="input-wrap"><input id="f-value" type="text" value="${it?.value ? esc(it.value) : ""}" placeholder="例如：npm_demo_token_0000" /></span></label>
+        <label class="field"><span class="field-label">用途</span>
+          <span class="input-wrap"><input id="f-purpose" value="${it?.purpose ? esc(it.purpose) : ""}" placeholder="例如：发布 npm 包（仅白名单命令注入）" /></span></label>
+        <label class="field"><span class="field-label">过期时间（可选）</span>
+          <span class="input-wrap"><input id="f-expires" type="date" value="${it?.expiresAt ? esc(it.expiresAt) : ""}" /></span></label>
+      </div>
+
+      <div id="f-file-fields">
+        <label class="field"><span class="field-label">附件（加密存储）</span>
+          <span class="attach-box">
+            <input type="file" id="f-file" style="display:none" />
+            <button type="button" class="btn btn-ghost btn-sm" id="f-file-pick">选择文件…</button>
+            <span id="f-file-info" class="attach-info">${it?.attachment ? `${esc(it.attachment)} · ${esc(it.size || "")}` : "未选择文件"}</span>
+          </span>
+          <span class="limit-hint">单文件上限 50MB · 文件本体独立加密，存储端不可见</span></label>
+        <label class="field"><span class="field-label">备注</span>
+          <span class="input-wrap"><input id="f-note" value="${it?.note ? esc(it.note) : ""}" placeholder="可选说明" /></span></label>
+      </div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" data-act="cancel">取消</button>
       <button class="btn btn-primary" data-act="save">保存</button>
     </div>`, (modal) => {
-    const updateLogin = () => {
-      $("#f-login-fields").style.display =
-        $("#f-type").value === "login" ? "" : "none";
+    const chips = modal.querySelectorAll("#f-type-chips .chip");
+    const groups = {
+      login: modal.querySelector("#f-login-fields"),
+      note: modal.querySelector("#f-note-fields"),
+      secret: modal.querySelector("#f-secret-fields"),
+      file: modal.querySelector("#f-file-fields"),
     };
-    $("#f-type").addEventListener("change", updateLogin);
-    updateLogin();
+    let currentType = it?.type || "login";
+    const applyType = (t) => {
+      currentType = t;
+      chips.forEach((c) => c.classList.toggle("active", c.dataset.type === t));
+      Object.entries(groups).forEach(([k, el]) => { el.style.display = k === t ? "" : "none"; });
+      // 笔记类型使用宽版弹窗（Markdown 编辑区放大）；其余类型常规尺寸
+      modal.classList.toggle("modal-wide", t === "note");
+    };
+    chips.forEach((c) => c.addEventListener("click", () => applyType(c.dataset.type)));
+    applyType(currentType);
+
+    // Markdown 编辑器：语法高亮层 + 滚动同步
+    const ta = modal.querySelector("#f-content");
+    const hl = modal.querySelector(".md-hl");
+    const syncHl = () => {
+      hl.innerHTML = mdHighlight(ta.value);
+      hl.scrollTop = ta.scrollTop;
+      hl.scrollLeft = ta.scrollLeft;
+    };
+    ta.addEventListener("input", syncHl);
+    ta.addEventListener("scroll", () => { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; });
+    // 编辑框可纵向拉伸：让高亮层随编辑框同步扩张，避免拉伸后新行无高亮/不可见
+    if (typeof ResizeObserver !== "undefined") {
+      new ResizeObserver(() => { ta.parentElement.style.height = ta.offsetHeight + "px"; }).observe(ta);
+    }
+    syncHl();
+
+    // 文件附件：选择交互 + 50MB 上限
+    const fileInput = modal.querySelector("#f-file");
+    const fileInfo = modal.querySelector("#f-file-info");
+    modal.querySelector("#f-file-pick").addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      if (f.size > FILE_LIMIT) {
+        toast("超过 50MB 上限，已拒绝选择", "warn");
+        fileInput.value = "";
+        fileInfo.textContent = it?.attachment ? `${it.attachment} · ${it.size}` : "未选择文件";
+        return;
+      }
+      selFile = { name: f.name, size: fmtSize(f.size), fileType: f.type || "application/octet-stream" };
+      fileInfo.textContent = `${selFile.name} · ${selFile.size}`;
+      toast(`已选择附件 ${f.name}（${selFile.size}）`, "ok");
+    });
+
     modal.querySelector('[data-act="cancel"]').addEventListener("click", closeModal);
     modal.querySelector('[data-act="save"]').addEventListener("click", () => {
       const name = $("#f-name").value.trim();
       if (!name) { toast("请填写名称", "warn"); return; }
-      const isLogin = $("#f-type").value === "login";
+      const now = new Date().toISOString().slice(0, 19) + "Z";
+      const base = { name, revision: now };
+      let data;
+      if (currentType === "login") {
+        data = { ...base, type: "login",
+          username: $("#f-username").value.trim(), password: $("#f-password").value.trim(),
+          uris: $("#f-uri").value.split(",").map((s) => s.trim()).filter(Boolean),
+          custom: it?.custom || [] };
+        if (!data.username || !data.password) { toast("请填写用户名与密码", "warn"); return; }
+      } else if (currentType === "note") {
+        data = { ...base, type: "note", content: $("#f-content").value };
+        if (!data.content.trim()) { toast("请填写笔记内容", "warn"); return; }
+      } else if (currentType === "secret") {
+        data = { ...base, type: "secret",
+          value: $("#f-value").value.trim(), purpose: $("#f-purpose").value.trim(),
+          expiresAt: $("#f-expires").value || "" };
+        if (!data.value) { toast("请填写密钥值", "warn"); return; }
+      } else {
+        if (!selFile && !it?.attachment) { toast("请选择附件文件（上限 50MB）", "warn"); return; }
+        data = { ...base, type: "file",
+          note: $("#f-note").value.trim(),
+          size: selFile ? selFile.size : it.size,
+          fileType: selFile ? selFile.fileType : it.fileType,
+          attachment: selFile ? selFile.name : it.attachment };
+      }
       if (it) {
-        it.name = name;
-        it.type = isLogin ? "login" : "secureNote";
-        if (isLogin) {
-          it.username = $("#f-username").value.trim();
-          it.password = $("#f-password").value.trim();
-          it.uris = $("#f-uri").value.split(",").map((s) => s.trim()).filter(Boolean);
-          it.note = $("#f-note").value.trim();
-        } else {
-          it.note = $("#f-note").value.trim();
-          it.username = it.password = undefined;
-          it.uris = [];
-        }
-        it.revision = new Date().toISOString().replace("T", "T").slice(0, 19) + "Z";
+        Object.assign(it, data);
         toast("条目已保存（revisionDate 已更新）", "ok");
       } else {
-        DB.items.unshift({
-          id: "it" + Math.random().toString(36).slice(2, 8),
-          type: isLogin ? "login" : "secureNote",
-          name, favorite: false,
-          revision: new Date().toISOString().slice(0, 19) + "Z",
-          username: isLogin ? $("#f-username").value.trim() : undefined,
-          password: isLogin ? $("#f-password").value.trim() : undefined,
-          uris: isLogin ? $("#f-uri").value.split(",").map((s) => s.trim()).filter(Boolean) : [],
-          note: $("#f-note").value.trim(),
-          custom: [],
-        });
+        DB.items.unshift({ id: "it" + Math.random().toString(36).slice(2, 8), ...data });
         state.selectedId = DB.items[0].id;
         toast("条目已创建", "ok");
       }
@@ -613,13 +839,16 @@ function bindEvents() {
     state.search = e.target.value;
     renderList();
   });
-  document.querySelectorAll("#item-filters .chip").forEach((c) =>
-    c.addEventListener("click", () => {
-      document.querySelectorAll("#item-filters .chip").forEach((x) => x.classList.remove("active"));
-      c.classList.add("active");
-      state.filter = c.dataset.filter;
-      renderList();
-    }));
+  // 条目筛选：事件委托绑定在容器上（chips 为静态节点，委托防御任何重渲染场景）
+  const itemFilters = $("#item-filters");
+  if (itemFilters) itemFilters.addEventListener("click", (e) => {
+    const chip = e.target.closest(".chip");
+    if (!chip || !itemFilters.contains(chip)) return;
+    itemFilters.querySelectorAll(".chip").forEach((x) => x.classList.remove("active"));
+    chip.classList.add("active");
+    state.filter = chip.dataset.filter;
+    renderList();
+  });
   document.querySelectorAll("#page-audit .chip").forEach((c) =>
     c.addEventListener("click", () => {
       document.querySelectorAll("#page-audit .chip").forEach((x) => x.classList.remove("active"));
@@ -635,7 +864,6 @@ function bindEvents() {
   document.querySelectorAll(".nav-item[data-page]").forEach((b) =>
     b.addEventListener("click", () => {
       state.page = b.dataset.page;
-      state.filter = state.page === "items" ? state.filter : state.filter;
       setPage(b.dataset.page);
     }));
 }
@@ -656,12 +884,6 @@ function applyHash() {
     return;
   }
   if (["rules", "settings", "audit"].includes(h)) { state.page = h; showScreen("vault"); }
-}
-
-/* ---------- 工具 ---------- */
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 /* ---------- 启动 ---------- */

@@ -7,6 +7,9 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <!-- 弹窗根节点置于最前：保证名称型点击工具优先命中弹窗内控件（弹窗 chips 与页面筛选 chips 文案相同） -->
+  <div id="modal-root"></div>
+
   <!-- 解锁页 -->
   <section id="screen-unlock" class="screen active">
     <div class="unlock-card">
@@ -64,7 +67,7 @@
         <header class="topbar">
           <div class="search-wrap">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
-            <input id="search-input" type="text" placeholder="搜索名称、用户名或站点…" />
+            <input id="search-input" type="text" placeholder="搜索名称、账号、用途或内容…" />
           </div>
           <div class="topbar-right">
             <span class="sync-state" title="已同步 · 轮询 60s"><span class="dot dot-ok"></span>已同步</span>
@@ -86,8 +89,9 @@
               <div id="item-filters" class="filters">
                 <button class="chip active" data-filter="all">全部</button>
                 <button class="chip" data-filter="login">登录</button>
-                <button class="chip" data-filter="secureNote">安全笔记</button>
-                <button class="chip" data-filter="favorite">收藏</button>
+                <button class="chip" data-filter="note">笔记</button>
+                <button class="chip" data-filter="secret">密钥</button>
+                <button class="chip" data-filter="file">文件</button>
               </div>
               <div id="item-list" class="item-list"></div>
             </div>
@@ -132,7 +136,6 @@
     </div>
   </section>
 
-  <div id="modal-root"></div>
   <div id="toast-root" class="toast-root"></div>
   <div id="nav-root"></div>
 
