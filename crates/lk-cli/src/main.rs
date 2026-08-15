@@ -1071,13 +1071,17 @@ fn cmd_item_copy(out: &mut impl Write, dir: &std::path::Path, id: &str, field: &
         );
         return 2;
     };
-    if let Err(e) = clipboard::copy_and_schedule_clear(value.to_string()) {
+    if let Err(e) = clipboard::copy(value.to_string()) {
         eprintln!("lk: {e}");
         return 1;
     }
     let _ = writeln!(out, "已复制，30 秒后自动清除（期间请勿复制其他内容）");
-    // 进程驻留 30s 保证清除线程存活
+    // 主线程驻留 30s 后同步清除（不 spawn 后台线程：process::exit 不 join
+    // 会立即杀死后台线程，清除是否执行是竞态；同步执行保证 cli.md §2 语义）
     std::thread::sleep(std::time::Duration::from_secs(clipboard::CLEAR_AFTER_SECS));
+    if let Err(e) = clipboard::clear() {
+        eprintln!("lk: 剪贴板自动清除失败: {e}");
+    }
     0
 }
 

@@ -206,6 +206,93 @@ mod imp {
         Ok(())
     }
 
+    /// 仅限当前用户的 pipe 安全属性（ipc.md §2「pipe ACL」，A2）。
+    ///
+    /// Windows 默认 DACL 允许同机器任意进程连接；这里显式构建 DACL，
+    /// 仅授予当前进程用户 SID 完全访问权（SYSTEM/Administrators 亦不放行），
+    /// 配合随机 pipe 名实现「仅本用户可访问」（Linux 侧 UDS 0600 的对应补齐）。
+    /// 描述符与 ACL 缓冲随结构体存活，保证 CreateNamedPipeW 调用期间有效。
+    struct UserOnlySa {
+        attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+        _sd: windows_sys::Win32::Security::SECURITY_DESCRIPTOR,
+        _acl: Vec<u8>,
+    }
+
+    fn user_only_sa() -> std::io::Result<UserOnlySa> {
+        use windows_sys::Win32::Security::{
+            AddAccessAllowedAce, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+            SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, PSECURITY_DESCRIPTOR, PSID,
+            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        // GENERIC_ALL = 0x1000_0000（SE_FILE_OBJECT 型访问掩码的完全控制）。
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        // SECURITY_DESCRIPTOR_REVISION = 1（windows-sys 未导出该常量，按文档用字面量）。
+        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+        unsafe {
+            // 1) 当前进程主令牌 → 用户 SID。GetTokenInformation 把 SID 拷贝进
+            //    调用方缓冲区（TOKEN_USER.User.Sid 指向缓冲区内的 SID），
+            //    令牌句柄用完即可关闭。
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut user_buf = [0u8; 128];
+            let mut ret_len: u32 = 0;
+            let ok = GetTokenInformation(
+                token,
+                TokenUser,
+                user_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                user_buf.len() as u32,
+                &mut ret_len,
+            );
+            let _ = CloseHandle(token);
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let user = &*(user_buf.as_ptr() as *const TOKEN_USER);
+            let sid: PSID = user.User.Sid;
+
+            // 2) DACL：单条 ACE = 该用户 SID 完全访问（AddAccessAllowedAce
+            //    会把 SID 拷贝进 ACL 缓冲区，此后与令牌无关）。
+            let mut acl_buf = vec![0u8; 256];
+            let acl = acl_buf.as_mut_ptr() as *mut ACL;
+            if InitializeAcl(acl, acl_buf.len() as u32, ACL_REVISION) == 0
+                || AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, sid) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            // 3) 自包含安全描述符：DACL 指针指向上面的 ACL 缓冲区。
+            let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();
+            if InitializeSecurityDescriptor(
+                &mut sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
+                SECURITY_DESCRIPTOR_REVISION,
+            ) == 0
+                || SetSecurityDescriptorDacl(
+                    &mut sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
+                    1, /* bDaclPresent */
+                    acl,
+                    0, /* bDaclDefaulted */
+                ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let attrs = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: &mut sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
+                bInheritHandle: 0,
+            };
+            Ok(UserOnlySa {
+                attrs,
+                _sd: sd,
+                _acl: acl_buf,
+            })
+        }
+    }
+
     /// 监听并处理连接（每连接一线程）。
     pub fn serve(
         _dir: &Path,
@@ -215,6 +302,8 @@ mod imp {
         let ep = read_endpoint(_dir)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "缺少 daemon.json"))?;
         let name = wide(&ep.address);
+        // ipc.md §2：named pipe 显式 ACL 仅限当前用户（默认 DACL 放行同机器任意进程）
+        let sa = user_only_sa()?;
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -228,7 +317,7 @@ mod imp {
                     64 * 1024,
                     64 * 1024,
                     0,
-                    std::ptr::null(),
+                    &sa.attrs as *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
                 )
             };
             if handle == INVALID_HANDLE_VALUE {
