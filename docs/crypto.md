@@ -7,7 +7,8 @@
 ## 1. 设计目标
 
 - **零知识彻底**：主密码不出客户端；存储端（BYO 云）只见密文。
-- **密钥互不复用**：三把功能密钥由 HKDF 分叉，互不可推导、互不可替代。
+- **密钥互不复用**：数据加密与审计 HMAC 两把功能密钥由 HKDF 分叉，恢复信封
+  密钥由恢复码独立派生；互不可推导、互不可替代。
 - **格式自描述**：密文 blob 内嵌格式类型与版本号，支持演进与迁移。
 - **刻意不同于 Bitwarden**：Bitwarden 用 CBC + HMAC 组合（AES-256-CBC +
   HMAC-SHA256）；我们**只用 AES-256-GCM**（AEAD），这是拍板决定，勿改。
@@ -19,16 +20,19 @@
    │  Argon2id(m=64MiB, t=3, p=4, salt=16B 随机)
    ▼
 主密钥 MK（32B）
-   │  HKDF-SHA256（各自独立 info 标签，提取一次、扩展三次，互不复用）
+   │  HKDF-SHA256（各自独立 info 标签，提取一次、扩展两次，互不复用）
    ├──▶ 数据加密密钥 K_data    —— 加密全部条目/索引/附件 blob
-   ├──▶ 恢复信封密钥 K_recovery —— 加密主密钥副本（恢复信封，见 recovery.md）
    └──▶ 审计 HMAC 密钥 K_audit  —— 审计日志防篡改（见 audit.md）
+
+恢复信封密钥 K_recovery **不在** MK 分叉之内：由恢复码 + Argon2id 独立派生
+（见 [recovery.md](recovery.md) §3）。
 ```
 
 - 主密钥 **永不明文落盘**；磁盘上主密钥的持久副本仅存在于**恢复信封**中
   （用 K_recovery 加密，见 [recovery.md](recovery.md)）。
-- 解锁后三把密钥只存在于守护进程内存（[ipc.md](ipc.md)），锁定即擦除
-  （实现用 `zeroize`）。
+- 解锁后 K_data / K_audit 只存在于守护进程内存（[ipc.md](ipc.md)），锁定即擦除
+  （实现用 `zeroize`）；K_recovery 仅在生成/重加密恢复信封时由恢复码临时派生，
+  用后即擦除（见 [recovery.md](recovery.md) §3）。
 
 ### KDF 参数（固定）
 
@@ -47,8 +51,9 @@
 
 | 用途 | 原语 | 说明 |
 |------|------|------|
-| 主密钥/信封密钥派生 | Argon2id (64MiB,3,4) | 见 §2 |
-| 密钥分叉 | HKDF-SHA256 | 三把密钥各自独立 info |
+| 主密钥派生 | Argon2id (64MiB,3,4) | 主密码 → MK，见 §2 |
+| 恢复信封密钥派生 | Argon2id（信封内独立 salt） | 恢复码 → K_recovery，见 recovery.md §3 |
+| 密钥分叉 | HKDF-SHA256 | K_data / K_audit 两把密钥各自独立 info |
 | 数据加密 | AES-256-GCM | AEAD；随机 12B nonce 每次加密重新生成 |
 | 审计防篡改 | HMAC-SHA256 | K_audit；见 audit.md |
 | 随机源 | CSPRNG（`rand` / 平台） | salt、nonce、条目/附件密钥、会话令牌 |

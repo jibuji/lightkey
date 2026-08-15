@@ -73,7 +73,7 @@ webkit2gtk 系统库，不阻塞）；`lk-app` 由 CI 在 Windows/macOS 上以 `
 
 | 主题 | 一句话 |
 |------|--------|
-| 加密 | Argon2id(64MiB,3,4) → 主密钥；HKDF-SHA256 分叉三密钥；AES-256-GCM；自描述密文（[crypto.md](crypto.md)） |
+| 加密 | Argon2id(64MiB,3,4) → 主密钥；HKDF-SHA256 分叉 + AES-256-GCM；自描述密文（[crypto.md](crypto.md)） |
 | 数据 | 条目级密文 blob + 加密索引；CAS + last-write-wins；30 天墓碑（[data-model.md](data-model.md)） |
 | 同步 | BYO 存储（WebDAV/S3）无服务器；加密索引 + 轮询（默认 60s）；无推送（[sync.md](sync.md)） |
 | 守护进程 | 持解锁态，密钥仅内存；会话令牌随解锁轮换（[ipc.md](ipc.md)） |

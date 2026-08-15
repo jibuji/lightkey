@@ -36,7 +36,7 @@
 | 命令 | 语义 | 里程碑 |
 |------|------|--------|
 | `lk sync` | 触发一次同步（轮询 + CAS 上传） | M1 |
-| `lk config sync set <url> <creds>` | 配置 BYO 存储（WebDAV/S3）与轮询间隔（15s~24h，默认 60s） | M1 |
+| `lk config sync set <url>` | 配置 BYO 存储（WebDAV/S3）与轮询间隔（15s~24h，默认 60s）；位置参数只接受存储 URL，凭据交互式提示输入（不回显），也可 `--credentials-file <path>` 或 `--stdin` 导入，不接受凭据明文位置参数 | M1 |
 | `lk config get <key>` | 读取配置 | M1 |
 
 ## 4. Agent 授权门
@@ -57,7 +57,9 @@
 
 ## 6. 行为约束
 
-- 交互式密码输入不回显；`lk unlock` 支持 `--stdin` 管道（供脚本，明确警示）。
+- 交互式敏感输入（主密码、存储凭据）不回显；`lk unlock` 与
+  `lk config sync set` 支持 `--stdin` 管道（供脚本，明确警示），后者另支持
+  `--credentials-file` 文件导入。
 - 所有敏感输出（密码/令牌）默认不落 stdout 日志；`--json` 输出仅用于机器消费，
   同样遵循最小字段。
 - 错误信息不区分「未解锁/令牌错」（[ipc.md](ipc.md) §3）。

@@ -18,7 +18,7 @@ needs-decision，不得自行变更。
 | D1 | V1 MVP 交付 = 核心库 + CLI（`lk`）+ 桌面应用；浏览器扩展是 M3（V1 之后）；本任务产出可开工实施 spec（含前端设计） | [architecture.md](architecture.md)、[milestones.md](milestones.md) |
 | D2 | 技术栈：Tauri 2（Rust 核心 + React）；CLI 复用同一 Rust 核心；Windows + macOS 为验收平台，Linux 冒烟不阻塞 | [architecture.md](architecture.md)、[testing.md](testing.md) |
 | D3 | 里程碑：M0 骨架+单机闭环 → M1 同步（BYO 变更发现 + CAS + 墓碑）→ M2 Agent 授权门 + 桌面端 → M3 浏览器填充 | [milestones.md](milestones.md) |
-| D4 | 加密：vault 头随机 16B salt + KDF 参数 + 密文格式类型/版本号；Argon2id(m=64MiB,t=3,p=4) 派生主密钥；HKDF-SHA256 分叉数据加密/恢复信封/审计 HMAC 三密钥互不复用；原语刻意不同于 Bitwarden（AES-256-GCM，不用 CBC+HMAC） | [crypto.md](crypto.md) |
+| D4 | 加密：vault 头随机 16B salt + KDF 参数 + 密文格式类型/版本号；Argon2id(m=64MiB,t=3,p=4) 派生主密钥；HKDF-SHA256 分叉数据加密/审计 HMAC 两密钥互不复用，恢复信封密钥由恢复码 + Argon2id 独立派生（2026-08-15 grilling 后补充拍板，见下文）；原语刻意不同于 Bitwarden（AES-256-GCM，不用 CBC+HMAC） | [crypto.md](crypto.md) |
 | D5 | 数据模型：条目级密文 blob + 加密索引 + revisionDate 增量同步 + 软删除墓碑（30 天延迟硬删）+ 乐观并发（CAS，整条目 last-write-wins）；条目 schema 参照 Bitwarden login/secureNote 映射；附件每附件独立密钥 + 1 MiB 流式分块；自描述密文格式（含类型版本号） | [data-model.md](data-model.md) |
 | D6 | 元数据可见性：条目 blob 与索引/清单文件全部加密；存储端只见密文文件 + 文件名时间戳（零知识彻底） | [data-model.md](data-model.md)、[sync.md](sync.md) |
 | D7 | 变更发现：加密索引 + 轮询（默认 60s，可配 15s~24h）；无推送、无中间态加载、静默轮询；发现变更才下载条目；BYO（WebDAV/S3 无服务器）无推送下的变更发现是方案 A 在 BYO 场景的真实代价，写入文档 | [sync.md](sync.md) |
@@ -33,11 +33,20 @@ needs-decision，不得自行变更。
 
 ## 需新决策的事项
 
-1. **恢复信封密钥的派生来源矛盾（待船长拍板）**：D4 与 [crypto.md](crypto.md) §2
-   称「恢复信封密钥」为 MK 经 HKDF-SHA256 分叉的三密钥之一，信封用其加密；
-   而 D9 与 [recovery.md](recovery.md) §3 称信封密钥由**恢复码**经 Argon2id 派生
-   （恢复流程仅需恢复码 + 新主密码）。若信封密钥派生自 MK，仅凭恢复码无法解密
-   信封，与恢复流程矛盾。需裁决：恢复信封密钥仅由恢复码派生（并修订
-   crypto.md §2 分叉图），或另定「恢复信封密钥」的用途。
+### 已补充拍板（2026-08-15 grilling 后 · 来源：no-mistakes review）
+
+1. **恢复信封密钥派生来源（裁定：选项 A，以 [recovery.md](recovery.md) 为准）**：
+   恢复信封密钥 K_recovery 由**恢复码 + Argon2id 独立派生**，与主密钥无关；
+   HKDF-SHA256 仅分叉两把密钥——数据加密密钥 K_data 与审计 HMAC 密钥 K_audit。
+   恢复时仅凭**恢复码 + 新设主密码**即可取回主密钥副本。已修订
+   [crypto.md](crypto.md) §2 分叉图（原 D4 其余内容仍然有效）。
+2. **审计密钥轮换验证链（裁定：选项 A）**：切换审计密钥前，先用旧 K_audit
+   签名一条「审计密钥轮换」事件（记录切换时间与新旧密钥标识），形成验证链：
+   新密钥验证新事件，旧事件通过链条追溯到轮换签名，旧日志全程可验证；审计
+   永久保留 + 防篡改语义不变。已修订 [recovery.md](recovery.md) §3 第 3 步与
+   [audit.md](audit.md) §3.1（原 D11 其余内容仍然有效）。
+3. **BYO 存储凭据输入形态（裁定）**：`lk config sync set` 改为交互式提示输入
+   （不回显），并支持从文件/stdin 导入；命令行位置参数只接受存储 URL，不接受
+   凭据明文。已修订 [cli.md](cli.md) §3 与 [sync.md](sync.md) §6。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
