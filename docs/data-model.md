@@ -7,7 +7,7 @@
 ## 1. 总原则
 
 - **条目级密文 blob**：每条目独立加密（K_data），独立文件。
-- **加密索引**：条目清单/索引整体加密；存储端只见密文文件与文件名时间戳（D6）。
+- **加密索引**：条目清单/索引整体加密；存储端只见密文文件（文件名纯 UUID，无时间戳，见下）。
 - **增量同步**：靠 `revisionDate`；**乐观并发**：CAS，整条目 last-write-wins（D5）。
 - **软删除**：删除 = 写墓碑，30 天延迟硬删（D5）。
 
@@ -23,7 +23,7 @@
 | 规则 rule | `{uuid}.rule.lk` | K_data | 授权门白名单规则（M2，见 authorization-gate.md） |
 | 恢复信封 | `recovery.envelope` | K_recovery | 主密钥副本（见 recovery.md） |
 
-- 文件名中的对象 id 为 UUID v4；时间戳后缀仅用于同步排序，不含内容信息。
+- 文件名中的对象 id 为 UUID v4；**无时间戳后缀**——同步排序依据加密索引内 `revisionDate`（文件名带时间戳会向存储端泄漏修改时间，违反 D6 零知识彻底）。
 
 ## 3. 条目 schema（四类存储类型定案 v2，见 [design/spec.md](design/spec.md) §4）
 
