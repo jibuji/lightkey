@@ -5,7 +5,7 @@
 ## 项目一句话
 
 轻钥 LightKey：个人密钥/私密信息管理工具，从零自研（不 fork Bitwarden），
-客户端全开源（MIT）。当前为 **M1（同步）完成 + M2 授权门/桌面** 阶段。
+客户端全开源（MIT）。当前为 **M1.5 插件化改造完成 + M2 授权门/桌面** 阶段。
 
 ## 规格是唯一权威
 
@@ -22,7 +22,8 @@
 - 同步 E2E（M1 双客户端）：`bash scripts/e2e_m1.sh [lk-binary-path]`；
   单机回归：`bash scripts/e2e_m0.sh`（都用 `file://` 本地模拟存储，无需凭据）。
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
-  `crates/lk-app/tauri.conf.json` 的 devUrl 一致）。
+  `crates/lk-app/tauri.conf.json` 的 devUrl 一致）；D 层单测 `npm test`
+  （vitest；事件总线契约/装配/宿主渲染）。
 - CI 骨架：`.github/workflows/ci.yml`。
 
 ## 交付纪律
@@ -42,7 +43,13 @@
   trait + 本地模拟/WebDAV/S3 实现；E2E `scripts/e2e_m1.sh`）
 - [x] M1 并发结构（G1 根治）：同步轮次 = 抓取无锁 + 应用短锁两阶段；命令与
   后台同步并发，网络 I/O 不持守护进程锁；vault 内存用读写锁（权限层与数据层
-  互斥解耦，见 `crates/lk-cli/src/daemon.rs` 模块文档）
+  互斥解耦，见 `crates/lk-cli/src/daemon/` 模块文档）
+- [x] M1.5 插件化改造（Cordis）：lk-core A/B 层 trait 服务 + 事件总线
+  （`crates/lk-core/src/service.rs` / `bus.rs`；密文格式/存储布局/IPC 协议零变更）；
+  daemon 按 C 层边界拆 `crates/lk-cli/src/daemon/{mod,config,sync}.rs` 并装配
+  总线；D 层真 Cordis 宿主 + `frontend/src/cordis.yml` 装配（theme /
+  ipc-bridge / preference-store / toast + 槽位骨架），事件契约见
+  `frontend/src/events.ts`
 - [ ] M2 授权门 + 桌面 · [ ] M3 浏览器填充
 
 ## Maintaining this file
