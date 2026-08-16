@@ -613,6 +613,40 @@ mod tests {
         assert_eq!(resolve_starter(10, &t), "proc20");
     }
 
+    /// Windows 诊断（临时）：打印进程链回溯各步骤结果。
+    #[cfg(windows)]
+    #[test]
+    fn diag_walk_windows() {
+        let pid = std::process::id();
+        let t = ToolhelpTable;
+        eprintln!("DIAG pid={pid}");
+        eprintln!("DIAG session_ok={}", peer_session_ok(pid));
+        let mut p = pid;
+        for i in 0..10 {
+            match t.process_name(p) {
+                Some(n) => eprintln!("DIAG [{i}] {p} name={n:?}"),
+                None => {
+                    eprintln!("DIAG [{i}] {p} NAME-NONE");
+                    break;
+                }
+            }
+            match t.parent_pid(p) {
+                Some(par) => {
+                    eprintln!("DIAG [{i}] {p} parent={par}");
+                    if par == p || par == 0 {
+                        break;
+                    }
+                    p = par;
+                }
+                None => {
+                    eprintln!("DIAG [{i}] {p} PARENT-NONE");
+                    break;
+                }
+            }
+        }
+        eprintln!("DIAG starter={}", resolve_starter(pid, &t));
+    }
+
     /// Linux 真实进程链：spawn `sh -c sleep`，回溯 sleep 的父链必须经过 sh，
     /// 且顶层给出真实可执行文件路径（本机测试平台）。
     #[cfg(target_os = "linux")]
