@@ -245,3 +245,74 @@ fn audit_append_semantics() {
         assert!(log.verify(&keys, &|_| None).is_err());
     }
 }
+
+/// 事件总线属性（M1.5 事件总线契约，`docs/plugin-architecture.md` §5）：
+///
+/// - **投递完备**：任意事件序列 → 每个订阅者都收到全部事件（无丢失）。
+/// - **保序**：单个订阅者按广播顺序收到事件。
+///
+/// 订阅者与发送者之间无返回值（观察广播），故不测聚合语义。
+fn any_event() -> impl Strategy<Value = lk_core::bus::VaultEvent> {
+    use lk_core::bus::{LockReason, SessionVia, VaultEvent};
+    prop_oneof![
+        (
+            prop::array::uniform16(any::<u8>()),
+            "[a-z]{0,12}",
+            "[a-z]{0,8}",
+            any::<bool>(),
+        )
+            .prop_map(|(b, rev, kind, deleted)| VaultEvent::ItemChanged {
+                item_id: uuid::Uuid::from_bytes(b),
+                revision_date: rev,
+                kind,
+                deleted,
+            }),
+        any::<u8>().prop_map(|v| VaultEvent::SessionUnlocked {
+            via: match v % 3 {
+                0 => SessionVia::Password,
+                1 => SessionVia::Biometric,
+                _ => SessionVia::Recovery,
+            },
+        }),
+        any::<u8>().prop_map(|v| VaultEvent::SessionLocked {
+            reason: match v % 4 {
+                0 => LockReason::Manual,
+                1 => LockReason::Timeout,
+                2 => LockReason::Lockscreen,
+                _ => LockReason::DaemonExit,
+            },
+        }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+    /// 任意事件序列 → 每个订阅者都收到全部事件且保序（emit 广播语义）。
+    #[test]
+    fn bus_delivers_all_events_to_all_subscribers(events in prop::collection::vec(any_event(), 0..64)) {
+        use lk_core::bus::{EventBus, EventSink};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Rec(Mutex<Vec<lk_core::bus::VaultEvent>>);
+        impl EventSink for Rec {
+            fn on_event(&self, event: &lk_core::bus::VaultEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let bus = Arc::new(EventBus::new());
+        let a = Arc::new(Rec::default());
+        let b = Arc::new(Rec::default());
+        bus.subscribe(Arc::clone(&a) as Arc<dyn EventSink>);
+        bus.subscribe(Arc::clone(&b) as Arc<dyn EventSink>);
+
+        for event in &events {
+            bus.emit(event);
+        }
+        // 投递完备 + 保序：与广播序列一致
+        prop_assert_eq!(&*a.0.lock().unwrap(), &events);
+        prop_assert_eq!(&*b.0.lock().unwrap(), &events);
+    }
+}

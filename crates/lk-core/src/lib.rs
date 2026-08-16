@@ -8,31 +8,49 @@
 //!
 //! ## 模块与规格文档
 //!
+//! ### A 层 · 数据平面（安全核心，trait 服务 + 事件总线，`docs/plugin-architecture.md` §3.1）
+//!
+//! | 插件 | 模块 | 规格 |
+//! |------|------|------|
+//! | crypto | [`crypto`] | vault 头、KDF 派生、AEAD、自描述密文格式 | `docs/crypto.md` |
+//! | vault-store | [`vault`] | 落盘存储层：条目 CRUD、加密索引、CAS、软删除、初始化/恢复编排 | `docs/data-model.md`、`docs/recovery.md` |
+//! | recovery | [`recovery`] | 恢复码、恢复信封、K_recovery 派生 | `docs/recovery.md` |
+//! | audit | [`audit`] | 追加式审计日志 + HMAC 防篡改、密钥轮换验证链 | `docs/audit.md` |
+//! | session | [`session`] | 会话令牌签发/校验/轮换 | `docs/ipc.md` |
+//!
+//! ### B 层 · 能力域
+//!
+//! | 插件 | 模块 | 规格 |
+//! |------|------|------|
+//! | storage-backend | [`storage`] | BYO 存储后端抽象：本地模拟 / WebDAV / S3（可插拔 trait） | `docs/sync.md` |
+//! | sync-engine | [`sync`] | BYO 变更发现、轮询、冲突收敛 | `docs/sync.md` |
+//! | authz-gate | [`authz`] | Agent 授权门三层模型、规则库、启动者判定（M2） | `docs/authorization-gate.md` |
+//!
+//! ### 共享 / 宿主侧
+//!
 //! | 模块 | 职责 | 规格 |
 //! |------|------|------|
-//! | [`crypto`] | vault 头、KDF 派生、AEAD、自描述密文格式 | `docs/crypto.md` |
 //! | [`model`] | 条目（四类 v2）/附件/索引/墓碑数据模型 | `docs/data-model.md` |
-//! | [`vault`] | 落盘存储层：条目 CRUD、加密索引、CAS、软删除、初始化/恢复编排 | `docs/data-model.md`、`docs/recovery.md` |
-//! | [`session`] | 会话令牌签发/校验/轮换 | `docs/ipc.md` |
-//! | [`recovery`] | 恢复码、恢复信封、K_recovery 派生 | `docs/recovery.md` |
-//! | [`audit`] | 追加式审计日志 + HMAC 防篡改、密钥轮换验证链 | `docs/audit.md` |
 //! | [`ipc`] | JSON-RPC 2.0 协议类型、会话令牌、错误码 | `docs/ipc.md` |
-//! | [`sync`] | BYO 变更发现、轮询、冲突收敛（M1） | `docs/sync.md` |
-//! | [`storage`] | BYO 存储后端抽象：本地模拟 / WebDAV / S3（M1） | `docs/sync.md` |
-//! | [`authz`] | Agent 授权门三层模型、规则库、启动者判定（M2） | `docs/authorization-gate.md` |
+//! | [`bus`] | 事件总线（模拟 Cordis `emit`：观察广播，fire-and-forget） | `docs/plugin-architecture.md` §5 |
+//! | [`service`] | A/B 层 trait 服务 + C 层装配点（[`service::CoreServices`]） | `docs/plugin-architecture.md` §3/§4 |
 //!
 //! ## 里程碑状态
 //!
 //! M0（单机闭环）+ M1（同步）已实现：加密、四类条目 CRUD、CAS、墓碑、会话、
 //! 恢复信封、审计、IPC 协议类型、BYO 变更发现（轮询 + CAS 上传 + 墓碑收敛）。
-//! M2 授权门为占位模块。
+//! M1.5（插件化改造）已实现：A/B 层按插件边界重组为 trait 服务 + 事件总线
+//! （[`service`] / [`bus`]；行为不回归：密文格式、存储布局、IPC 协议零变更），
+//! D 层真 Cordis 宿主见 `frontend/`。M2 授权门为占位模块。
 
 pub mod audit;
 pub mod authz;
+pub mod bus;
 pub mod crypto;
 pub mod ipc;
 pub mod model;
 pub mod recovery;
+pub mod service;
 pub mod session;
 pub mod storage;
 pub mod sync;
