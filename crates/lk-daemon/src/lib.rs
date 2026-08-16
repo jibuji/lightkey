@@ -923,6 +923,63 @@ mod tests {
         ));
     }
 
+    /// M2 推送通道：订阅连接收到 JSON-RPC notification 帧（决策 #3 A）；
+    /// 广播非阻塞（EventSink 只做内存投递）。
+    #[test]
+    fn push_channel_notifies_session_and_item_events() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut audit = AuditLog::open(dir.path()).unwrap();
+            init_vault_with_params(dir.path(), "pw", false, &mut audit, &test_kdf_params())
+                .unwrap();
+        }
+        let mut daemon = Daemon::start(dir.path()).unwrap();
+        let unlock = rpc_result(&daemon.handle(&rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw" }),
+        )));
+        let token = unlock["token"].as_str().unwrap().to_string();
+        let shared = daemon.shared();
+        // 订阅连接（桌面壳模拟）：subscribe 校验通过 → 流模式
+        let (sid, rx) = shared.push.subscribe();
+        assert_eq!(shared.push.subscriber_count(), 1);
+        // 写条目 → item.changed 帧（kind → 协议字段 type）
+        daemon.handle(&rpc_line(
+            M_ITEM_PUT,
+            Some(&token),
+            json!({ "item": {
+                "type": "login", "name": "X", "username": "u",
+                "password": "p", "uris": [], "custom": []
+            } }),
+        ));
+        let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let fv: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(fv["jsonrpc"], "2.0");
+        assert_eq!(fv["method"], "item.changed");
+        assert!(fv.get("id").is_none(), "notification 无 id");
+        assert_eq!(fv["params"]["type"], "login");
+        assert_eq!(fv["params"]["deleted"], false);
+        // 锁定 → session.locked 帧；重解锁 → session.unlocked 帧（订阅保持）
+        daemon.handle(&rpc_line(M_VAULT_LOCK, Some(&token), json!({})));
+        let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let fv: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(fv["method"], "session.locked");
+        assert_eq!(fv["params"]["reason"], "manual");
+        daemon.handle(&rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw" }),
+        ));
+        let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let fv: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(fv["method"], "session.unlocked");
+        assert_eq!(fv["params"]["via"], "password");
+        // 退订后不再推送
+        shared.push.unsubscribe(sid);
+        assert_eq!(shared.push.subscriber_count(), 0);
+    }
+
     /// 慢网络后端：get/put 注入固定延迟，并在每次慢调用开始时发信号
     /// （测试借此确定同步线程正处在网络 I/O 中——即「持锁窗口」）。
     struct SlowBackend {
