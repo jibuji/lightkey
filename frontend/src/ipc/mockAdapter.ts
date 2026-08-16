@@ -32,6 +32,19 @@ function delay<T>(value: T): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(value), LATENCY_MS));
 }
 
+/**
+ * 拒绝路径的延迟。
+ *
+ * 不能写成 `delay(Promise.reject(err))`：`Promise.reject` 在调用瞬间即产生
+ * 已拒绝的内层 promise，其 rejection 在下一个微任务检查点就会触发
+ * `unhandledRejection`（此时外层的 300ms 计时器尚未 adopt 它，处理器也无
+ * 从挂上）。这里让 rejection 只在计时器触发时产生，调用方（测试）可在
+ * 计时器前先行挂处理器，杜绝 unhandled rejection。
+ */
+function delayReject(error: Error): Promise<never> {
+  return new Promise((_, reject) => setTimeout(() => reject(error), LATENCY_MS));
+}
+
 function nowStamp(): string {
   return new Date().toISOString().slice(0, 19) + "Z";
 }
@@ -65,7 +78,7 @@ export class MockAdapter implements LightKeyIpc {
 
   async unlock(masterPassword: string): Promise<void> {
     if (masterPassword !== MOCK_MASTER_PASSWORD) {
-      return delay(Promise.reject(new VaultInvalidError()));
+      return delayReject(new VaultInvalidError());
     }
     this.resetStore(true);
     this.unlocked = true;
@@ -90,7 +103,7 @@ export class MockAdapter implements LightKeyIpc {
   async get(id: string): Promise<Item> {
     this.requireUnlocked();
     const it = this.items.find((x) => x.id === id);
-    if (!it) return delay(Promise.reject(new Error("item.not_found")));
+    if (!it) return delayReject(new Error("item.not_found"));
     // 返回副本：前端持有的条目与 mock 库隔离，模拟真实 IPC 的序列化边界
     // （否则外部修改会经共享引用泄漏进前端 state，CAS 冲突无法复现）
     return delay(structuredClone(it));
@@ -106,10 +119,10 @@ export class MockAdapter implements LightKeyIpc {
   async update(id: string, draft: ItemDraft, opts?: UpdateOptions): Promise<Item> {
     this.requireUnlocked();
     const idx = this.items.findIndex((x) => x.id === id);
-    if (idx < 0) return delay(Promise.reject(new Error("item.not_found")));
+    if (idx < 0) return delayReject(new Error("item.not_found"));
     const current = this.items[idx];
     if (opts?.expectedRevision !== undefined && opts.expectedRevision !== current.revision) {
-      return delay(Promise.reject(new ConflictError()));
+      return delayReject(new ConflictError());
     }
     const updated = { ...draft, id, revision: nowStamp() } as Item;
     this.items[idx] = updated;

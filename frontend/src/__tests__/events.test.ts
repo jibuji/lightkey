@@ -107,8 +107,15 @@ describe("session.unlocked / session.locked —— 会话切换", () => {
     const states: string[] = [];
     ctx.on("session.unlocked", () => states.push("unlocked"));
     const unlockPromise = ctx.session.unlock("wrong");
+    // 同步挂拒绝处理：mock 的 300ms 延迟在 advanceTimers 期间触发 reject，
+    // 处理器必须先于计时器存在（否则产生 unhandled rejection——CI 环境
+    // 的 unhandled-rejection 检查先于下方断言触发，本地时序则碰巧通过）。
+    const rejection = unlockPromise.catch((err: unknown) => err);
     await vi.advanceTimersByTimeAsync(300);
-    await expect(unlockPromise).rejects.toThrow("vault.invalid");
+    await expect(rejection).resolves.toMatchObject({
+      name: "VaultInvalidError",
+      message: "vault.invalid",
+    });
     expect(ctx.session.unlocked).toBe(false);
     expect(states).toEqual([]);
   });
