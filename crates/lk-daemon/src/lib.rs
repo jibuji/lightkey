@@ -22,6 +22,7 @@
 //!   客户端自报字段一律不信任。
 
 pub mod config;
+pub mod dirs;
 pub mod notifier;
 pub mod sync;
 pub mod transport;
@@ -414,6 +415,15 @@ impl Daemon {
         let shared = Arc::clone(&self.shared);
         let mut vault = shared.vault.write().unwrap();
         self.lock_internal_locked(&mut vault, reason);
+    }
+
+    /// 带原因的锁定（M2 desktop：锁屏自动锁定 `LockReason::Lockscreen`）。
+    ///
+    /// 桌面壳在进程内直接调用（不经 IPC，避免引入协议面）：锁屏检测线程
+    /// → `lock_with_reason(Lockscreen)` → 事件总线广播 `session.locked`
+    /// （reason=lockscreen）→ 通知桥推送给订阅中的前端。
+    pub fn lock_with_reason(&mut self, reason: LockReason) {
+        self.lock_internal_with(reason);
     }
 
     /// 锁定（调用方已持 vault 写锁；供锁定/恢复/强制重置共用）。
