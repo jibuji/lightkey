@@ -9,6 +9,7 @@
  */
 
 import type { Context, Plugin } from "@cordisjs/core";
+import { CLIPBOARD_CLEAR_MS } from "../events";
 import type { ToastMessage, ToastService } from "../services/types";
 
 export const CLIPBOARD_TOAST_TEXT = "已复制，30 秒后自动清除";
@@ -28,7 +29,7 @@ export const toast: Plugin.Function<Context> = Object.assign((ctx: Context) => {
     const message: ToastMessage = {
       id,
       text,
-      clearedAt: clearedAt ?? new Date(Date.now() + 30_000).toISOString(),
+      clearedAt: clearedAt ?? new Date(Date.now() + CLIPBOARD_CLEAR_MS).toISOString(),
     };
     toasts = [...toasts, message];
     // 自动清除（默认 30s；`clipboard.copied` 的 clearedAt 由发送方给出）
@@ -36,7 +37,7 @@ export const toast: Plugin.Function<Context> = Object.assign((ctx: Context) => {
       toasts = toasts.filter((t) => t.id !== id);
       timers.delete(id);
       notify();
-    }, 30_000);
+    }, CLIPBOARD_CLEAR_MS);
     timers.set(id, timer);
     notify();
     return id;

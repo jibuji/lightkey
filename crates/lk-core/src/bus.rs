@@ -12,7 +12,7 @@
 //!
 //! | 事件 | 负载 | 发送方（插件边界） | 监听者 |
 //! |------|------|--------------------|--------|
-//! | [`VaultEvent::ItemChanged`] | `{ itemId, revisionDate, kind, deleted }` | vault-store（A） | sync-engine（B）· audit（A）· ui-vault（D） |
+//! | [`VaultEvent::ItemChanged`] | `{ itemId, revisionDate, kind, deleted }`（`kind` = 协议字段 `type`，`type` 为 Rust 关键字故用 `kind`；M2 IPC 通知桥序列化时映射回 `type`） | vault-store（A） | sync-engine（B）· audit（A）· ui-vault（D） |
 //! | [`VaultEvent::SessionUnlocked`] | `{ via }` | session（A） | ui 各插件（D）· sync-engine（B） |
 //! | [`VaultEvent::SessionLocked`] | `{ reason }` | session（A） | ui 各插件（D）· sync-engine（B） |
 //!
@@ -73,6 +73,8 @@ pub enum VaultEvent {
     ItemChanged {
         item_id: uuid::Uuid,
         revision_date: String,
+        /// 条目类型（login/note/secret/file）；协议字段为 `type`
+        /// （`type` 是 Rust 关键字，故内部用 `kind`）。
         kind: String,
         deleted: bool,
     },
