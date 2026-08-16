@@ -388,7 +388,7 @@ pub fn resolve_peer_cwd(pid: u32) -> Option<String> {
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
-        if handle == std::ptr::null_mut() {
+        if handle.is_null() {
             return None;
         }
         let result = (|| {
@@ -433,7 +433,7 @@ pub fn resolve_peer_cwd(pid: u32) -> Option<String> {
             if cwd.Buffer.is_null() || cwd.Length == 0 {
                 return None;
             }
-            let mut buf = vec![0u16; (cwd.Length as usize + 1) / 2];
+            let mut buf = vec![0u16; (cwd.Length as usize).div_ceil(2)];
             if ReadProcessMemory(
                 handle,
                 cwd.Buffer as *const _,
