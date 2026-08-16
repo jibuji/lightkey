@@ -622,7 +622,7 @@ mod tests {
         eprintln!("DIAG pid={pid}");
         eprintln!("DIAG session_ok={}", peer_session_ok(pid));
         let mut p = pid;
-        for i in 0..10 {
+        for i in 0..40 {
             match t.process_name(p) {
                 Some(n) => eprintln!("DIAG [{i}] {p} name={n:?}"),
                 None => {
