@@ -622,7 +622,7 @@ mod imp {
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
 
-    pub(crate) struct PipeStream {
+    pub struct PipeStream {
         handle: SendHandle,
     }
 
