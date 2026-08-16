@@ -1,0 +1,69 @@
+# cordis.yml —— 应用数据（随应用发布的声明式装配契约）
+# docs/plugin-architecture.md §6.2
+#
+# 只描述「用哪个插件、怎么组合、传什么配置」；不含逻辑；运行时不可变。
+# 条目字段：name（插件名，注册表 key）/ config（插件配置，经 @cordisjs/schema
+# 校验）/ slot（槽位）/ order（槽位内顺序）/ page（content 页面路由）。
+# 无 slot 的插件是服务（ipc-bridge / preference-store / theme / toast），
+# 被其他插件 inject 消费，不直接占槽位。
+# M2 新增 ui-unlock / ui-vault / ui-rules / ui-settings / ui-audit /
+# desktop-shell / approval 即在此增删（数据驱动落点）。
+
+# 服务（地基）
+- name: ipc-bridge
+- name: preference-store
+- name: theme
+  config:
+    defaultTheme: dark
+- name: toast
+
+# 槽位组件（组件 = 插件条目；slot/order = 布局数据）
+# sidebar：导航项（导航项本身也是组件）+ 底部锁定
+- name: nav-vault
+  slot: sidebar
+  order: 1
+  page: vault
+- name: nav-rules
+  slot: sidebar
+  order: 2
+  page: rules
+- name: nav-settings
+  slot: sidebar
+  order: 3
+  page: settings
+- name: nav-audit
+  slot: sidebar
+  order: 4
+  page: audit
+- name: lock
+  slot: sidebar
+  order: 99
+
+# topbar：搜索 + 同步状态 + 主题切换
+- name: search
+  slot: topbar
+  order: 1
+- name: sync-status
+  slot: topbar
+  order: 2
+- name: theme-toggle
+  slot: topbar
+  order: 3
+
+# content：页面（M2 由 ui-* 插件替换实现）
+- name: page-vault
+  slot: content
+  order: 1
+  page: vault
+- name: page-rules
+  slot: content
+  order: 2
+  page: rules
+- name: page-settings
+  slot: content
+  order: 3
+  page: settings
+- name: page-audit
+  slot: content
+  order: 4
+  page: audit

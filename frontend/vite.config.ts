@@ -17,4 +17,6 @@ export default defineConfig({
     target: "es2021",
     outDir: "dist",
   },
+  // cordis.yml 以 `?raw` 形式随应用打包（装配契约；yml 非默认资产类型）
+  assetsInclude: ["**/*.yml"],
 });
