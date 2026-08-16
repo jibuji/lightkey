@@ -26,8 +26,8 @@ use crate::crypto::{
     Keys, SealType, VaultHeader,
 };
 use crate::model::{
-    AttachmentBundle, AttachmentMeta, IndexEntry, Item, ItemDraft, ItemSummary, ObjectKind,
-    Tombstone, CHUNK_BYTES, MAX_FILE_BYTES, TOMBSTONE_GRACE,
+    AttachmentBundle, AttachmentMeta, IndexEntry, Item, ItemDraft, ItemKind, ItemSummary,
+    ObjectKind, Rule, RuleDraft, Tombstone, CHUNK_BYTES, MAX_FILE_BYTES, TOMBSTONE_GRACE,
 };
 use crate::recovery::{RecoveryCode, RecoveryEnvelope};
 use crate::{Error, Result};
@@ -45,6 +45,9 @@ pub const ENVELOPE_FILE: &str = "recovery.envelope";
 
 fn item_file(dir: &Path, id: uuid::Uuid) -> PathBuf {
     dir.join(format!("{id}.item.lk"))
+}
+fn rule_file(dir: &Path, id: uuid::Uuid) -> PathBuf {
+    dir.join(format!("{id}.rule.lk"))
 }
 fn tomb_file(dir: &Path, id: uuid::Uuid) -> PathBuf {
     dir.join(format!("{id}.tomb.lk"))
@@ -187,6 +190,7 @@ fn wipe_vault_files(dir: &Path) -> Result<()> {
             || name == INDEX_FILE
             || name == ENVELOPE_FILE
             || name.ends_with(".item.lk")
+            || name.ends_with(".rule.lk")
             || name.ends_with(".tomb.lk")
             || name.ends_with(".attach.lk")
             || name.ends_with(".chunk.lk");
@@ -293,6 +297,12 @@ impl UnlockedVault {
         std::fs::read(&path).map_err(|_| Error::ItemNotFound(id))
     }
 
+    /// 规则密文原文（同步上传用，不重加密）。
+    pub fn rule_blob(&self, id: uuid::Uuid) -> Result<Vec<u8>> {
+        let path = rule_file(&self.dir, id);
+        std::fs::read(&path).map_err(|_| Error::ItemNotFound(id))
+    }
+
     /// 墓碑密文原文（可能不存在——远端墓碑缺失时由引擎合成）。
     pub fn tomb_blob(&self, id: uuid::Uuid) -> Result<Vec<u8>> {
         let path = tomb_file(&self.dir, id);
@@ -337,6 +347,36 @@ impl UnlockedVault {
         self.save_index()
     }
 
+    /// 拉取规则落盘（原样密文；revision/deleted 以远端索引为准——规则体无
+    /// revision 字段，修订号只在索引内）。
+    pub(crate) fn import_rule(
+        &mut self,
+        blob: &[u8],
+        rule: &Rule,
+        revision: &str,
+        deleted: bool,
+    ) -> Result<()> {
+        let id = rule.id;
+        write_atomic(&rule_file(&self.dir, id), blob)?;
+        self.index.insert(
+            id,
+            IndexEntry {
+                id,
+                revision: revision.to_string(),
+                kind: ObjectKind::Rule,
+                deleted,
+            },
+        );
+        if let Some(last) = &self.last_revision {
+            if revision > last.as_str() {
+                self.last_revision = Some(revision.to_string());
+            }
+        } else {
+            self.last_revision = Some(revision.to_string());
+        }
+        self.save_index()
+    }
+
     /// 拉取墓碑落盘（原样密文）。
     pub(crate) fn import_tomb(&self, blob: &[u8], tomb: &Tombstone) -> Result<()> {
         write_atomic(&tomb_file(&self.dir, tomb.id), blob)
@@ -356,12 +396,13 @@ impl UnlockedVault {
         Ok(())
     }
 
-    /// 硬删（同步确认后）：条目 + 墓碑 + 附件密文 + 索引条目。
+    /// 硬删（同步确认后）：条目/规则 + 墓碑 + 附件密文 + 索引条目。
     /// 不做 30 天检查（由同步引擎按「已同步确认」语义裁决后调用）。
     pub(crate) fn hard_delete(&mut self, id: uuid::Uuid) -> Result<()> {
-        // 先读条目取附件 id（file 条目）：删掉 .item.lk 后即无从获取（G1 同款顺序）
+        // 先读条目取附件 id（file 条目）：删掉 `.item.lk` 后即无从获取（G1 同款顺序）
         let attach_id = self.read_item_file(id).ok().and_then(|i| i.attach_id());
         fs::remove_file(item_file(&self.dir, id)).ok();
+        fs::remove_file(rule_file(&self.dir, id)).ok();
         fs::remove_file(tomb_file(&self.dir, id)).ok();
         self.remove_attachment(attach_id)?;
         self.index.remove(&id);
@@ -429,24 +470,45 @@ impl UnlockedVault {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".item.lk") {
-                continue;
+            if name.ends_with(".item.lk") {
+                let bytes = fs::read(entry.path())?;
+                let item: Item = match open(keys.k_data.as_ref(), SealType::Item, &name, &bytes)
+                    .and_then(|pt| Ok(serde_json::from_slice(&pt)?))
+                {
+                    Ok(item) => item,
+                    Err(_) => continue, // 单条损坏跳过（与索引损坏同语义：不阻塞解锁）
+                };
+                let e = IndexEntry {
+                    id: item.id(),
+                    revision: item.revision().to_string(),
+                    kind: ObjectKind::Item,
+                    deleted: item.deleted(),
+                };
+                index.insert(e.id, e.clone());
+                entries.push(e);
+            } else if name.ends_with(".rule.lk") {
+                // 规则随同一索引重建（data-model.md §6；损坏跳过，不阻塞解锁）。
+                // 规则体无 deleted 字段：软删状态从墓碑恢复（revision 同源）。
+                let bytes = fs::read(entry.path())?;
+                let rule: Rule = match open(keys.k_data.as_ref(), SealType::Rule, &name, &bytes)
+                    .and_then(|pt| Ok(serde_json::from_slice(&pt)?))
+                {
+                    Ok(rule) => rule,
+                    Err(_) => continue,
+                };
+                let tomb_state = Self::read_tomb(dir, keys, &format!("{}.tomb.lk", rule.id))
+                    .ok()
+                    .map(|t| (t.revision, true));
+                let (revision, deleted) = tomb_state.unwrap_or_else(|| (now_iso(), false));
+                let e = IndexEntry {
+                    id: rule.id,
+                    revision,
+                    kind: ObjectKind::Rule,
+                    deleted,
+                };
+                index.insert(e.id, e.clone());
+                entries.push(e);
             }
-            let bytes = fs::read(entry.path())?;
-            let item: Item = match open(keys.k_data.as_ref(), SealType::Item, &name, &bytes)
-                .and_then(|pt| Ok(serde_json::from_slice(&pt)?))
-            {
-                Ok(item) => item,
-                Err(_) => continue, // 单条损坏跳过（与索引损坏同语义：不阻塞解锁）
-            };
-            let e = IndexEntry {
-                id: item.id(),
-                revision: item.revision().to_string(),
-                kind: ObjectKind::Item,
-                deleted: item.deleted(),
-            };
-            index.insert(e.id, e.clone());
-            entries.push(e);
         }
         entries.sort_by_key(|e| e.id);
         let sealed = seal(
@@ -705,7 +767,206 @@ impl UnlockedVault {
         Ok(tomb)
     }
 
-    /// 30 天延迟硬删：删除条目 + 墓碑 + 附件密文（同步确认口留给 M1）。
+    // -- 规则（M2；`docs/authorization-gate.md` §4）--------------------------
+    // 规则 = vault 内加密对象（`{uuid}.rule.lk`，K_data 密封），与条目同一
+    // 索引/轮询路径同步（data-model.md §6）。唯一写入路径：`lk rule add` +
+    // 桌面规则页；不开放手动改加密文件；规则变更写审计 + 广播
+    // `item.changed(kind="rule")`（决策 #6）。软删/墓碑/30 天硬删与条目同路径
+    // （删除在多端传播）。
+
+    /// `item.changed(kind="rule")` 观察广播（决策 #6：规则变更复用该事件）。
+    fn emit_rule_changed(&self, rule_id: uuid::Uuid, revision: &str, deleted: bool) {
+        if let Some(bus) = &self.bus {
+            bus.emit(&VaultEvent::ItemChanged {
+                item_id: rule_id,
+                revision_date: revision.to_string(),
+                kind: "rule".to_string(),
+                deleted,
+            });
+        }
+    }
+
+    fn read_rule_file(&self, id: uuid::Uuid) -> Result<Rule> {
+        let path = rule_file(&self.dir, id);
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let bytes = fs::read(&path).map_err(|_| Error::ItemNotFound(id))?;
+        let pt = open(self.keys.k_data.as_ref(), SealType::Rule, &name, &bytes)?;
+        Ok(serde_json::from_slice(&pt)?)
+    }
+
+    fn write_rule_file(&self, rule: &Rule) -> Result<()> {
+        let path = rule_file(&self.dir, rule.id);
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let blob = seal(
+            self.keys.k_data.as_ref(),
+            SealType::Rule,
+            &name,
+            &rule.to_plaintext()?,
+        );
+        write_atomic(&path, &blob)
+    }
+
+    /// 新建/替换规则（`id=None` = 新建；`Some` = 替换，保留 created）。
+    /// 规则体无 revision（规格字段集），修订号在索引内（`next_revision`）。
+    pub fn put_rule(&mut self, draft: RuleDraft, id: Option<uuid::Uuid>) -> Result<Rule> {
+        if !std::path::Path::new(&draft.project_dir).is_absolute() {
+            return Err(Error::Other("projectDir 必须是绝对路径".into()));
+        }
+        let existing = match id {
+            Some(id) => Some(self.read_rule_file(id)?),
+            None => None,
+        };
+        let rule = Rule {
+            id: id.unwrap_or_else(random_uuid),
+            project_dir: draft.project_dir,
+            name: draft.name,
+            command: draft.command,
+            keys: draft.keys,
+            created: existing.map(|r| r.created).unwrap_or_else(now_iso),
+        };
+        let rev = self.next_revision();
+        self.write_rule_file(&rule)?;
+        self.index.insert(
+            rule.id,
+            IndexEntry {
+                id: rule.id,
+                revision: rev.clone(),
+                kind: ObjectKind::Rule,
+                deleted: false,
+            },
+        );
+        self.save_index()?;
+        self.emit_rule_changed(rule.id, &rev, false);
+        Ok(rule)
+    }
+
+    /// 全部解密态规则（**不含已删除**；解密失败 → `Err`——规则库损坏
+    /// fail-closed，授权门第 1 层据此拒绝）。
+    pub fn list_rules(&self) -> Result<Vec<Rule>> {
+        let mut out = Vec::new();
+        let mut ids: Vec<uuid::Uuid> = self
+            .index
+            .iter()
+            .filter(|(_, e)| e.kind == ObjectKind::Rule && !e.deleted)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort();
+        for id in ids {
+            out.push(self.read_rule_file(id)?);
+        }
+        Ok(out)
+    }
+
+    /// 单条规则（含已删除——`rule.get`/同步 LWW 复核用）。
+    pub fn get_rule(&self, id: uuid::Uuid) -> Result<Rule> {
+        self.read_rule_file(id)
+    }
+
+    /// 按 key 名解析 secret 条目值（授权门用）：未删除的 secret 条目按
+    /// 名称精确匹配；不存在/非 secret/已删除 → `Ok(None)`。
+    /// 文件缺失的条目跳过（list() 自愈剔除；授权门按「无法解析」处理）。
+    pub fn find_secret_by_name(&self, name: &str) -> Result<Option<String>> {
+        Ok(self.secret_values()?.remove(name))
+    }
+
+    /// 全部未删除 secret 条目（name → value；单次扫描，授权门批量解析用）。
+    /// 文件缺失的条目跳过。
+    pub fn secret_values(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut ids: Vec<uuid::Uuid> = self
+            .index
+            .iter()
+            .filter(|(_, e)| e.kind == ObjectKind::Item && !e.deleted)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort();
+        let mut out = std::collections::HashMap::new();
+        for id in ids {
+            let Ok(item) = self.read_item_file(id) else {
+                continue;
+            };
+            if item.kind() == ItemKind::Secret {
+                if let Item::Secret { name, value, .. } = item {
+                    out.insert(name, value);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 规则当前修订号（索引内；不存在 → `None`）。
+    pub fn rule_revision(&self, id: uuid::Uuid) -> Option<String> {
+        self.index.get(&id).map(|e| e.revision.clone())
+    }
+
+    /// 软删除规则（墓碑；30 天延迟硬删；删除随同步传播——与条目同路径）。
+    pub fn delete_rule(&mut self, id: uuid::Uuid) -> Result<Tombstone> {
+        self.read_rule_file(id)?; // 不存在 → ItemNotFound
+        if self.index.get(&id).map(|e| e.deleted).unwrap_or(false) {
+            // 幂等：已删除 → 返回既有墓碑
+            let path = tomb_file(&self.dir, id);
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            return match fs::read(&path) {
+                Ok(bytes) => {
+                    let pt = open(
+                        self.keys.k_data.as_ref(),
+                        SealType::Tombstone,
+                        &name,
+                        &bytes,
+                    )?;
+                    Ok(serde_json::from_slice(&pt)?)
+                }
+                Err(_) => Ok(Tombstone {
+                    id,
+                    deleted_at: now_iso(),
+                    revision: self
+                        .index
+                        .get(&id)
+                        .map(|e| e.revision.clone())
+                        .unwrap_or_else(now_iso),
+                }),
+            };
+        }
+        let rev = self.next_revision();
+        if let Some(e) = self.index.get_mut(&id) {
+            e.deleted = true;
+            e.revision = rev.clone();
+        }
+        let tomb = Tombstone {
+            id,
+            deleted_at: now_iso(),
+            revision: rev.clone(),
+        };
+        let path = tomb_file(&self.dir, id);
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let blob = seal(
+            self.keys.k_data.as_ref(),
+            SealType::Tombstone,
+            &name,
+            &serde_json::to_vec(&tomb)?,
+        );
+        write_atomic(&path, &blob)?;
+        self.save_index()?;
+        self.emit_rule_changed(id, &rev, true);
+        Ok(tomb)
+    }
+
+    /// 30 天延迟硬删：删除条目/规则 + 墓碑 + 附件密文（同步确认口留给 M1）。
     pub fn purge_expired(&mut self, now: &str) -> Result<usize> {
         let now = parse_iso(now).unwrap_or_else(time::OffsetDateTime::now_utc);
         let mut purged = 0usize;
@@ -734,6 +995,7 @@ impl UnlockedVault {
             // 删掉 `.item.lk` 后即无从获取——顺序不可颠倒（G1）。
             let attach_id = self.read_item_file(id).ok().and_then(|i| i.attach_id());
             fs::remove_file(item_file(&self.dir, id)).ok();
+            fs::remove_file(rule_file(&self.dir, id)).ok();
             fs::remove_file(tomb_file(&self.dir, id)).ok();
             self.remove_attachment(attach_id)?;
             self.index.remove(&id);
@@ -937,6 +1199,8 @@ pub fn recover_vault_with_params(
         let name = entry.file_name().to_string_lossy().to_string();
         let kind = if name.ends_with(".item.lk") {
             SealType::Item
+        } else if name.ends_with(".rule.lk") {
+            SealType::Rule
         } else if name.ends_with(".tomb.lk") {
             SealType::Tombstone
         } else if name.ends_with(".attach.lk") {
@@ -1530,6 +1794,131 @@ mod tests {
         drop(v2);
         let mut v3 = unlock_vault(dir.path(), "pw").unwrap();
         assert_eq!(v3.list().unwrap().len(), n_before);
+    }
+
+    /// M2：规则 CRUD——落盘形态（{uuid}.rule.lk 密封）、索引 kind=Rule、
+    /// 广播 item.changed(kind="rule")、软删墓碑、恢复重加密、索引重建保留。
+    #[test]
+    fn rule_crud_seal_recover_and_rebuild() {
+        let (dir, audit, code) = temp_vault("rules");
+        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        // 新建
+        let proj = std::env::temp_dir()
+            .join("lk-test-proj")
+            .to_string_lossy()
+            .to_string();
+        let rule = v
+            .put_rule(
+                RuleDraft {
+                    project_dir: proj.clone(),
+                    name: "publish".into(),
+                    command: "npm publish".into(),
+                    keys: vec!["NPM_TOKEN".into()],
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(rule.name, "publish");
+        // 落盘：{uuid}.rule.lk 且为密文（非明文 JSON）
+        let path = dir.path().join(format!("{}.rule.lk", rule.id));
+        assert!(path.exists());
+        let blob = std::fs::read(&path).unwrap();
+        assert!(!blob
+            .windows(b"npm publish".len())
+            .any(|w| w == b"npm publish"));
+        // 索引含 kind=Rule
+        assert!(v
+            .index_snapshot()
+            .iter()
+            .any(|e| e.id == rule.id && e.kind == ObjectKind::Rule));
+        // 列表/取值
+        assert_eq!(v.list_rules().unwrap().len(), 1);
+        assert_eq!(v.get_rule(rule.id).unwrap().name, "publish");
+        // 广播 item.changed(kind="rule")（决策 #6）
+        let bus = Arc::new(crate::bus::EventBus::new());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let e = Arc::clone(&events);
+        bus.subscribe(Arc::new(crate::bus::FnSink::new(move |ev| {
+            e.lock().unwrap().push(ev.clone());
+        })));
+        v.attach_bus(bus);
+        v.put_rule(
+            RuleDraft {
+                project_dir: proj,
+                name: "publish2".into(),
+                command: "npm *".into(),
+                keys: vec!["A".into(), "B".into()],
+            },
+            Some(rule.id),
+        )
+        .unwrap();
+        v.delete_rule(rule.id).unwrap();
+        let seen = events.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        match &seen[0] {
+            crate::bus::VaultEvent::ItemChanged { kind, deleted, .. } => {
+                assert_eq!(kind, "rule");
+                assert!(!deleted);
+            }
+            other => panic!("应广播 item.changed(kind=rule)：{other:?}"),
+        }
+        match &seen[1] {
+            crate::bus::VaultEvent::ItemChanged { kind, deleted, .. } => {
+                assert_eq!(kind, "rule");
+                assert!(deleted, "软删广播 deleted=true");
+            }
+            other => panic!("应广播 item.changed(kind=rule, deleted)：{other:?}"),
+        }
+        // 软删：墓碑 + 列表不再含
+        assert!(dir.path().join(format!("{}.tomb.lk", rule.id)).exists());
+        assert_eq!(v.list_rules().unwrap().len(), 0);
+        // 索引重建保留规则（含已删除标记由重建语义决定：重建不含 deleted 信息）
+        drop(v);
+        let idx = dir.path().join(INDEX_FILE);
+        let mut bytes = std::fs::read(&idx).unwrap();
+        bytes[10] ^= 0xFF;
+        std::fs::write(&idx, &bytes).unwrap();
+        let v2 = unlock_vault(dir.path(), "pw").unwrap();
+        assert!(v2
+            .index_snapshot()
+            .iter()
+            .any(|e| e.id == rule.id && e.kind == ObjectKind::Rule));
+        drop(v2);
+        // 恢复：规则密文随重加密换钥（旧钥打不开新密文）
+        drop(audit);
+        let new_code = recover_vault_with_params(
+            dir.path(),
+            &RecoveryCode::parse(&code).unwrap(),
+            "newpw",
+            &mut AuditLog::open(dir.path()).unwrap(),
+            &crypto::test_kdf_params(),
+        )
+        .unwrap();
+        assert_ne!(new_code.display(), code);
+        let v3 = unlock_vault(dir.path(), "newpw").unwrap();
+        let rules = v3.list_rules().unwrap();
+        assert_eq!(rules.len(), 0, "恢复后软删规则仍删除");
+        assert!(v3
+            .index_snapshot()
+            .iter()
+            .any(|e| e.id == rule.id && e.kind == ObjectKind::Rule));
+        // 旧钥打不开新规则密文（已换钥）
+        let blob = std::fs::read(dir.path().join(format!("{}.rule.lk", rule.id))).unwrap();
+        let old_keys = {
+            let mk = load_header(dir.path())
+                .unwrap()
+                .kdf
+                .derive_master_key("pw")
+                .unwrap();
+            mk.derive_keys()
+        };
+        assert!(open(
+            old_keys.k_data.as_ref(),
+            SealType::Rule,
+            &format!("{}.rule.lk", rule.id),
+            &blob,
+        )
+        .is_err());
     }
 
     #[test]

@@ -4,21 +4,22 @@
 # 从零自研路线（把 Bitwarden 当技术规格书照抄设计，不抄代码、不 fork、不以其为底座）。
 #
 # Crate 布局（决议集：核心 crate + CLI + Tauri 桌面壳 + React 前端）：
-#   crates/lk-core  核心库：加密、数据模型、同步、授权门、审计、IPC 协议类型
-#   crates/lk-cli   CLI（`lk`），复用 lk-core；`lk daemon` 宿主守护进程
-#   crates/lk-app   Tauri 2 桌面壳，复用 lk-core
+#   crates/lk-core    核心库：加密、数据模型、同步、授权门、审计、IPC 协议类型
+#   crates/lk-daemon  C 层守护进程宿主（决策 #2 A：下沉共享，CLI 与桌面内置实例复用）
+#   crates/lk-cli     CLI（`lk`），复用 lk-core + lk-daemon；`lk daemon` 入口
+#   crates/lk-app     Tauri 2 桌面壳，复用 lk-core（M2 桌面任务起复用 lk-daemon）
 #   frontend/       React + TypeScript 前端（Vite 构建）
 #
 # 详细设计见 docs/（docs/README.md 是文档索引）。
 
 [workspace]
 resolver = "2"
-members = ["crates/lk-core", "crates/lk-cli", "crates/lk-app"]
+members = ["crates/lk-core", "crates/lk-daemon", "crates/lk-cli", "crates/lk-app"]
 
-# 默认成员 = 核心 + CLI（在任意平台可直接 `cargo test` / `cargo check`）。
+# 默认成员 = 核心 + daemon + CLI（在任意平台可直接 `cargo test` / `cargo check`）。
 # `lk-app`（Tauri）需要平台系统依赖（Linux 需 webkit2gtk），由 CI 在
 # Windows 上以 `--workspace` 显式检查（补充拍板 #4）。
-default-members = ["crates/lk-core", "crates/lk-cli"]
+default-members = ["crates/lk-core", "crates/lk-daemon", "crates/lk-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -66,12 +67,14 @@ proptest = "1"                                  # 属性测试：加密往返 / 
 proptest-derive = "1"
 tempfile = "3"                                  # 测试用临时 vault 目录
 
-# --- Windows named pipe（lk-cli，cfg(windows)）---
+# --- Windows named pipe（lk-cli / lk-daemon / lk-core starter，cfg(windows)）---
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
 ] }

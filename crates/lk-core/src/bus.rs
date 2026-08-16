@@ -70,10 +70,11 @@ impl LockReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultEvent {
     /// `item.changed`：条目新建/更新（`deleted=false`）或软删除（`deleted=true`）。
+    /// M2 起规则变更同样广播本事件（`kind="rule"`，决策 #6）。
     ItemChanged {
         item_id: uuid::Uuid,
         revision_date: String,
-        /// 条目类型（login/note/secret/file）；协议字段为 `type`
+        /// 对象类型（login/note/secret/file/rule）；协议字段为 `type`
         /// （`type` 是 Rust 关键字，故内部用 `kind`）。
         kind: String,
         deleted: bool,
@@ -82,6 +83,16 @@ pub enum VaultEvent {
     SessionUnlocked { via: SessionVia },
     /// `session.locked`：锁定（令牌已失效、密钥已擦除）。
     SessionLocked { reason: LockReason },
+    /// `authz.request`（M2）：授权门进入第 3 层弹窗审批——「需要用户决策」
+    /// 的通知（plugin-architecture.md §5.3）；决策权始终在 Rust 侧，
+    /// 用户选择经 `approval.result` 回传。`keys` 仅 key 名，永不含值。
+    AuthzRequest {
+        request_id: uuid::Uuid,
+        starter: String,
+        project_dir: String,
+        command: String,
+        keys: Vec<String>,
+    },
 }
 
 impl VaultEvent {
@@ -91,6 +102,7 @@ impl VaultEvent {
             VaultEvent::ItemChanged { .. } => "item.changed",
             VaultEvent::SessionUnlocked { .. } => "session.unlocked",
             VaultEvent::SessionLocked { .. } => "session.locked",
+            VaultEvent::AuthzRequest { .. } => "authz.request",
         }
     }
 }
@@ -236,5 +248,16 @@ mod tests {
         assert_eq!(LockReason::Timeout.as_str(), "timeout");
         assert_eq!(LockReason::Lockscreen.as_str(), "lockscreen");
         assert_eq!(LockReason::DaemonExit.as_str(), "daemon-exit");
+        assert_eq!(
+            VaultEvent::AuthzRequest {
+                request_id: uuid::Uuid::nil(),
+                starter: "s".into(),
+                project_dir: "/p".into(),
+                command: "npm publish".into(),
+                keys: vec!["NPM_TOKEN".into()],
+            }
+            .name(),
+            "authz.request"
+        );
     }
 }

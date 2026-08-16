@@ -2401,15 +2401,13 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "hex",
- "keyring",
- "libc",
  "lk-core",
+ "lk-daemon",
  "rpassword",
  "serde",
  "serde_json",
  "tempfile",
  "uuid",
- "windows-sys 0.59.0",
  "zeroize",
 ]
 
@@ -2423,6 +2421,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "proptest",
  "quick-xml 0.37.5",
  "rand 0.8.7",
@@ -2434,6 +2433,26 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "uuid",
+ "windows-sys 0.59.0",
+ "zeroize",
+]
+
+[[package]]
+name = "lk-daemon"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "keyring",
+ "libc",
+ "lk-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "uuid",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

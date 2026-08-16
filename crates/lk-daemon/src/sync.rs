@@ -7,12 +7,15 @@
 //!
 //! 锁/恢复竞态（密钥已变）→ 本轮放弃（Err），下一轮重试。
 //! 水位/摘要/风暴等级在锁外持久化（`sync-state.json`）。
+//!
+//! M2：规则与条目同路径同步（视图新增 `rule*` 读取面）。
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use lk_core::crypto::Keys;
 use lk_core::ipc::*;
+use lk_core::model::{IndexEntry, Item, Rule, Tombstone};
 use lk_core::storage::{backend_from_url, StorageBackend};
 use lk_core::sync::{storm_level_after, SyncEngine};
 use lk_core::vault::UnlockedVault;
@@ -53,24 +56,45 @@ impl lk_core::sync::VaultRead for LockedVaultView {
         self.keys.clone()
     }
 
-    fn index_snapshot(&self) -> lk_core::Result<Vec<lk_core::model::IndexEntry>> {
+    fn index_snapshot(&self) -> lk_core::Result<Vec<IndexEntry>> {
         let v = self.vault.read().unwrap();
         v.as_ref()
             .map(|v| v.index_snapshot())
             .ok_or(Error::SessionInvalid)
     }
 
-    fn item(&self, id: uuid::Uuid) -> lk_core::Result<lk_core::model::Item> {
+    fn item(&self, id: uuid::Uuid) -> lk_core::Result<Item> {
         let v = self.vault.read().unwrap();
         v.as_ref().ok_or(Error::SessionInvalid)?.get(id)
     }
 
-    fn item_with_blob(&self, id: uuid::Uuid) -> lk_core::Result<(lk_core::model::Item, Vec<u8>)> {
+    fn item_with_blob(&self, id: uuid::Uuid) -> lk_core::Result<(Item, Vec<u8>)> {
         let v = self.vault.read().unwrap();
         let v = v.as_ref().ok_or(Error::SessionInvalid)?;
         let item = v.get(id)?;
         let blob = v.item_blob(id)?;
         Ok((item, blob))
+    }
+
+    fn rule(&self, id: uuid::Uuid) -> lk_core::Result<Rule> {
+        let v = self.vault.read().unwrap();
+        v.as_ref().ok_or(Error::SessionInvalid)?.get_rule(id)
+    }
+
+    fn rule_with_blob(&self, id: uuid::Uuid) -> lk_core::Result<(Rule, Vec<u8>)> {
+        let v = self.vault.read().unwrap();
+        let v = v.as_ref().ok_or(Error::SessionInvalid)?;
+        let rule = v.get_rule(id)?;
+        let blob = v.rule_blob(id)?;
+        Ok((rule, blob))
+    }
+
+    fn rule_revision(&self, id: uuid::Uuid) -> Option<String> {
+        self.vault
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|v| v.rule_revision(id))
     }
 
     fn tomb_blob(&self, id: uuid::Uuid) -> lk_core::Result<Vec<u8>> {
@@ -81,7 +105,7 @@ impl lk_core::sync::VaultRead for LockedVaultView {
     fn attachment_blobs(
         &self,
         attach_id: uuid::Uuid,
-    ) -> lk_core::Result<(lk_core::model::AttachmentMeta, Vec<u8>, Vec<(u32, Vec<u8>)>)> {
+    ) -> lk_core::Result<lk_core::sync::AttachmentBlobs> {
         let v = self.vault.read().unwrap();
         let v = v.as_ref().ok_or(Error::SessionInvalid)?;
         let meta = v.attachment_meta(attach_id)?;
@@ -102,7 +126,7 @@ impl lk_core::sync::VaultRead for LockedVaultView {
             .unwrap_or_default()
     }
 
-    fn tombstones(&self) -> lk_core::Result<Vec<(uuid::Uuid, lk_core::model::Tombstone)>> {
+    fn tombstones(&self) -> lk_core::Result<Vec<(uuid::Uuid, Tombstone)>> {
         let v = self.vault.read().unwrap();
         v.as_ref()
             .map(|v| v.tombstones())
@@ -222,7 +246,7 @@ pub fn try_sync_trigger(
 }
 
 /// 同步失败分类 → IPC 错误响应（与 M1 原有映射一致）。
-pub(crate) fn sync_fail_response(id: Value, e: &SyncFail) -> RpcResponse {
+pub fn sync_fail_response(id: Value, e: &SyncFail) -> RpcResponse {
     match e {
         SyncFail::NotConfigured => {
             RpcResponse::err(id, ERR_SYNC_NOT_CONFIGURED, MSG_SYNC_NOT_CONFIGURED, None)

@@ -43,11 +43,11 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (core + cli)
-        run: cargo clippy -p lk-core -p lk-cli --all-targets -- -D warnings
+      - name: Clippy (core + daemon + cli)
+        run: cargo clippy -p lk-core -p lk-daemon -p lk-cli --all-targets -- -D warnings
 
-      - name: Test (core + cli)
-        run: cargo test -p lk-core -p lk-cli
+      - name: Test (core + daemon + cli)
+        run: cargo test -p lk-core -p lk-daemon -p lk-cli
 
       - name: Check workspace (incl. Tauri shell)
         run: cargo check --workspace

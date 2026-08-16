@@ -413,10 +413,70 @@ impl ItemDraft {
 }
 
 // ---------------------------------------------------------------------------
+// 授权规则（M2；authorization-gate.md §4）
+// ---------------------------------------------------------------------------
+
+/// 授权门白名单规则（`docs/authorization-gate.md` §4，字段含 `name`——决策 #6）。
+///
+/// - 落盘：`{uuid}.rule.lk`，K_data 密封（[`SealType::Rule`](crate::crypto::SealType::Rule)）；
+/// - 随库同步：经同一加密索引/轮询路径（[`ObjectKind::Rule`]，data-model.md §6）；
+/// - 规则体内无 `revision`（规格字段集），修订号只在索引（[`IndexEntry`]）内；
+/// - 唯一写入路径：`lk rule add`（CLI）+ 桌面规则管理页（M2 desktop）；
+///   不开放手动改加密文件；规则变更写审计。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Rule {
+    pub id: Uuid,
+    /// 规范化绝对路径（`lk rule add` 时 canonicalize）。
+    pub project_dir: String,
+    /// 规则名（决策 #6；与前端 AuthRule.name 对齐）。
+    pub name: String,
+    /// 具名命令，可 glob（如 `npm publish` 精确、`npm *` 通配；大小写敏感）。
+    pub command: String,
+    /// 授权注入的 key 名（最小集合）。
+    pub keys: Vec<String>,
+    /// 创建时间（ISO-8601 UTC；替换时保留）。
+    pub created: String,
+}
+
+/// 规则草稿（`rule.add` / 桌面规则页产出；id/created 由 vault 注入）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleDraft {
+    pub project_dir: String,
+    pub name: String,
+    pub command: String,
+    pub keys: Vec<String>,
+}
+
+impl Rule {
+    /// 规则密文 JSON（存入 `{uuid}.rule.lk` 的载荷）。
+    pub fn to_plaintext(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn from_plaintext(bytes: &[u8]) -> Result<Rule> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    /// 由草稿构造新规则（id/created 由调用方注入）。
+    pub fn from_draft(draft: RuleDraft, id: Uuid, created: String) -> Rule {
+        Rule {
+            id,
+            project_dir: draft.project_dir,
+            name: draft.name,
+            command: draft.command,
+            keys: draft.keys,
+            created,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 索引 / 墓碑 / 附件
 // ---------------------------------------------------------------------------
 
-/// vault 对象类型（索引覆盖条目与规则；M0 只产生条目）。
+/// vault 对象类型（索引覆盖条目与规则；M0 只产生条目；M2 起产生规则）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ObjectKind {
@@ -425,6 +485,8 @@ pub enum ObjectKind {
 }
 
 /// 加密索引条目（`index.lk` 载荷元素；最小可索引字段，全部在密文内）。
+/// 规则与条目同路径同步（data-model.md §6）：规则软删同样以 `deleted` 标记
+/// + 墓碑传播（决策 #6：规则变更复用 `item.changed(kind="rule")`，含删除）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexEntry {

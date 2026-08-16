@@ -41,7 +41,9 @@ use uuid::Uuid;
 use sha2::Digest;
 
 use crate::crypto::{open, parse_iso, seal, Keys, SealType};
-use crate::model::{AttachmentMeta, IndexEntry, Item, ObjectKind, Tombstone, TOMBSTONE_GRACE};
+use crate::model::{
+    AttachmentMeta, IndexEntry, Item, ObjectKind, Rule, Tombstone, TOMBSTONE_GRACE,
+};
 use crate::storage::{valid_key, PutOutcome, StorageBackend, INDEX_KEY};
 use crate::vault::UnlockedVault;
 use crate::{Error, Result};
@@ -211,6 +213,15 @@ pub trait VaultRead {
     /// 条目 + 密文（**同一一致性点**读取；推送/冲突裁决用）。
     fn item_with_blob(&self, id: Uuid) -> Result<(Item, Vec<u8>)>;
 
+    /// 解密态规则（M2；拉取 LWW 初筛）。
+    fn rule(&self, id: Uuid) -> Result<Rule>;
+
+    /// 规则 + 密文（**同一一致性点**读取；推送用）。
+    fn rule_with_blob(&self, id: Uuid) -> Result<(Rule, Vec<u8>)>;
+
+    /// 规则当前修订号（索引内——规则体无 revision 字段；LWW 初筛用）。
+    fn rule_revision(&self, id: Uuid) -> Option<String>;
+
     /// 墓碑密文（可能不存在——远端墓碑缺失时由引擎合成）。
     fn tomb_blob(&self, id: Uuid) -> Result<Vec<u8>>;
 
@@ -241,6 +252,20 @@ impl VaultRead for UnlockedVault {
         let item = self.get(id)?;
         let blob = self.item_blob(id)?;
         Ok((item, blob))
+    }
+
+    fn rule(&self, id: Uuid) -> Result<Rule> {
+        self.get_rule(id)
+    }
+
+    fn rule_with_blob(&self, id: Uuid) -> Result<(Rule, Vec<u8>)> {
+        let rule = self.get_rule(id)?;
+        let blob = self.rule_blob(id)?;
+        Ok((rule, blob))
+    }
+
+    fn rule_revision(&self, id: Uuid) -> Option<String> {
+        self.rule_revision(id)
     }
 
     fn tomb_blob(&self, id: Uuid) -> Result<Vec<u8>> {
@@ -286,13 +311,25 @@ impl SyncPlan {
     }
 }
 
-/// 待导入的远端条目。
+/// 待导入的远端对象（条目或规则；M2 起规则与条目同路径同步）。
+enum PendingObject {
+    Item(Item),
+    Rule(Rule),
+}
+
+/// 待导入的远端对象。
 struct PendingImport {
     id: Uuid,
-    /// 已解密条目（校验 + 应用阶段 LWW 复核）。
-    item: Item,
-    /// 条目密文（原样落盘）。
-    item_blob: Vec<u8>,
+    /// 对象类型（密文文件名与索引 kind 同源）。
+    kind: ObjectKind,
+    /// 远端索引修订号（规则体无 revision，以索引为准；条目与体内一致）。
+    revision: String,
+    /// 远端索引 deleted 标记（规则删除状态在索引内）。
+    deleted: bool,
+    /// 对象密文（原样落盘）。
+    blob: Vec<u8>,
+    /// 已解密对象（校验 + 应用阶段 LWW 复核）。
+    object: PendingObject,
     /// (密文, 已解密)；远端墓碑缺失 → 引擎合成。
     tomb: Option<(Vec<u8>, Tombstone)>,
     attachments: Vec<PendingAttachment>,
@@ -359,6 +396,23 @@ impl<'a> SyncEngine<'a> {
             .and_then(|pt| Ok(serde_json::from_slice(&pt)?))
     }
 
+    fn open_rule(&self, view: &dyn VaultRead, key: &str, blob: &[u8]) -> Result<Rule> {
+        open(view.keys().k_data.as_ref(), SealType::Rule, key, blob)
+            .map_err(|_| Error::SyncAnomaly(format!("远端 {key} 无法解密（可能被篡改）")))
+            .and_then(|pt| Ok(serde_json::from_slice(&pt)?))
+    }
+
+    /// 远端索引中某对象的条目（CAS 冲突 LWW 裁决用：规则修订号只在索引内）。
+    fn remote_rule_entry(&self, view: &dyn VaultRead, id: Uuid) -> Result<Option<IndexEntry>> {
+        match self.remote.get(INDEX_KEY)? {
+            Some(g) => {
+                let entries = self.open_index(view, &g.data)?;
+                Ok(entries.into_iter().find(|e| e.id == id))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn open_meta(&self, view: &dyn VaultRead, key: &str, blob: &[u8]) -> Result<AttachmentMeta> {
         open(view.keys().k_data.as_ref(), SealType::Attach, key, blob)
             .map_err(|_| Error::SyncAnomaly(format!("远端 {key} 无法解密（可能被篡改）")))
@@ -383,22 +437,37 @@ impl<'a> SyncEngine<'a> {
             None => {
                 let mut map = HashMap::new();
                 for obj in self.remote.list()? {
-                    if !valid_key(&obj.key) || !obj.key.ends_with(".item.lk") {
-                        continue; // 只信已知形态的条目文件（防恶意键）
+                    if !valid_key(&obj.key) {
+                        continue; // 只信已知形态的对象文件（防恶意键）
                     }
                     let Some(g) = self.remote.get(&obj.key)? else {
                         continue;
                     };
-                    let item = self.open_item(view, &obj.key, &g.data)?;
-                    map.insert(
-                        item.id(),
-                        IndexEntry {
-                            id: item.id(),
-                            revision: item.revision().to_string(),
-                            kind: ObjectKind::Item,
-                            deleted: item.deleted(),
-                        },
-                    );
+                    if obj.key.ends_with(".item.lk") {
+                        let item = self.open_item(view, &obj.key, &g.data)?;
+                        map.insert(
+                            item.id(),
+                            IndexEntry {
+                                id: item.id(),
+                                revision: item.revision().to_string(),
+                                kind: ObjectKind::Item,
+                                deleted: item.deleted(),
+                            },
+                        );
+                    } else if obj.key.ends_with(".rule.lk") {
+                        // 规则体无 revision：以创建时间作合成修订号（索引丢失
+                        // 重建路径；稳定、零 churn——同一规则两端同值）
+                        let rule = self.open_rule(view, &obj.key, &g.data)?;
+                        map.insert(
+                            rule.id,
+                            IndexEntry {
+                                id: rule.id,
+                                revision: rule.created.clone(),
+                                kind: ObjectKind::Rule,
+                                deleted: false,
+                            },
+                        );
+                    }
                 }
                 Ok((map, None))
             }
@@ -438,15 +507,15 @@ impl<'a> SyncEngine<'a> {
             // 拉取：远端较新（或本地缺失）→ 下载密文缓冲（不落盘）
             let mut skipped = Vec::new();
             for id in &pull_ids {
-                let remote_rev = match remote_idx.get(id) {
-                    Some(e) => e.revision.clone(),
+                let remote_entry = match remote_idx.get(id) {
+                    Some(e) => e.clone(),
                     None => continue,
                 };
-                if pulled.get(id).map(String::as_str) == Some(remote_rev.as_str()) {
+                if pulled.get(id).map(String::as_str) == Some(remote_entry.revision.as_str()) {
                     continue; // 已按同一 revision 缓冲；远端未再前进
                 }
-                if self.pull_entry(view, *id, &mut plan, &mut skipped)? {
-                    pulled.insert(*id, remote_rev);
+                if self.pull_entry(view, *id, &remote_entry, &mut plan, &mut skipped)? {
+                    pulled.insert(*id, remote_entry.revision);
                 }
             }
 
@@ -464,16 +533,16 @@ impl<'a> SyncEngine<'a> {
             // 墓碑硬删：≥30 天且已同步确认 → 远端删除 + 本地硬删计划
             let purged = self.purge_phase(view, now, &remote_idx, &pushed_ids, &mut plan)?;
 
-            // 合并索引（远端为底 + 本轮已缓冲的远端条目 + 快照较新者；
-            // 剔除跳过（对象缺失/推送被并发更新跳过）与硬删条目；透传 rule）
+            // 合并索引（远端为底 + 本轮已缓冲的远端对象 + 快照较新者；
+            // 剔除跳过（对象缺失/推送被并发更新跳过）与硬删对象）
             let pending: Vec<IndexEntry> = plan
                 .imports
                 .iter()
                 .map(|i| IndexEntry {
                     id: i.id,
-                    revision: i.item.revision().to_string(),
-                    kind: ObjectKind::Item,
-                    deleted: i.item.deleted(),
+                    revision: i.revision.clone(),
+                    kind: i.kind,
+                    deleted: i.deleted,
                 })
                 .collect();
             let merged = merge_indexes(
@@ -524,11 +593,27 @@ impl<'a> SyncEngine<'a> {
 
     // -- 拉取（缓冲；不落盘）-----------------------------------------------
 
-    /// 拉取一条远端条目到计划（含墓碑/附件缓冲）。返回是否已缓冲。
+    /// 拉取一条远端对象（条目/规则）到计划（含墓碑/附件缓冲）。返回是否已缓冲。
     fn pull_entry(
         &self,
         view: &dyn VaultRead,
         id: Uuid,
+        remote_entry: &IndexEntry,
+        plan: &mut SyncPlan,
+        skipped: &mut Vec<Uuid>,
+    ) -> Result<bool> {
+        match remote_entry.kind {
+            ObjectKind::Item => self.pull_item(view, id, remote_entry, plan, skipped),
+            ObjectKind::Rule => self.pull_rule(view, id, remote_entry, plan, skipped),
+        }
+    }
+
+    /// 拉取一条远端条目到计划（含墓碑/附件缓冲）。
+    fn pull_item(
+        &self,
+        view: &dyn VaultRead,
+        id: Uuid,
+        remote_entry: &IndexEntry,
         plan: &mut SyncPlan,
         skipped: &mut Vec<Uuid>,
     ) -> Result<bool> {
@@ -551,8 +636,11 @@ impl<'a> SyncEngine<'a> {
         }
         let mut pending = PendingImport {
             id,
-            item: remote_item.clone(),
-            item_blob: g.data,
+            kind: ObjectKind::Item,
+            revision: remote_entry.revision.clone(),
+            deleted: remote_item.deleted(),
+            blob: g.data,
+            object: PendingObject::Item(remote_item.clone()),
             tomb: None,
             attachments: Vec::new(),
         };
@@ -582,6 +670,68 @@ impl<'a> SyncEngine<'a> {
         }
         if let Some(aid) = remote_item.attach_id() {
             self.pull_attachment(view, aid, &mut pending.attachments, &mut plan.summary)?;
+        }
+        plan.upsert_import(pending);
+        Ok(true)
+    }
+
+    /// 拉取一条远端规则（含墓碑缓冲；规则无附件）。
+    fn pull_rule(
+        &self,
+        view: &dyn VaultRead,
+        id: Uuid,
+        remote_entry: &IndexEntry,
+        plan: &mut SyncPlan,
+        skipped: &mut Vec<Uuid>,
+    ) -> Result<bool> {
+        let rule_key = format!("{id}.rule.lk");
+        let Some(g) = self.remote.get(&rule_key)? else {
+            plan.summary
+                .warnings
+                .push(format!("远端索引含规则 {id} 但对象缺失，已跳过"));
+            skipped.push(id);
+            return Ok(false);
+        };
+        let remote_rule = self.open_rule(view, &rule_key, &g.data)?;
+        // LWW 初筛：本地规则修订号（索引）不更旧 → 不缓冲
+        if let Some(local_rev) = view.rule_revision(id) {
+            if local_rev >= remote_entry.revision {
+                return Ok(false);
+            }
+        }
+        let mut pending = PendingImport {
+            id,
+            kind: ObjectKind::Rule,
+            revision: remote_entry.revision.clone(),
+            deleted: remote_entry.deleted,
+            blob: g.data,
+            object: PendingObject::Rule(remote_rule),
+            tomb: None,
+            attachments: Vec::new(),
+        };
+        if remote_entry.deleted {
+            let tomb_key = format!("{id}.tomb.lk");
+            match self.remote.get(&tomb_key)? {
+                Some(tg) => {
+                    let tomb = self.open_tomb(view, &tomb_key, &tg.data)?;
+                    pending.tomb = Some((tg.data, tomb));
+                }
+                None => {
+                    // 远端墓碑缺失（上传端中断）→ 合成（revision = 索引修订号）
+                    let tomb = Tombstone {
+                        id,
+                        deleted_at: remote_entry.revision.clone(),
+                        revision: remote_entry.revision.clone(),
+                    };
+                    let blob = seal(
+                        view.keys().k_data.as_ref(),
+                        SealType::Tombstone,
+                        &tomb_key,
+                        &serde_json::to_vec(&tomb)?,
+                    );
+                    pending.tomb = Some((blob, tomb));
+                }
+            }
         }
         plan.upsert_import(pending);
         Ok(true)
@@ -651,6 +801,25 @@ impl<'a> SyncEngine<'a> {
         id: Uuid,
         plan: &mut SyncPlan,
     ) -> Result<PushResult> {
+        let kind = local_snapshot
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.kind)
+            .unwrap_or(ObjectKind::Item);
+        match kind {
+            ObjectKind::Item => self.push_item(view, local_snapshot, id, plan),
+            ObjectKind::Rule => self.push_rule(view, local_snapshot, id, plan),
+        }
+    }
+
+    /// 推送一条本地较新的条目；返回推送结果。
+    fn push_item(
+        &self,
+        view: &dyn VaultRead,
+        local_snapshot: &[IndexEntry],
+        id: Uuid,
+        plan: &mut SyncPlan,
+    ) -> Result<PushResult> {
         let snap_rev = local_snapshot
             .iter()
             .find(|e| e.id == id)
@@ -690,8 +859,11 @@ impl<'a> SyncEngine<'a> {
                                     // 远端更晚 → 放弃本地，采纳远端（缓冲，应用阶段落盘）
                                     let mut pending = PendingImport {
                                         id,
-                                        item: remote_item.clone(),
-                                        item_blob: g.data,
+                                        kind: ObjectKind::Item,
+                                        revision: remote_item.revision().to_string(),
+                                        deleted: remote_item.deleted(),
+                                        blob: g.data,
+                                        object: PendingObject::Item(remote_item.clone()),
                                         tomb: None,
                                         attachments: Vec::new(),
                                     };
@@ -770,6 +942,139 @@ impl<'a> SyncEngine<'a> {
         Ok(PushResult::Pushed)
     }
 
+    /// 推送一条本地较新的规则（规则体无 revision：修订号在本地索引快照内；
+    /// CAS 冲突时以远端索引修订号做 LWW 裁决）。
+    fn push_rule(
+        &self,
+        view: &dyn VaultRead,
+        local_snapshot: &[IndexEntry],
+        id: Uuid,
+        plan: &mut SyncPlan,
+    ) -> Result<PushResult> {
+        let snap_rev = local_snapshot
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.revision.clone())
+            .unwrap_or_default();
+        let snap_deleted = local_snapshot
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.deleted)
+            .unwrap_or(false);
+        let (rule, blob) = match view.rule_with_blob(id) {
+            Ok(v) => v,
+            Err(_) => {
+                plan.summary
+                    .warnings
+                    .push(format!("本地索引含规则 {id} 但规则文件缺失，跳过推送"));
+                return Ok(PushResult::Skipped);
+            }
+        };
+        if view.rule_revision(id).as_deref() != Some(snap_rev.as_str()) {
+            return Ok(PushResult::Skipped); // 并发更新 → 本轮跳过，下轮再推
+        }
+        let rule_key = format!("{id}.rule.lk");
+        let _ = rule;
+
+        // CAS 上传：base = 远端当前 ETag（不存在 → 创建）；冲突 → LWW 收敛
+        let mut expected = self.remote.etag(&rule_key)?;
+        let mut attempts = 0;
+        loop {
+            match self.remote.put(&rule_key, &blob, expected.as_deref())? {
+                PutOutcome::Written { .. } => break,
+                PutOutcome::Conflict => {
+                    plan.summary.conflicts += 1;
+                    attempts += 1;
+                    match self.remote.get(&rule_key)? {
+                        None => expected = None, // 对象被删 → 重试创建
+                        Some(g) => {
+                            // 规则体无 revision：以远端索引修订号裁决 LWW
+                            let remote_entry = self.remote_rule_entry(view, id)?;
+                            let remote_rev = remote_entry
+                                .as_ref()
+                                .map(|e| e.revision.as_str())
+                                .unwrap_or("");
+                            match snap_rev.as_str().cmp(remote_rev) {
+                                std::cmp::Ordering::Greater => {
+                                    if attempts > MAX_PUSH_RETRIES {
+                                        return Err(Error::SyncStorage(format!(
+                                            "规则 {id} CAS 冲突重试耗尽，本轮放弃"
+                                        )));
+                                    }
+                                    // 本地更晚 → 用新 ETag 重试
+                                    expected = self.remote.etag(&rule_key)?;
+                                }
+                                _ => {
+                                    // 远端更晚/相同 → 放弃本地，采纳远端
+                                    let remote_rule = self.open_rule(view, &rule_key, &g.data)?;
+                                    let mut pending = PendingImport {
+                                        id,
+                                        kind: ObjectKind::Rule,
+                                        revision: remote_entry
+                                            .as_ref()
+                                            .map(|e| e.revision.clone())
+                                            .unwrap_or_else(|| remote_rule.created.clone()),
+                                        deleted: remote_entry
+                                            .as_ref()
+                                            .map(|e| e.deleted)
+                                            .unwrap_or(false),
+                                        blob: g.data,
+                                        object: PendingObject::Rule(remote_rule),
+                                        tomb: None,
+                                        attachments: Vec::new(),
+                                    };
+                                    if pending.deleted {
+                                        let tomb_key = format!("{id}.tomb.lk");
+                                        match self.remote.get(&tomb_key)? {
+                                            Some(tg) => {
+                                                let tomb =
+                                                    self.open_tomb(view, &tomb_key, &tg.data)?;
+                                                pending.tomb = Some((tg.data, tomb));
+                                            }
+                                            None => {
+                                                let tomb = Tombstone {
+                                                    id,
+                                                    deleted_at: pending.revision.clone(),
+                                                    revision: pending.revision.clone(),
+                                                };
+                                                let t_blob = seal(
+                                                    view.keys().k_data.as_ref(),
+                                                    SealType::Tombstone,
+                                                    &tomb_key,
+                                                    &serde_json::to_vec(&tomb)?,
+                                                );
+                                                pending.tomb = Some((t_blob, tomb));
+                                            }
+                                        }
+                                    }
+                                    plan.upsert_import(pending);
+                                    return Ok(PushResult::Adopted);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 墓碑（若规则已软删）：随规则上传（删除随同步传播）
+        if snap_deleted {
+            if let Ok(tblob) = view.tomb_blob(id) {
+                let tomb_key = format!("{id}.tomb.lk");
+                let t_expected = self.remote.etag(&tomb_key)?;
+                if let PutOutcome::Conflict =
+                    self.remote.put(&tomb_key, &tblob, t_expected.as_deref())?
+                {
+                    plan.summary
+                        .warnings
+                        .push(format!("墓碑 {id} 远端较新，本轮不覆盖"));
+                }
+            }
+        }
+        plan.summary.pushed += 1;
+        Ok(PushResult::Pushed)
+    }
+
     fn push_attachment(
         &self,
         view: &dyn VaultRead,
@@ -826,10 +1131,12 @@ impl<'a> SyncEngine<'a> {
             }
             match remote_idx.get(&id) {
                 Some(e)
-                    if e.kind == ObjectKind::Item && e.deleted && e.revision == tomb.revision =>
+                    if (e.kind == ObjectKind::Item || e.kind == ObjectKind::Rule)
+                        && e.deleted
+                        && e.revision == tomb.revision =>
                 {
                     // 已同步确认 → 远端 + 本地同时硬删
-                    self.hard_delete_remote(view, id)?;
+                    self.hard_delete_remote(view, id, e.kind)?;
                     plan.hard_delete.push((id, tomb.revision.clone()));
                     purged.push(id);
                 }
@@ -845,14 +1152,19 @@ impl<'a> SyncEngine<'a> {
         Ok(purged)
     }
 
-    /// 远端硬删：条目 + 墓碑 + 附件（元数据 + 分块）。
-    fn hard_delete_remote(&self, view: &dyn VaultRead, id: Uuid) -> Result<()> {
-        self.remote.delete(&format!("{id}.item.lk"))?;
+    /// 远端硬删：条目/规则密文 + 墓碑 + 附件（元数据 + 分块）。
+    fn hard_delete_remote(&self, view: &dyn VaultRead, id: Uuid, kind: ObjectKind) -> Result<()> {
+        match kind {
+            ObjectKind::Item => self.remote.delete(&format!("{id}.item.lk"))?,
+            ObjectKind::Rule => self.remote.delete(&format!("{id}.rule.lk"))?,
+        }
         self.remote.delete(&format!("{id}.tomb.lk"))?;
-        if let Ok(item) = view.item(id) {
-            if let Some(aid) = item.attach_id() {
-                for key in view.attachment_keys(aid) {
-                    self.remote.delete(&key)?;
+        if kind == ObjectKind::Item {
+            if let Ok(item) = view.item(id) {
+                if let Some(aid) = item.attach_id() {
+                    for key in view.attachment_keys(aid) {
+                        self.remote.delete(&key)?;
+                    }
                 }
             }
         }
@@ -863,40 +1175,59 @@ impl<'a> SyncEngine<'a> {
 
     /// 将抓取计划写入本地 vault。
     ///
-    /// 冲突复核（同步期间命令改了同一条目 → CAS 兜底）：
+    /// 冲突复核（同步期间命令改了同一对象 → CAS 兜底）：
     /// - 导入前 LWW 复核：仅当远端仍胜（或本地缺失）才导入；本地已更新且
     ///   更晚/相同 → 跳过（下轮收敛，本地编辑永不被旧快照覆盖）。
-    /// - 硬删前复核：当前墓碑 revision 与裁决时一致且条目未被并发复活
+    /// - 硬删前复核：当前墓碑 revision 与裁决时一致且对象未被并发复活
     ///   → 才硬删；否则跳过（下轮收敛）。
     ///
     /// 摘要的 pulled/purged 按实际应用计数回填。
     pub fn apply_round(&self, vault: &mut UnlockedVault, plan: &mut SyncPlan) -> Result<()> {
         for imp in &plan.imports {
-            let local = vault.get(imp.id).ok();
-            let remote_wins = match &local {
-                None => true,
-                Some(l) => matches!(lww(l, &imp.item), Lww::Remote),
-            };
-            if !remote_wins {
-                continue;
-            }
-            // 替换附件：被替换掉的本地旧附件（若引用更换）随导入清理
-            if let Some(old) = &local {
-                if old.attach_id() != imp.item.attach_id() {
-                    vault.remove_attachment(old.attach_id())?;
+            match &imp.object {
+                PendingObject::Item(item) => {
+                    let local = vault.get(imp.id).ok();
+                    let remote_wins = match &local {
+                        None => true,
+                        Some(l) => matches!(lww(l, item), Lww::Remote),
+                    };
+                    if !remote_wins {
+                        continue;
+                    }
+                    // 替换附件：被替换掉的本地旧附件（若引用更换）随导入清理
+                    if let Some(old) = &local {
+                        if old.attach_id() != item.attach_id() {
+                            vault.remove_attachment(old.attach_id())?;
+                        }
+                    }
+                    vault.import_item(&imp.blob, item)?;
+                    if let Some((blob, tomb)) = &imp.tomb {
+                        vault.import_tomb(blob, tomb)?;
+                    }
+                    for att in &imp.attachments {
+                        vault.import_attachment(&att.meta_blob, &att.meta, &att.chunks)?;
+                    }
                 }
-            }
-            vault.import_item(&imp.item_blob, &imp.item)?;
-            if let Some((blob, tomb)) = &imp.tomb {
-                vault.import_tomb(blob, tomb)?;
-            }
-            for att in &imp.attachments {
-                vault.import_attachment(&att.meta_blob, &att.meta, &att.chunks)?;
+                PendingObject::Rule(rule) => {
+                    // 复核：本地规则修订号（索引）不更旧 → 跳过（下轮收敛）
+                    let local_rev = vault.rule_revision(imp.id);
+                    if local_rev
+                        .as_deref()
+                        .map(|r| r >= imp.revision.as_str())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    vault.import_rule(&imp.blob, rule, &imp.revision, imp.deleted)?;
+                    if let Some((blob, tomb)) = &imp.tomb {
+                        vault.import_tomb(blob, tomb)?;
+                    }
+                }
             }
             plan.summary.pulled += 1;
         }
         for (id, rev) in &plan.hard_delete {
-            // 复核：当前墓碑仍是裁决时的版本，且条目未被并发复活/更新
+            // 复核：当前墓碑仍是裁决时的版本，且对象未被并发复活/更新
             let tomb_ok = vault
                 .tombstones()
                 .iter()
@@ -931,15 +1262,12 @@ impl<'a> SyncEngine<'a> {
 /// - 远端 revision 更大（或本地缺失）→ 拉取；
 /// - 本地 revision 更大（或远端缺失）→ 推送；
 /// - 同 revision 但 deleted 标记不一致 → 拉取（内容哈希决胜兜底）。
-/// - rule 条目不参与差异（M1 不处理规则；合并时透传）。
+/// - 条目与规则同路径（M2：规则软删/墓碑经同一 diff 传播）。
 fn diff(local: &[IndexEntry], remote: &HashMap<Uuid, IndexEntry>) -> (Vec<Uuid>, Vec<Uuid>) {
     let local_map: HashMap<Uuid, &IndexEntry> = local.iter().map(|e| (e.id, e)).collect();
     let mut pull = Vec::new();
     let mut push = Vec::new();
     for e in remote.values() {
-        if e.kind != ObjectKind::Item {
-            continue;
-        }
         match local_map.get(&e.id) {
             None => pull.push(e.id),
             Some(le) => {
@@ -954,11 +1282,8 @@ fn diff(local: &[IndexEntry], remote: &HashMap<Uuid, IndexEntry>) -> (Vec<Uuid>,
         }
     }
     for le in local {
-        if le.kind != ObjectKind::Item {
-            continue;
-        }
         if !remote.contains_key(&le.id) {
-            // 已删除条目远端缺失 → 不推送：远端要么从未有（无需传播），
+            // 已删除对象远端缺失 → 不推送：远端要么从未有（无需传播），
             // 要么已硬删（再推送会让对端把墓碑拉回，形成复活循环）。
             // 本地清理由 purge_phase 按「≥30 天」裁决。
             if !le.deleted {
@@ -1126,6 +1451,14 @@ mod tests {
 
     fn sync(vault: &mut UnlockedVault, remote: &LocalStorage, now: &str) -> SyncSummary {
         SyncEngine::new(remote).run_round(vault, now).unwrap()
+    }
+
+    /// 平台无关的「绝对路径」假值（Windows 下 `/proj` 非绝对，put_rule 校验拒绝）。
+    fn fake_abs_proj() -> String {
+        std::env::temp_dir()
+            .join("lk-test-proj")
+            .to_string_lossy()
+            .to_string()
     }
 
     /// 注时：`days` 天后的 ISO（硬删裁决用）。
@@ -1425,17 +1758,36 @@ mod tests {
         drop(fx);
     }
 
+    /// M2：规则与条目同路径同步——远端有规则（索引 + `{uuid}.rule.lk`）→
+    /// 拉取落盘；远端索引含规则但对象缺失（损坏/中断）→ 自愈剔除（与条目
+    /// 同语义）。
     #[test]
-    fn rule_entries_pass_through_remote_index() {
+    fn rule_sync_pulls_and_self_heals_missing_object() {
         let (fx, mut a, _b, remote) = fixture();
-        // 远端索引注入 rule 条目（M2 前向兼容：不处理、不透传丢失）
-        let rule = IndexEntry {
+        // 远端真实规则（密文 + 索引条目）
+        let rule_obj = crate::model::Rule {
             id: Uuid::new_v4(),
-            revision: "2026-01-01T00:00:00.000000Z".into(),
+            project_dir: "/proj".into(),
+            name: "publish".into(),
+            command: "npm publish".into(),
+            keys: vec!["NPM_TOKEN".into()],
+            created: "2026-01-01T00:00:00.000000Z".into(),
+        };
+        let key = format!("{}.rule.lk", rule_obj.id);
+        let rule_blob = seal(
+            a.keys().k_data.as_ref(),
+            SealType::Rule,
+            &key,
+            &rule_obj.to_plaintext().unwrap(),
+        );
+        remote.put(&key, &rule_blob, None).unwrap();
+        let entry = IndexEntry {
+            id: rule_obj.id,
+            revision: "2026-01-02T00:00:00.000000Z".into(),
             kind: ObjectKind::Rule,
             deleted: false,
         };
-        let entries = vec![rule.clone()];
+        let entries = vec![entry.clone()];
         let blob = seal(
             a.keys().k_data.as_ref(),
             SealType::Index,
@@ -1443,9 +1795,15 @@ mod tests {
             &serde_json::to_vec(&entries).unwrap(),
         );
         remote.put(INDEX_KEY, &blob, None).unwrap();
-        // A 同步（有本地条目待推送）→ 合并索引保留 rule 条目
+        // A 同步 → 规则被拉取落盘（索引保留）
         a.put(None, login_draft("X"), None).unwrap();
-        sync(&mut a, &remote, &now_iso());
+        let s = sync(&mut a, &remote, &now_iso());
+        assert_eq!(s.pulled, 1, "规则随条目同路径拉取");
+        let rules = a.list_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, rule_obj.id);
+        assert_eq!(rules[0].command, "npm publish");
+        // 索引同时含规则与条目
         let idx = remote.get(INDEX_KEY).unwrap().unwrap();
         let parsed: Vec<IndexEntry> = serde_json::from_slice(
             &open(
@@ -1459,8 +1817,130 @@ mod tests {
         .unwrap();
         assert!(parsed
             .iter()
-            .any(|e| e.id == rule.id && e.kind == ObjectKind::Rule));
+            .any(|e| e.id == rule_obj.id && e.kind == ObjectKind::Rule));
         assert!(parsed.iter().any(|e| e.kind == ObjectKind::Item));
+
+        // 自愈：远端索引含规则但对象缺失 → 合并索引剔除（不引失效密文）
+        let ghost = IndexEntry {
+            id: Uuid::new_v4(),
+            revision: "2026-01-03T00:00:00.000000Z".into(),
+            kind: ObjectKind::Rule,
+            deleted: false,
+        };
+        let mut entries2 = parsed.clone();
+        entries2.push(ghost.clone());
+        let blob2 = seal(
+            a.keys().k_data.as_ref(),
+            SealType::Index,
+            INDEX_KEY,
+            &serde_json::to_vec(&entries2).unwrap(),
+        );
+        remote.put(INDEX_KEY, &blob2, None).unwrap();
+        sync(&mut a, &remote, &now_iso());
+        let idx = remote.get(INDEX_KEY).unwrap().unwrap();
+        let parsed: Vec<IndexEntry> = serde_json::from_slice(
+            &open(
+                a.keys().k_data.as_ref(),
+                SealType::Index,
+                INDEX_KEY,
+                &idx.data,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !parsed.iter().any(|e| e.id == ghost.id),
+            "对象缺失的规则索引条目应被自愈剔除"
+        );
+        drop(fx);
+    }
+
+    /// M2：规则双端收敛——A 添加规则 → 同步 → B 同步拉取；
+    /// A 删除规则 → 同步 → B 同步收到删除（软删 + 墓碑传播）。
+    #[test]
+    fn rule_push_pull_and_delete_propagate() {
+        let (fx, mut a, mut b, remote) = fixture();
+        // A 添加规则
+        let rule = a
+            .put_rule(
+                crate::model::RuleDraft {
+                    project_dir: fake_abs_proj(),
+                    name: "publish".into(),
+                    command: "npm publish".into(),
+                    keys: vec!["NPM_TOKEN".into()],
+                },
+                None,
+            )
+            .unwrap();
+        // A → 远端
+        let s = sync(&mut a, &remote, &now_iso());
+        assert_eq!(s.pushed, 1);
+        assert!(
+            remote
+                .get(&format!("{}.rule.lk", rule.id))
+                .unwrap()
+                .is_some(),
+            "远端应有规则密文"
+        );
+        // B 拉取
+        let s = sync(&mut b, &remote, &now_iso());
+        assert_eq!(s.pulled, 1);
+        let b_rules = b.list_rules().unwrap();
+        assert_eq!(b_rules.len(), 1);
+        assert_eq!(b_rules[0].command, "npm publish");
+        // B 再同步 → 无变化（不重复拉取）
+        let s = sync(&mut b, &remote, &now_iso());
+        assert!(s.is_clean(), "规则收敛后不再拉取：{s:?}");
+        // A 删除规则 → 传播
+        a.delete_rule(rule.id).unwrap();
+        let s = sync(&mut a, &remote, &now_iso());
+        assert_eq!(s.pushed, 1, "软删规则随同步推送");
+        let s = sync(&mut b, &remote, &now_iso());
+        assert_eq!(s.pulled, 1, "B 收到规则删除（墓碑）");
+        assert_eq!(b.list_rules().unwrap().len(), 0, "B 的规则已删除");
+        drop(fx);
+    }
+
+    /// M2：规则 LWW——两端各自添加同一 id 不同内容（替换），revision 更新
+    /// 者胜（与条目同语义）。
+    #[test]
+    fn rule_lww_conflict_resolves_by_revision() {
+        let (fx, mut a, mut b, remote) = fixture();
+        let rule = a
+            .put_rule(
+                crate::model::RuleDraft {
+                    project_dir: fake_abs_proj(),
+                    name: "p".into(),
+                    command: "npm publish".into(),
+                    keys: vec!["A".into()],
+                },
+                None,
+            )
+            .unwrap();
+        let rev1 = a.rule_revision(rule.id).unwrap();
+        sync(&mut a, &remote, &now_iso());
+        sync(&mut b, &remote, &now_iso());
+        // B 替换（内容不同，revision 更新）
+        b.put_rule(
+            crate::model::RuleDraft {
+                project_dir: fake_abs_proj(),
+                name: "p2".into(),
+                command: "npm *".into(),
+                keys: vec!["B".into()],
+            },
+            Some(rule.id),
+        )
+        .unwrap();
+        let rev2 = b.rule_revision(rule.id).unwrap();
+        assert!(rev2 > rev1, "替换 bump 修订号");
+        sync(&mut b, &remote, &now_iso());
+        // A 同步 → 拉取新版本
+        let s = sync(&mut a, &remote, &now_iso());
+        assert_eq!(s.pulled, 1);
+        let a_rules = a.list_rules().unwrap();
+        assert_eq!(a_rules.len(), 1);
+        assert_eq!(a_rules[0].name, "p2");
+        assert_eq!(a_rules[0].keys, vec!["B".to_string()]);
         drop(fx);
     }
 
@@ -1897,6 +2377,15 @@ mod tests {
                     return Ok((self.new_item.clone(), self.new_blob.clone()));
                 }
                 self.v.item_with_blob(id)
+            }
+            fn rule(&self, id: Uuid) -> Result<Rule> {
+                self.v.rule(id)
+            }
+            fn rule_with_blob(&self, id: Uuid) -> Result<(Rule, Vec<u8>)> {
+                self.v.rule_with_blob(id)
+            }
+            fn rule_revision(&self, id: Uuid) -> Option<String> {
+                self.v.rule_revision(id)
             }
             fn tomb_blob(&self, id: Uuid) -> Result<Vec<u8>> {
                 self.v.tomb_blob(id)

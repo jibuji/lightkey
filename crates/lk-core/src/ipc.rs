@@ -2,9 +2,9 @@
 //!
 //! - 协议：**JSON-RPC 2.0**（`jsonrpc`/`method`/`params`/`id`/`result`/`error`），
 //!   serde 序列化；版本前缀方法名（`vault.unlock`、`item.get`…）。
-//! - 方法表见模块内常量；M1 已实现 `sync.trigger` / `sync.poll`；M2 方法
-//!   （`authz.evaluate`/`approval.request`/`rule.*`）返回 `-32601 Method not found`
-//!   （占位，不实现）。
+//! - 方法表见模块内常量；M1 已实现 `sync.trigger` / `sync.poll`；M2 已实现
+//!   `authz.evaluate` / `approval.result` / `rule.add|list|remove` 与
+//!   `subscribe`（通知订阅，决策 #3 A）。
 //! - 会话令牌随每次解锁轮换；除 `vault.status`/`vault.init`/`vault.unlock` 外的
 //!   请求必须携带 `token`；令牌错误/过期 → 统一 `session.invalid`（防探测）。
 //! - 最小字段原则：响应只含调用方被授权的最小已解密字段。
@@ -135,11 +135,20 @@ pub const M_ITEM_DELETE: &str = "item.delete";
 pub const M_ITEM_EXPORT: &str = "item.export";
 pub const M_AUDIT_LIST: &str = "audit.list";
 pub const M_AUDIT_VERIFY: &str = "audit.verify";
-// M1/M2 占位（未实现 → ERR_METHOD_NOT_FOUND）
+// M1：同步（M1 已实现）
 pub const M_SYNC_TRIGGER: &str = "sync.trigger";
 pub const M_SYNC_POLL: &str = "sync.poll";
+// M2：授权门 + 规则 + 审批回传 + 通知订阅（决策 #6：`rule.add/list/remove`；
+// 顶层阻塞判定 `authz.evaluate`；审批回传 `approval.result`——`approval.request`
+// 已移除，其语义并入 `ApprovalChannel::open` trait）
 pub const M_AUTHZ_EVALUATE: &str = "authz.evaluate";
-pub const M_APPROVAL_REQUEST: &str = "approval.request";
+pub const M_APPROVAL_RESULT: &str = "approval.result";
+pub const M_RULE_ADD: &str = "rule.add";
+pub const M_RULE_LIST: &str = "rule.list";
+pub const M_RULE_REMOVE: &str = "rule.remove";
+/// 通知订阅（决策 #3 A）：客户端连接后发 `subscribe`，连接转入流模式，
+/// 守护进程主动写 JSON-RPC notification 帧（无 `id`，一行一帧）。
+pub const M_SUBSCRIBE: &str = "subscribe";
 
 // ---------------------------------------------------------------------------
 // 各方法参数/结果类型（最小字段）
@@ -291,6 +300,170 @@ pub struct SyncPollResult {
     pub summary: Option<crate::sync::SyncSummary>,
     /// 同步水位（最近成功轮询时间，ISO-8601 UTC）。
     pub watermark: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// M2：授权门 / 规则 / 审批回传 / 通知订阅
+// ---------------------------------------------------------------------------
+
+/// `authz.evaluate` 参数。
+///
+/// **守护进程侧派生，不信任客户端**（authorization-gate.md §3）：`starter`/
+/// `cwd` 字段即使携带也一律忽略——启动者与工作目录以 IPC 对端 PID 回溯
+/// 结果为准（伪造 cwd 绕过必须失败）。`channel` 仅作审计来源标注。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthzEvaluateParams {
+    /// 具名命令（如 `npm publish`；匹配规则 command glob）。
+    pub command: String,
+    /// 请求注入的 key 名（值不可见、名可指名，决策 #1）。
+    pub keys: Vec<String>,
+    /// 审计来源标注（`cli` | `desktop`；缺省 = cli）。
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// 客户端自报 cwd（**仅供提示，判定一律以对端真实 cwd 为准**）。
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// `authz.evaluate` 结果（最小字段：只含被批准命令的 env 变量，ipc.md §4）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthzEvaluateResult {
+    pub allowed: bool,
+    /// `allowed=false` 时的拒绝原因（`denied` | `timeout` | 细分 reason）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `allowed=true` 时被批准注入的 env（key 名 → 值；只含被授权 key）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// `approval.result` 参数（审批回传；决策权始终在 Rust 侧，§5.3）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalResultParams {
+    pub request_id: Uuid,
+    /// `allowed` | `denied`（timeout 由守护进程侧超时产生，客户端不可发）。
+    pub decision: String,
+}
+
+/// `approval.result` 结果：是否被守护进程接受（伪造/已超时的 requestId
+/// 被忽略 → `accepted=false`）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalResultOutcome {
+    pub accepted: bool,
+}
+
+/// `rule.add` 参数（决策 #6：规则含 `name`；写入唯一合法路径之一）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleAddParams {
+    /// 规范化绝对路径（守护进程侧 canonicalize 校验）。
+    pub project_dir: String,
+    pub name: String,
+    /// 具名命令（可 glob）。
+    pub command: String,
+    pub keys: Vec<String>,
+    /// 审计来源标注（`cli` | `desktop`；缺省 = cli）。
+    #[serde(default)]
+    pub channel: Option<String>,
+}
+
+/// `rule.add` 结果：完整规则。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleAddResult {
+    pub rule: crate::model::Rule,
+}
+
+/// `rule.list` 结果（最小字段：规则全字段，无密钥值）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleListResult {
+    pub rules: Vec<crate::model::Rule>,
+}
+
+/// `rule.remove` 参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleRemoveParams {
+    pub id: Uuid,
+    /// 审计来源标注（`cli` | `desktop`；缺省 = cli）。
+    #[serde(default)]
+    pub channel: Option<String>,
+}
+
+/// 规则字段校验（超长/非法 → `Err`，不入库；testing.md 第三层 #19）。
+///
+/// - `projectDir`：绝对路径且可 canonicalize（存在）；
+/// - `command`：非空、≤ 1024、无控制字符；
+/// - `name`：非空、≤ 256、无控制字符；
+/// - `keys`：1..=32 个，均为合法环境变量名（`[A-Za-z_][A-Za-z0-9_]*`）。
+pub fn validate_rule_fields(
+    project_dir: &str,
+    name: &str,
+    command: &str,
+    keys: &[String],
+) -> std::result::Result<(), String> {
+    if project_dir.is_empty() || !std::path::Path::new(project_dir).is_absolute() {
+        return Err("projectDir 必须是绝对路径".into());
+    }
+    if std::fs::canonicalize(project_dir).is_err() {
+        return Err(format!("projectDir 无法解析：{project_dir}"));
+    }
+    if name.is_empty() || name.len() > 256 || has_control_chars(name) {
+        return Err("name 必须是非空、≤256 字符且无控制字符的规则名".into());
+    }
+    if command.is_empty() || command.len() > 1024 || has_control_chars(command) {
+        return Err("command 必须是非空、≤1024 字符且无控制字符的命令".into());
+    }
+    if keys.is_empty() || keys.len() > 32 {
+        return Err("keys 必须是 1~32 个 key 名".into());
+    }
+    let valid_name = |k: &str| {
+        let mut chars = k.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if let Some(bad) = keys.iter().find(|k| !valid_name(k)) {
+        return Err(format!(
+            "非法 key 名：{bad}（须为环境变量名 [A-Za-z_][A-Za-z0-9_]*）"
+        ));
+    }
+    Ok(())
+}
+
+/// `authz.evaluate` 的 keys/command 参数校验（同规则字段规则）。
+pub fn validate_evaluate_fields(command: &str, keys: &[String]) -> std::result::Result<(), String> {
+    if command.is_empty() || command.len() > 4096 || has_control_chars(command) {
+        return Err("command 必须是非空、≤4096 字符且无控制字符的命令".into());
+    }
+    if keys.is_empty() || keys.len() > 32 {
+        return Err("keys 必须是 1~32 个 key 名".into());
+    }
+    let valid_name = |k: &str| {
+        let mut chars = k.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if let Some(bad) = keys.iter().find(|k| !valid_name(k)) {
+        return Err(format!(
+            "非法 key 名：{bad}（须为环境变量名 [A-Za-z_][A-Za-z0-9_]*）"
+        ));
+    }
+    Ok(())
+}
+
+fn has_control_chars(s: &str) -> bool {
+    s.chars().any(|c| c.is_control())
 }
 
 /// 统一「会话无效」错误响应。

@@ -249,6 +249,8 @@ pub enum SealType {
     Chunk = 6,
     /// vault 头内密钥校验值（KCV）
     Check = 7,
+    /// 规则 `{uuid}.rule.lk`（M2 新增；既有类型字节不变，零回归）
+    Rule = 8,
 }
 
 impl SealType {
@@ -265,6 +267,7 @@ impl SealType {
             5 => Some(SealType::Tombstone),
             6 => Some(SealType::Chunk),
             7 => Some(SealType::Check),
+            8 => Some(SealType::Rule),
             _ => None,
         }
     }
@@ -279,6 +282,7 @@ impl SealType {
             SealType::Tombstone => "tomb",
             SealType::Chunk => "chunk",
             SealType::Check => "check",
+            SealType::Rule => "rule",
         }
     }
 }

@@ -24,7 +24,8 @@
 //! |------|------|------|
 //! | storage-backend | [`storage`] | BYO 存储后端抽象：本地模拟 / WebDAV / S3（可插拔 trait） | `docs/sync.md` |
 //! | sync-engine | [`sync`] | BYO 变更发现、轮询、冲突收敛 | `docs/sync.md` |
-//! | authz-gate | [`authz`] | Agent 授权门三层模型、规则库、启动者判定（M2） | `docs/authorization-gate.md` |
+//! | authz-gate | [`authz`] | Agent 授权门三层模型、规则库、审批通道 | `docs/authorization-gate.md` |
+//! | starter | [`starter`] | 启动者判定：IPC 对端 PID 进程链回溯 + cwd（fail-closed） | `docs/authorization-gate.md` §3 |
 //!
 //! ### 共享 / 宿主侧
 //!
@@ -52,6 +53,7 @@ pub mod model;
 pub mod recovery;
 pub mod service;
 pub mod session;
+pub mod starter;
 pub mod storage;
 pub mod sync;
 pub mod vault;
