@@ -2076,10 +2076,12 @@ mod tests {
         let id = rule["id"].as_str().unwrap().to_string();
         assert_eq!(rule["name"], "pub");
         assert_eq!(rule["command"], "npm publish");
-        assert_eq!(
-            rule["projectDir"],
-            proj.path().to_string_lossy().to_string()
-        );
+        // projectDir 以 canonical 形态入库（Windows 下含 \\?\ 前缀与短名展开）
+        let canonical_proj = std::fs::canonicalize(proj.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(rule["projectDir"], canonical_proj);
         // 广播 item.changed(kind=rule, deleted=false)（决策 #6）
         let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let fv: Value = serde_json::from_str(&frame).unwrap();

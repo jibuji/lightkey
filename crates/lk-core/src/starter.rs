@@ -7,8 +7,11 @@
 //! - 判定依据 = **进程链回溯 + 工作目录**：回溯发起进程的父进程链，确定
 //!   启动者（可归属的顶层进程，如终端/编辑器/agent 进程）；工作目录 = 发起
 //!   命令时的 cwd（**以对端进程真实 cwd 为准**，并 canonicalize 解析符号链接）。
-//! - **回溯失败（权限/跨会话/进程消失）→ `starter = "unknown"` → fail-closed**
-//!   （授权门第 1 层默认拒绝）。
+//! - **对端自身不可读（权限/跨会话/进程消失）→ `starter = "unknown"` →
+//!   fail-closed**（授权门第 1 层默认拒绝）；**中间祖先不可读**（Windows
+//!   Toolhelp32 不枚举 smss 等系统进程、进程竞态消失）→ 取**已回溯的最顶层
+//!   可归属进程**（回溯结果依然真实，不 fail-open；授权仍由规则决定，
+//!   starter 用于审计与第 1 层兜底）。
 //! - 实现：Linux `/proc` 进程树；Windows Toolhelp32 + 进程 PEB（cwd）；
 //!   macOS `sysctl`（kinfo_proc）/ `proc_pidpath`。
 //!
@@ -51,10 +54,12 @@ pub trait ProcessTable: Send + Sync {
 /// 进程链回溯：从对端 PID 沿父进程链逐级上溯，取**顶层可归属进程**。
 ///
 /// 规则：
-/// - 逐级回溯至会话组长/顶层；任何一步读取失败（权限/跨会话/进程消失）
+/// - 逐级回溯至会话组长/顶层；**对端自身读取失败**（权限/跨会话/进程消失）
 ///   → 整体失败 → [`UNKNOWN_STARTER`]（fail-closed）；
-/// - 环检测（父链成环）→ 失败 → fail-closed；
-/// - 深度超过 [`MAX_WALK_DEPTH`] → 取已回溯的最深层（有效结果，不 fail-closed）。
+/// - **中间祖先读取失败**（Windows Toolhelp 不枚举 smss 等系统进程 / 进程
+///   竞态消失）→ 取**已回溯的最顶层可归属进程**（不 fail-open：回溯结果
+///   依然真实；授权仍由规则决定，starter 只用于审计与第 1 层兜底）；
+/// - 父链成环 → 取已回溯的最顶层；深度超过 [`MAX_WALK_DEPTH`] 同语义。
 ///
 /// 结果 starter 优先取可执行文件规范化路径（审计示例 `/usr/bin/zsh`），
 /// 取不到时退化为进程名。
@@ -75,15 +80,19 @@ fn walk_chain(peer_pid: u32, table: &dyn ProcessTable) -> Option<(u32, String)> 
     let mut top: Option<(u32, String)> = None;
     for _ in 0..=MAX_WALK_DEPTH {
         if !seen.insert(pid) {
-            return None; // 父链成环 → fail-closed
+            break; // 父链成环 → 取已回溯的最顶层
         }
-        let name = table.process_name(pid)?; // 读取失败 → fail-closed
-        let is_leader = table.is_session_leader(pid)?; // 跨会话读取失败 → fail-closed
+        let Some(name) = table.process_name(pid) else {
+            break; // 祖先不可读 → 取已回溯的最顶层（对端自身不可读 → None）
+        };
+        let is_leader = table.is_session_leader(pid).unwrap_or(false);
         top = Some((pid, name));
         if is_leader {
             break; // 会话组长 = 顶层可归属进程
         }
-        let parent = table.parent_pid(pid)?;
+        let Some(parent) = table.parent_pid(pid) else {
+            break; // 祖先不可读 → 取已回溯的最顶层
+        };
         if parent == pid || parent == 0 {
             break;
         }
@@ -564,12 +573,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_when_chain_read_fails() {
-        // 权限/跨会话：中间进程读不到 → fail-closed
+    fn unknown_when_peer_unreadable() {
+        // 对端自身读不到（权限/跨会话/进程消失）→ fail-closed unknown
+        let t = FakeTable::new();
+        assert_eq!(resolve_starter(999_999, &t), UNKNOWN_STARTER);
+        assert_eq!(resolve_starter(0, &t), UNKNOWN_STARTER);
+    }
+
+    #[test]
+    fn topmost_when_middle_ancestor_unreadable() {
+        // 中间祖先读不到（Windows Toolhelp 不枚举 smss 等）→ 取已回溯的
+        // 最顶层可归属进程（回溯结果依然真实，不 fail-open）
         let mut t = FakeTable::new();
         t.chain(&[(10, 20, "/bin/lk"), (30, 0, "/bin/zsh")]);
         t.leaders.insert(30);
-        assert_eq!(resolve_starter(10, &t), UNKNOWN_STARTER);
+        assert_eq!(resolve_starter(10, &t), "/bin/lk");
     }
 
     #[test]
@@ -580,11 +598,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_on_parent_loop() {
-        // 父链成环 → fail-closed（不无限循环）
+    fn topmost_on_parent_loop() {
+        // 父链成环 → 取已回溯的最顶层（不无限循环）
         let mut t = FakeTable::new();
         t.chain(&[(10, 20, "/bin/lk"), (20, 10, "/bin/x")]);
-        assert_eq!(resolve_starter(10, &t), UNKNOWN_STARTER);
+        assert_eq!(resolve_starter(10, &t), "/bin/x");
     }
 
     #[test]
@@ -611,43 +629,6 @@ mod tests {
         t.leaders.insert(20);
         t.exes.remove(&20);
         assert_eq!(resolve_starter(10, &t), "proc20");
-    }
-
-    /// Windows 诊断（临时）：打印进程链回溯各步骤结果。
-    #[cfg(windows)]
-    #[test]
-    fn diag_walk_windows() {
-        let pid = std::process::id();
-        let t = ToolhelpTable;
-        eprintln!("DIAG pid={pid}");
-        eprintln!("DIAG session_ok={}", peer_session_ok(pid));
-        let mut p = pid;
-        for i in 0..40 {
-            match t.process_name(p) {
-                Some(n) => eprintln!("DIAG [{i}] {p} name={n:?}"),
-                None => {
-                    eprintln!("DIAG [{i}] {p} NAME-NONE");
-                    break;
-                }
-            }
-            match t.parent_pid(p) {
-                Some(par) => {
-                    eprintln!("DIAG [{i}] {p} parent={par}");
-                    if par == p || par == 0 {
-                        break;
-                    }
-                    p = par;
-                }
-                None => {
-                    eprintln!("DIAG [{i}] {p} PARENT-NONE");
-                    break;
-                }
-            }
-        }
-        let starter = resolve_starter(pid, &t);
-        eprintln!("DIAG starter={}", starter);
-        // 故意失败以让诊断出现在失败日志（临时）
-        panic!("DIAG-FAIL starter={} pid={}", starter, pid);
     }
 
     /// Linux 真实进程链：spawn `sh -c sleep`，回溯 sleep 的父链必须经过 sh，
