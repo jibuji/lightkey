@@ -1425,4 +1425,3 @@ fn cmd_config_get(out: &mut impl Write, dir: &std::path::Path, key: &str, json_o
 fn cmd_daemon(dir: &std::path::Path) -> i32 {
     lk_daemon::run(dir)
 }
-

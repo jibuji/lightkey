@@ -48,12 +48,15 @@ use lk_core::Error;
 use serde_json::{json, Value};
 
 pub mod config;
+pub mod notifier;
 pub mod sync;
 pub mod transport;
 
 pub use config::*;
+pub use notifier::{frame_for_event, Notifier};
 use sync::sync_fail_response;
 pub use sync::{run_sync_round, run_sync_round_with, try_sync_trigger};
+pub use transport::{PeerInfo, PushHub};
 
 /// 会话令牌文件名（0600；CLI 进程间传递，锁定即删除）。
 pub const SESSION_TOKEN_FILE: &str = "session.token";
@@ -102,6 +105,8 @@ pub struct SharedDaemon {
     pub config: RwLock<Config>,
     /// 同步运行状态（水位 / 最近摘要 / 风暴等级）。
     pub sync: Mutex<SyncRuntime>,
+    /// 推送通道（通知订阅连接集合；`subscriber_count>0` = 桌面壳已订阅）。
+    pub push: Arc<PushHub>,
 }
 
 /// 守护进程状态（命令侧；多连接线程经 `Mutex<Daemon>` 串行访问）。
@@ -134,11 +139,17 @@ impl Daemon {
         // 落地时再迁入 SharedDaemon。
         let core = CoreServices::new();
         let sessions = core.new_session();
+        // M2 通知桥：订阅总线，Rust 事件 → notification 帧 → 订阅连接
+        // （决策 #3 A；广播非阻塞——内存投递，socket 写入由订阅连接
+        // 自己的 writer 线程承担）
+        let push = PushHub::new();
+        core.subscribe(Arc::new(Notifier::new(Arc::clone(&push))));
         let shared = Arc::new(SharedDaemon {
             dir: dir.clone(),
             vault: Arc::new(RwLock::new(None)),
             config: RwLock::new(config),
             sync: Mutex::new(sync),
+            push,
         });
         Ok(Daemon {
             sessions,
@@ -223,6 +234,8 @@ impl Daemon {
                 }
             }
             M_SYNC_POLL => self.require_session(id.clone(), token, |me| me.sync_poll(id.clone())),
+            // M2：通知订阅（会话校验；响应 ok 后传输层把连接转入流模式）
+            M_SUBSCRIBE => self.require_session(id.clone(), token, |me| me.subscribe(id.clone())),
             // M2 占位（authz.evaluate / approval.result / rule.* 待 M2 实现）
             M_AUTHZ_EVALUATE | M_APPROVAL_RESULT | M_RULE_ADD | M_RULE_LIST | M_RULE_REMOVE => {
                 RpcResponse::err(id.clone(), ERR_METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None)
@@ -647,6 +660,14 @@ impl Daemon {
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
 
+    // -- M2：通知订阅 ------------------------------------------------
+
+    /// `subscribe`：会话校验已由 require_session 完成；响应 ok 后传输层把
+    /// 连接转入流模式（守护进程主动推送 notification 帧）。
+    fn subscribe(&mut self, id: Value) -> RpcResponse {
+        RpcResponse::ok(id, json!({}))
+    }
+
     /// `sync.trigger` 无锁路径的会话预检（命令锁内调用）：解锁态 + 令牌有效。
     pub fn trigger_precheck(&self, token: Option<&[u8]>) -> bool {
         self.vault_peek() && self.sessions.validate(token.unwrap_or(&[]))
@@ -722,7 +743,6 @@ pub fn global_shutdown() -> &'static AtomicBool {
     &SHUTDOWN
 }
 
-
 // ---------------------------------------------------------------------------
 // 守护进程入口（CLI 与桌面内嵌实例共用；决策 #2 A：宿主下沉到共享 crate）
 // ---------------------------------------------------------------------------
@@ -794,7 +814,7 @@ pub fn run(dir: &Path) -> i32 {
     }
     let handler_state = state.clone();
     let handler_shared = shared.clone();
-    let handler = std::sync::Arc::new(move |line: &str| -> String {
+    let handler = std::sync::Arc::new(move |line: &str, _peer: &PeerInfo| -> String {
         // sync.trigger：命令锁外执行轮次（网络 I/O 不阻塞其他命令；
         // 会话预检与活动时间戳短暂持锁）
         if let Some(resp) = try_sync_trigger(&handler_state, &handler_shared, line) {
@@ -803,15 +823,17 @@ pub fn run(dir: &Path) -> i32 {
         let mut guard = handler_state.lock().expect("daemon mutex poisoned");
         guard.handle(line)
     });
+    // M2：订阅连接（通知推送；hub 经 SharedDaemon 与命令侧共享）
+    let hub = Some(Arc::clone(&shared.push));
     eprintln!(
         "lk daemon: 监听于 {}（pid {}）",
         dir.display(),
         std::process::id()
     );
     #[cfg(unix)]
-    let result = transport::serve(listener, handler, global_shutdown());
+    let result = transport::serve(listener, handler, hub, global_shutdown());
     #[cfg(windows)]
-    let result = transport::serve(dir, handler, daemon::global_shutdown());
+    let result = transport::serve(dir, handler, hub, global_shutdown());
     // 优雅退出清理：删令牌 + 端点
     if let Ok(mut guard) = state.lock() {
         guard.shutdown();

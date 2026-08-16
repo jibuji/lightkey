@@ -75,9 +75,7 @@ impl lk_core::sync::VaultRead for LockedVaultView {
 
     fn rule(&self, id: uuid::Uuid) -> lk_core::Result<lk_core::model::Rule> {
         let v = self.vault.read().unwrap();
-        v.as_ref()
-            .ok_or(Error::SessionInvalid)?
-            .get_rule(id)
+        v.as_ref().ok_or(Error::SessionInvalid)?.get_rule(id)
     }
 
     fn rule_with_blob(&self, id: uuid::Uuid) -> lk_core::Result<(lk_core::model::Rule, Vec<u8>)> {
