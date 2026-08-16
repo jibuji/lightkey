@@ -26,6 +26,13 @@ hex.workspace = true
 reqwest.workspace = true
 quick-xml.workspace = true
 
+# 启动者判定（starter）：unix 读 /proc·sysctl，Windows Toolhelp + PEB
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
