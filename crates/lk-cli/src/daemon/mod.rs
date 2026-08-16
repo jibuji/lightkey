@@ -354,7 +354,6 @@ impl Daemon {
     }
 
     /// 锁定：先签名审计事件（用当前 K_audit），再擦除密钥 + 失效令牌 + 删令牌文件。
-    /// 锁定：先签名审计事件（用当前 K_audit），再擦除密钥 + 失效令牌 + 删令牌文件。
     /// 默认 reason = manual（`lock_internal_with` 可指定）。
     fn lock_internal(&mut self) {
         self.lock_internal_with(LockReason::Manual);

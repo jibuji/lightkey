@@ -79,7 +79,7 @@ export async function createHost(registry: Record<string, Plugin> = PLUGIN_REGIS
   const slots = new SlotRegistry();
 
   // 宿主服务先于插件挂载（plugins 经 inject 声明依赖）
-  await ctx.plugin((c) => {
+  const hostServices = await ctx.plugin((c) => {
     c.provide("slots", slots);
     c.provide("nav", createNavService());
   });
@@ -92,6 +92,7 @@ export async function createHost(registry: Record<string, Plugin> = PLUGIN_REGIS
     nav: ctx.nav,
     dispose: () => {
       for (const m of mounted) m.dispose();
+      hostServices.dispose();
     },
   };
 }

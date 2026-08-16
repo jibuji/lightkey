@@ -22,7 +22,9 @@ import type { Context } from "@cordisjs/core";
 /** 主题名（design/spec.md §2 的暗/浅两套 tokens）。 */
 export type ThemeName = "dark" | "light";
 
-/** `item.changed` 负载（与 Rust `VaultEvent::ItemChanged` 字段对齐）。 */
+/** `item.changed` 负载，与 Rust `VaultEvent::ItemChanged` 语义对齐（字段名映射：
+ *  Rust `item_id`/`revision_date`/`kind` → 协议 `itemId`/`revisionDate`/`type`；
+ *  `kind` 即 `type`，`type` 是 Rust 关键字，故 Rust 内部用 `kind`）。 */
 export interface ItemChangedPayload {
   itemId: string;
   /** 新 revision（ISO-8601 UTC）。 */

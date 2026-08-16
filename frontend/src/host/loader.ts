@@ -9,7 +9,7 @@
  * 说明：`@cordisjs/plugin-loader`（4.x）面向 Node 运行时（fs 读写 +
  * 动态 import 插件模块），浏览器/Vite 构建无法直接运行；本 loader 以
  * 同语义实现：解析 + 校验 + 按序 `ctx.plugin()` 挂载，插件解析走
- * 静态注册表（Vite 打包内联）。yml 文件仍随应用发布（`frontend/cordis.yml`）。
+ * 静态注册表（Vite 打包内联）。yml 文件仍随应用发布（`frontend/src/cordis.yml`）。
  */
 
 import { Schema } from "@cordisjs/schema";

@@ -106,21 +106,11 @@ export const theme: Plugin.Function<Context, ThemeConfig> = Object.assign(
       return () => {
         const root = typeof document !== "undefined" ? document.documentElement : null;
         if (root) {
-          root.style.removeProperty("--bg-0");
-          root.style.removeProperty("--bg-1");
-          root.style.removeProperty("--bg-2");
-          root.style.removeProperty("--bg-3");
-          root.style.removeProperty("--border");
-          root.style.removeProperty("--fg-0");
-          root.style.removeProperty("--fg-1");
-          root.style.removeProperty("--fg-2");
-          root.style.removeProperty("--brand");
-          root.style.removeProperty("--brand-strong");
-          root.style.removeProperty("--accent");
-          root.style.removeProperty("--danger");
-          root.style.removeProperty("--success");
-          root.style.removeProperty("--warning");
-          delete root?.dataset.theme;
+          // 遍历 token 键（与 THEME_PALETTES 同源，避免硬编码列表与 palette 漂移）
+          for (const key of Object.keys(THEME_PALETTES.dark)) {
+            root.style.removeProperty(key);
+          }
+          delete root.dataset.theme;
         }
       };
     });
