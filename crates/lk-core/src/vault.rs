@@ -1803,10 +1803,14 @@ mod tests {
         let (dir, audit, code) = temp_vault("rules");
         let mut v = unlock_vault(dir.path(), "pw").unwrap();
         // 新建
+        let proj = std::env::temp_dir()
+            .join("lk-test-proj")
+            .to_string_lossy()
+            .to_string();
         let rule = v
             .put_rule(
                 RuleDraft {
-                    project_dir: "/proj".into(),
+                    project_dir: proj.clone(),
                     name: "publish".into(),
                     command: "npm publish".into(),
                     keys: vec!["NPM_TOKEN".into()],
@@ -1840,7 +1844,7 @@ mod tests {
         v.attach_bus(bus);
         v.put_rule(
             RuleDraft {
-                project_dir: "/proj".into(),
+                project_dir: proj,
                 name: "publish2".into(),
                 command: "npm *".into(),
                 keys: vec!["A".into(), "B".into()],

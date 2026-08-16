@@ -368,15 +368,13 @@ pub fn rule_matches(rule: &Rule, canonical_cwd: &str, command: &str) -> bool {
     project_dir_matches(&rule.project_dir, canonical_cwd) && glob_match(&rule.command, command)
 }
 
-/// projectDir 祖先匹配：`cwd` 等于 `project_dir`，或 `cwd` 以
-/// `project_dir + "/"` 开头（目录边界，`/a/b/cd` 不匹配 `/a/b/c`）。
+/// projectDir 祖先匹配：`cwd` 等于 `project_dir`，或 `cwd` 是 `project_dir`
+/// 的路径前缀（**按路径组件**比较——目录边界 `/a/b/cd` 不匹配 `/a/b/c`；
+/// 分隔符随平台，Windows `C:\\a\\b` 与 `/` 写法均正确）。
 pub fn project_dir_matches(project_dir: &str, canonical_cwd: &str) -> bool {
-    let dir = project_dir.trim_end_matches('/');
-    let cwd = canonical_cwd.trim_end_matches('/');
-    if cwd == dir {
-        return true;
-    }
-    cwd.starts_with(&format!("{dir}/"))
+    let dir = std::path::Path::new(project_dir);
+    let cwd = std::path::Path::new(canonical_cwd);
+    cwd == dir || cwd.starts_with(dir)
 }
 
 /// 命令 glob 匹配（`*` = 任意长度、`?` = 单字符；其余字面量，大小写敏感）。

@@ -1453,6 +1453,14 @@ mod tests {
         SyncEngine::new(remote).run_round(vault, now).unwrap()
     }
 
+    /// 平台无关的「绝对路径」假值（Windows 下 `/proj` 非绝对，put_rule 校验拒绝）。
+    fn fake_abs_proj() -> String {
+        std::env::temp_dir()
+            .join("lk-test-proj")
+            .to_string_lossy()
+            .to_string()
+    }
+
     /// 注时：`days` 天后的 ISO（硬删裁决用）。
     fn future_iso(days: i64) -> String {
         (time::OffsetDateTime::now_utc() + time::Duration::days(days))
@@ -1856,7 +1864,7 @@ mod tests {
         let rule = a
             .put_rule(
                 crate::model::RuleDraft {
-                    project_dir: "/proj".into(),
+                    project_dir: fake_abs_proj(),
                     name: "publish".into(),
                     command: "npm publish".into(),
                     keys: vec!["NPM_TOKEN".into()],
@@ -1901,7 +1909,7 @@ mod tests {
         let rule = a
             .put_rule(
                 crate::model::RuleDraft {
-                    project_dir: "/proj".into(),
+                    project_dir: fake_abs_proj(),
                     name: "p".into(),
                     command: "npm publish".into(),
                     keys: vec!["A".into()],
@@ -1915,7 +1923,7 @@ mod tests {
         // B 替换（内容不同，revision 更新）
         b.put_rule(
             crate::model::RuleDraft {
-                project_dir: "/proj".into(),
+                project_dir: fake_abs_proj(),
                 name: "p2".into(),
                 command: "npm *".into(),
                 keys: vec!["B".into()],
