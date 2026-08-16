@@ -20,9 +20,9 @@
 //! - 错误信息不区分「未解锁/令牌错」（ipc.md §3 语义）。
 
 mod clipboard;
-mod dirs;
 
 use lk_daemon as daemon;
+use lk_daemon::dirs;
 use lk_daemon::transport;
 
 use std::io::Write;

@@ -1,6 +1,6 @@
 [package]
 name = "lk-app"
-description = "LightKey 桌面应用（Tauri 2 壳）：宿主前端并复用 lk-core"
+description = "LightKey 桌面应用（Tauri 2 壳）：内置守护实例（决策 #2 A）+ IPC 桥 + 托盘 + 锁屏监听"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,10 +12,20 @@ authors.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon：托盘（决策 #4 A：关闭=隐藏托盘保持解锁，托盘退出=退出即锁）
+tauri = { version = "2", features = ["tray-icon"] }
+# 原生目录选择器（ui-rules 新建规则的「项目目录选择器」，spec §6.4）
+tauri-plugin-dialog = "2"
 lk-core = { path = "../lk-core" }
+lk-daemon = { path = "../lk-daemon" }
 serde.workspace = true
 serde_json.workspace = true
 
-# 骨架占位：Tauri 壳在 M2 里程碑接入（窗口、IPC 桥、托盘、审批弹窗）。
-# 图标为占位图形，M2 补正式 ico / icns。
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS 锁屏检测：CGSessionCopyCurrentDictionary 会话字典轮询
+# （NSWorkspace 需 objc 绑定，此处用 CoreGraphics C API 更小面）
+core-foundation = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# Windows 锁屏监听：隐藏消息窗口 + WTSRegisterSessionNotification
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }

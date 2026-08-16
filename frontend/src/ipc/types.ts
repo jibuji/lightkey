@@ -17,7 +17,17 @@
  *   - CAS 冲突 → ConflictError（UI 提示「条目已被其他设备修改」覆盖/取消）
  */
 
-import type { Item, ItemDraft, ItemSummary, SyncStatus } from "../types";
+import type {
+  AuditEvent,
+  AuthRule,
+  ConfigPatch,
+  ConfigView,
+  Item,
+  ItemDraft,
+  ItemSummary,
+  RuleInput,
+  SyncStatus,
+} from "../types";
 
 export class ConflictError extends Error {
   constructor() {
@@ -33,18 +43,39 @@ export class VaultInvalidError extends Error {
   }
 }
 
+export class SessionInvalidError extends Error {
+  constructor() {
+    super("session.invalid");
+    this.name = "SessionInvalidError";
+  }
+}
+
 export interface UpdateOptions {
   /** 乐观并发（CAS）：传该条目加载时的 revision，不匹配则抛 ConflictError */
   expectedRevision?: string;
 }
 
+/** JSON-RPC notification 帧（守护进程推送；无 id，`docs/ipc.md` 决策 #3 A）。 */
+export interface NotificationFrame {
+  jsonrpc?: string;
+  /** 事件名：item.changed / session.unlocked / session.locked / authz.request。 */
+  method: string;
+  /** 事件负载（最小字段，无密钥值；`docs/plugin-architecture.md` §5.2）。 */
+  params: Record<string, unknown>;
+}
+
 export interface LightKeyIpc {
+  /** 适配器种类（mock = 内存模拟；tauri = 真实守护进程桥）。 */
+  readonly kind: "mock" | "tauri";
+
   /** vault.status：解锁态、同步水位 */
   status(): Promise<{ unlocked: boolean }>;
   /** vault.unlock：主密码解锁；错误统一为 VaultInvalidError */
   unlock(masterPassword: string): Promise<void>;
   /** vault.lock：立即锁定（内存密钥擦除） */
   lock(): Promise<void>;
+  /** vault.recover：恢复码 + 新主密码 → 新恢复码（仅展示一次） */
+  recover(recoveryCode: string, newPassword: string): Promise<{ recoveryCode: string }>;
 
   /** item.list：解密态最小索引 */
   list(): Promise<ItemSummary[]>;
@@ -61,11 +92,31 @@ export interface LightKeyIpc {
   syncStatus(): Promise<SyncStatus>;
   syncTrigger(): Promise<SyncStatus>;
 
-  /** audit.list（M2 页骨架） */
-  auditList(): Promise<import("../types").AuditEvent[]>;
+  /** audit.list（审计事件流；无密钥值） */
+  auditList(): Promise<AuditEvent[]>;
 
-  /** rule.*（M2 页骨架） */
-  ruleList(): Promise<import("../types").AuthRule[]>;
-  ruleCreate(rule: import("../types").AuthRule): Promise<void>;
+  /** rule.*（决策 #6：`rule.add|list|remove`；规则含 name） */
+  ruleList(): Promise<AuthRule[]>;
+  ruleAdd(input: RuleInput): Promise<AuthRule>;
   ruleRemove(id: string): Promise<void>;
+
+  /** approval.result：审批回传（allowed | denied；超时由守护进程侧产生） */
+  approvalResult(
+    requestId: string,
+    decision: "allowed" | "denied",
+  ): Promise<{ accepted: boolean }>;
+
+  /** config.get / config.set（ui-settings；config.json 非敏感运行时配置） */
+  configGet(): Promise<ConfigView>;
+  configSet(patch: ConfigPatch): Promise<void>;
+
+  /** 原生目录选择器（ui-rules 项目目录；浏览器/mock 环境返回 null） */
+  pickDir(): Promise<string | null>;
+
+  /**
+   * 通知订阅（决策 #3 A）：注册帧回调，返回退订函数。
+   * - tauri：建立守护进程推送流（`subscribe` 命令；解锁后自动重订阅）；
+   * - mock：仅登记回调（模拟帧经 QA 钩子 `simulateAuthzRequest` 触发）。
+   */
+  subscribeNotifications(onFrame: (frame: NotificationFrame) => void): Promise<() => void>;
 }

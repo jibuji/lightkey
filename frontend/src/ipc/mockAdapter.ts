@@ -7,19 +7,36 @@
  * - 锁定 = 内存擦除：条目/规则回到初始 fixture，会话令牌失效。
  * - item.update 走 CAS：expectedRevision 与当前 revision 不符 → ConflictError。
  * - 软删除语义：remove 即从库移除（mock 不模拟墓碑延迟）。
+ * - 规则/审批/config（M2）：规则 CRUD 走 `rule.add|list|remove`（决策 #6）；
+ *   approvalResult 对已知 requestId 返回 accepted；config 内存态；恢复码
+ *   接受 demo 码并重设主密码。
+ * - 通知订阅（决策 #3 A）：`subscribeNotifications` 仅登记回调；模拟帧经
+ *   QA 钩子触发（`simulateAuthzRequest` / `simulateItemChanged`），用于
+ *   验证 ipc-bridge 的帧翻译路径与审批弹窗闭环。
  *
- * QA 钩子：`window.__LIGHTKEY_MOCK__.simulateExternalEdit(id)` 可模拟其他
- * 设备已修改某条目（改 revision），用于验证 CAS 冲突提示。仅 dev 可用。
+ * QA 钩子：`window.__LIGHTKEY_MOCK__`（仅 dev 可用）。
  */
 
-import type { AuditEvent, AuthRule, Item, ItemDraft, ItemSummary, SyncStatus } from "../types";
+import type {
+  AuditEvent,
+  AuthRule,
+  ConfigPatch,
+  ConfigView,
+  Item,
+  ItemDraft,
+  ItemSummary,
+  RuleInput,
+  SyncStatus,
+} from "../types";
 import {
   ConflictError,
   VaultInvalidError,
   type LightKeyIpc,
+  type NotificationFrame,
   type UpdateOptions,
 } from "./types";
 import {
+  DEMO_RECOVERY_CODE,
   MOCK_AUDIT,
   MOCK_ITEMS,
   MOCK_MASTER_PASSWORD,
@@ -54,16 +71,30 @@ function newId(): string {
 }
 
 export class MockAdapter implements LightKeyIpc {
+  readonly kind = "mock" as const;
+
   private unlocked = false;
+  private masterPassword = MOCK_MASTER_PASSWORD;
   private items: Item[] = [];
   private rules: AuthRule[] = [];
   private audit: AuditEvent[] = [];
+  /** 通知订阅回调（subscribeNotifications 登记；QA 钩子触发模拟帧）。 */
+  private onFrame: ((frame: NotificationFrame) => void) | null = null;
+  /** 待审批 requestId 集合（approvalResult 据此裁决 accepted）。 */
+  private pendingApprovals = new Set<string>();
+  /** 模拟 config（守护进程 config.json 的内存等价物）。 */
+  private config: ConfigView = {
+    autoLockMinutes: 5,
+    approvalTimeoutSecs: 30,
+    sync: { url: "webdavs://dav.example.com/lightkey", intervalSecs: 60 },
+  };
 
   /** 解锁后重建内存库（fixture）；锁定则擦除。 */
   private resetStore(restore: boolean) {
     this.items = restore ? structuredClone(MOCK_ITEMS) : [];
     this.rules = restore ? structuredClone(MOCK_RULES) : [];
     this.audit = restore ? [...MOCK_AUDIT] : [];
+    this.pendingApprovals.clear();
   }
 
   private requireUnlocked() {
@@ -77,7 +108,7 @@ export class MockAdapter implements LightKeyIpc {
   }
 
   async unlock(masterPassword: string): Promise<void> {
-    if (masterPassword !== MOCK_MASTER_PASSWORD) {
+    if (masterPassword !== this.masterPassword) {
       return delayReject(new VaultInvalidError());
     }
     this.resetStore(true);
@@ -89,6 +120,20 @@ export class MockAdapter implements LightKeyIpc {
     this.unlocked = false;
     this.resetStore(false);
     return delay(undefined);
+  }
+
+  async recover(recoveryCode: string, newPassword: string): Promise<{ recoveryCode: string }> {
+    if (recoveryCode.replace(/\s/g, "") !== DEMO_RECOVERY_CODE.replace(/\s/g, "")) {
+      return delayReject(new VaultInvalidError());
+    }
+    if (newPassword.length < 4) {
+      return delayReject(new Error("vault.invalid"));
+    }
+    // 恢复 = 更换主密码 + 重建库（与守护进程 vault.recover 语义一致：锁定态）
+    this.masterPassword = newPassword;
+    this.resetStore(true);
+    this.unlocked = false;
+    return delay({ recoveryCode: DEMO_RECOVERY_CODE });
   }
 
   /* ---------- item ---------- */
@@ -113,6 +158,7 @@ export class MockAdapter implements LightKeyIpc {
     this.requireUnlocked();
     const item = { ...draft, id: newId(), revision: nowStamp() } as Item;
     this.items.unshift(item);
+    this.emitItemChanged(item);
     return delay(structuredClone(item));
   }
 
@@ -126,16 +172,19 @@ export class MockAdapter implements LightKeyIpc {
     }
     const updated = { ...draft, id, revision: nowStamp() } as Item;
     this.items[idx] = updated;
+    this.emitItemChanged(updated);
     return delay(structuredClone(updated));
   }
 
   async remove(id: string): Promise<void> {
     this.requireUnlocked();
+    const it = this.items.find((x) => x.id === id);
     this.items = this.items.filter((x) => x.id !== id);
+    if (it) this.emitItemChanged({ ...it, revision: nowStamp() }, true);
     return delay(undefined);
   }
 
-  /* ---------- sync / audit / rule ---------- */
+  /* ---------- sync / audit ---------- */
 
   async syncStatus(): Promise<SyncStatus> {
     this.requireUnlocked();
@@ -152,15 +201,25 @@ export class MockAdapter implements LightKeyIpc {
     return delay([...this.audit]);
   }
 
+  /* ---------- rule（决策 #6：rule.add|list|remove；含 name） ---------- */
+
   async ruleList(): Promise<AuthRule[]> {
     this.requireUnlocked();
     return delay([...this.rules]);
   }
 
-  async ruleCreate(rule: AuthRule): Promise<void> {
+  async ruleAdd(input: RuleInput): Promise<AuthRule> {
     this.requireUnlocked();
-    this.rules.push(rule);
-    return delay(undefined);
+    if (!input.projectDir || !input.name || !input.command || !input.keys.length) {
+      return delayReject(new Error("invalid params"));
+    }
+    const rule: AuthRule = {
+      id: "r" + Math.random().toString(36).slice(2, 6),
+      ...input,
+      created: nowStamp(),
+    };
+    this.rules.unshift(rule);
+    return delay(structuredClone(rule));
   }
 
   async ruleRemove(id: string): Promise<void> {
@@ -169,7 +228,76 @@ export class MockAdapter implements LightKeyIpc {
     return delay(undefined);
   }
 
-  /* ---------- QA 钩子（仅 mock；模拟其他设备修改以演示 CAS 冲突） ---------- */
+  /* ---------- approval / config / 目录选择器 / 通知订阅 ---------- */
+
+  async approvalResult(
+    requestId: string,
+    _decision: "allowed" | "denied",
+  ): Promise<{ accepted: boolean }> {
+    this.requireUnlocked();
+    const accepted = this.pendingApprovals.delete(requestId);
+    return delay({ accepted });
+  }
+
+  async configGet(): Promise<ConfigView> {
+    return delay(structuredClone(this.config));
+  }
+
+  async configSet(patch: ConfigPatch): Promise<void> {
+    const next = structuredClone(this.config);
+    if (patch.autoLockMinutes !== undefined) next.autoLockMinutes = patch.autoLockMinutes;
+    if (patch.syncUrl !== undefined) {
+      next.sync =
+        patch.syncUrl.trim() === ""
+          ? null
+          : { url: patch.syncUrl.trim(), intervalSecs: patch.pollSecs ?? 60 };
+    } else if (patch.pollSecs !== undefined && next.sync) {
+      next.sync.intervalSecs = patch.pollSecs;
+    }
+    this.config = next;
+    return delay(undefined);
+  }
+
+  async pickDir(): Promise<string | null> {
+    // 浏览器无原生目录选择器；QA 钩子可注入模拟结果
+    return delay(this.mockPickDir);
+  }
+
+  async subscribeNotifications(
+    onFrame: (frame: NotificationFrame) => void,
+  ): Promise<() => void> {
+    this.onFrame = onFrame;
+    return () => {
+      if (this.onFrame === onFrame) this.onFrame = null;
+    };
+  }
+
+  /* ---------- QA 钩子（仅 mock；验证帧翻译 / 审批弹窗闭环） ---------- */
+
+  /** 模拟守护进程推送 authz.request 帧（审批弹窗演示/测试入口）。 */
+  simulateAuthzRequest(params: {
+    requestId: string;
+    starter: string;
+    projectDir: string;
+    command: string;
+    keys: string[];
+  }): void {
+    this.pendingApprovals.add(params.requestId);
+    this.onFrame?.({ jsonrpc: "2.0", method: "authz.request", params });
+  }
+
+  /** 模拟守护进程推送 item.changed 帧（ui-vault 刷新 / CAS 场景）。 */
+  simulateItemChanged(params: {
+    itemId: string;
+    revisionDate: string;
+    type: string;
+    deleted: boolean;
+  }): void {
+    this.onFrame?.({ jsonrpc: "2.0", method: "item.changed", params });
+  }
+
+  /** 模拟目录选择结果（pickDir 返回值；null = 用户取消）。 */
+  mockPickDir: string | null = null;
 
   /**
    * 模拟其他设备已修改该条目（revision 改为“未来”时间戳，保证与当前库内
@@ -184,12 +312,33 @@ export class MockAdapter implements LightKeyIpc {
   readItem(id: string): Item | null {
     return this.items.find((x) => x.id === id) ?? null;
   }
+
+  /** QA 只读检查：mock 是否处于解锁态。 */
+  isUnlocked(): boolean {
+    return this.unlocked;
+  }
+
+  private emitItemChanged(item: Item, deleted = false) {
+    this.onFrame?.({
+      jsonrpc: "2.0",
+      method: "item.changed",
+      params: { itemId: item.id, revisionDate: item.revision, type: item.type, deleted },
+    });
+  }
 }
 
 /** 暴露 QA 钩子（dev console 用；真实适配器无此面） */
 export function installMockQaHooks(adapter: MockAdapter) {
   (window as unknown as Record<string, unknown>).__LIGHTKEY_MOCK__ = {
     simulateExternalEdit: (id: string) => adapter.simulateExternalEdit(id),
+    simulateAuthzRequest: (params: Parameters<MockAdapter["simulateAuthzRequest"]>[0]) =>
+      adapter.simulateAuthzRequest(params),
+    simulateItemChanged: (params: Parameters<MockAdapter["simulateItemChanged"]>[0]) =>
+      adapter.simulateItemChanged(params),
+    setPickDirResult: (path: string | null) => {
+      adapter.mockPickDir = path;
+    },
     readItem: (id: string) => adapter.readItem(id),
+    isUnlocked: () => adapter.isUnlocked(),
   };
 }

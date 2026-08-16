@@ -22,6 +22,7 @@
 //!   客户端自报字段一律不信任。
 
 pub mod config;
+pub mod dirs;
 pub mod notifier;
 pub mod sync;
 pub mod transport;
@@ -414,6 +415,15 @@ impl Daemon {
         let shared = Arc::clone(&self.shared);
         let mut vault = shared.vault.write().unwrap();
         self.lock_internal_locked(&mut vault, reason);
+    }
+
+    /// 带原因的锁定（M2 desktop：锁屏自动锁定 `LockReason::Lockscreen`）。
+    ///
+    /// 桌面壳在进程内直接调用（不经 IPC，避免引入协议面）：锁屏检测线程
+    /// → `lock_with_reason(Lockscreen)` → 事件总线广播 `session.locked`
+    /// （reason=lockscreen）→ 通知桥推送给订阅中的前端。
+    pub fn lock_with_reason(&mut self, reason: LockReason) {
+        self.lock_internal_with(reason);
     }
 
     /// 锁定（调用方已持 vault 写锁；供锁定/恢复/强制重置共用）。
@@ -1307,38 +1317,77 @@ pub fn try_authz_evaluate(
 // 守护进程入口（CLI / 桌面内嵌实例共用；决策 #2 A）
 // ---------------------------------------------------------------------------
 
-/// 以守护进程方式运行：绑定端点 → 装配 → 后台轮询 → 服务直至退出。
-/// 返回进程退出码（`lk daemon` 与桌面内嵌线程共用）。
-pub fn run(dir: &Path) -> i32 {
+/// 绑定端点 + 装配守护（Daemon::start + 后台同步轮询线程），在后台线程
+/// 运行 serve 循环直至 [`global_shutdown`] 置位。
+///
+/// - CLI（`lk daemon`）：经 [`run`] 调用，绑定失败直接报错退出；
+/// - 桌面内嵌（M2 desktop）：进程内起守护线程，**同时 serve 本地 socket 供
+///   `lk` CLI 复用**（决策 #2 A）；返回句柄供 tauri command 桥转发
+///   JSON-RPC 与订阅推送。
+///
+/// 返回（守护线程句柄, 命令锁, 跨线程共享态）。
+pub type EmbeddedDaemon = (
+    std::thread::JoinHandle<i32>,
+    Arc<Mutex<Daemon>>,
+    Arc<SharedDaemon>,
+);
+
+pub fn serve_embedded(dir: &Path) -> std::result::Result<EmbeddedDaemon, String> {
     let bind = transport::bind_server(dir);
     #[cfg(unix)]
     let listener = match bind {
         Ok(l) => l,
-        Err(e) => {
-            eprintln!("lk daemon: 绑定失败：{e}");
-            return 1;
-        }
+        Err(e) => return Err(format!("绑定失败：{e}")),
     };
     #[cfg(windows)]
     if let Err(e) = bind {
-        eprintln!("lk daemon: 绑定失败：{e}");
-        return 1;
+        return Err(format!("绑定失败：{e}"));
     }
     let daemon = match Daemon::start(dir) {
         Ok(d) => d,
-        Err(e) => {
-            eprintln!("lk daemon: 启动失败：{e}");
-            return 1;
-        }
+        Err(e) => return Err(format!("启动失败：{e}")),
     };
     let shared = daemon.shared();
-    let state = std::sync::Arc::new(std::sync::Mutex::new(daemon));
+    let state = Arc::new(Mutex::new(daemon));
     // 后台同步轮询线程（M1）：只在解锁态 + 已配置时执行一轮；锁定即停止。
     // 间隔 = 配置值 × 2^风暴等级（封顶 24h）；失败静默（下一轮重试）。
-    {
-        use lk_core::sync::{next_poll_interval, DEFAULT_SYNC_INTERVAL_SECS};
-        let poller = shared.clone();
-        std::thread::spawn(move || {
+    spawn_sync_poller(Arc::clone(&shared));
+    let handler = make_handler(&state, &shared);
+    let hub = Some(Arc::clone(&shared.push));
+    let serve_state = Arc::clone(&state);
+    #[cfg(windows)]
+    let serve_dir = dir.to_path_buf();
+    let thread = std::thread::Builder::new()
+        .name("lk-daemon".into())
+        .spawn(move || {
+            #[cfg(unix)]
+            let result = transport::serve(listener, handler, hub, global_shutdown());
+            #[cfg(windows)]
+            let result = transport::serve(&serve_dir, handler, hub, global_shutdown());
+            // 优雅退出清理：删令牌 + 端点（serve 循环结束后由本线程执行；
+            // 桌面端进程退出路径由 lk-app 侧 `shutdown_on_exit` 兜底，双清理幂等）
+            if let Ok(mut guard) = serve_state.lock() {
+                guard.shutdown();
+            }
+            match result {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("lk daemon: {e}");
+                    1
+                }
+            }
+        })
+        .map_err(|e| format!("守护线程启动失败：{e}"))?;
+    Ok((thread, state, shared))
+}
+
+/// 后台同步轮询线程（解锁态 + 已配置时按风暴退避间隔执行轮次）。
+fn spawn_sync_poller(shared: Arc<SharedDaemon>) {
+    use lk_core::sync::{next_poll_interval, DEFAULT_SYNC_INTERVAL_SECS};
+    let poller = shared;
+    std::thread::Builder::new()
+        .name("lk-sync-poller".into())
+        .spawn(move || {
             let mut next_sleep = DEFAULT_SYNC_INTERVAL_SECS;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(next_sleep));
@@ -1370,25 +1419,23 @@ pub fn run(dir: &Path) -> i32 {
                     next_sleep = next_poll_interval(base, 0);
                 }
             }
-        });
-    }
-    let handler = make_handler(&state, &shared);
-    let hub = Some(Arc::clone(&shared.push));
+        })
+        .expect("同步轮询线程可启动");
+}
+
+/// 以守护进程方式运行（CLI `lk daemon` 入口）：绑定 → 装配 → 服务直至退出。
+/// 返回进程退出码。
+pub fn run(dir: &Path) -> i32 {
     eprintln!(
         "lk daemon: 监听于 {}（pid {}）",
         dir.display(),
         std::process::id()
     );
-    #[cfg(unix)]
-    let result = transport::serve(listener, handler, hub, global_shutdown());
-    #[cfg(windows)]
-    let result = transport::serve(dir, handler, hub, global_shutdown());
-    // 优雅退出清理：删令牌 + 端点
-    if let Ok(mut guard) = state.lock() {
-        guard.shutdown();
-    }
-    match result {
-        Ok(()) => 0,
+    match serve_embedded(dir) {
+        Ok((thread, _state, _shared)) => {
+            // 服务直至退出（SIGINT/SIGTERM → serve 循环置位退出）
+            thread.join().unwrap_or(1)
+        }
         Err(e) => {
             eprintln!("lk daemon: {e}");
             1

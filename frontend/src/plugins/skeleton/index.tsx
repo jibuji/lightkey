@@ -1,5 +1,5 @@
 /**
- * ui 骨架插件（M1.5 首批：React 宿主 + 槽位 + 最小壳）。
+ * ui 骨架插件（M1.5 首批 + M2 搜索接线）。
  *
  * 每个槽位组件 = 一个 Cordis 插件条目（cordis.yml）：组件本体写死
  * （components.tsx，声明 `slot` 字段），布局数据（slot/order/page）
@@ -8,24 +8,17 @@
  * 组件与槽位的对应（§6.1）：
  * - sidebar：nav-vault / nav-rules / nav-settings / nav-audit（导航项本身
  *   也是组件）+ lock（底部锁定，order 99）；
- * - topbar：search / sync-status / theme-toggle；
- * - content：page-vault / page-rules / page-settings / page-audit
- *   （M2 由 ui-* 插件替换）。
+ * - topbar：search（M2 接线：300ms 防抖 → `vault.search` 事件；回车 →
+ *   `vault.search-enter`，spec §6.2 空态引导）/ sync-status / theme-toggle；
+ * - content：由 ui-* 插件挂载（ui-unlock 锁态整页 + ui-vault/rules/
+ *   settings/audit）。
  */
 
 import { useEffect, useState, type ComponentType, type ReactNode } from "react";
 import { Schema } from "@cordisjs/schema";
 import type { Context, Plugin } from "@cordisjs/core";
 import type { SlotName } from "../../host/slots";
-import {
-  LockButton,
-  NavItem,
-  PlaceholderPage,
-  SearchBox,
-  SyncStatus,
-  ThemeToggle,
-  VaultPageDemo,
-} from "./components";
+import { LockButton, NavItem, SearchBox, SyncStatus, ThemeToggle } from "./components";
 
 /** 槽位组件共享配置（布局数据；组件声明作缺省）。 */
 export const slotComponentConfig = Schema.object({
@@ -45,7 +38,7 @@ export interface SlotComponentConfig {
 }
 
 /** 槽位组件配置校验（yml 原始值 → schema 校验；Config 入口为 unknown）。 */
-function validateSlotConfig(raw: unknown): SlotComponentConfig {
+export function validateSlotConfig(raw: unknown): SlotComponentConfig {
   return slotComponentConfig(raw as Parameters<typeof slotComponentConfig>[0]);
 }
 
@@ -163,11 +156,21 @@ export const search: Plugin.Function<Context, SlotComponentConfig> = Object.assi
       "search",
       config,
       (() => {
-        const Comp = () => (
-          <SearchBox
-            onEnter={() => ctx.toast.show("搜索在 M2 随 ui-vault 实现")}
-          />
-        );
+        const Comp = () => {
+          const [value, setValue] = useState("");
+          // 300ms 防抖 → vault.search（spec §6.2；搜索词不经明文值）
+          useEffect(() => {
+            const t = setTimeout(() => ctx.emit("vault.search", { query: value }), 300);
+            return () => clearTimeout(t);
+          }, [value]);
+          return (
+            <SearchBox
+              value={value}
+              onChange={setValue}
+              onEnter={() => ctx.emit("vault.search-enter", { query: value })}
+            />
+          );
+        };
         Comp.slot = "topbar";
         return Comp;
       })() as ComponentType<Record<string, unknown>>,
@@ -175,7 +178,7 @@ export const search: Plugin.Function<Context, SlotComponentConfig> = Object.assi
       10,
     );
   },
-  { inject: ["slots", "toast"], Config: validateSlotConfig },
+  { inject: ["slots"], Config: validateSlotConfig },
 );
 
 export const syncStatus: Plugin.Function<Context, SlotComponentConfig> = Object.assign(
@@ -248,53 +251,3 @@ export const themeToggle: Plugin.Function<Context, SlotComponentConfig> = Object
   },
   { inject: ["slots", "theme"], Config: validateSlotConfig },
 );
-
-/* ---------------- content · 页面 ---------------- */
-
-const pagePlugin = (page: string, title: string, description: string): Plugin.Function<Context, SlotComponentConfig> =>
-  Object.assign(
-    (ctx: Context, config: SlotComponentConfig) => {
-      register(
-        ctx,
-        `page-${page}`,
-        config,
-        (() => {
-          const Comp = () => <PlaceholderPage title={title} description={description} />;
-          Comp.slot = "content";
-          return Comp;
-        })() as ComponentType<Record<string, unknown>>,
-        "content",
-        10,
-      );
-    },
-    {
-      inject: ["slots"],
-      Config: validateSlotConfig,
-    },
-  );
-
-/** 条目页占位（事件总线演示面板）。 */
-export const pageVault: Plugin.Function<Context, SlotComponentConfig> = Object.assign(
-  (ctx: Context, config: SlotComponentConfig) => {
-    register(
-      ctx,
-      "page-vault",
-      config,
-      (() => {
-        const Comp = () => <VaultPageDemo ctx={ctx} />;
-        Comp.slot = "content";
-        return Comp;
-      })() as ComponentType<Record<string, unknown>>,
-      "content",
-      10,
-    );
-  },
-  {
-    inject: ["slots", "session", "theme", "toast", "ipc"],
-    Config: validateSlotConfig,
-  },
-);
-
-export const pageRules = pagePlugin("rules", "规则", "M2 实现规则 CRUD（ui-rules，规则库在 vault 内加密、按项目目录绑定）。");
-export const pageSettings = pagePlugin("settings", "设置", "M2 实现同步/安全/审计保留 + 主题选择（ui-settings，依赖 theme）。");
-export const pageAudit = pagePlugin("audit", "审计", "M2 实现事件流只读展示（ui-audit；无密钥值）。");
