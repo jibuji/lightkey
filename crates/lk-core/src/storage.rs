@@ -37,14 +37,14 @@ fn is_uuid(s: &str) -> bool {
 }
 
 /// 校验对象键：只接受已知文件名形态（index.lk / {uuid}.item.lk /
-/// {uuid}.tomb.lk / {uuid}.attach.lk / {uuid}.{i}.chunk.lk）。
+/// {uuid}.rule.lk / {uuid}.tomb.lk / {uuid}.attach.lk / {uuid}.{i}.chunk.lk）。
 ///
 /// 防路径穿越：远端 `list()` 结果不可信，任何不匹配的键一律拒绝。
 pub fn valid_key(key: &str) -> bool {
     if key == INDEX_KEY {
         return true;
     }
-    for sfx in [".item.lk", ".tomb.lk", ".attach.lk"] {
+    for sfx in [".item.lk", ".rule.lk", ".tomb.lk", ".attach.lk"] {
         if let Some(stem) = key.strip_suffix(sfx) {
             return is_uuid(stem);
         }
