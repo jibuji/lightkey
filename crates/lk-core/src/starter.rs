@@ -644,7 +644,10 @@ mod tests {
                 }
             }
         }
-        eprintln!("DIAG starter={}", resolve_starter(pid, &t));
+        let starter = resolve_starter(pid, &t);
+        eprintln!("DIAG starter={}", starter);
+        // 故意失败以让诊断出现在失败日志（临时）
+        panic!("DIAG-FAIL starter={} pid={}", starter, pid);
     }
 
     /// Linux 真实进程链：spawn `sh -c sleep`，回溯 sleep 的父链必须经过 sh，
