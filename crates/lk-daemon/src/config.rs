@@ -1,14 +1,15 @@
 //! C 层 daemon 宿主 · config.json 读写边界（`docs/plugin-architecture.md` §3.3）。
 //!
-//! - `config.json`：非敏感运行时配置（空闲超时 / 同步 URL / 轮询间隔），
-//!   明文原子写（tmp + rename）；CLI `lk config` 与守护进程热更新共用。
+//! - `config.json`：非敏感运行时配置（空闲超时 / 同步 URL / 轮询间隔 /
+//!   审批超时），明文原子写（tmp + rename）；CLI `lk config` 与守护进程
+//!   热更新共用。
 //! - `sync-state.json`：同步运行状态（水位 / 最近摘要 / 风暴等级），
 //!   跨重启保留。
 //! - 同步凭据（WebDAV/S3）：系统钥匙串（service=`lightkey-sync`），
 //!   不进 vault 密文、不进审计明文、不落日志；`file://` 本地模拟无需凭据。
 //!
 //! 归属分界（`docs/plugin-architecture.md` §9）：敏感加密数据 → Rust vault
-//! 落盘；非敏感运行时配置 → 本模块；UI 偏好（含主题）→ D 层 preference-store。
+//! 落盘；非敏感运行时配置 → 本模块；UI 偏好（含主题） → D 层 preference-store。
 
 use std::path::Path;
 
@@ -19,6 +20,9 @@ pub const SYNC_STATE_FILE: &str = "sync-state.json";
 /// 钥匙串 service 名（凭据 = `{username, password}` JSON；user = 存储 URL）。
 const SYNC_KEYRING_SERVICE: &str = "lightkey-sync";
 
+/// 审批超时默认值（第 3 层弹窗 30s 超时默认拒绝；`lk-core::authz` 常量对齐）。
+const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 30;
+
 /// 守护进程配置（`config.json`）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +32,14 @@ pub struct Config {
     /// M1 同步配置（`lk config sync set` 写入；缺省 = 未配置同步）。
     #[serde(default)]
     pub sync: Option<lk_core::sync::SyncConfig>,
+    /// M2 审批超时秒数（`authz.evaluate` 第 3 层弹窗等待；超时默认拒绝）。
+    /// 缺省 30；测试可调小以缩短等待。
+    #[serde(default = "default_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+}
+
+fn default_approval_timeout_secs() -> u64 {
+    DEFAULT_APPROVAL_TIMEOUT_SECS
 }
 
 impl Default for Config {
@@ -35,6 +47,7 @@ impl Default for Config {
         Config {
             auto_lock_minutes: 5,
             sync: None,
+            approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
         }
     }
 }

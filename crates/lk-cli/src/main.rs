@@ -93,9 +93,9 @@ enum Command {
     /// 触发一次同步（轮询 + CAS 上传）【M1】
     Sync,
     /// Agent 授权门规则管理（add / list / remove）【M2】
-    Rule,
+    Rule(Box<RuleArgs>),
     /// 给具名命令注入被批准的环境变量【M2】
-    Inject,
+    Inject(Box<InjectArgs>),
     /// 读写本地配置【M1】
     Config(Box<ConfigArgs>),
 }
@@ -138,6 +138,45 @@ enum ConfigSyncCommand {
         #[arg(long)]
         stdin: bool,
     },
+}
+
+/// `lk rule` 参数。
+#[derive(clap::Args)]
+struct RuleArgs {
+    #[command(subcommand)]
+    command: RuleCommand,
+}
+
+/// `lk rule` 子命令（cli.md §4；决策 #6：规则含 name）。
+#[derive(Subcommand)]
+enum RuleCommand {
+    /// 新增白名单规则（入库加密；projectDir 规范化后入库）
+    Add {
+        /// 项目目录（规范化绝对路径；须存在）
+        project_dir: String,
+        /// 具名命令（可 glob，如 "npm *"；含空格需引号）
+        command: String,
+        /// 规则名（如 publish）
+        #[arg(long)]
+        name: String,
+        /// 授权注入的 key 名（1~32 个；值不可见、名可指名）
+        keys: Vec<String>,
+    },
+    /// 列出规则（最小字段）
+    List,
+    /// 删除规则（软删除，删除随同步传播）
+    Remove { id: String },
+}
+
+/// `lk inject` 参数（决策 #1 A：`--keys` 指名，值不可见）。
+#[derive(clap::Args)]
+struct InjectArgs {
+    /// 请求注入的 key 名（agent 已知名字，只是不知道值）
+    #[arg(long, num_args = 1.., value_name = "NAME")]
+    keys: Vec<String>,
+    /// 注入 env 后执行的命令（`--` 之后）
+    #[arg(last = true, required = true, value_name = "CMD")]
+    command: Vec<String>,
 }
 
 /// `lk recover` 参数。
@@ -306,16 +345,8 @@ fn run(cli: &Cli) -> i32 {
         Command::Daemon => cmd_daemon(&dir),
         Command::Sync => cmd_sync(out, &dir, cli.json),
         Command::Config(args) => cmd_config(out, &dir, &args.command, cli.json),
-        // M2 占位
-        Command::Rule | Command::Inject => {
-            let name = match &cli.command {
-                Command::Rule => "rule",
-                Command::Inject => "inject",
-                _ => unreachable!(),
-            };
-            eprintln!("lk {name}: 该命令将在 M2（授权门）中实现");
-            2
-        }
+        Command::Rule(args) => cmd_rule(out, &dir, &args.command, cli.json),
+        Command::Inject(args) => cmd_inject(out, &dir, &args.keys, &args.command),
     }
 }
 
@@ -1415,6 +1446,197 @@ fn cmd_config_get(out: &mut impl Write, dir: &std::path::Path, key: &str, json_o
             eprintln!("lk config: 未配置 {key}");
             1
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 授权门：规则管理 / 注入（M2）
+// ---------------------------------------------------------------------------
+
+/// `lk rule` 入口。
+fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json_out: bool) -> i32 {
+    match cmd {
+        RuleCommand::Add {
+            project_dir,
+            command,
+            name,
+            keys,
+        } => cmd_rule_add(out, dir, project_dir, name, command, keys, json_out),
+        RuleCommand::List => cmd_rule_list(out, dir, json_out),
+        RuleCommand::Remove { id } => cmd_rule_remove(out, dir, id, json_out),
+    }
+}
+
+/// `lk rule add <projectDir> <command> --name <name> <keys...>`：
+/// projectDir 规范化（解析符号链接）后入库。
+fn cmd_rule_add(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    project_dir: &str,
+    name: &str,
+    command: &str,
+    keys: &[String],
+    json_out: bool,
+) -> i32 {
+    if keys.is_empty() {
+        eprintln!("lk rule add: 至少需要 1 个 key 名（值不可见、名可指名）");
+        return 2;
+    }
+    let canonical = match std::fs::canonicalize(project_dir) {
+        Ok(c) => c.to_string_lossy().to_string(),
+        Err(e) => {
+            eprintln!("lk rule add: 项目目录无法解析：{project_dir}（{e}）");
+            return 1;
+        }
+    };
+    match rpc(
+        dir,
+        M_RULE_ADD,
+        json!({
+            "projectDir": canonical,
+            "name": name,
+            "command": command,
+            "keys": keys,
+            "channel": "cli",
+        }),
+    ) {
+        Ok(res) => {
+            let rule: lk_core::model::Rule = serde_json::from_value(res["rule"].clone())
+                .unwrap_or_else(|_| lk_core::model::Rule {
+                    id: uuid::Uuid::nil(),
+                    project_dir: canonical,
+                    name: name.to_string(),
+                    command: command.to_string(),
+                    keys: keys.to_vec(),
+                    created: String::new(),
+                });
+            if json_out {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&rule).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(out, "已添加规则: {}（{}）", rule.id, rule.name);
+            }
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+/// `lk rule list`：列出规则（最小字段）。
+fn cmd_rule_list(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
+    match rpc(dir, M_RULE_LIST, json!({ "channel": "cli" })) {
+        Ok(res) => {
+            let rules: Vec<lk_core::model::Rule> =
+                serde_json::from_value(res["rules"].clone()).unwrap_or_default();
+            if json_out {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&rules).unwrap_or_default()
+                );
+            } else {
+                if rules.is_empty() {
+                    let _ = writeln!(out, "（无规则。lk rule add <projectDir> <command> --name <name> <keys...> 添加）");
+                }
+                for r in &rules {
+                    let _ = writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}\t{}",
+                        r.id,
+                        r.name,
+                        r.project_dir,
+                        r.command,
+                        r.keys.join(",")
+                    );
+                }
+            }
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+/// `lk rule remove <id>`：软删除（墓碑；删除随同步传播）。
+fn cmd_rule_remove(out: &mut impl Write, dir: &std::path::Path, id: &str, json_out: bool) -> i32 {
+    match rpc(dir, M_RULE_REMOVE, json!({ "id": id, "channel": "cli" })) {
+        Ok(_) => {
+            let _ = writeln!(out, "已删除规则 {id}（软删除，30 天后硬删）");
+            let _ = json_out;
+            0
+        }
+        Err(c) => c,
+    }
+}
+
+/// `lk inject --keys <name...> -- <cmd...>`：三层授权 → 注入子进程 env。
+///
+/// - 注入的是子进程环境变量（值只进子进程，**绝不进 lk 自身 stdout/日志/审计**）；
+/// - 拒绝/超时 → 非零退出码 + 审计留痕（authorization-gate.md §5）。
+fn cmd_inject(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    keys: &[String],
+    command: &[String],
+) -> i32 {
+    if keys.is_empty() {
+        eprintln!("lk inject: 需要 --keys <name...> 指名请求的 key（值不可见、名可指名）");
+        return 2;
+    }
+    let command_str = command.join(" ");
+    // 不传 starter/cwd：守护进程以 IPC 对端真实 PID 回溯 + 真实 cwd 判定
+    // （客户端自报字段一律不信任，伪造 cwd 必须失败）。
+    match rpc(
+        dir,
+        M_AUTHZ_EVALUATE,
+        json!({ "command": command_str, "keys": keys, "channel": "cli" }),
+    ) {
+        Ok(res) => {
+            let allowed = res["allowed"].as_bool().unwrap_or(false);
+            if !allowed {
+                let reason = res["reason"].as_str().unwrap_or("denied");
+                eprintln!("lk inject: 已拒绝（{}）", reason_text(reason));
+                return 1;
+            }
+            // 只含被授权 key 的 env（值在此刻才离开守护进程，且只进子进程）
+            let env: std::collections::BTreeMap<String, String> =
+                serde_json::from_value(res["env"].clone()).unwrap_or_default();
+            if env.is_empty() {
+                eprintln!("lk inject: 无可注入的 key（请求的 key 未被授权）");
+                return 1;
+            }
+            let mut child = std::process::Command::new(&command[0]);
+            child.args(&command[1..]);
+            child.envs(&env);
+            match child.status() {
+                Ok(status) => {
+                    let code = status.code().unwrap_or(1);
+                    let _ = out;
+                    code
+                }
+                Err(e) => {
+                    eprintln!("lk inject: 启动命令失败：{e}");
+                    1
+                }
+            }
+        }
+        Err(c) => c,
+    }
+}
+
+/// 拒绝原因 → 用户文案（不泄露库内容；仅反馈请求无法满足）。
+fn reason_text(reason: &str) -> &'static str {
+    match reason {
+        "unknown_starter" => "无法确定启动者（进程回溯失败）",
+        "no_cwd" => "无法确定工作目录",
+        "missing_keys" => "请求的 key 无法满足（部分 key 不存在或不可注入）",
+        "rule_corrupt" => "规则库损坏",
+        "no_ui" => "无审批界面（未命中规则且桌面端未运行）",
+        "rejected" => "用户拒绝",
+        "timeout" => "审批超时（默认拒绝）",
+        _ => "未获授权",
     }
 }
 

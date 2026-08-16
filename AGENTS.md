@@ -16,11 +16,13 @@
 
 ## 常用命令
 
-- 核心+CLI 测试/检查（Linux 上 Tauri 壳需 webkit2gtk，CI 在 Windows 检查；
+- 核心+daemon+CLI 测试/检查（Linux 上 Tauri 壳需 webkit2gtk，CI 在 Windows 检查；
   Windows 优先，补充拍板 #4）：
   `cargo test` / `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`
+  （三 crate：lk-core / lk-daemon / lk-cli）
 - 同步 E2E（M1 双客户端）：`bash scripts/e2e_m1.sh [lk-binary-path]`；
-  单机回归：`bash scripts/e2e_m0.sh`（都用 `file://` 本地模拟存储，无需凭据）。
+  单机回归：`bash scripts/e2e_m0.sh`；授权门 E2E（M2）：`bash scripts/e2e_m2.sh`
+  （都用 `file://` 本地模拟存储，无需凭据）。
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
   `crates/lk-app/tauri.conf.json` 的 devUrl 一致）；D 层单测 `npm test`
   （vitest；事件总线契约/装配/宿主渲染）。
@@ -50,7 +52,23 @@
   总线；D 层真 Cordis 宿主 + `frontend/src/cordis.yml` 装配（theme /
   ipc-bridge / preference-store / toast + 槽位骨架），事件契约见
   `frontend/src/events.ts`
-- [ ] M2 授权门 + 桌面 · [ ] M3 浏览器填充
+- [x] M2 核心（Rust 授权门 + 推送通道 + daemon 下沉）：
+  - C 层 daemon 宿主下沉到共享 crate **`crates/lk-daemon`**（决策 #2 A，
+    `lk-cli` 与桌面内置实例复用；`lk_daemon::run(dir)` 为守护进程入口）
+  - 推送通道（决策 #3 A）：`transport::PushHub` + `notifier::Notifier`
+    （EventSink），订阅连接收 JSON-RPC notification 帧（`subscribe` 方法）
+  - 授权门（`lk-core/src/authz.rs`）：三层模型 + `ApprovalChannel` trait +
+    `PendingApprovals`（30s 超时默认拒绝）；`authz.evaluate` 三阶段编排
+    （`try_authz_evaluate`：等待不持命令锁，G1）
+  - 启动者判定（`lk-core/src/starter.rs`）：IPC 对端 PID 进程链回溯
+    （Linux procfs / Windows Toolhelp+PEB / macOS sysctl），失败 fail-closed
+  - 规则库：`model::Rule`（含 name，决策 #6）+ `{uuid}.rule.lk` 密封 +
+    `SealType::Rule` + 索引 `ObjectKind::Rule` + 与条目同路径同步
+    （软删/墓碑/30 天硬删）；变更广播 `item.changed(kind="rule")`
+  - IPC/CLI（决策 #6/#1）：`authz.evaluate` / `approval.result` /
+    `rule.add|list|remove`（`approval.request` 已移除）；`lk rule add|list|remove`
+    + `lk inject --keys <name...> -- <cmd>`（值只进子进程 env）
+- [ ] M2 桌面（approval 弹窗 / desktop-shell / ui-* / Windows Hello）· [ ] M3 浏览器填充
 
 ## Maintaining this file
 
