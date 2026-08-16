@@ -1934,7 +1934,10 @@ mod tests {
         assert!(fv.get("id").is_none());
         assert_eq!(
             fv["params"]["projectDir"],
-            proj.path().to_string_lossy().to_string()
+            std::fs::canonicalize(proj.path())
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
         );
         assert_eq!(fv["params"]["command"], "yarn publish");
         assert_eq!(fv["params"]["keys"][0], "NPM_TOKEN");
