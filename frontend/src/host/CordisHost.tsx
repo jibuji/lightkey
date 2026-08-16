@@ -23,16 +23,19 @@ import { ipcBridge } from "../plugins/ipc-bridge";
 import { preferenceStore } from "../plugins/preference-store";
 import { theme } from "../plugins/theme";
 import { toast } from "../plugins/toast";
+import { approval } from "../plugins/approval";
+import { desktopShell } from "../plugins/desktop-shell";
+import { uiUnlock } from "../plugins/ui-unlock";
+import { uiVault } from "../plugins/ui-vault";
+import { uiRules } from "../plugins/ui-rules";
+import { uiSettings } from "../plugins/ui-settings";
+import { uiAudit } from "../plugins/ui-audit";
 import {
   lock,
   navAudit,
   navRules,
   navSettings,
   navVault,
-  pageAudit,
-  pageRules,
-  pageSettings,
-  pageVault,
   search,
   syncStatus,
   themeToggle,
@@ -58,11 +61,15 @@ export const PLUGIN_REGISTRY: Record<string, Plugin> = {
   search,
   "sync-status": syncStatus,
   "theme-toggle": themeToggle,
-  // content
-  "page-vault": pageVault,
-  "page-rules": pageRules,
-  "page-settings": pageSettings,
-  "page-audit": pageAudit,
+  // content（M2 ui-*；ui-unlock 为锁态整页）
+  "ui-unlock": uiUnlock,
+  "ui-vault": uiVault,
+  "ui-rules": uiRules,
+  "ui-settings": uiSettings,
+  "ui-audit": uiAudit,
+  // 服务（无槽位）
+  approval,
+  "desktop-shell": desktopShell,
 };
 
 export interface HostInstance {

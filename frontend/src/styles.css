@@ -566,3 +566,47 @@ mark.hl { background: rgba(240, 138, 60, 0.28); color: var(--fg-0); border-radiu
   font-size: var(--fs-lg); line-height: 1; padding: 0 2px;
 }
 .toast-dismiss:hover { color: var(--fg-0); }
+
+/* ---------- M2：审批弹窗（spec §6.5：启动者/目录/命令/Key Tag/倒计时环） ---------- */
+.approval-root { position: relative; z-index: var(--z-dialog); }
+.approval-dialog { text-align: left; }
+.approval-source { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-4); }
+.approval-avatar {
+  width: 40px; height: 40px; border-radius: var(--r-md); background: var(--bg-3);
+  display: grid; place-items: center; color: var(--fg-1);
+}
+.approval-cmd-box {
+  background: var(--bg-0); border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: var(--sp-3); font-family: var(--font-mono); font-size: var(--fs-sm);
+  margin-bottom: var(--sp-3); word-break: break-all;
+}
+.approval-keys { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.approval-timer {
+  display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-4);
+  color: var(--fg-1); font-size: var(--fs-sm);
+}
+.ring-wrap { position: relative; width: 44px; height: 44px; flex: none; display: inline-grid; place-items: center; }
+.ring-wrap svg { position: absolute; inset: 0; }
+.ring-num {
+  font-family: var(--font-mono); font-size: var(--fs-sm); font-weight: 700;
+  color: var(--fg-0);
+}
+
+/* ---------- M2：规则新建 —— key 名多选（仅显示已授权 key 名，spec §6.4） ---------- */
+.key-options { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.key-option {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 4px 3px 10px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-2);
+  transition: border-color 150ms ease, background 150ms ease;
+}
+.key-option:hover { border-color: rgba(207, 139, 163, 0.4); }
+.key-option.selected { border-color: rgba(207, 139, 163, 0.55); background: rgba(207, 139, 163, 0.1); }
+.key-option input { accent-color: var(--accent); }
+.key-option .key-tag { background: none; border: none; padding: 0; }
+
+@media (max-width: 600px) {
+  .approval-source { flex-wrap: wrap; }
+  .approval-timer { flex-wrap: wrap; }
+  .approval-cmd-box { font-size: var(--fs-xs); }
+}

@@ -86,18 +86,18 @@ export const MOCK_ITEMS: Item[] = [
 ];
 
 export const MOCK_RULES: AuthRule[] = [
-  { id: "r1", projectDir: "~/work/proj-a", command: "npm publish", keys: ["NPM_TOKEN"], created: "2026-08-14T10:00:00Z" },
-  { id: "r2", projectDir: "~/work/proj-a", command: "cargo publish", keys: ["CARGO_REGISTRY_TOKEN"], created: "2026-08-14T10:05:00Z" },
-  { id: "r3", projectDir: "~/work/proj-b", command: "aws s3 sync *", keys: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], created: "2026-08-15T09:00:00Z" },
+  { id: "r1", projectDir: "~/work/proj-a", name: "发布 npm 包", command: "npm publish", keys: ["NPM_TOKEN"], created: "2026-08-14T10:00:00Z" },
+  { id: "r2", projectDir: "~/work/proj-a", name: "发布 cargo 包", command: "cargo publish", keys: ["CARGO_REGISTRY_TOKEN"], created: "2026-08-14T10:05:00Z" },
+  { id: "r3", projectDir: "~/work/proj-b", name: "同步 AWS 资产", command: "aws s3 sync *", keys: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], created: "2026-08-15T09:00:00Z" },
 ];
 
 export const MOCK_AUDIT: AuditEvent[] = [
-  { ts: "10:24:33", starter: "zsh", target: "npm publish", dir: "~/work/proj-a", result: "allowed", note: "规则命中" },
-  { ts: "10:22:10", starter: "claude", target: "bash -c curl …", dir: "~/work/proj-c", result: "denied", note: "默认拒绝" },
-  { ts: "10:18:02", starter: "code", target: "git push", dir: "~/work/proj-a", result: "allowed", note: "规则命中" },
-  { ts: "09:58:47", starter: "claude", target: "npm publish", dir: "~/work/proj-b", result: "timeout", note: "审批超时(30s)" },
-  { ts: "09:41:12", starter: "lk", target: "vault.unlock", dir: "—", result: "allowed", note: "解锁成功" },
-  { ts: "09:12:03", starter: "zsh", target: "git push", dir: "~/work/proj-d", result: "denied", note: "默认拒绝" },
+  { eventId: "e1", ts: "2026-08-16T10:24:33Z", starter: "zsh", target: "npm", command: "lk inject <a1b2c3d4>", result: "allowed", channel: "cli" },
+  { eventId: "e2", ts: "2026-08-16T10:22:10Z", starter: "claude", target: "bash", command: "lk inject <9f8e7d6c>", result: "denied", channel: "cli" },
+  { eventId: "e3", ts: "2026-08-16T10:18:02Z", starter: "code", target: "git", command: "lk inject <11223344>", result: "allowed", channel: "approval" },
+  { eventId: "e4", ts: "2026-08-16T09:58:47Z", starter: "claude", target: "npm", command: "lk inject <55667788>", result: "timeout", channel: "approval" },
+  { eventId: "e5", ts: "2026-08-16T09:41:12Z", starter: "lk", target: "daemon", command: "vault.unlock", result: "allowed", channel: "desktop" },
+  { eventId: "e6", ts: "2026-08-16T09:12:03Z", starter: "zsh", target: "git", command: "lk inject <aabbccdd>", result: "denied", channel: "cli" },
 ];
 
 export const MOCK_SETTINGS: VaultSettings = {
@@ -106,6 +106,7 @@ export const MOCK_SETTINGS: VaultSettings = {
   syncUrl: "webdavs://dav.example.com/lightkey",
   pollSec: "60",
   retention: "永久",
+  theme: "dark",
 };
 
 /** mock 解锁主密码（演示用；真实实现由 Argon2id 派生校验，见 crypto.md） */

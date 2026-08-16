@@ -65,33 +65,72 @@ export interface ItemSummary {
   revision: string;
 }
 
-/* ---------- 规则 / 审计 / 设置 / 同步（M2 页骨架用 mock 数据） ---------- */
+/* ---------- 规则 / 审计 / 设置 / 同步（M2） ---------- */
 
+/** 规则（`rule.list` 结果；决策 #6：含 `name`；字段对齐 lk-core model::Rule）。 */
 export interface AuthRule {
   id: string;
+  /** 规范化绝对路径（守护进程侧 canonicalize）。 */
   projectDir: string;
+  name: string;
+  /** 具名命令（可 glob）。 */
+  command: string;
+  /** 授权注入的 key 名（最小集合）。 */
+  keys: string[];
+  /** 创建时间（ISO-8601 UTC）。 */
+  created: string;
+}
+
+/** 新建规则输入（`rule.add`；id/created 由守护进程注入）。 */
+export interface RuleInput {
+  projectDir: string;
+  name: string;
   command: string;
   keys: string[];
-  created: string;
 }
 
 export type AuditResult = "allowed" | "denied" | "timeout";
 
+/** 审计来源通道。 */
+export type AuditChannel = "cli" | "desktop" | "approval";
+
+/** 审计事件（对齐 lk-core audit::AuditEvent；无密钥值）。 */
 export interface AuditEvent {
+  eventId: string;
+  /** ISO-8601 UTC。 */
   ts: string;
+  /** 启动者进程（进程链回溯结果）。 */
   starter: string;
+  /** 目标程序。 */
   target: string;
-  dir: string;
+  /** 命令摘要（敏感参数已脱敏）。 */
+  command: string;
   result: AuditResult;
-  note: string;
+  channel: AuditChannel;
 }
 
+/** 守护进程配置视图（`config.get`；同步凭据不经此面——走系统钥匙串）。 */
+export interface ConfigView {
+  autoLockMinutes: number;
+  approvalTimeoutSecs: number;
+  sync: { url: string; intervalSecs: number } | null;
+}
+
+/** 设置页保存补丁（`config.set`；缺省字段不修改；syncUrl 空串 = 移除同步）。 */
+export interface ConfigPatch {
+  autoLockMinutes?: number;
+  syncUrl?: string;
+  pollSecs?: number;
+}
+
+/** 设置页表单形态（含主题选择；生物识别宽限 M2 置灰预留，决策 #5 B）。 */
 export interface VaultSettings {
   autoLockMin: string;
   bioGrace: boolean;
   syncUrl: string;
   pollSec: string;
   retention: string;
+  theme: "dark" | "light";
 }
 
 export interface SyncStatus {

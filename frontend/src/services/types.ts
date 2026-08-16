@@ -87,6 +87,14 @@ export interface NavService {
   subscribe(listener: () => void): () => void;
 }
 
+/** desktop-shell 服务：窗口/托盘联动（决策 #4 A；tauri 环境生效，mock no-op）。 */
+export interface ShellService {
+  /** 关闭主窗口 = 隐藏到托盘、保持解锁（Rust 侧已拦截 close 事件；备用命令）。 */
+  closeToTray(): Promise<void>;
+  /** 退出应用（托盘退出 = 守护退出 = 锁定）。 */
+  quit(): Promise<void>;
+}
+
 declare module "@cordisjs/core" {
   interface Context {
     ipc: LightKeyIpc;
@@ -96,5 +104,7 @@ declare module "@cordisjs/core" {
     session: SessionService;
     slots: SlotRegistry;
     nav: NavService;
+    /** desktop-shell 插件提供（M2）。 */
+    shell: ShellService;
   }
 }

@@ -4,10 +4,10 @@
 # 只描述「用哪个插件、怎么组合、传什么配置」；不含逻辑；运行时不可变。
 # 条目字段：name（插件名，注册表 key）/ config（插件配置，经 @cordisjs/schema
 # 校验）/ slot（槽位）/ order（槽位内顺序）/ page（content 页面路由）。
-# 无 slot 的插件是服务（ipc-bridge / preference-store / theme / toast），
-# 被其他插件 inject 消费，不直接占槽位。
-# M2 新增 ui-unlock / ui-vault / ui-rules / ui-settings / ui-audit /
-# desktop-shell / approval 即在此增删（数据驱动落点）。
+# 无 slot 的插件是服务（ipc-bridge / preference-store / theme / toast /
+# approval / desktop-shell），被其他插件 inject 消费，不直接占槽位。
+# M2：ui-* 五插件挂 content（ui-unlock 为锁态整页，宿主按 session 切换）；
+# approval / desktop-shell 为服务插件。
 
 # 服务（地基）
 - name: ipc-bridge
@@ -50,20 +50,29 @@
   slot: topbar
   order: 3
 
-# content：页面（M2 由 ui-* 插件替换实现）
-- name: page-vault
+# content：页面（M2 由 ui-* 插件挂载）
+# ui-unlock：锁态整页（page=unlock，宿主锁态单独渲染，无三栏）
+- name: ui-unlock
   slot: content
-  order: 1
+  order: 0
+  page: unlock
+- name: ui-vault
+  slot: content
+  order: 10
   page: vault
-- name: page-rules
+- name: ui-rules
   slot: content
-  order: 2
+  order: 20
   page: rules
-- name: page-settings
+- name: ui-settings
   slot: content
-  order: 3
+  order: 30
   page: settings
-- name: page-audit
+- name: ui-audit
   slot: content
-  order: 4
+  order: 40
   page: audit
+
+# 服务（无槽位；M2 桌面层）
+- name: approval
+- name: desktop-shell

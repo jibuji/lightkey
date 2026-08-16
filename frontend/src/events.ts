@@ -11,7 +11,9 @@
  * | `session.locked` | `{ reason }` | Rust session → IPC 通知 → 本层重新 emit | ui 各插件（回解锁页）· sync-engine（暂停轮询） |
  * | `theme.changed` | `{ theme }` | theme 插件（TS 内 emit，不跨进程） | 所有 ui 插件（重渲染） |
  * | `clipboard.copied` | `{ source, field, clearedAt }` | ui 组件（TS 内 emit，不跨进程） | Toast（提示）· 30s 清除计时 |
- * | `authz.request` | `{ requestId, starter, projectDir, command, keys[] }` | Rust authz-gate → IPC 通知 | approval 弹窗（**M2 接入，本里程碑不发出**） |
+ * | `authz.request` | `{ requestId, starter, projectDir, command, keys[] }` | Rust authz-gate → IPC 通知 | approval 弹窗（**M2 已接入**） |
+ * | `vault.search` | `{ query }` | topbar 搜索框（TS 内 emit，300ms 防抖） | ui-vault（过滤列表） |
+ * | `vault.search-enter` | `{ query }` | topbar 搜索框回车（TS 内 emit） | ui-vault（空态引导新建） |
  *
  * 分发语义：`emit`（观察广播，fire-and-forget）；`authz.request` 的审批结果
  * 经 IPC 方法 `approval.result` 回传（跨进程无同步事件返回值，§5.3）。
@@ -55,7 +57,7 @@ export interface ClipboardCopiedPayload {
   clearedAt: string;
 }
 
-/** `authz.request` 负载（M2 随 authz-gate 接入；本节仅声明契约）。 */
+/** `authz.request` 负载（M2 已随 authz-gate + 通知桥接入）。 */
 export interface AuthzRequestPayload {
   requestId: string;
   starter: string;
@@ -63,6 +65,11 @@ export interface AuthzRequestPayload {
   command: string;
   /** 仅 key 名，密钥值永不进事件负载。 */
   keys: string[];
+}
+
+/** `vault.search` 负载（topbar 搜索框 → ui-vault；300ms 防抖）。 */
+export interface VaultSearchPayload {
+  query: string;
 }
 
 declare module "@cordisjs/core" {
@@ -73,6 +80,10 @@ declare module "@cordisjs/core" {
     "theme.changed"(payload: { theme: ThemeName }): void;
     "clipboard.copied"(payload: ClipboardCopiedPayload): void;
     "authz.request"(payload: AuthzRequestPayload): void;
+    /** topbar 搜索词（防抖后）。 */
+    "vault.search"(payload: VaultSearchPayload): void;
+    /** topbar 搜索框回车（空态「未找到，按回车新建」引导）。 */
+    "vault.search-enter"(payload: VaultSearchPayload): void;
   }
 }
 
