@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口默认能力（骨架最小集，M2 按需增补）",
+  "description": "主窗口能力（M2 desktop：事件监听 + 原生目录选择器；窗口/托盘动作在 Rust 侧，不需 JS 权限）",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:default"]
 }
