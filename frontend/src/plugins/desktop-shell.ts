@@ -11,6 +11,7 @@
  *   宿主据此回解锁页——本插件不重复接线。
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import type { Context, Plugin } from "@cordisjs/core";
 import type { ShellService } from "../services/types";
 
@@ -23,7 +24,6 @@ export const desktopShell: Plugin.Function<Context> = Object.assign((ctx: Contex
     },
     async quit() {
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
         await invoke("app_quit");
       } catch {
         ctx.toast.show("退出仅桌面（Tauri）环境生效");

@@ -135,14 +135,20 @@ function RuleCreateModal({
   const [busy, setBusy] = useState(false);
   const [secretNames, setSecretNames] = useState<string[]>([]);
 
-  // key 名多选数据源：保险库内 secret 条目名（最小授权可见面）
+  // key 名多选数据源：保险库内 secret 条目名（最小授权可见面）；
+  // 仅保留合法环境变量名（守护进程侧同规则校验：[A-Za-z_][A-Za-z0-9_]*）
   useEffect(() => {
     let alive = true;
     void ctx.ipc
       .list()
       .then((items: ItemSummary[]) => {
         if (!alive) return;
-        setSecretNames(items.filter((it) => it.type === "secret").map((it) => it.name));
+        setSecretNames(
+          items
+            .filter((it) => it.type === "secret")
+            .map((it) => it.name)
+            .filter((n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n)),
+        );
       })
       .catch(() => undefined);
     return () => {

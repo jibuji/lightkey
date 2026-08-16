@@ -5,7 +5,7 @@
 ## 项目一句话
 
 轻钥 LightKey：个人密钥/私密信息管理工具，从零自研（不 fork Bitwarden），
-客户端全开源（MIT）。当前为 **M1.5 插件化改造完成 + M2 授权门/桌面** 阶段。
+客户端全开源（MIT）。当前为 **M2 完成（授权门 + 桌面端）** 阶段。
 
 ## 规格是唯一权威
 
@@ -25,7 +25,10 @@
   （都用 `file://` 本地模拟存储，无需凭据）。
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
   `crates/lk-app/tauri.conf.json` 的 devUrl 一致）；D 层单测 `npm test`
-  （vitest；事件总线契约/装配/宿主渲染）。
+  （vitest；事件总线契约/装配/宿主渲染/审批弹窗）。
+- 桌面壳 Windows 验收：`cargo check --workspace --target x86_64-pc-windows-gnu`
+  （本地需 mingw 交叉工具链：conda env `lightkey-mingw`，PATH 前置其 bin；
+  Linux 无 webkit2gtk 不编译 lk-app）。
 - CI 骨架：`.github/workflows/ci.yml`。
 
 ## 交付纪律
@@ -45,7 +48,7 @@
   trait + 本地模拟/WebDAV/S3 实现；E2E `scripts/e2e_m1.sh`）
 - [x] M1 并发结构（G1 根治）：同步轮次 = 抓取无锁 + 应用短锁两阶段；命令与
   后台同步并发，网络 I/O 不持守护进程锁；vault 内存用读写锁（权限层与数据层
-  互斥解耦，见 `crates/lk-cli/src/daemon/` 模块文档）
+  互斥解耦，见 `crates/lk-daemon/src/lib.rs` 模块文档）
 - [x] M1.5 插件化改造（Cordis）：lk-core A/B 层 trait 服务 + 事件总线
   （`crates/lk-core/src/service.rs` / `bus.rs`；密文格式/存储布局/IPC 协议零变更）；
   daemon 按 C 层边界拆 `crates/lk-cli/src/daemon/{mod,config,sync}.rs` 并装配
@@ -53,8 +56,8 @@
   ipc-bridge / preference-store / toast + 槽位骨架），事件契约见
   `frontend/src/events.ts`
 - [x] M2 核心（Rust 授权门 + 推送通道 + daemon 下沉）：
-  - C 层 daemon 宿主下沉到共享 crate **`crates/lk-daemon`**（决策 #2 A，
-    `lk-cli` 与桌面内置实例复用；`lk_daemon::run(dir)` 为守护进程入口）
+  - C 层 daemon 宿主下沉到共享 crate **`crates/lk-daemon`**（决策 #2 A；
+    `lk_daemon::run(dir)` CLI 入口 / `serve_embedded` 桌面内嵌入口）
   - 推送通道（决策 #3 A）：`transport::PushHub` + `notifier::Notifier`
     （EventSink），订阅连接收 JSON-RPC notification 帧（`subscribe` 方法）
   - 授权门（`lk-core/src/authz.rs`）：三层模型 + `ApprovalChannel` trait +
@@ -68,7 +71,10 @@
   - IPC/CLI（决策 #6/#1）：`authz.evaluate` / `approval.result` /
     `rule.add|list|remove`（`approval.request` 已移除）；`lk rule add|list|remove`
     + `lk inject --keys <name...> -- <cmd>`（值只进子进程 env）
-- [ ] M2 桌面（approval 弹窗 / desktop-shell / ui-* / Windows Hello）· [ ] M3 浏览器填充
+- [x] M2 桌面（Tauri 壳：内置守护实例/托盘/锁屏 WTS+CGSession/command 桥/通知
+  订阅桥；approval 弹窗 + 30s 倒计时；ui-unlock/vault/rules/settings/audit
+  五插件 + 锁态整页↔三栏切换；Windows Hello 置灰预留，决策 #5 B）
+- [ ] M3 浏览器填充
 
 ## Maintaining this file
 
