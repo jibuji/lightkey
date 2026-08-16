@@ -15,10 +15,12 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
 use crate::audit::{AuditLog, AuditResult, EventInput};
+use crate::bus::{EventBus, VaultEvent};
 use crate::crypto::{
     self, bump_iso, now_iso, open, parse_iso, random_array, random_uuid, seal, KdfCost, KdfParams,
     Keys, SealType, VaultHeader,
@@ -200,12 +202,18 @@ fn wipe_vault_files(dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// 解锁态 vault：密钥 + 内存索引缓存（锁定即整体丢弃，密钥经 Zeroizing 擦除）。
+///
+/// A 层 **vault-store** 插件边界（`docs/plugin-architecture.md` §3.1）：
+/// 条目/索引/墓碑/附件 CRUD、CAS、30 天延迟硬删；可挂事件总线，
+/// 写操作成功后广播 `item.changed`（fire-and-forget；未挂总线 = 零行为差异）。
 pub struct UnlockedVault {
     dir: PathBuf,
     keys: Keys,
     index: HashMap<uuid::Uuid, IndexEntry>,
     /// 本会话已签发的最大 revision（保证严格递增）。
     last_revision: Option<String>,
+    /// 事件总线（C 层宿主装配；缺省 = 不广播）。
+    bus: Option<Arc<EventBus>>,
 }
 
 impl UnlockedVault {
@@ -243,7 +251,25 @@ impl UnlockedVault {
             keys,
             index,
             last_revision,
+            bus: None,
         })
+    }
+
+    /// 挂载事件总线（C 层宿主在解锁后装配；`item.changed` 广播）。
+    pub fn attach_bus(&mut self, bus: Arc<EventBus>) {
+        self.bus = Some(bus);
+    }
+
+    /// `item.changed` 观察广播（fire-and-forget；订阅者须非阻塞，见 [`EventBus`]）。
+    fn emit_item_changed(&self, item: &Item, deleted: bool) {
+        if let Some(bus) = &self.bus {
+            bus.emit(&VaultEvent::ItemChanged {
+                item_id: item.id(),
+                revision_date: item.revision().to_string(),
+                kind: item.kind().as_str().to_string(),
+                deleted,
+            });
+        }
     }
 
     pub fn keys(&self) -> &Keys {
@@ -613,6 +639,7 @@ impl UnlockedVault {
             },
         );
         self.save_index()?;
+        self.emit_item_changed(&item, false);
         Ok(item)
     }
 
@@ -674,6 +701,7 @@ impl UnlockedVault {
             e.revision = rev;
         }
         self.save_index()?;
+        self.emit_item_changed(&item, true);
         Ok(tomb)
     }
 
