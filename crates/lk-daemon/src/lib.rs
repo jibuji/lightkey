@@ -47,14 +47,13 @@ use lk_core::vault::{self, UnlockedVault};
 use lk_core::Error;
 use serde_json::{json, Value};
 
-mod config;
-mod sync;
+pub mod config;
+pub mod sync;
+pub mod transport;
 
 pub use config::*;
-#[cfg(test)]
-pub use sync::run_sync_round_with;
 use sync::sync_fail_response;
-pub use sync::{run_sync_round, try_sync_trigger};
+pub use sync::{run_sync_round, run_sync_round_with, try_sync_trigger};
 
 /// 会话令牌文件名（0600；CLI 进程间传递，锁定即删除）。
 pub const SESSION_TOKEN_FILE: &str = "session.token";
@@ -224,8 +223,8 @@ impl Daemon {
                 }
             }
             M_SYNC_POLL => self.require_session(id.clone(), token, |me| me.sync_poll(id.clone())),
-            // M2 占位
-            M_AUTHZ_EVALUATE | M_APPROVAL_REQUEST => {
+            // M2 占位（authz.evaluate / approval.result / rule.* 待 M2 实现）
+            M_AUTHZ_EVALUATE | M_APPROVAL_RESULT | M_RULE_ADD | M_RULE_LIST | M_RULE_REMOVE => {
                 RpcResponse::err(id.clone(), ERR_METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None)
             }
             _ => RpcResponse::err(id.clone(), ERR_METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None),
@@ -466,8 +465,8 @@ impl Daemon {
         // 广播 `session.locked(daemon-exit)`（进程退出前的最后事件）
         self.sessions.invalidate_with(LockReason::DaemonExit);
         self.remove_session_token();
-        if let Some(ep) = super::transport::read_endpoint(&self.shared.dir) {
-            super::transport::cleanup(&self.shared.dir, &ep);
+        if let Some(ep) = crate::transport::read_endpoint(&self.shared.dir) {
+            crate::transport::cleanup(&self.shared.dir, &ep);
         }
     }
 
@@ -721,6 +720,109 @@ extern "C" fn handle_signal(_: libc::c_int) {
 /// 全局信号标志的引用（供 transport 主循环轮询）。
 pub fn global_shutdown() -> &'static AtomicBool {
     &SHUTDOWN
+}
+
+
+// ---------------------------------------------------------------------------
+// 守护进程入口（CLI 与桌面内嵌实例共用；决策 #2 A：宿主下沉到共享 crate）
+// ---------------------------------------------------------------------------
+
+/// 以守护进程方式运行：绑定端点 → 装配 → 后台轮询 → 服务直至退出。
+/// 返回进程退出码（`lk daemon` 与桌面内嵌线程共用）。
+pub fn run(dir: &Path) -> i32 {
+    let bind = transport::bind_server(dir);
+    #[cfg(unix)]
+    let listener = match bind {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("lk daemon: 绑定失败：{e}");
+            return 1;
+        }
+    };
+    #[cfg(windows)]
+    if let Err(e) = bind {
+        eprintln!("lk daemon: 绑定失败：{e}");
+        return 1;
+    }
+    let daemon = match Daemon::start(dir) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("lk daemon: 启动失败：{e}");
+            return 1;
+        }
+    };
+    let shared = daemon.shared();
+    let state = std::sync::Arc::new(std::sync::Mutex::new(daemon));
+    // 后台同步轮询线程（M1）：只在解锁态 + 已配置时执行一轮；锁定即停止。
+    // 间隔 = 配置值 × 2^风暴等级（封顶 24h）；失败静默（下一轮重试）。
+    {
+        use lk_core::sync::{next_poll_interval, DEFAULT_SYNC_INTERVAL_SECS};
+        let poller = shared.clone();
+        std::thread::spawn(move || {
+            let mut next_sleep = DEFAULT_SYNC_INTERVAL_SECS;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(next_sleep));
+                {
+                    let mut cfg = poller.config.write().unwrap();
+                    *cfg = read_config(&poller.dir);
+                }
+                let (base, enabled, unlocked) = {
+                    let cfg = poller.config.read().unwrap();
+                    let base = cfg
+                        .sync
+                        .as_ref()
+                        .filter(|c| c.validate().is_ok())
+                        .map(|c| c.interval_secs)
+                        .unwrap_or(DEFAULT_SYNC_INTERVAL_SECS);
+                    (
+                        base,
+                        cfg.sync.is_some(),
+                        poller.vault.read().unwrap().is_some(),
+                    )
+                };
+                if unlocked && enabled {
+                    if let Err(e) = run_sync_round(&poller) {
+                        eprintln!("lk daemon: 同步失败（下一轮重试）：{}", e.message());
+                    }
+                    next_sleep =
+                        next_poll_interval(base, poller.sync.lock().unwrap().state.storm_level);
+                } else {
+                    next_sleep = next_poll_interval(base, 0);
+                }
+            }
+        });
+    }
+    let handler_state = state.clone();
+    let handler_shared = shared.clone();
+    let handler = std::sync::Arc::new(move |line: &str| -> String {
+        // sync.trigger：命令锁外执行轮次（网络 I/O 不阻塞其他命令；
+        // 会话预检与活动时间戳短暂持锁）
+        if let Some(resp) = try_sync_trigger(&handler_state, &handler_shared, line) {
+            return resp;
+        }
+        let mut guard = handler_state.lock().expect("daemon mutex poisoned");
+        guard.handle(line)
+    });
+    eprintln!(
+        "lk daemon: 监听于 {}（pid {}）",
+        dir.display(),
+        std::process::id()
+    );
+    #[cfg(unix)]
+    let result = transport::serve(listener, handler, global_shutdown());
+    #[cfg(windows)]
+    let result = transport::serve(dir, handler, daemon::global_shutdown());
+    // 优雅退出清理：删令牌 + 端点
+    if let Ok(mut guard) = state.lock() {
+        guard.shutdown();
+    }
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("lk daemon: {e}");
+            1
+        }
+    }
 }
 
 #[cfg(test)]

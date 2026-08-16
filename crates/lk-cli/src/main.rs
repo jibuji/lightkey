@@ -20,9 +20,10 @@
 //! - 错误信息不区分「未解锁/令牌错」（ipc.md §3 语义）。
 
 mod clipboard;
-mod daemon;
 mod dirs;
-mod transport;
+
+use lk_daemon as daemon;
+use lk_daemon::transport;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -1422,103 +1423,6 @@ fn cmd_config_get(out: &mut impl Write, dir: &std::path::Path, key: &str, json_o
 // ---------------------------------------------------------------------------
 
 fn cmd_daemon(dir: &std::path::Path) -> i32 {
-    let bind = transport::bind_server(dir);
-    #[cfg(unix)]
-    let listener = match bind {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("lk daemon: 绑定失败：{e}");
-            return 1;
-        }
-    };
-    #[cfg(windows)]
-    if let Err(e) = bind {
-        eprintln!("lk daemon: 绑定失败：{e}");
-        return 1;
-    }
-    let daemon = match daemon::Daemon::start(dir) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("lk daemon: 启动失败：{e}");
-            return 1;
-        }
-    };
-    // 请求 → 响应（逐行 JSON）。命令互斥锁只保护命令侧内存状态一致性；
-    // 同步轮次（后台轮询 / sync.trigger）在命令锁外执行网络 I/O——
-    // 锁只剩数据层内存一致性保护（vault 读写锁，见 daemon.rs 模块文档）。
-    let shared = daemon.shared();
-    let state = std::sync::Arc::new(std::sync::Mutex::new(daemon));
-    // 后台同步轮询线程（M1）：只在解锁态 + 已配置时执行一轮；锁定即停止
-    // （不执行任何同步活动）。间隔 = 配置值 × 2^风暴等级（封顶 24h）；
-    // 失败静默（本轮放弃，下一轮重试）；配置由 CLI 直接写盘，每轮热更新。
-    // 轮次 = 抓取（无锁网络）→ 应用（短写锁）：与前台命令并发，不排队。
-    {
-        use lk_core::sync::{next_poll_interval, DEFAULT_SYNC_INTERVAL_SECS};
-        let poller = shared.clone();
-        std::thread::spawn(move || {
-            let mut next_sleep = DEFAULT_SYNC_INTERVAL_SECS;
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(next_sleep));
-                // 配置热更新（CLI 直接写盘；每轮重读）
-                {
-                    let mut cfg = poller.config.write().unwrap();
-                    *cfg = daemon::read_config(&poller.dir);
-                }
-                let (base, enabled, unlocked) = {
-                    let cfg = poller.config.read().unwrap();
-                    let base = cfg
-                        .sync
-                        .as_ref()
-                        .filter(|c| c.validate().is_ok())
-                        .map(|c| c.interval_secs)
-                        .unwrap_or(DEFAULT_SYNC_INTERVAL_SECS);
-                    (
-                        base,
-                        cfg.sync.is_some(),
-                        poller.vault.read().unwrap().is_some(),
-                    )
-                };
-                if unlocked && enabled {
-                    if let Err(e) = daemon::run_sync_round(&poller) {
-                        eprintln!("lk daemon: 同步失败（下一轮重试）：{}", e.message());
-                    }
-                    next_sleep =
-                        next_poll_interval(base, poller.sync.lock().unwrap().state.storm_level);
-                } else {
-                    next_sleep = next_poll_interval(base, 0);
-                }
-            }
-        });
-    }
-    let handler_state = state.clone();
-    let handler_shared = shared.clone();
-    let handler = std::sync::Arc::new(move |line: &str| -> String {
-        // sync.trigger：命令锁外执行轮次（网络 I/O 不阻塞其他命令；
-        // 会话预检与活动时间戳短暂持锁）
-        if let Some(resp) = daemon::try_sync_trigger(&handler_state, &handler_shared, line) {
-            return resp;
-        }
-        let mut guard = handler_state.lock().expect("daemon mutex poisoned");
-        guard.handle(line)
-    });
-    eprintln!(
-        "lk daemon: 监听于 {}（pid {}）",
-        dir.display(),
-        std::process::id()
-    );
-    #[cfg(unix)]
-    let result = transport::serve(listener, handler, daemon::global_shutdown());
-    #[cfg(windows)]
-    let result = transport::serve(dir, handler, daemon::global_shutdown());
-    // 优雅退出清理：删令牌 + 端点
-    if let Ok(mut guard) = state.lock() {
-        guard.shutdown();
-    }
-    match result {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("lk daemon: {e}");
-            1
-        }
-    }
+    lk_daemon::run(dir)
 }
+

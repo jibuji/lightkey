@@ -19,8 +19,8 @@ use lk_core::vault::UnlockedVault;
 use lk_core::Error;
 use serde_json::{json, Value};
 
-use super::config::read_config;
-use super::{extract_token, session_invalid, SharedDaemon};
+use crate::config::read_config;
+use crate::{extract_token, session_invalid, SharedDaemon};
 
 /// 同步轮次的失败分类（IPC 错误码映射用）。
 #[derive(Debug)]
@@ -71,6 +71,29 @@ impl lk_core::sync::VaultRead for LockedVaultView {
         let item = v.get(id)?;
         let blob = v.item_blob(id)?;
         Ok((item, blob))
+    }
+
+    fn rule(&self, id: uuid::Uuid) -> lk_core::Result<lk_core::model::Rule> {
+        let v = self.vault.read().unwrap();
+        v.as_ref()
+            .ok_or(Error::SessionInvalid)?
+            .get_rule(id)
+    }
+
+    fn rule_with_blob(&self, id: uuid::Uuid) -> lk_core::Result<(lk_core::model::Rule, Vec<u8>)> {
+        let v = self.vault.read().unwrap();
+        let v = v.as_ref().ok_or(Error::SessionInvalid)?;
+        let rule = v.get_rule(id)?;
+        let blob = v.rule_blob(id)?;
+        Ok((rule, blob))
+    }
+
+    fn rule_revision(&self, id: uuid::Uuid) -> Option<String> {
+        self.vault
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|v| v.rule_revision(id))
     }
 
     fn tomb_blob(&self, id: uuid::Uuid) -> lk_core::Result<Vec<u8>> {
@@ -129,7 +152,7 @@ pub fn run_sync_round(
     if cfg.validate().is_err() {
         return Err(SyncFail::NotConfigured);
     }
-    let creds = super::config::load_sync_credentials(&cfg.url).map_err(SyncFail::Credentials)?;
+    let creds = crate::config::load_sync_credentials(&cfg.url).map_err(SyncFail::Credentials)?;
     let backend: Box<dyn StorageBackend> =
         backend_from_url(&cfg.url, creds).map_err(SyncFail::Engine)?;
     run_sync_round_with(shared, backend)
@@ -190,7 +213,7 @@ pub fn run_sync_round_with(
 /// 外执行（网络 I/O 不阻塞其他命令；与后台轮询并发安全——数据层 CAS +
 /// vault 短写锁兜底）。非 trigger 请求 → `None`（走常规命令路径）。
 pub fn try_sync_trigger(
-    state: &Mutex<super::Daemon>,
+    state: &Mutex<crate::Daemon>,
     shared: &SharedDaemon,
     line: &str,
 ) -> Option<String> {

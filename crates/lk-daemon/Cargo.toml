@@ -1,6 +1,6 @@
 [package]
-name = "lk-cli"
-description = "LightKey 命令行工具（`lk`）：条目管理、解锁/锁定、恢复、审计、守护进程"
+name = "lk-daemon"
+description = "LightKey C 层守护进程宿主：IPC 路由、推送通道、授权门装配、空闲自动锁定"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,22 +8,23 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "lk"
-path = "src/main.rs"
-
 [dependencies]
 lk-core = { path = "../lk-core" }
-lk-daemon = { path = "../lk-daemon" }
-clap.workspace = true
-uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
-rpassword.workspace = true
-arboard.workspace = true
 hex.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
+keyring.workspace = true
+sha2.workspace = true
+time.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
