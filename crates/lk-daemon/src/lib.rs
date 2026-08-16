@@ -1737,10 +1737,16 @@ mod tests {
     }
 
     /// 测试用对端：真实 PID + 指定 cwd（授权判定走真实进程链回溯）。
+    /// cwd 以 canonical 形态给出（与生产传输层 `resolve_peer_cwd` 一致：
+    /// Windows 短名/符号链接须解析，否则与 canonical 规则 projectDir 不匹配）。
     fn test_peer(cwd: Option<&std::path::Path>) -> PeerInfo {
         PeerInfo {
             pid: std::process::id(),
-            cwd: cwd.map(|p| p.to_string_lossy().to_string()),
+            cwd: cwd.map(|p| {
+                std::fs::canonicalize(p)
+                    .map(|c| c.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| p.to_string_lossy().to_string())
+            }),
         }
     }
 
