@@ -1,0 +1,105 @@
+# LightKey 发布流水线（2026-08-19 新增，独立于 ci.yml 测试门禁）
+#
+#   - tag v* push          → Windows 打包（NSIS + MSI），产物挂到 GitHub Release
+#   - main push            → 同样打包，但只留 Actions artifact（最新构建手动下载，不建 Release）
+#   - workflow_dispatch    → 手动打版，行为同 main push（artifact 留存）
+# tag 触发时跳过 artifact 留存，避免同一份产物重复上传。
+# 安装包未做代码签名（暂无证书），Windows SmartScreen 未签名警告属当前预期，不阻塞发布。
+# NSIS / MSI 打包器（NSIS、WiX）由 tauri-bundler 首次构建时自动下载，无需额外准备。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Build Windows installers
+    runs-on: windows-latest
+    permissions:
+      contents: write # softprops/action-gh-release 创建 Release 并上传附件（仅本 job 需要）
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: frontend
+
+      - name: Cache tauri-cli binary
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/tauri-cli
+          key: tauri-cli-v2-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install tauri-cli
+        shell: bash
+        run: |
+          if [ ! -x "$RUNNER_TOOL_CACHE/tauri-cli/cargo-tauri.exe" ]; then
+            cargo install tauri-cli --locked --version "^2"
+            mkdir -p "$RUNNER_TOOL_CACHE/tauri-cli"
+            cp "$HOME/.cargo/bin/cargo-tauri.exe" "$RUNNER_TOOL_CACHE/tauri-cli/"
+          else
+            echo "tauri-cli restored from cache"
+          fi
+          echo "$RUNNER_TOOL_CACHE/tauri-cli" >> "$GITHUB_PATH"
+
+      - name: Build installers (NSIS + MSI)
+        run: cargo tauri build
+        working-directory: crates/lk-app
+
+      - name: Collect installers with versioned names
+        shell: pwsh
+        run: |
+          $version = (Get-Content 'crates/lk-app/tauri.conf.json' -Raw | ConvertFrom-Json).version
+          New-Item -ItemType Directory -Force 'artifacts' | Out-Null
+          $files = @(Get-ChildItem 'target/release/bundle/nsis' -Filter '*-setup.exe' -ErrorAction SilentlyContinue) + `
+                   @(Get-ChildItem 'target/release/bundle/msi' -Filter '*.msi' -ErrorAction SilentlyContinue)
+          foreach ($f in $files) {
+            $name = if ($f.FullName -like '*nsis*') {
+              "LightKey-$version-windows-x86_64-setup.exe"
+            } else {
+              "LightKey-$version-windows-x86_64.msi"
+            }
+            Copy-Item $f.FullName (Join-Path 'artifacts' $name)
+          }
+          Get-ChildItem 'artifacts' | Select-Object Name, Length
+
+      - name: Upload installers as workflow artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LightKey-windows-installers
+          path: artifacts/
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true
