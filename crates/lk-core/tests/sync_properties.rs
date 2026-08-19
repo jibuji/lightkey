@@ -115,14 +115,21 @@ fn multi_client_sync_converges_any_order() {
     // 种子 vault（随机 KDF 参数 + 随机密钥；不落仓库）
     let seed = tempfile::tempdir().unwrap();
     let mut audit = AuditLog::open(seed.path()).unwrap();
-    init_vault_with_params(seed.path(), "pw", false, &mut audit, &test_kdf_params()).unwrap();
+    init_vault_with_params(
+        seed.path(),
+        "pw123456",
+        false,
+        &mut audit,
+        &test_kdf_params(),
+    )
+    .unwrap();
 
     let mut dirs = Vec::new();
     let mut vaults: Vec<UnlockedVault> = Vec::new();
     for _ in 0..CLIENTS {
         let dir = tempfile::tempdir().unwrap();
         copy_vault(seed.path(), dir.path());
-        vaults.push(UnlockedVault::unlock(dir.path(), "pw").unwrap());
+        vaults.push(UnlockedVault::unlock(dir.path(), "pw123456").unwrap());
         dirs.push(dir);
     }
     let remote_dir = tempfile::tempdir().unwrap();

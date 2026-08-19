@@ -70,8 +70,15 @@ fn cas_conflict_and_last_write_wins_converge() {
     for _ in 0..8 {
         let dir = tempfile::tempdir().unwrap();
         let mut audit = AuditLog::open(dir.path()).unwrap();
-        init_vault_with_params(dir.path(), "pw", false, &mut audit, &test_kdf_params()).unwrap();
-        let mut v = UnlockedVault::unlock(dir.path(), "pw").unwrap();
+        init_vault_with_params(
+            dir.path(),
+            "pw123456",
+            false,
+            &mut audit,
+            &test_kdf_params(),
+        )
+        .unwrap();
+        let mut v = UnlockedVault::unlock(dir.path(), "pw123456").unwrap();
 
         let draft = |name: &str| ItemDraft::Login {
             name: name.into(),
@@ -123,8 +130,15 @@ fn tombstone_invariants() {
     for _ in 0..8 {
         let dir = tempfile::tempdir().unwrap();
         let mut audit = AuditLog::open(dir.path()).unwrap();
-        init_vault_with_params(dir.path(), "pw", false, &mut audit, &test_kdf_params()).unwrap();
-        let mut v = UnlockedVault::unlock(dir.path(), "pw").unwrap();
+        init_vault_with_params(
+            dir.path(),
+            "pw123456",
+            false,
+            &mut audit,
+            &test_kdf_params(),
+        )
+        .unwrap();
+        let mut v = UnlockedVault::unlock(dir.path(), "pw123456").unwrap();
 
         let draft = ItemDraft::Secret {
             name: "k".into(),
@@ -155,11 +169,16 @@ fn recovery_envelope_properties() {
         let mut audit = AuditLog::open(dir.path()).unwrap();
 
         // 建库 → 解锁 → 写入一条
-        let (_, code) =
-            init_vault_with_params(dir.path(), "pw", false, &mut audit, &test_kdf_params())
-                .unwrap();
+        let (_, code) = init_vault_with_params(
+            dir.path(),
+            "pw123456",
+            false,
+            &mut audit,
+            &test_kdf_params(),
+        )
+        .unwrap();
         {
-            let mut v = UnlockedVault::unlock(dir.path(), "pw").unwrap();
+            let mut v = UnlockedVault::unlock(dir.path(), "pw123456").unwrap();
             let draft = ItemDraft::Note {
                 name: "n".into(),
                 content: "content".into(),
@@ -170,7 +189,7 @@ fn recovery_envelope_properties() {
         // 恢复前：记录旧密钥（用于「旧钥不可解新数据」断言）
         let old_keys = {
             let hdr = lk_core::vault::load_header(dir.path()).unwrap();
-            let mk = hdr.kdf.derive_master_key("pw").unwrap();
+            let mk = hdr.kdf.derive_master_key("pw123456").unwrap();
             mk.derive_keys()
         };
 
@@ -179,22 +198,27 @@ fn recovery_envelope_properties() {
         assert!(recover_vault_with_params(
             dir.path(),
             &wrong,
-            "newpw",
+            "newpw123",
             &mut audit,
             &test_kdf_params()
         )
         .is_err());
 
         // 正确恢复码 + 新主密码 → 新恢复码
-        let new_code =
-            recover_vault_with_params(dir.path(), &code, "newpw", &mut audit, &test_kdf_params())
-                .unwrap();
+        let new_code = recover_vault_with_params(
+            dir.path(),
+            &code,
+            "newpw123",
+            &mut audit,
+            &test_kdf_params(),
+        )
+        .unwrap();
         assert_ne!(new_code.display(), code.display());
 
         // 新密码可解锁、条目可读；旧密码失败
-        let mut v2 = UnlockedVault::unlock(dir.path(), "newpw").unwrap();
+        let mut v2 = UnlockedVault::unlock(dir.path(), "newpw123").unwrap();
         assert_eq!(v2.list().unwrap().len(), 1);
-        assert!(UnlockedVault::unlock(dir.path(), "pw").is_err());
+        assert!(UnlockedVault::unlock(dir.path(), "pw123456").is_err());
 
         // 旧钥不可解新数据：条目密文已用新钥重加密
         let item_id = v2.list().unwrap()[0].id;

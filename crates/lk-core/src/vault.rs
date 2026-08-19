@@ -39,6 +39,18 @@ pub const INDEX_FILE: &str = "index.lk";
 /// 恢复信封文件名。
 pub const ENVELOPE_FILE: &str = "recovery.envelope";
 
+/// 主密码最小长度（建库/恢复设置新主密码时校验；与原型设计一致：至少 8 位）。
+pub const MIN_MASTER_PASSWORD_LEN: usize = 8;
+
+/// 主密码校验：不满足最小长度 → [`Error::WeakPassword`]。
+/// 所有「设置新主密码」的入口（建库/恢复）必须先行调用（安全核心留 Rust）。
+pub fn validate_master_password(password: &str) -> Result<()> {
+    if password.chars().count() < MIN_MASTER_PASSWORD_LEN {
+        return Err(Error::WeakPassword);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 文件路径
 // ---------------------------------------------------------------------------
@@ -132,6 +144,9 @@ pub fn init_vault_with_params(
     audit: &mut AuditLog,
     params: &KdfParams,
 ) -> Result<(VaultHeader, RecoveryCode)> {
+    // 主密码策略校验先于一切（含已存在判定；弱密码/已存在库统一由上层拒
+    // 绝，防探测不区分——ipc.md §3 语义在 UI 的体现）
+    validate_master_password(password)?;
     if vault_exists(dir) {
         if !reset {
             return Err(Error::VaultExists);
@@ -1166,6 +1181,8 @@ pub fn recover_vault_with_params(
     audit: &mut AuditLog,
     new_params: &KdfParams,
 ) -> Result<RecoveryCode> {
+    // 恢复 = 重设主密码：同样执行最小长度策略（recovery.md §3 流程）
+    validate_master_password(new_password)?;
     let header = load_header(dir)?;
     let envelope = RecoveryEnvelope::from_bytes(&fs::read(envelope_file(dir))?)?;
 
@@ -1283,7 +1300,7 @@ mod tests {
         let mut audit = AuditLog::open(dir.path()).unwrap();
         let (_h, code) = init_vault_with_params(
             dir.path(),
-            "pw",
+            "pw123456",
             false,
             &mut audit,
             &crypto::test_kdf_params(),
@@ -1306,13 +1323,56 @@ mod tests {
         }
     }
 
+    /// M2.5 主密码策略：<8 位拒绝（WeakPassword）；≥8 位通过；恢复的新主
+    /// 密码同策略（recovery.md §3 重设主密码）。
+    #[test]
+    fn master_password_policy_enforced_on_init_and_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut audit = AuditLog::open(dir.path()).unwrap();
+
+        // 弱密码（<8 位）→ 不建库
+        assert!(matches!(
+            init_vault_with_params(
+                dir.path(),
+                "short",
+                false,
+                &mut audit,
+                &crypto::test_kdf_params()
+            ),
+            Err(Error::WeakPassword)
+        ));
+        assert!(!vault_exists(dir.path()));
+
+        // ≥8 位 → 建库
+        let (_, code) = init_vault_with_params(
+            dir.path(),
+            "pw123456",
+            false,
+            &mut audit,
+            &crypto::test_kdf_params(),
+        )
+        .unwrap();
+
+        // 恢复设置新主密码同样校验（recovery.md §3 重设主密码）
+        assert!(matches!(
+            recover_vault_with_params(
+                dir.path(),
+                &RecoveryCode::parse(&code.display()).unwrap(),
+                "new",
+                &mut audit,
+                &crypto::test_kdf_params()
+            ),
+            Err(Error::WeakPassword)
+        ));
+    }
+
     #[test]
     fn init_creates_layout() {
         let dir = tempfile::tempdir().unwrap();
         let mut audit = AuditLog::open(dir.path()).unwrap();
         let (header, code) = init_vault_with_params(
             dir.path(),
-            "pw",
+            "pw123456",
             false,
             &mut audit,
             &crypto::test_kdf_params(),
@@ -1329,7 +1389,7 @@ mod tests {
         assert!(matches!(
             init_vault_with_params(
                 dir.path(),
-                "pw",
+                "pw123456",
                 false,
                 &mut audit,
                 &crypto::test_kdf_params()
@@ -1341,7 +1401,7 @@ mod tests {
     #[test]
     fn crud_and_cas() {
         let (dir, audit, _code) = temp_vault("crud");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         assert_eq!(v.list().unwrap().len(), 0);
 
         // create
@@ -1397,13 +1457,13 @@ mod tests {
     #[test]
     fn revision_monotonic_across_restarts() {
         let (dir, _audit, _code) = temp_vault("mono");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         let i1 = v.put(None, login_draft("a"), None).unwrap();
         let i2 = v.put(None, login_draft("b"), None).unwrap();
         assert!(i2.revision() > i1.revision());
         drop(v);
         // 重启（重新解锁）：索引里最大 revision 作为起点，仍严格递增
-        let mut v2 = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v2 = unlock_vault(dir.path(), "pw123456").unwrap();
         let i3 = v2.put(None, login_draft("c"), None).unwrap();
         assert!(i3.revision() > i2.revision());
     }
@@ -1411,7 +1471,7 @@ mod tests {
     #[test]
     fn corrupted_index_rebuilds() {
         let (dir, _audit, _code) = temp_vault("idx");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         let item = v.put(None, login_draft("a"), None).unwrap();
         drop(v);
         // 破坏 index.lk
@@ -1420,7 +1480,7 @@ mod tests {
         bytes[10] ^= 0xFF;
         std::fs::write(&idx, &bytes).unwrap();
         // 解锁不阻塞，索引重建
-        let mut v2 = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v2 = unlock_vault(dir.path(), "pw123456").unwrap();
         assert_eq!(v2.list().unwrap().len(), 1);
         assert_eq!(v2.get(item.id()).unwrap().name(), "a");
     }
@@ -1428,7 +1488,7 @@ mod tests {
     #[test]
     fn purge_expired_after_grace() {
         let (dir, _audit, _code) = temp_vault("purge");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         let item = v.put(None, login_draft("old"), None).unwrap();
         v.delete(item.id()).unwrap();
         // 未到期 → 不 purge
@@ -1448,7 +1508,7 @@ mod tests {
     #[test]
     fn purge_removes_file_attachment() {
         let (dir, _audit, _code) = temp_vault("purge-attach");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         // 1 MiB + 123 B → 2 块
         let data: Vec<u8> = (0..(CHUNK_BYTES as usize + 123))
             .map(|i| (i % 251) as u8)
@@ -1501,7 +1561,7 @@ mod tests {
     #[test]
     fn attachment_chunking_and_export() {
         let (dir, _audit, _code) = temp_vault("attach");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         // 2.5 MiB（3 块）
         let data: Vec<u8> = (0..(2 * 1024 * 1024 + 512 * 1024))
             .map(|i| (i % 251) as u8)
@@ -1579,7 +1639,7 @@ mod tests {
     #[test]
     fn recover_flow_rotates_everything() {
         let (dir, mut audit, code) = temp_vault("recover");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         let item = v.put(None, login_draft("keep-me"), None).unwrap();
         let data = b"attachment-data".to_vec();
         let fitem = v
@@ -1604,7 +1664,7 @@ mod tests {
             let mk = load_header(dir.path())
                 .unwrap()
                 .kdf
-                .derive_master_key("pw")
+                .derive_master_key("pw123456")
                 .unwrap();
             mk.derive_keys()
         };
@@ -1614,7 +1674,7 @@ mod tests {
         assert!(recover_vault_with_params(
             dir.path(),
             &bad_code,
-            "newpw",
+            "newpw123",
             &mut audit,
             &crypto::test_kdf_params()
         )
@@ -1624,7 +1684,7 @@ mod tests {
         let new_code = recover_vault_with_params(
             dir.path(),
             &RecoveryCode::parse(&code).unwrap(),
-            "newpw",
+            "newpw123",
             &mut audit,
             &crypto::test_kdf_params(),
         )
@@ -1632,8 +1692,8 @@ mod tests {
         assert_ne!(new_code.display(), code, "恢复码轮换");
 
         // 旧密码不可解锁，新密码可
-        assert!(unlock_vault(dir.path(), "pw").is_err());
-        let mut v2 = unlock_vault(dir.path(), "newpw").unwrap();
+        assert!(unlock_vault(dir.path(), "pw123456").is_err());
+        let mut v2 = unlock_vault(dir.path(), "newpw123").unwrap();
         // 条目可读（重加密成功）
         assert_eq!(v2.get(item.id()).unwrap().name(), "keep-me");
         assert!(v2.get(item.id()).unwrap().deleted());
@@ -1663,7 +1723,7 @@ mod tests {
             .unwrap();
         let new_params = load_header(dir.path()).unwrap().kdf;
         assert!(
-            new_params.derive_master_key("newpw").unwrap().as_bytes() == mk_roundtrip.as_bytes()
+            new_params.derive_master_key("newpw123").unwrap().as_bytes() == mk_roundtrip.as_bytes()
         );
 
         // 审计链：轮换事件在旧钥下可验，轮换后事件在新钥下可验
@@ -1685,7 +1745,7 @@ mod tests {
     #[test]
     fn recover_with_corrupt_index_keeps_items() {
         let (dir, mut audit, code) = temp_vault("recover-idx");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         let item = v.put(None, login_draft("keep-me"), None).unwrap();
         v.put(
             None,
@@ -1716,14 +1776,14 @@ mod tests {
         let new_code = recover_vault_with_params(
             dir.path(),
             &RecoveryCode::parse(&code).unwrap(),
-            "newpw",
+            "newpw123",
             &mut audit,
             &crypto::test_kdf_params(),
         )
         .unwrap();
         assert_ne!(new_code.display(), code);
         // 新密码解锁：条目数与恢复前一致，条目可读
-        let mut v2 = unlock_vault(dir.path(), "newpw").unwrap();
+        let mut v2 = unlock_vault(dir.path(), "newpw123").unwrap();
         assert_eq!(
             v2.list().unwrap().len(),
             n_before,
@@ -1732,7 +1792,7 @@ mod tests {
         assert_eq!(v2.get(item.id()).unwrap().name(), "keep-me");
         // 二次解锁不重建（索引合法），条目仍可见
         drop(v2);
-        let mut v3 = unlock_vault(dir.path(), "newpw").unwrap();
+        let mut v3 = unlock_vault(dir.path(), "newpw123").unwrap();
         assert_eq!(v3.list().unwrap().len(), n_before);
     }
 
@@ -1741,7 +1801,7 @@ mod tests {
     #[test]
     fn recover_with_missing_index_keeps_items() {
         let (dir, mut audit, code) = temp_vault("recover-idx-missing");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         let item = v.put(None, login_draft("keep-me"), None).unwrap();
         let n_before = v.list().unwrap().len();
         assert_eq!(n_before, 1);
@@ -1752,14 +1812,14 @@ mod tests {
         let new_code = recover_vault_with_params(
             dir.path(),
             &RecoveryCode::parse(&code).unwrap(),
-            "newpw",
+            "newpw123",
             &mut audit,
             &crypto::test_kdf_params(),
         )
         .unwrap();
         assert_ne!(new_code.display(), code);
         // 新密码解锁：条目数与恢复前一致，条目可读
-        let mut v2 = unlock_vault(dir.path(), "newpw").unwrap();
+        let mut v2 = unlock_vault(dir.path(), "newpw123").unwrap();
         assert_eq!(
             v2.list().unwrap().len(),
             n_before,
@@ -1772,14 +1832,14 @@ mod tests {
     #[test]
     fn unlock_with_missing_index_keeps_items() {
         let (dir, _audit, _code) = temp_vault("unlock-idx-missing");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         let item = v.put(None, login_draft("keep-me"), None).unwrap();
         let n_before = v.list().unwrap().len();
         assert_eq!(n_before, 1);
         drop(v);
         // 删除 index.lk 后正常解锁：不得出现空列表
         std::fs::remove_file(dir.path().join(INDEX_FILE)).unwrap();
-        let mut v2 = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v2 = unlock_vault(dir.path(), "pw123456").unwrap();
         assert_eq!(
             v2.list().unwrap().len(),
             n_before,
@@ -1792,7 +1852,7 @@ mod tests {
             "解锁后应重建并落盘索引"
         );
         drop(v2);
-        let mut v3 = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v3 = unlock_vault(dir.path(), "pw123456").unwrap();
         assert_eq!(v3.list().unwrap().len(), n_before);
     }
 
@@ -1801,7 +1861,7 @@ mod tests {
     #[test]
     fn rule_crud_seal_recover_and_rebuild() {
         let (dir, audit, code) = temp_vault("rules");
-        let mut v = unlock_vault(dir.path(), "pw").unwrap();
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
         // 新建
         let proj = std::env::temp_dir()
             .join("lk-test-proj")
@@ -1878,7 +1938,7 @@ mod tests {
         let mut bytes = std::fs::read(&idx).unwrap();
         bytes[10] ^= 0xFF;
         std::fs::write(&idx, &bytes).unwrap();
-        let v2 = unlock_vault(dir.path(), "pw").unwrap();
+        let v2 = unlock_vault(dir.path(), "pw123456").unwrap();
         assert!(v2
             .index_snapshot()
             .iter()
@@ -1889,13 +1949,13 @@ mod tests {
         let new_code = recover_vault_with_params(
             dir.path(),
             &RecoveryCode::parse(&code).unwrap(),
-            "newpw",
+            "newpw123",
             &mut AuditLog::open(dir.path()).unwrap(),
             &crypto::test_kdf_params(),
         )
         .unwrap();
         assert_ne!(new_code.display(), code);
-        let v3 = unlock_vault(dir.path(), "newpw").unwrap();
+        let v3 = unlock_vault(dir.path(), "newpw123").unwrap();
         let rules = v3.list_rules().unwrap();
         assert_eq!(rules.len(), 0, "恢复后软删规则仍删除");
         assert!(v3
@@ -1908,7 +1968,7 @@ mod tests {
             let mk = load_header(dir.path())
                 .unwrap()
                 .kdf
-                .derive_master_key("pw")
+                .derive_master_key("pw123456")
                 .unwrap();
             mk.derive_keys()
         };
@@ -1927,7 +1987,7 @@ mod tests {
         let n_before = audit.count().unwrap();
         let (header, _new_code) = init_vault_with_params(
             dir.path(),
-            "pw2",
+            "pw222222",
             true,
             &mut audit,
             &crypto::test_kdf_params(),

@@ -1375,8 +1375,14 @@ mod tests {
             if s.is_none() {
                 let dir = tempfile::tempdir().unwrap();
                 let mut audit = AuditLog::open(dir.path()).unwrap();
-                init_vault_with_params(dir.path(), "pw", false, &mut audit, &test_kdf_params())
-                    .unwrap();
+                init_vault_with_params(
+                    dir.path(),
+                    "pw123456",
+                    false,
+                    &mut audit,
+                    &test_kdf_params(),
+                )
+                .unwrap();
                 *s = Some(dir);
             }
             // 泄露借用：thread_local 持有的 TempDir 生命周期为 'static 语义
@@ -1415,7 +1421,7 @@ mod tests {
     }
 
     fn unlock(dir: &std::path::Path) -> UnlockedVault {
-        UnlockedVault::unlock(dir, "pw").unwrap()
+        UnlockedVault::unlock(dir, "pw123456").unwrap()
     }
 
     /// 场景夹具：两个客户端 vault（同密钥）+ 共享远端存储。

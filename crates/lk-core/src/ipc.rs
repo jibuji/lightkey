@@ -94,6 +94,8 @@ pub const ERR_LIMIT: i64 = -32005;
 pub const ERR_RATE_LIMITED: i64 = -32006;
 /// 库已存在（`lk init` 未带 --force）。
 pub const ERR_VAULT_EXISTS: i64 = -32007;
+/// 主密码不满足最小长度（`vault.init`/`vault.recover` 设置新主密码时）。
+pub const ERR_WEAK_PASSWORD: i64 = -32013;
 /// 审计 HMAC 链校验失败。
 pub const ERR_AUDIT_VERIFY: i64 = -32008;
 /// 同步：未配置 BYO 存储（`lk sync` 前需 `lk config sync set`）。
@@ -112,6 +114,7 @@ pub const MSG_ITEM_NOT_FOUND: &str = "item.not_found";
 pub const MSG_LIMIT: &str = "item.limit";
 pub const MSG_RATE_LIMITED: &str = "rate.limited";
 pub const MSG_VAULT_EXISTS: &str = "vault.exists";
+pub const MSG_WEAK_PASSWORD: &str = "vault.weak_password";
 pub const MSG_AUDIT_VERIFY: &str = "audit.verify_failed";
 pub const MSG_METHOD_NOT_FOUND: &str = "method not found";
 pub const MSG_SYNC_NOT_CONFIGURED: &str = "sync.not_configured";
@@ -154,11 +157,14 @@ pub const M_SUBSCRIBE: &str = "subscribe";
 // 各方法参数/结果类型（最小字段）
 // ---------------------------------------------------------------------------
 
-/// `vault.status` 结果：解锁态、版本、同步水位。
+/// `vault.status` 结果：解锁态、库是否已初始化、版本、同步水位。
+/// `initialized=false` = 首次启动（前端据此进入初始化向导，M2.5）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusResult {
     pub unlocked: bool,
+    /// 库是否已初始化（`vault.json` 存在）；无库 = 首启 → 初始化向导。
+    pub initialized: bool,
     pub version: String,
     /// 同步水位（M1 起有值；M0 恒为 null）。
     pub sync_watermark: Option<String>,
