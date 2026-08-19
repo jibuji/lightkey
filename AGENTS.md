@@ -76,6 +76,11 @@
 - [x] M2 桌面（Tauri 壳：内置守护实例/托盘/锁屏 WTS+CGSession/command 桥/通知
   订阅桥；approval 弹窗 + 30s 倒计时；ui-unlock/vault/rules/settings/audit
   五插件 + 锁态整页↔三栏切换；Windows Hello 置灰预留，决策 #5 B）
+- [x] M2.5 首次初始化向导（首启门控：`vault.status.initialized` 无库→向导 /
+  有库→解锁页；ui-onboarding 四步插件：设主密码(强度+一致) → 真实恢复码
+  (仅 init 响应一次) → 完成解锁；主密码 ≥8 位策略留 Rust（vault.init/
+  recover 校验，弱密码/已存在库 UI 统一文案）；浏览器 E2E 用
+  `__LIGHTKEY_MOCK__.simulateFreshInstall()` + 重载模拟首启）
 - [ ] M3 浏览器填充
 
 ## Maintaining this file

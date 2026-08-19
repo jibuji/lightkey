@@ -260,13 +260,16 @@ describe("tauri 模式：会话事件去重（本地广播 + 推送帧不双发�
   class FakeTauriAdapter implements LightKeyIpc {
     readonly kind = "tauri" as const;
     unlocked = false;
+    /** 已初始化库（tauri 模式默认有库；首启门控场景见 onboarding 测试）。 */
+    initialized = true;
     private handler: ((f: NotificationFrame) => void) | null = null;
-    status = vi.fn(async () => ({ unlocked: this.unlocked }));
+    status = vi.fn(async () => ({ unlocked: this.unlocked, initialized: this.initialized }));
     unlock = vi.fn(async (_pw: string) => {
       this.unlocked = true;
       // 守护进程在响应前已广播 session.unlocked（真实语义：帧先于响应）
       this.pushSessionUnlocked();
     });
+    init = vi.fn(async (_pw: string) => ({ recoveryCode: "x" }));
     lock = vi.fn(async () => {
       this.unlocked = false;
       this.handler?.({ jsonrpc: "2.0", method: "session.locked", params: { reason: "manual" } });

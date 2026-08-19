@@ -60,11 +60,20 @@ export interface ToastService {
   subscribe(listener: (toasts: ToastMessage[]) => void): () => void;
 }
 
-/** session 服务（ipc-bridge 提供）：解锁态 + 事件翻译。 */
+/** session 服务（ipc-bridge 提供）：解锁态 + 首启门控 + 事件翻译。 */
 export interface SessionService {
   readonly unlocked: boolean;
+  /** 库是否已初始化（`vault.status.initialized`；null = 尚未探测到）。
+   *  无库 = 首启 → 初始化向导；有库 → 解锁页（M2.5 互斥门控）。 */
+  readonly initialized: boolean | null;
   /** 解锁（mock/tauri 适配器；成功 → 广播 `session.unlocked`）。 */
   unlock(masterPassword: string): Promise<void>;
+  /**
+   * 初始化向导：vault.init 建库（主密码策略/恢复码生成全在后端）。
+   * 恢复码仅此一次返回（前端不生成、不落盘）；成功 → 标记库已初始化
+   * （不广播事件：向导中途不打断，完成后经 unlock 切主界面）。
+   */
+  initialize(masterPassword: string): Promise<{ recoveryCode: string }>;
   /** 锁定（适配器；广播 `session.locked(manual)`）。 */
   lock(): Promise<void>;
   /**

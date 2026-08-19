@@ -94,6 +94,9 @@ pub enum Error {
     /// 库已存在（`lk init` 在已初始化目录上执行）
     #[error("库已存在")]
     VaultExists,
+    /// 主密码不满足最小长度（建库/恢复设置新主密码时校验）
+    #[error("主密码至少 8 位")]
+    WeakPassword,
     /// 库未初始化
     #[error("库未初始化")]
     NotInitialized,

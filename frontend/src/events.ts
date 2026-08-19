@@ -14,6 +14,7 @@
  * | `authz.request` | `{ requestId, starter, projectDir, command, keys[] }` | Rust authz-gate → IPC 通知 | approval 弹窗（**M2 已接入**） |
  * | `vault.search` | `{ query }` | topbar 搜索框（TS 内 emit，300ms 防抖） | ui-vault（过滤列表） |
  * | `vault.search-enter` | `{ query }` | topbar 搜索框回车（TS 内 emit） | ui-vault（空态引导新建） |
+ * | `vault.initialized` | `{ initialized }` | ipc-bridge（守护进程 `vault.status` 探测结果，TS 内 emit，不跨进程） | 宿主（锁态整页互斥门控：无库→onboarding / 有库→unlock） |
  *
  * 分发语义：`emit`（观察广播，fire-and-forget）；`authz.request` 的审批结果
  * 经 IPC 方法 `approval.result` 回传（跨进程无同步事件返回值，§5.3）。
@@ -84,6 +85,9 @@ declare module "@cordisjs/core" {
     "vault.search"(payload: VaultSearchPayload): void;
     /** topbar 搜索框回车（空态「未找到，按回车新建」引导）。 */
     "vault.search-enter"(payload: VaultSearchPayload): void;
+    /** 首启门控：守护进程库状态探测结果（ipc-bridge 本地 emit；宿主据
+     *  此在初始化向导与解锁页间互斥切换，M2.5）。 */
+    "vault.initialized"(payload: { initialized: boolean }): void;
   }
 }
 

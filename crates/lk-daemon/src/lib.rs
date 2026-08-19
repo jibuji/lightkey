@@ -308,9 +308,11 @@ impl Daemon {
 
     fn vault_status(&self, id: Value) -> RpcResponse {
         let unlocked = self.vault_peek();
+        let initialized = vault::vault_exists(&self.shared.dir);
         let watermark = self.shared.sync.lock().unwrap().state.watermark.clone();
         let result = StatusResult {
             unlocked,
+            initialized,
             version: env!("CARGO_PKG_VERSION").to_string(),
             sync_watermark: watermark,
         };
@@ -343,6 +345,9 @@ impl Daemon {
             }
             Err(Error::VaultExists) => {
                 RpcResponse::err(id, ERR_VAULT_EXISTS, MSG_VAULT_EXISTS, None)
+            }
+            Err(Error::WeakPassword) => {
+                RpcResponse::err(id, ERR_WEAK_PASSWORD, MSG_WEAK_PASSWORD, None)
             }
             Err(e) => RpcResponse::err(
                 id,
@@ -472,6 +477,11 @@ impl Daemon {
                     recovery_code: new_code.display(),
                 };
                 RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
+            }
+            Err(Error::WeakPassword) => {
+                // 新主密码不满足最小长度（与 vault.init 同策略）
+                self.recover_guard.on_failure();
+                RpcResponse::err(id, ERR_WEAK_PASSWORD, MSG_WEAK_PASSWORD, None)
             }
             Err(_) => {
                 // 统一：恢复码错误 / 信封损坏 / 未初始化
@@ -1463,8 +1473,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut audit = AuditLog::open(dir.path()).unwrap();
-            init_vault_with_params(dir.path(), "pw", false, &mut audit, &test_kdf_params())
-                .unwrap();
+            init_vault_with_params(
+                dir.path(),
+                "pw123456",
+                false,
+                &mut audit,
+                &test_kdf_params(),
+            )
+            .unwrap();
         }
         let mut daemon = Daemon::start(dir.path()).unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1474,7 +1490,11 @@ mod tests {
         })));
 
         let unlock = rpc_result(&daemon.handle(
-            &rpc_line(M_VAULT_UNLOCK, None, json!({ "masterPassword": "pw" })),
+            &rpc_line(
+                M_VAULT_UNLOCK,
+                None,
+                json!({ "masterPassword": "pw123456" }),
+            ),
             &PeerInfo::unknown(),
         ));
         let token = unlock["token"].as_str().unwrap().to_string();
@@ -1521,6 +1541,80 @@ mod tests {
                 reason: LockReason::Manual
             }
         ));
+    }
+
+    /// M2.5 首启检测：`vault.status` 的 `initialized` 标志——无库 = 首启（前端
+    /// 据此进初始化向导）；`vault.init` 建库后翻转；`vault.init` 的弱密码/
+    /// 已存在均被拒绝（错误码不同，UI 层统一文案不区分，ipc.md §3）。
+    #[test]
+    fn vault_status_reports_initialized_and_init_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::start(dir.path()).unwrap();
+
+        // 无库：initialized=false（首启）
+        let resp = daemon.handle(
+            &rpc_line(M_VAULT_STATUS, None, json!({})),
+            &PeerInfo::unknown(),
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["initialized"], false);
+        assert_eq!(v["result"]["unlocked"], false);
+
+        // 弱主密码（<8 位）→ 拒绝（ERR_WEAK_PASSWORD）
+        let resp = daemon.handle(
+            &rpc_line(M_VAULT_INIT, None, json!({ "masterPassword": "short" })),
+            &PeerInfo::unknown(),
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], ERR_WEAK_PASSWORD);
+        assert_eq!(v["error"]["message"], MSG_WEAK_PASSWORD);
+        // 弱密码未建库：仍为未初始化
+        let resp = daemon.handle(
+            &rpc_line(M_VAULT_STATUS, None, json!({})),
+            &PeerInfo::unknown(),
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["initialized"], false);
+
+        // 合法主密码 → 建库 + 恢复码（仅展示一次）+ initialized=true
+        let resp = daemon.handle(
+            &rpc_line(M_VAULT_INIT, None, json!({ "masterPassword": "pw123456" })),
+            &PeerInfo::unknown(),
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["error"].is_null());
+        let code = v["result"]["recoveryCode"].as_str().unwrap();
+        assert_eq!(code.len(), 5 * 8 + 4, "恢复码 5 组 × 8 字符 + 4 空格");
+
+        // 已存在库 → 再次 init 拒绝（ERR_VAULT_EXISTS；前端统一文案）
+        let resp = daemon.handle(
+            &rpc_line(M_VAULT_INIT, None, json!({ "masterPassword": "pw123456" })),
+            &PeerInfo::unknown(),
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], ERR_VAULT_EXISTS);
+
+        // 有库：initialized=true（锁态也可响应，无需令牌）
+        let resp = daemon.handle(
+            &rpc_line(M_VAULT_STATUS, None, json!({})),
+            &PeerInfo::unknown(),
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["initialized"], true);
+        assert_eq!(v["result"]["unlocked"], false);
+
+        // 建库后即可用同一主密码解锁（向导 Step4 = init + unlock 两段）
+        let resp = daemon.handle(
+            &rpc_line(
+                M_VAULT_UNLOCK,
+                None,
+                json!({ "masterPassword": "pw123456" }),
+            ),
+            &PeerInfo::unknown(),
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["error"].is_null());
+        assert!(v["result"]["token"].as_str().unwrap().len() >= 32);
     }
 
     /// 慢网络后端（G1 回归夹具，同 M1.5）。
@@ -1593,12 +1687,22 @@ mod tests {
         let remote_dir = tempfile::tempdir().unwrap();
         {
             let mut audit = AuditLog::open(dir.path()).unwrap();
-            init_vault_with_params(dir.path(), "pw", false, &mut audit, &test_kdf_params())
-                .unwrap();
+            init_vault_with_params(
+                dir.path(),
+                "pw123456",
+                false,
+                &mut audit,
+                &test_kdf_params(),
+            )
+            .unwrap();
         }
         let mut daemon = Daemon::start(dir.path()).unwrap();
         let unlock = rpc_result(&daemon.handle(
-            &rpc_line(M_VAULT_UNLOCK, None, json!({ "masterPassword": "pw" })),
+            &rpc_line(
+                M_VAULT_UNLOCK,
+                None,
+                json!({ "masterPassword": "pw123456" }),
+            ),
             &PeerInfo::unknown(),
         ));
         let token = unlock["token"].as_str().unwrap().to_string();
@@ -1644,7 +1748,7 @@ mod tests {
                     std::fs::copy(dir.path().join(&name), b_dir.path().join(&name)).unwrap();
                 }
             }
-            let mut b = UnlockedVault::unlock(b_dir.path(), "pw").unwrap();
+            let mut b = UnlockedVault::unlock(b_dir.path(), "pw123456").unwrap();
             b.put(
                 Some(uuid::Uuid::parse_str(&x_id).unwrap()),
                 lk_core::model::ItemDraft::Login {
@@ -1750,7 +1854,7 @@ mod tests {
     ) -> (Arc<Mutex<Daemon>>, Arc<SharedDaemon>, String) {
         {
             let mut audit = AuditLog::open(dir).unwrap();
-            init_vault_with_params(dir, "pw", false, &mut audit, &test_kdf_params()).unwrap();
+            init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
         }
         let mut daemon = Daemon::start(dir).unwrap();
         // 审批超时调小（测试不等真实 30s）
@@ -1761,7 +1865,11 @@ mod tests {
             .unwrap()
             .approval_timeout_secs = 1;
         let unlock = rpc_result(&daemon.handle(
-            &rpc_line(M_VAULT_UNLOCK, None, json!({ "masterPassword": "pw" })),
+            &rpc_line(
+                M_VAULT_UNLOCK,
+                None,
+                json!({ "masterPassword": "pw123456" }),
+            ),
             &PeerInfo::unknown(),
         ));
         let token = unlock["token"].as_str().unwrap().to_string();
@@ -2330,7 +2438,11 @@ mod tests {
         assert_eq!(fv["params"]["reason"], "manual");
         // 重新解锁 → session.unlocked 帧（旧订阅连接保持有效）
         state.lock().unwrap().handle(
-            &rpc_line(M_VAULT_UNLOCK, None, json!({ "masterPassword": "pw" })),
+            &rpc_line(
+                M_VAULT_UNLOCK,
+                None,
+                json!({ "masterPassword": "pw123456" }),
+            ),
             &PeerInfo::unknown(),
         );
         let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();

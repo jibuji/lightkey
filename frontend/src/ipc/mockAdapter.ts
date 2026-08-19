@@ -70,10 +70,20 @@ function newId(): string {
   return "it" + Math.random().toString(36).slice(2, 8);
 }
 
+/**
+ * mock 首启标志（localStorage；仅 QA/dev）：`simulateFreshInstall` 写入，
+ * MockAdapter 构造时读取——浏览器 E2E 可「重载后仍为首启」，真实走
+ * 启动 → vault.status 探测 → 向导 的完整路径。
+ */
+const MOCK_FRESH_KEY = "lightkey:mock:fresh";
+
 export class MockAdapter implements LightKeyIpc {
   readonly kind = "mock" as const;
 
   private unlocked = false;
+  /** 库是否已初始化（M2.5 首启门控；默认已初始化 = 回归解锁页，
+   *  首启场景经 `simulateFreshInstall` 模拟；localStorage 标志跨重载）。 */
+  private initialized = localStorage.getItem(MOCK_FRESH_KEY) !== "1";
   private masterPassword = MOCK_MASTER_PASSWORD;
   private items: Item[] = [];
   private rules: AuthRule[] = [];
@@ -103,8 +113,23 @@ export class MockAdapter implements LightKeyIpc {
 
   /* ---------- vault ---------- */
 
-  async status(): Promise<{ unlocked: boolean }> {
-    return delay({ unlocked: this.unlocked });
+  /** vault.status：解锁态、库是否已初始化（M2.5 首启门控：无库 → 向导） */
+  async status(): Promise<{ unlocked: boolean; initialized: boolean }> {
+    return delay({ unlocked: this.unlocked, initialized: this.initialized });
+  }
+
+  async init(masterPassword: string): Promise<{ recoveryCode: string }> {
+    if (this.initialized) {
+      return delayReject(new VaultInvalidError()); // 已存在库：与弱密码统一文案
+    }
+    if (masterPassword.length < 8) {
+      return delayReject(new VaultInvalidError()); // 主密码策略留后端；mock 对齐
+    }
+    this.masterPassword = masterPassword;
+    this.initialized = true;
+    this.unlocked = false;
+    this.resetStore(false); // 新库为空（解锁时才回填演示 fixture）
+    return delay({ recoveryCode: DEMO_RECOVERY_CODE });
   }
 
   async unlock(masterPassword: string): Promise<void> {
@@ -313,9 +338,33 @@ export class MockAdapter implements LightKeyIpc {
     return this.items.find((x) => x.id === id) ?? null;
   }
 
+  /** 模拟未初始化环境（全新安装首启）：清空库 + 回默认主密码；
+   *  写 localStorage 标志，重载后仍为首启（浏览器 E2E 全路径）。 */
+  simulateFreshInstall(): void {
+    localStorage.setItem(MOCK_FRESH_KEY, "1");
+    this.initialized = false;
+    this.unlocked = false;
+    this.masterPassword = MOCK_MASTER_PASSWORD;
+    this.resetStore(false);
+  }
+
+  /** 模拟已有库（回归解锁页；清首启标志）。 */
+  simulateInstalled(): void {
+    localStorage.removeItem(MOCK_FRESH_KEY);
+    this.initialized = true;
+    this.unlocked = false;
+    this.masterPassword = MOCK_MASTER_PASSWORD;
+    this.resetStore(false);
+  }
+
   /** QA 只读检查：mock 是否处于解锁态。 */
   isUnlocked(): boolean {
     return this.unlocked;
+  }
+
+  /** QA 只读检查：mock 库是否已初始化（首启门控依据）。 */
+  isInitialized(): boolean {
+    return this.initialized;
   }
 
   private emitItemChanged(item: Item, deleted = false) {
@@ -338,7 +387,10 @@ export function installMockQaHooks(adapter: MockAdapter) {
     setPickDirResult: (path: string | null) => {
       adapter.mockPickDir = path;
     },
+    simulateFreshInstall: () => adapter.simulateFreshInstall(),
+    simulateInstalled: () => adapter.simulateInstalled(),
     readItem: (id: string) => adapter.readItem(id),
     isUnlocked: () => adapter.isUnlocked(),
+    isInitialized: () => adapter.isInitialized(),
   };
 }

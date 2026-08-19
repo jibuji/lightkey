@@ -6,10 +6,15 @@
  *   提供，顺序 = 布局数据）；
  * - **锁态：整页 ui-unlock（无三栏）**——宿主按 `session.unlocked/locked`
  *   在「整页解锁」与「三栏」间切换（spec §6.2 宿主职责；ui-unlock 挂
- *   content 槽位 page="unlock"，锁态单独渲染）。
+ *   content 槽位 page="unlock"，锁态单独渲染）；
+ * - **锁态 + 无库（M2.5 首启）：整页 ui-onboarding（初始化向导）**——与
+ *   ui-unlock 互斥：门控数据 = `session.initialized`（守护进程 vault.status
+ *   探测；null = 探测中，渲染检测占位）；完成后 unlock → session.unlocked
+ *   自动切三栏。
  *
  * 骨架只负责「放哪」；槽位内组件由 slot 注册表提供。宿主订阅事件总线
- * （`theme.changed` / `session.*` / `item.changed`）触发重渲染。
+ * （`theme.changed` / `session.*` / `item.changed` / `vault.initialized`）
+ * 触发重渲染。
  */
 
 import type { Context } from "@cordisjs/core";
@@ -28,10 +33,22 @@ export interface SkeletonProps {
 export function Skeleton({ ctx, topbar, sidebar, content, currentPage }: SkeletonProps) {
   const unlocked = ctx.session.unlocked;
 
-  // 锁态：整页 ui-unlock（无三栏；spec §6.2 宿主切换）
+  // 锁态：M2.5 首启门控——无库 → 整页初始化向导；有库 → 整页 ui-unlock
+  // （互斥；门控数据 = session.initialized；null = 探测中，渲染占位）
   if (!unlocked) {
-    const unlock = content.find((e) => e.meta?.page === "unlock");
-    if (unlock) return <unlock.component key={unlock.name} />;
+    const initialized = ctx.session.initialized;
+    if (initialized === null) {
+      return (
+        <div className="app">
+          <div className="content">
+            <div className="content-panel card muted">正在检测库状态…</div>
+          </div>
+        </div>
+      );
+    }
+    const lockedPage = initialized ? "unlock" : "onboarding";
+    const locked = content.find((e) => e.meta?.page === lockedPage);
+    if (locked) return <locked.component key={locked.name} />;
     return (
       <div className="app">
         <div className="content">

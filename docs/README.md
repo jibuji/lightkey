@@ -31,7 +31,7 @@
 | [testing.md](testing.md) | 三层测试策略与 CI | 全部 |
 | [cli.md](cli.md) | `lk` CLI 命令参考 | 全部 |
 | [design/spec.md](design/spec.md) | 前端设计规范（tokens/组件/流程） | M2（界面） |
-| [design/prototype](design/prototype/) | 高保真单页原型（可交互、可截图评审） | M2（界面） |
+| [design/prototype](design/prototype/) | 高保真单页原型（可交互、可截图评审；含 M2.5 初始化向导） | M2/M2.5（界面） |
 
 ## 快速导航
 

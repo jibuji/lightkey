@@ -57,6 +57,8 @@ function mapError(e: unknown): Error {
   const message = (e as { message?: string })?.message;
   if (code === "item.conflict" || message === "item.conflict") return new ConflictError();
   if (code === "vault.invalid" || message === "vault.invalid") return new VaultInvalidError();
+  // 初始化向导统一文案：主密码校验失败 / 库已存在不区分（ipc.md §3 防探测）
+  if (code === "vault.exists" || code === "vault.weak_password") return new VaultInvalidError();
   if (message === "session.invalid") return new SessionInvalidError();
   return e instanceof Error ? e : new Error(String(e));
 }
@@ -80,8 +82,16 @@ async function ensureSubscribed(): Promise<void> {
 export class TauriAdapter implements LightKeyIpc {
   readonly kind = "tauri" as const;
 
-  async status(): Promise<{ unlocked: boolean }> {
+  async status(): Promise<{ unlocked: boolean; initialized: boolean }> {
     return rpc("vault.status");
+  }
+
+  async init(masterPassword: string): Promise<{ recoveryCode: string }> {
+    try {
+      return rpc<{ recoveryCode: string }>("vault.init", { masterPassword });
+    } catch (e) {
+      throw mapError(e);
+    }
   }
 
   async unlock(masterPassword: string): Promise<void> {

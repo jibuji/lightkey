@@ -60,4 +60,5 @@
 | M1 | 第二层双客户端冲突合并全部场景 |
 | M1.5 | 行为不回归：M0/M1 全量测试（第一层 + E2E e2e_m0.sh / e2e_m1.sh）重组后全绿；密文格式/存储布局/IPC 协议零变更；D 层事件总线单测（item.changed 三方响应、session.unlocked/locked、theme.changed 重渲染、clipboard.copied Toast+30s 清除） |
 | M2 | 第三层安全专项 + 授权门单测 + 桌面验收（Windows） |
+| M2.5 | 首启门控：`vault.status.initialized` 单测（无库/有库）+ 初始化向导四步流单测（弱/强/不一致门控、恢复码勾选门控、完成跳转解锁、统一错误文案）+ 有库启动 → 解锁页回归（host/浏览器 E2E） |
 | M3 | 填充协议集成（扩展 ↔ 守护进程）模拟 |

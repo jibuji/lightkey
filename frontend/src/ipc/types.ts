@@ -3,7 +3,9 @@
  * 协议面（docs/ipc.md）。本层只声明协议形状，不实现传输。
  *
  * 方法名对照 docs/ipc.md §4：
- *   status   → vault.status        unlock → vault.unlock        lock → vault.lock
+ *   status   → vault.status（含 initialized：库是否已初始化，M2.5 首启门控）
+ *   init     → vault.init（建库；恢复码仅一次返回）
+ *   unlock   → vault.unlock        lock → vault.lock
  *   list     → item.list           get    → item.get
  *   create/update → item.put（无 id 新建 / 带 expectedRevision 整条替换）   remove → item.delete
  *   syncStatus → sync.status       syncTrigger → sync.trigger
@@ -68,10 +70,12 @@ export interface LightKeyIpc {
   /** 适配器种类（mock = 内存模拟；tauri = 真实守护进程桥）。 */
   readonly kind: "mock" | "tauri";
 
-  /** vault.status：解锁态、同步水位 */
-  status(): Promise<{ unlocked: boolean }>;
+  /** vault.status：解锁态、库是否已初始化（无库 = 首启 → 初始化向导）、同步水位 */
+  status(): Promise<{ unlocked: boolean; initialized: boolean }>;
   /** vault.unlock：主密码解锁；错误统一为 VaultInvalidError */
   unlock(masterPassword: string): Promise<void>;
+  /** vault.init：建库（设主密码 + 生成恢复码/信封）；恢复码仅此一次返回 */
+  init(masterPassword: string): Promise<{ recoveryCode: string }>;
   /** vault.lock：立即锁定（内存密钥擦除） */
   lock(): Promise<void>;
   /** vault.recover：恢复码 + 新主密码 → 新恢复码（仅展示一次） */

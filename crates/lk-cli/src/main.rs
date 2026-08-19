@@ -376,6 +376,7 @@ fn rpc_fail(msg: &str, code: i64, data: Option<&Value>) -> i32 {
         ERR_VAULT_EXISTS => {
             "库已存在（如需重置请使用 lk init --force，旧数据不可恢复）".to_string()
         }
+        ERR_WEAK_PASSWORD => "主密码至少 8 位（建库/恢复时校验）".to_string(),
         ERR_SYNC_NOT_CONFIGURED => format!(
             "未配置同步存储，请先运行 lk config sync set <url>{}",
             if detail.is_empty() {

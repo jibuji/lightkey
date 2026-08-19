@@ -418,8 +418,8 @@ mod tests {
 
     fn test_vault(dir: &Path) -> UnlockedVault {
         let mut audit = AuditLog::open(dir).unwrap();
-        init_vault_with_params(dir, "pw", false, &mut audit, &test_kdf_params()).unwrap();
-        UnlockedVault::unlock(dir, "pw").unwrap()
+        init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
+        UnlockedVault::unlock(dir, "pw123456").unwrap()
     }
 
     /// 事件总线契约：`item.changed` 一事件三方响应（sync-engine 推送 /
@@ -568,7 +568,10 @@ mod tests {
 
         // crypto 服务
         let params = test_kdf_params();
-        let keys = core.crypto().derive_keys("pw", &params).expect("KDF 派生");
+        let keys = core
+            .crypto()
+            .derive_keys("pw123456", &params)
+            .expect("KDF 派生");
         let blob = core
             .crypto()
             .seal(keys.k_data.as_ref(), SealType::Item, "obj", b"hello");
@@ -577,7 +580,7 @@ mod tests {
             .open(keys.k_data.as_ref(), SealType::Item, "obj", &blob);
         assert_eq!(opened.unwrap(), b"hello");
         // 错误密钥 → 统一 Decrypt
-        let other = core.crypto().derive_keys("pw2", &params).unwrap();
+        let other = core.crypto().derive_keys("pw222222", &params).unwrap();
         assert!(matches!(
             core.crypto()
                 .open(other.k_data.as_ref(), SealType::Item, "obj", &blob),
@@ -589,7 +592,7 @@ mod tests {
         let code = recovery.generate_code();
         let parsed = recovery.parse_code(&code.display()).unwrap();
         assert_eq!(parsed.display(), code.display());
-        let mk = params.derive_master_key("pw").unwrap();
+        let mk = params.derive_master_key("pw123456").unwrap();
         let envelope = recovery
             .build_envelope(&code, &mk, params.clone(), KdfCost::from(&params))
             .unwrap();

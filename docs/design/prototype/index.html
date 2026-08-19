@@ -41,6 +41,95 @@
     </div>
   </section>
 
+  <!-- 初始化向导（首启：欢迎 → 设主密码 → 恢复码 → 完成） -->
+  <section id="screen-onboarding" class="screen">
+    <div class="onboard-card">
+      <div class="onboard-progress" aria-hidden="true">
+        <span class="ostep active" data-step="1"></span>
+        <span class="ostep" data-step="2"></span>
+        <span class="ostep" data-step="3"></span>
+        <span class="ostep" data-step="4"></span>
+      </div>
+
+      <!-- Step 1：欢迎 -->
+      <div class="onboard-step active" id="onboard-step-1">
+        <div class="brand-mark brand-mark-lg" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4M18 5l2 2M15 8l2 2"/></svg>
+        </div>
+        <h1 class="onboard-title">欢迎使用 LightKey</h1>
+        <p class="onboard-sub">轻钥 · 个人密钥管理 · 首次使用需要几步初始化</p>
+        <ul class="onboard-features">
+          <li><span class="feat-ic"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"/></svg></span>密钥仅在本机加密解密，云端只见密文</li>
+          <li><span class="feat-ic"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"/></svg></span>BYO 存储：WebDAV / S3 任意自备云</li>
+          <li><span class="feat-ic"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"/></svg></span>恢复码兜底：忘记主密码也能找回</li>
+        </ul>
+        <button class="btn btn-primary btn-block" id="ob-next-1">开始设置</button>
+      </div>
+
+      <!-- Step 2：设主密码 -->
+      <div class="onboard-step" id="onboard-step-2">
+        <h2 class="onboard-title">设置主密码</h2>
+        <p class="onboard-sub">主密码用于加密你的密钥库，仅存于本机，任何云端都看不到它。</p>
+        <form class="onboard-form" autocomplete="off">
+          <label class="field">
+            <span class="field-label">主密码</span>
+            <span class="input-wrap">
+              <input id="ob-password" type="password" placeholder="至少 8 位" />
+              <button type="button" class="icon-btn input-affix" data-toggle-password="ob-password" aria-label="显示/隐藏密码" tabindex="-1">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </span>
+          </label>
+          <div class="strength-meter" id="ob-strength" data-lv="0">
+            <span class="strength-seg"></span><span class="strength-seg"></span><span class="strength-seg"></span><span class="strength-seg"></span>
+            <span class="strength-label" id="ob-strength-label">—</span>
+          </div>
+          <label class="field">
+            <span class="field-label">确认主密码</span>
+            <span class="input-wrap"><input id="ob-confirm" type="password" placeholder="再次输入主密码" /></span>
+          </label>
+          <p class="onboard-error" id="ob-pw-error"></p>
+          <div class="modal-actions onboard-actions">
+            <button type="button" class="btn btn-ghost" id="ob-prev-2">上一步</button>
+            <button type="button" class="btn btn-primary" id="ob-next-2" disabled>下一步</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Step 3：恢复码（仅一次） -->
+      <div class="onboard-step" id="onboard-step-3">
+        <h2 class="onboard-title">保存恢复码</h2>
+        <p class="onboard-sub">恢复码是主密码之外的第二把钥匙，<b style="color:var(--warning)">仅显示这一次</b>。</p>
+        <div class="recovery-code" id="ob-code"></div>
+        <div class="recovery-warn" style="text-align:left">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <span>请抄写到纸上或存入密码管理器；应用不会再次展示、不会上传。</span>
+        </div>
+        <div class="onboard-code-actions">
+          <button class="btn btn-ghost btn-sm" id="ob-copy">复制恢复码</button>
+        </div>
+        <label class="onboard-check">
+          <input type="checkbox" id="ob-saved" />
+          <span>我已妥善保存恢复码</span>
+        </label>
+        <div class="modal-actions onboard-actions">
+          <button class="btn btn-ghost" id="ob-prev-3">上一步</button>
+          <button class="btn btn-primary" id="ob-next-3" disabled>下一步</button>
+        </div>
+      </div>
+
+      <!-- Step 4：完成 -->
+      <div class="onboard-step" id="onboard-step-4">
+        <div class="onboard-done-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"/></svg>
+        </div>
+        <h2 class="onboard-title">初始化完成</h2>
+        <p class="onboard-sub">密钥库已创建并加密，主密码与恢复码均已生效。</p>
+        <button class="btn btn-primary btn-block" id="ob-finish">进入 LightKey</button>
+      </div>
+    </div>
+  </section>
+
   <!-- 主界面（解锁后） -->
   <section id="screen-vault" class="screen">
     <div class="app">
