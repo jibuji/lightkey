@@ -25,6 +25,7 @@ import { theme } from "../plugins/theme";
 import { toast } from "../plugins/toast";
 import { approval } from "../plugins/approval";
 import { desktopShell } from "../plugins/desktop-shell";
+import { uiOnboarding } from "../plugins/ui-onboarding";
 import { uiUnlock } from "../plugins/ui-unlock";
 import { uiVault } from "../plugins/ui-vault";
 import { uiRules } from "../plugins/ui-rules";
@@ -43,6 +44,7 @@ import {
 import { CordisLoader } from "./loader";
 import { Skeleton } from "./Skeleton";
 import { SlotRegistry } from "./slots";
+import type { LightKeyIpc } from "../ipc/types";
 import type { NavService, ToastMessage } from "../services/types";
 
 /** 插件注册表（Vite 静态 import；M2 新增插件 = 此处注册 + cordis.yml 增条目）。 */
@@ -61,7 +63,8 @@ export const PLUGIN_REGISTRY: Record<string, Plugin> = {
   search,
   "sync-status": syncStatus,
   "theme-toggle": themeToggle,
-  // content（M2 ui-*；ui-unlock 为锁态整页）
+  // content（M2 ui-*；ui-unlock 为锁态整页，M2.5 ui-onboarding 首启向导）
+  "ui-onboarding": uiOnboarding,
   "ui-unlock": uiUnlock,
   "ui-vault": uiVault,
   "ui-rules": uiRules,
@@ -80,8 +83,17 @@ export interface HostInstance {
   dispose: () => void;
 }
 
+/** createHost 选项（测试装配注入）。 */
+export interface HostOptions {
+  /** 注入 ipc-bridge 适配器（单测/QA 用；缺省 = createIpc() 按运行环境选择）。 */
+  ipcAdapter?: LightKeyIpc;
+}
+
 /** 创建宿主：装配宿主服务 + 挂载 cordis.yml 全部插件。 */
-export async function createHost(registry: Record<string, Plugin> = PLUGIN_REGISTRY): Promise<HostInstance> {
+export async function createHost(
+  registry: Record<string, Plugin> = PLUGIN_REGISTRY,
+  options: HostOptions = {},
+): Promise<HostInstance> {
   const ctx = new Context();
   const slots = new SlotRegistry();
 
@@ -92,7 +104,12 @@ export async function createHost(registry: Record<string, Plugin> = PLUGIN_REGIS
   });
 
   const loader = new CordisLoader(ctx, registry);
-  const mounted = await loader.load(cordisYml);
+  const entries = loader.parse(cordisYml);
+  if (options.ipcAdapter) {
+    const entry = entries.find((e) => e.name === "ipc-bridge");
+    if (entry) entry.config = { ...entry.config, adapter: options.ipcAdapter };
+  }
+  const mounted = await loader.loadEntries(entries);
   return {
     ctx,
     slots,
@@ -150,15 +167,17 @@ function ToastLayer({ toastService }: { toastService: HostInstance["ctx"]["toast
 }
 
 /** 根组件：装配宿主 → 渲染三栏骨架 + 事件重渲染。 */
-export function CordisHost() {
+/** 根组件：装配宿主 → 渲染三栏骨架 + 事件重渲染。
+ *  `ipcAdapter` 仅供测试注入（生产缺省 = 按运行环境选择 mock/tauri）。 */
+export function CordisHost({ ipcAdapter }: { ipcAdapter?: LightKeyIpc }) {
   const [host, setHost] = useState<HostInstance | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
-  // 事件重渲染计数器（theme.changed / session.* / item.changed）
+  // 事件重渲染计数器（theme.changed / session.* / item.changed / vault.initialized）
   const [, forceTick] = useReducer((x: number) => x + 1, 0);
 
   useEffect(() => {
     let disposed = false;
-    void createHost().then(
+    void createHost(PLUGIN_REGISTRY, { ipcAdapter }).then(
       (h) => {
         if (disposed) {
           h.dispose();
@@ -173,19 +192,22 @@ export function CordisHost() {
     };
   }, []);
 
-  // 订阅总线事件 → 重渲染（theme.changed 重渲染 / 会话切换 / item.changed）
+  // 订阅总线事件 → 重渲染（theme.changed 重渲染 / 会话切换 / item.changed /
+  // vault.initialized 首启门控）
   useEffect(() => {
     if (!host) return;
     const offTheme = host.ctx.on("theme.changed", () => forceTick());
     const offUnlocked = host.ctx.on("session.unlocked", () => forceTick());
     const offLocked = host.ctx.on("session.locked", () => forceTick());
     const offChanged = host.ctx.on("item.changed", () => forceTick());
+    const offInitialized = host.ctx.on("vault.initialized", () => forceTick());
     const offNav = host.nav.subscribe(() => forceTick());
     return () => {
       offTheme();
       offUnlocked();
       offLocked();
       offChanged();
+      offInitialized();
       offNav();
     };
   }, [host]);

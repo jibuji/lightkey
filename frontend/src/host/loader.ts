@@ -69,7 +69,11 @@ export class CordisLoader {
 
   /** 按序挂载全部条目；返回已挂载条目（含卸载句柄）。 */
   async load(raw: string): Promise<MountedPlugin[]> {
-    const entries = this.parse(raw);
+    return this.loadEntries(this.parse(raw));
+  }
+
+  /** 按序挂载已解析条目（createHost 可用预解析 + 配置注入后调用）。 */
+  async loadEntries(entries: PluginEntry[]): Promise<MountedPlugin[]> {
     const mounted: MountedPlugin[] = [];
     for (const entry of entries) {
       if (entry.disabled) continue;

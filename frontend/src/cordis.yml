@@ -50,11 +50,17 @@
   slot: topbar
   order: 3
 
-# content：页面（M2 由 ui-* 插件挂载）
+# content：页面（M2 由 ui-* 插件挂载；M2.5 增 ui-onboarding 首启向导）
+# ui-onboarding：锁态整页（page=onboarding，宿主按 session.initialized 门控；
+#   无库 → 向导，有库 → 解锁页，与 ui-unlock 互斥）
+- name: ui-onboarding
+  slot: content
+  order: 0
+  page: onboarding
 # ui-unlock：锁态整页（page=unlock，宿主锁态单独渲染，无三栏）
 - name: ui-unlock
   slot: content
-  order: 0
+  order: 1
   page: unlock
 - name: ui-vault
   slot: content

@@ -41,16 +41,17 @@ describe("cordis.yml loader", () => {
   it("解析 + schema 校验（非法条目拒绝）", () => {
     const loader = new CordisLoader(new Context(), {});
     const entries = loader.parse(cordisYml);
-    // 19 条：6 服务（4 地基 + approval + desktop-shell）+ 13 槽位组件
-    // （5 sidebar + 3 topbar + 5 content ui-*）
-    expect(entries).toHaveLength(19);
+    // 20 条：6 服务（4 地基 + approval + desktop-shell）+ 14 槽位组件
+    // （5 sidebar + 3 topbar + 6 content ui-*：M2.5 增 ui-onboarding）
+    expect(entries).toHaveLength(20);
     expect(entries[0].name).toBe("ipc-bridge");
     expect(entries.find((e) => e.name === "lock")?.order).toBe(99);
     expect(entries.find((e) => e.name === "theme")?.config).toEqual({
       defaultTheme: "dark",
     });
-    // M2：ui-* 挂 content；approval / desktop-shell 为服务
+    // M2/M2.5：ui-* 挂 content；approval / desktop-shell 为服务
     expect(entries.find((e) => e.name === "ui-unlock")?.page).toBe("unlock");
+    expect(entries.find((e) => e.name === "ui-onboarding")?.page).toBe("onboarding");
     expect(entries.find((e) => e.name === "approval")?.slot).toBeUndefined();
     expect(entries.find((e) => e.name === "desktop-shell")?.slot).toBeUndefined();
 
@@ -111,8 +112,10 @@ describe("cordis.yml 装配（createHost）", () => {
         "sync-status",
         "theme-toggle",
       ]);
-      // content：ui-unlock（锁态整页，order 0）在 ui-* 页面之前
+      // content：ui-onboarding（首启向导，order 0）→ ui-unlock（锁态整页）
+      // → ui-* 页面（M2.5 锁定态前置）
       expect(host.slots.list("content").map((e) => e.name)).toEqual([
+        "ui-onboarding",
         "ui-unlock",
         "ui-vault",
         "ui-rules",
@@ -122,6 +125,7 @@ describe("cordis.yml 装配（createHost）", () => {
       // 布局元数据：content 页面路由
       expect(host.slots.page("vault")?.name).toBe("ui-vault");
       expect(host.slots.page("unlock")?.name).toBe("ui-unlock");
+      expect(host.slots.page("onboarding")?.name).toBe("ui-onboarding");
       // 服务装配完整（M2：desktop-shell 提供 ctx.shell）
       expect(host.ctx.theme.current).toBe("dark");
       expect(host.ctx.session.unlocked).toBe(false);
@@ -156,7 +160,11 @@ describe("宿主渲染（锁态整页 ↔ 三栏切换 + 槽位 + 事件重渲�
       await vi.advanceTimersByTimeAsync(0);
     });
 
-    // 锁态：整页解锁（无 sidebar/topbar 三栏）
+    // 锁态：先等 `vault.status` 探测（300ms mock 延迟）→ 有库 → 整页解锁
+    // （无 sidebar/topbar 三栏）；探测中 = 检测占位（M2.5 首启门控）
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
     expect(container.querySelector(".screen-unlock")).not.toBeNull();
     expect(container.querySelector(".sidebar")).toBeNull();
     expect(container.querySelector(".topbar")).toBeNull();
