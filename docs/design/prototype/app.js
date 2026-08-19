@@ -62,7 +62,7 @@ const DB = {
 
 /* ---------- 状态 ---------- */
 const state = {
-  screen: "unlock",        // unlock | vault
+  screen: "unlock",        // unlock | onboarding | vault
   page: "items",           // items | rules | settings | audit
   filter: "all",
   afilter: "all",
@@ -70,7 +70,11 @@ const state = {
   selectedId: "github",
   revealed: false,
   toastTimer: null,
+  onboardStep: 1,          // 初始化向导当前步骤 1..4
 };
+
+/* 首启判定（原型模拟）：localStorage 记录“库是否已初始化” */
+const HAS_VAULT_KEY = "lk_proto_has_vault";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -89,6 +93,57 @@ function setPage(page) {
   document.querySelectorAll(".nav-item[data-page]").forEach((b) =>
     b.classList.toggle("active", b.dataset.page === page));
   renderPage(page);
+}
+
+/* ---------- 初始化向导（首启） ---------- */
+function showOnboarding(step) {
+  state.onboardStep = step;
+  showScreen("onboarding");
+  renderOnboarding();
+}
+
+function renderOnboarding() {
+  const s = state.onboardStep;
+  document.querySelectorAll(".onboard-step").forEach((el, i) =>
+    el.classList.toggle("active", i + 1 === s));
+  document.querySelectorAll(".ostep").forEach((el, i) =>
+    el.classList.toggle("active", i + 1 <= s));
+  if (s === 2) updateObPassword();
+  if (s === 3) $("#ob-next-3").disabled = !$("#ob-saved").checked;
+}
+
+/* 强度评分 0..5：长度 / 大写混合 / 数字 / 符号 */
+function passwordStrength(pw) {
+  if (!pw) return 0;
+  let s = 0;
+  if (pw.length >= 8) s++;
+  if (pw.length >= 12) s++;
+  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) s++;
+  if (/\d/.test(pw)) s++;
+  if (/[^A-Za-z0-9]/.test(pw)) s++;
+  return s;
+}
+const STRENGTH_LABELS = ["", "弱", "中", "强", "极强"];
+
+function updateObPassword() {
+  const pw = $("#ob-password").value;
+  const cf = $("#ob-confirm").value;
+  const st = passwordStrength(pw);
+  const lv = st === 0 ? 0 : st <= 2 ? 1 : st === 3 ? 2 : st === 4 ? 3 : 4;
+  $("#ob-strength").dataset.lv = lv;
+  $("#ob-strength-label").textContent = lv === 0 ? "—" : STRENGTH_LABELS[lv];
+  let err = "";
+  const lenOk = pw.length >= 8;
+  if (pw && !lenOk) err = "主密码至少 8 位";
+  else if (cf && cf !== pw) err = "两次输入不一致";
+  $("#ob-pw-error").textContent = err;
+  $("#ob-next-2").disabled = !(lenOk && pw === cf);
+}
+
+function finishOnboarding() {
+  localStorage.setItem(HAS_VAULT_KEY, "1");
+  showScreen("vault");
+  toast("初始化完成 · 密钥库已创建并解锁", "ok");
 }
 
 /* ---------- 存储类型 v2 元信息 ---------- */
@@ -799,6 +854,7 @@ function buildNav() {
       <button data-nav="audit">审计</button>
       <span class="sep"></span>
       <button data-nav="recovery">恢复码</button>
+      <button data-nav="onboarding">初始化向导</button>
       <button class="warn" data-nav="approval">模拟 lk inject 审批</button>
       <span class="sep"></span>
       <button data-nav="hide" style="color:var(--fg-2)">隐藏导航</button>
@@ -809,6 +865,7 @@ function buildNav() {
       if (n === "hide") { root.innerHTML = ""; return; }
       if (n === "approval") { showScreen("vault"); openApproval(); return; }
       if (n === "recovery") { showScreen("vault"); openRecovery(); return; }
+      if (n === "onboarding") { localStorage.removeItem(HAS_VAULT_KEY); showOnboarding(1); return; }
       if (n === "unlock") { state.revealed = false; showScreen("unlock"); return; }
       if (n === "vault") { state.page = "items"; state.filter = "all"; showScreen("vault"); return; }
       setPage(n);
@@ -866,6 +923,18 @@ function bindEvents() {
       state.page = b.dataset.page;
       setPage(b.dataset.page);
     }));
+  /* 初始化向导交互 */
+  $("#ob-code").textContent = DEMO_RECOVERY_CODE;
+  $("#ob-copy").addEventListener("click", () => copyText(DEMO_RECOVERY_CODE.replace(/ /g, "")));
+  $("#ob-next-1").addEventListener("click", () => showOnboarding(2));
+  $("#ob-prev-2").addEventListener("click", () => showOnboarding(1));
+  $("#ob-next-2").addEventListener("click", () => { updateObPassword(); if (!$("#ob-next-2").disabled) showOnboarding(3); });
+  $("#ob-prev-3").addEventListener("click", () => showOnboarding(2));
+  $("#ob-next-3").addEventListener("click", () => showOnboarding(4));
+  $("#ob-finish").addEventListener("click", finishOnboarding);
+  $("#ob-password").addEventListener("input", updateObPassword);
+  $("#ob-confirm").addEventListener("input", updateObPassword);
+  $("#ob-saved").addEventListener("change", (e) => { $("#ob-next-3").disabled = !e.target.checked; });
 }
 
 /* ---------- Hash 深链（截图自动化用） ---------- */
@@ -873,6 +942,7 @@ function applyHash() {
   const h = location.hash.replace(/^#/, "");
   if (!h) return;
   if (h === "unlock") { showScreen("unlock"); return; }
+  if (h === "onboarding") { showOnboarding(1); return; }
   if (h === "vault") { state.page = "items"; state.filter = "all"; showScreen("vault"); return; }
   if (h === "approval") { showScreen("vault"); openApproval(); return; }
   if (h === "recovery") { showScreen("vault"); openRecovery(); return; }
@@ -891,5 +961,11 @@ document.addEventListener("DOMContentLoaded", () => {
   bindEvents();
   buildNav();
   applyHash();
-  if (state.screen === "unlock") showScreen("unlock");
+  if (!location.hash) {
+    // 首启判定：无库（未初始化）→ 进入初始化向导；已初始化 → 解锁页
+    if (localStorage.getItem(HAS_VAULT_KEY) === "1") showScreen("unlock");
+    else showOnboarding(1);
+  } else if (state.screen === "unlock") {
+    showScreen("unlock");
+  }
 });
