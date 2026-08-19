@@ -77,6 +77,7 @@
 | ipc-bridge | 桥 | 统一 IPC 门面 + mock/tauri 适配器 | 地基 | M1.5（首批） |
 | preference-store | 偏好存储 | 非敏感 UI 偏好落盘（localStorage/tauri store） | — | M1.5（首批） |
 | theme | 主题 | 设计 tokens、暗/浅色切换、偏好持久化 | preference-store | M1.5（首批） |
+| ui-onboarding | 初始化向导（首启） | 四步向导：欢迎/设主密码/恢复码展示/完成；首启门控（无库） | ipc-bridge | M2.5 |
 | ui-unlock | 解锁页 | 密码/Windows Hello/恢复码入口 | ipc-bridge | M2 |
 | ui-vault | 条目 | 列表/搜索/详情/编辑 | ipc-bridge | M2 |
 | ui-rules | 规则 | 规则 CRUD | ipc-bridge | M2 |
@@ -89,6 +90,8 @@
 > 「地基」= 无上游依赖，其余插件可注入。M1.5 的首批插件为
 > **theme + ipc-bridge + preference-store + ui 骨架（React 宿主 + 槽位 + 最小壳）**；
 > 其余 D 层插件在 M2 桌面端于骨架之上实现（见 [milestones.md](milestones.md)）。
+> M2.5 增 **ui-onboarding**（首启向导；与 ui-unlock 互斥——宿主锁态按
+> `vault.status.initialized` 门控，无库→向导 / 有库→解锁页）。
 
 ## 4. 依赖图（inject 方向）
 
@@ -180,6 +183,10 @@ desktop-shell / approval / browser-fill  ← ipc-bridge
   无需返回值聚合，故用 `emit`；若未来需收集结果再换 `parallel`。
 - 所有负载沿用 [ipc.md](ipc.md) §4 的**最小字段原则**：只含索引级元数据或 key 名，
   密钥值永不出守护进程、永不进事件负载。
+- D 层内部事件（不跨进程，不进本表）：`vault.search` / `vault.search-enter`
+  （topbar 搜索）与 `vault.initialized`（M2.5 首启门控：ipc-bridge 探测
+  `vault.status` 后本地 emit，宿主据此在向导/解锁页间互斥切换）——
+  契约见 `frontend/src/events.ts`。
 
 ### 5.3 跨进程方向与返回路径
 

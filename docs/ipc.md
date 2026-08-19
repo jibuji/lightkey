@@ -20,6 +20,8 @@
   serde 序列化（`lk-core::ipc` 定义请求/响应类型）。
 - 消息结构：`{ "jsonrpc": "2.0", "method": "...", "params": {...}, "id": n }`。
 - 版本：每个方法带版本前缀，如 `vault.unlock`、`item.get`、`authz.evaluate`。
+- 首启判定（M2.5）：桌面壳启动时查 `vault.status`——`initialized=false`（无库）
+  → 初始化向导；`true`（有库）→ 解锁页；与 `unlocked` 正交（锁态即可响应）。
 
 ## 3. 会话令牌（D10）
 
@@ -33,7 +35,8 @@
 
 | 方法 | 说明 | 返回（最小字段） |
 |------|------|------------------|
-| `vault.status` | 解锁态、同步水位、版本 | 布尔 + 水位戳 |
+| `vault.status` | 解锁态、**库是否已初始化**（M2.5 首启门控：无库 → 初始化向导）、同步水位、版本 | 布尔 ×2 + 水位戳 |
+| `vault.init` | 建库：设主密码（**至少 8 位**，弱密码 → `vault.weak_password`）+ 生成恢复码/信封；已存在库 → `vault.exists` | 恢复码（仅展示一次） |
 | `vault.unlock` | 主密码解锁 | 会话令牌 |
 | `vault.lock` | 立即锁定 | 无 |
 | `item.list` | 索引（解密态最小字段） | id/name/type/revision/deleted |
@@ -47,6 +50,9 @@
 - **最小字段原则**：IPC 响应只包含调用方被授权的最小已解密字段——例如
   `authz.evaluate` 只返回「被批准命令的 env 变量」，绝不返回整库内容
   （D10 原文：环境变量只注入被批准命令）。
+- **错误码**：`vault.init` 的弱密码（`vault.weak_password`）与已存在库
+  （`vault.exists`）错误码不同，但 UI 层统一文案不区分（防探测语义同
+  §3 的 `session.invalid`）；`vault.recover` 的新主密码同策略。
 
 ## 5. 自动锁定（D10）
 
