@@ -30,8 +30,9 @@
   （本地需 mingw 交叉工具链：conda env `lightkey-mingw`，PATH 前置其 bin；
   Linux 无 webkit2gtk 不编译 lk-app）。
 - CI 骨架：`.github/workflows/ci.yml`；发布流水线：`.github/workflows/release.yml`
-  （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI；tag `v*` → GitHub
-  Release 附件，main push / workflow_dispatch → Actions artifact；产物未签名属预期）。
+  （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI + 独立 CLI `lk.exe`；tag `v*` → GitHub
+  Release 附件，main push / workflow_dispatch → Actions artifact；资产名版本号 tag 触发时取
+  `GITHUB_REF_NAME` 去 v 前缀，否则回退 tauri.conf.json；产物未签名属预期）。
 
 ## 交付纪律
 
