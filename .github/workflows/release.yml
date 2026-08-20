@@ -1,11 +1,13 @@
 # LightKey 发布流水线（2026-08-19 新增，独立于 ci.yml 测试门禁）
 #
-#   - tag v* push          → Windows 打包（NSIS + MSI），产物挂到 GitHub Release
+#   - tag v* push          → Windows 打包（NSIS + MSI + 独立 CLI），产物挂到 GitHub Release
 #   - main push            → 同样打包，但只留 Actions artifact（最新构建手动下载，不建 Release）
 #   - workflow_dispatch    → 手动打版，行为同 main push（artifact 留存）
 # tag 触发时跳过 artifact 留存，避免同一份产物重复上传。
 # 安装包未做代码签名（暂无证书），Windows SmartScreen 未签名警告属当前预期，不阻塞发布。
 # NSIS / MSI 打包器（NSIS、WiX）由 tauri-bundler 首次构建时自动下载，无需额外准备。
+# 资产名版本号：tag 触发时取 tag（去 v 前缀），否则回退 tauri.conf.json 的 version。
+# 独立 CLI（target/release/lk.exe）随安装包一起分发，无需安装 GUI 即可纯命令行使用。
 
 name: Release
 
@@ -72,10 +74,18 @@ jobs:
         run: cargo tauri build
         working-directory: crates/lk-app
 
-      - name: Collect installers with versioned names
+      - name: Build standalone CLI (lk.exe)
+        run: cargo build --release -p lk-cli
+
+      - name: Collect artifacts with versioned names
         shell: pwsh
         run: |
-          $version = (Get-Content 'crates/lk-app/tauri.conf.json' -Raw | ConvertFrom-Json).version
+          # 版本号：tag 触发时取 tag（去 v 前缀，资产名与 Release 一致），否则回退 tauri.conf.json
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            (Get-Content 'crates/lk-app/tauri.conf.json' -Raw | ConvertFrom-Json).version
+          }
           New-Item -ItemType Directory -Force 'artifacts' | Out-Null
           $files = @(Get-ChildItem 'target/release/bundle/nsis' -Filter '*-setup.exe' -ErrorAction SilentlyContinue) + `
                    @(Get-ChildItem 'target/release/bundle/msi' -Filter '*.msi' -ErrorAction SilentlyContinue)
@@ -87,9 +97,10 @@ jobs:
             }
             Copy-Item $f.FullName (Join-Path 'artifacts' $name)
           }
+          Copy-Item 'target/release/lk.exe' (Join-Path 'artifacts' "lk-cli-$version-windows-x86_64.exe")
           Get-ChildItem 'artifacts' | Select-Object Name, Length
 
-      - name: Upload installers as workflow artifact
+      - name: Upload artifacts as workflow artifact
         if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
@@ -103,3 +114,8 @@ jobs:
         with:
           files: artifacts/*
           fail_on_unmatched_files: true
+          body: |
+            LightKey ${{ github.ref_name }} 发布产物：
+
+            - `LightKey-*-windows-x86_64-setup.exe` / `LightKey-*-windows-x86_64.msi`：Windows 安装包（NSIS / MSI；未签名，SmartScreen 警告属预期）
+            - `lk-cli-*-windows-x86_64.exe`：独立 `lk` 命令行工具——无需安装 GUI，纯命令行使用；`lk --help` 查看全部命令，详见 docs/cli.md
