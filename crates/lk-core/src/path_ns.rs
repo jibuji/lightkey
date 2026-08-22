@@ -61,6 +61,31 @@ pub fn is_wsl_canonical(s: &str) -> bool {
     strip_prefix_ci(s, WSL_SCHEME).is_some()
 }
 
+/// 是否为**合法**的 `wsl://<distro>[/<rest>]` 规范形（入库校验用；
+/// cross-subsystem.md §7.4「仅接受该形态本身」）：
+///
+/// - distro 段非空且不含 `\`（规范形分隔符一律 `/`）；
+/// - rest 各段非空（不允许 `//`、不以 `/` 结尾——[`wsl_canonical`] 的产物
+///   除 distro 根 `wsl://<distro>/` 外无尾斜杠）。
+pub fn is_valid_wsl_canonical(s: &str) -> bool {
+    let Some(rest) = strip_prefix_ci(s, WSL_SCHEME) else {
+        return false;
+    };
+    let mut segs = rest.split('/');
+    // split 恒产出至少一段；distro 段即首段
+    let distro = segs.next().unwrap_or("");
+    if distro.is_empty() || distro.contains('\\') {
+        return false;
+    }
+    // 剩余段全部非空；仅允许恰好一个空尾段（distro 根形态 `wsl://<distro>/`）
+    let tail: Vec<&str> = segs.collect();
+    match tail.as_slice() {
+        [] => true,   // wsl://<distro>
+        [""] => true, // wsl://<distro>/（规范根形态）
+        segs => segs.iter().all(|p| !p.is_empty()),
+    }
+}
+
 /// wsl:// 规范形的祖先匹配：`cwd` 等于 `project_dir` 或为其按目录组件的
 /// 前缀。比较大小写不敏感（NTFS 默认语义；distro 名保留原样但匹配不区分），
 /// 目录边界严格（`…/u/p2` 不命中 `…/u/p`）。两侧均应为规范形
@@ -158,6 +183,42 @@ mod tests {
             canonical_project_dir(r"\\?\UNC\server\share\x"),
             r"\\server\share\x"
         );
+    }
+
+    /// 合法规范形判定（入库校验用）：distro 段必须非空，rest 无空段；
+    /// `wsl://`、`wsl:///etc` 等缺 distro 形态非法（§7.4「仅接受该形态本身」）。
+    #[test]
+    fn valid_wsl_canonical_gate() {
+        for ok in [
+            "wsl://Debian/home/u/p",
+            "wsl://Debian/",
+            "wsl://Debian",
+            "WSL://Ubuntu-22.04/root", // 前缀大小写不敏感（与匹配侧一致）
+            "wsl://My_Distro/a/b/c",
+        ] {
+            assert!(is_valid_wsl_canonical(ok), "应合法：{ok}");
+        }
+        for bad in [
+            "wsl://",
+            "wsl:///",
+            "wsl:///etc",       // 空 distro
+            "wsl://Debian//x",  // 空段
+            "wsl://Debian/x/",  // 非根尾斜杠
+            "wsl://Deb\\ian/x", // distro 含反斜杠（非规范形分隔符）
+            "/home/u/p",
+            "",
+        ] {
+            assert!(!is_valid_wsl_canonical(bad), "应非法：{bad}");
+        }
+        // canonical_project_dir 的产物全部合法（自洽）
+        for raw in [
+            r"\\wsl.localhost\Debian\",
+            r"\\wsl$\Ubuntu\home\u",
+            r"\\?\UNC\wsl.localhost\D\a\b\c",
+        ] {
+            let c = canonical_project_dir(raw);
+            assert!(is_valid_wsl_canonical(&c), "归一化产物应合法：{c}");
+        }
     }
 
     #[test]

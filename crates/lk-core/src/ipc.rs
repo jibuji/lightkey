@@ -405,9 +405,10 @@ pub struct RuleRemoveParams {
 
 /// 规则字段校验（超长/非法 → `Err`，不入库；testing.md 第三层 #19）。
 ///
-/// - `projectDir`：绝对路径且可 canonicalize（存在）；`wsl://<distro>/<rest>`
-///   跨命名空间规范形（[`crate::path_ns`]，守护进程侧已归一化）例外——
-///   非本机文件系统路径，无法 canonicalize，仅接受该形态本身；
+/// - `projectDir`：绝对路径且可 canonicalize（存在）；**合法**的
+///   `wsl://<distro>[/<rest>]` 跨命名空间规范形（[`crate::path_ns`]，守护进程
+///   侧已归一化）例外——非本机文件系统路径，无法 canonicalize，仅接受该形态
+///   本身（缺 distro 段等畸形形态一律拒绝）；
 /// - `command`：非空、≤ 1024、无控制字符；
 /// - `name`：非空、≤ 256、无控制字符；
 /// - `keys`：1..=32 个，均为合法环境变量名（`[A-Za-z_][A-Za-z0-9_]*`）。
@@ -417,7 +418,7 @@ pub fn validate_rule_fields(
     command: &str,
     keys: &[String],
 ) -> std::result::Result<(), String> {
-    if !crate::path_ns::is_wsl_canonical(project_dir) {
+    if !crate::path_ns::is_valid_wsl_canonical(project_dir) {
         if project_dir.is_empty() || !std::path::Path::new(project_dir).is_absolute() {
             return Err("projectDir 必须是绝对路径".into());
         }

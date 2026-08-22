@@ -832,9 +832,10 @@ impl UnlockedVault {
     /// 新建/替换规则（`id=None` = 新建；`Some` = 替换，保留 created）。
     /// 规则体无 revision（规格字段集），修订号在索引内（`next_revision`）。
     pub fn put_rule(&mut self, draft: RuleDraft, id: Option<uuid::Uuid>) -> Result<Rule> {
-        // 绝对路径校验；`wsl://<distro>/<rest>` 跨命名空间规范形例外
-        // （非本机 fs 路径，cross-subsystem.md §7.4，入库前已归一化）。
-        if !crate::path_ns::is_wsl_canonical(&draft.project_dir)
+        // 绝对路径校验；合法的 `wsl://<distro>[/<rest>]` 跨命名空间规范形例外
+        // （非本机 fs 路径，cross-subsystem.md §7.4，入库前已归一化；畸形
+        // wsl:// 形态——缺 distro 段等——同样拒绝）。
+        if !crate::path_ns::is_valid_wsl_canonical(&draft.project_dir)
             && !std::path::Path::new(&draft.project_dir).is_absolute()
         {
             return Err(Error::Other("projectDir 必须是绝对路径".into()));

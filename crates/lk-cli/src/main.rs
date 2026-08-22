@@ -488,6 +488,15 @@ fn rpc_via_bridge(
             params["token"] = json!(t.trim());
         }
     }
+    // 审计 channel 如实标注桥接来源（cross-subsystem.md §7.5）：经 bridge 的
+    // authz.evaluate / rule.* 必须以 `wsl-bridge` 留痕，不得记作本地 cli
+    // （客户端硬编码的 "cli" 在此路径被覆写；其余方法无 channel 字段，不动）。
+    if matches!(
+        method,
+        M_AUTHZ_EVALUATE | M_RULE_ADD | M_RULE_LIST | M_RULE_REMOVE
+    ) {
+        params["channel"] = json!("wsl-bridge");
+    }
     let req = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1620,8 +1629,12 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
 }
 
 /// `lk rule add <projectDir> <command> --name <name> <keys...>`：
-/// projectDir 规范化（解析符号链接）后入库；以 `/` 开头且非现存本机路径时
-/// 解析为 `wsl://<默认发行版>/…` 并回显确认（cross-subsystem.md §7.4）。
+/// projectDir 规范化（解析符号链接）后入库。跨命名空间形态
+/// （cross-subsystem.md §7.4）：
+/// - 显式 `wsl://<distro>/...` 规范形直接采用（守护进程侧校验）；
+/// - 以 `/` 开头且非现存本机路径 → 解析为 `wsl://<默认发行版>/…` 并回显确认；
+/// - bridge 后端下解析出的 POSIX 绝对路径同样按默认发行版解析并回显确认
+///   （Windows 守护进程侧无法将裸 POSIX 路径视为绝对路径入库）。
 fn cmd_rule_add(
     out: &mut impl Write,
     dir: &std::path::Path,
@@ -1636,25 +1649,52 @@ fn cmd_rule_add(
         eprintln!("lk rule add: 至少需要 1 个 key 名（值不可见、名可指名）");
         return 2;
     }
-    let canonical = match std::fs::canonicalize(project_dir) {
-        Ok(c) => c.to_string_lossy().to_string(),
-        Err(_) if project_dir.starts_with('/') && !std::path::Path::new(project_dir).exists() => {
-            // 以 / 开头且非现存本机路径 → 可能是 WSL 内路径：解析为
-            // wsl://<默认发行版>/... 并回显确认（默认发行版歧义显式化）
-            match resolve_wsl_rule_dir(
-                project_dir,
-                std::io::stdin().is_terminal(),
-                &mut std::io::stdin().lock(),
-            ) {
-                Some(c) => c,
-                None => return 1,
+    // 显式 `wsl://<distro>/...` 规范形直接采用（守护进程侧校验形态合法性）——
+    // 本函数在默认发行版解析被拒时给出的重试指引就是该形态，必须可用。
+    let mut canonical = if lk_core::path_ns::is_valid_wsl_canonical(project_dir) {
+        project_dir.to_string()
+    } else {
+        match std::fs::canonicalize(project_dir) {
+            Ok(c) => c.to_string_lossy().to_string(),
+            Err(_)
+                if project_dir.starts_with('/') && !std::path::Path::new(project_dir).exists() =>
+            {
+                // 以 / 开头且非现存本机路径 → 可能是 WSL 内路径：解析为
+                // wsl://<默认发行版>/... 并回显确认（默认发行版歧义显式化）
+                match resolve_wsl_rule_dir(
+                    project_dir,
+                    std::io::stdin().is_terminal(),
+                    &mut std::io::stdin().lock(),
+                ) {
+                    Some(c) => c,
+                    None => return 1,
+                }
+            }
+            Err(e) => {
+                eprintln!("lk rule add: 项目目录无法解析：{project_dir}（{e}）");
+                return 1;
             }
         }
-        Err(e) => {
-            eprintln!("lk rule add: 项目目录无法解析：{project_dir}（{e}）");
-            return 1;
-        }
     };
+    // bridge 后端下，canonicalize 成功的 POSIX 绝对路径（WSL 内现存目录，含
+    // 相对路径的解析产物）属于 WSL 命名空间：Windows 守护进程无法将其视为
+    // 绝对路径入库，须解析为 `wsl://<distro>/...` 并回显确认后发送
+    // （cross-subsystem.md §7.4；本地后端不受影响，维持 POSIX 原语义）。
+    if canonical.starts_with('/')
+        && matches!(
+            bridge_backend::decide(),
+            bridge_backend::Decision::Bridge(_)
+        )
+    {
+        match resolve_wsl_rule_dir(
+            &canonical,
+            std::io::stdin().is_terminal(),
+            &mut std::io::stdin().lock(),
+        ) {
+            Some(c) => canonical = c,
+            None => return 1,
+        }
+    }
     match rpc(
         dir,
         M_RULE_ADD,
@@ -1691,9 +1731,10 @@ fn cmd_rule_add(
     }
 }
 
-/// 解析「以 `/` 开头且非现存本机路径」的 WSL 项目目录（cross-subsystem.md
-/// §7.4 第 4 条）：`<path>` → `wsl://<默认发行版><path>`，回显解析结果要求
-/// 确认（默认发行版歧义显式化，防静默错配）。
+/// 解析需折算为 WSL 命名空间的项目目录（cross-subsystem.md §7.4）：
+/// `<path>` → `wsl://<默认发行版><path>`，回显解析结果要求确认（默认发行版
+/// 歧义显式化，防静默错配）。两个调用点：非现存本机路径的 `/` 开头输入、
+/// bridge 后端下解析出的 POSIX 绝对路径。
 ///
 /// - 交互 TTY：回显 + y/N 确认；
 /// - 非交互（脚本/管道）：明确报错提示改用显式路径重试；
@@ -1703,7 +1744,14 @@ fn resolve_wsl_rule_dir(
     interactive: bool,
     input: &mut dyn std::io::BufRead,
 ) -> Option<String> {
-    let distro = detect_default_wsl_distro()?;
+    // 默认发行版不可探测 → 明确报错（绝不静默失败/静默错配）
+    let Some(distro) = detect_default_wsl_distro() else {
+        eprintln!(
+            "lk rule add: 无法探测 WSL 默认发行版（reg.exe 不可用或未安装 WSL）；\
+             请显式指定规范形路径重试：\n  lk rule add wsl://<发行版>{project_dir} ..."
+        );
+        return None;
+    };
     confirm_wsl_candidate(project_dir, &distro, interactive, input)
 }
 
@@ -1717,13 +1765,13 @@ fn confirm_wsl_candidate(
     let candidate = wsl_candidate(project_dir, distro)?;
     if !interactive {
         eprintln!(
-            "lk rule add: 「{project_dir}」不是现存本机路径，按 WSL 默认发行版解析为 {candidate}。\n\
+            "lk rule add: 「{project_dir}」按 WSL 默认发行版解析为 {candidate}。\n\
              当前为非交互环境，无法回显确认（防脚本静默错配）；请改用显式路径重试：\n  \
              lk rule add {candidate} ..."
         );
         return None;
     }
-    eprintln!("「{project_dir}」不是现存本机路径，已按 WSL 默认发行版解析为：{candidate}");
+    eprintln!("「{project_dir}」已按 WSL 默认发行版解析为：{candidate}");
     eprint!("确认将该目录入库？(y/N) ");
     let _ = std::io::stderr().flush();
     let mut ans = String::new();

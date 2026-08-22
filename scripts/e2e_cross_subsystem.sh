@@ -28,6 +28,7 @@
 #   - lk.exe 已知安装位置：%LOCALAPPDATA%\LightKey\（cross-subsystem.md §7.2）
 #   - bridge 后端选择环境变量：LIGHTKEY_BRIDGE=<lk.exe 路径>（§7.2）
 set -u
+set -o pipefail   # 管道中 lk 失败不得被 awk/grep 吞掉（断言真实性）
 
 # ---------------------------------------------------------------- 参数解析
 LK=""
@@ -80,10 +81,13 @@ fi
 [ -n "$WIN_HOME" ] && [ -f "$WIN_HOME/daemon.json" ] \
   || skip "Windows 侧未安装 LightKey 桌面应用（未找到 AppData/Roaming/lightkey/daemon.json；可用 LIGHTKEY_BRIDGE_HOME 指定）"
 
-# 3) bridge 中继 lk.exe（§7.2 已知安装位置清单）
+# 3) bridge 中继 lk.exe（§7.2 已知安装位置清单，与 lk-cli bridge_backend
+#    KNOWN_EXE_DIRS 对齐；Program Files 为 per-machine 安装兜底）
 RELAY="${LIGHTKEY_BRIDGE:-}"
 if [ -z "$RELAY" ]; then
-  for c in /mnt/*/Users/*/AppData/Local/LightKey/lk.exe /mnt/*/Program\ Files/LightKey/lk.exe; do
+  for c in /mnt/*/Users/*/AppData/Local/LightKey/lk.exe \
+           /mnt/*/Users/*/AppData/Local/Programs/LightKey/lk.exe \
+           /mnt/*/Program\ Files/LightKey/lk.exe; do
     [ -x "$c" ] && RELAY="$c" && break
   done
 fi
@@ -139,7 +143,11 @@ check "item add secret $KEY_NAME" 0 $?
 echo "== 5. authz.evaluate → 注入（channel=wsl-bridge）=="
 if [ "$AUTO" = 1 ]; then
   echo "（--auto-approve 模式：rule add 第②层白名单命中，自动放行，无弹窗）"
-  "$LK" rule add "$PROJ" "sh *" --name e2e-cross "$KEY_NAME" >/dev/null 2>&1
+  # 显式 wsl://<发行版> 规范形：非交互环境下默认发行版解析必须拒绝
+  # （cross-subsystem.md §7.4 回显确认），故用显式形态绕开确认而非跳过校验。
+  # $PROJ 为 WSL 内路径（本脚本工作目录），规范形即 wsl://<distro><abs-path>。
+  "$LK" rule add "wsl://${WSL_DISTRO_NAME:?WSL 发行版名未知}${PROJ}" "sh *" \
+    --name e2e-cross "$KEY_NAME" >/dev/null 2>&1
   check "rule add（命中 sh *，免弹窗）" 0 $?
 else
   echo ">>> 请注意 Windows 屏幕：即将弹出审批窗口（30s 倒计时），请点击「批准」。"
