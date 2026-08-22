@@ -128,6 +128,9 @@ export class MockAdapter implements LightKeyIpc {
     this.masterPassword = masterPassword;
     this.initialized = true;
     this.unlocked = false;
+    // 建库成功 = 首启结束：清除 simulateFreshInstall 的 localStorage 标志，
+    // 否则重载后新实例仍视为未初始化、又回向导（QA P2：对齐真实落盘语义）
+    localStorage.removeItem(MOCK_FRESH_KEY);
     this.resetStore(false); // 新库为空（解锁时才回填演示 fixture）
     return delay({ recoveryCode: DEMO_RECOVERY_CODE });
   }
@@ -151,8 +154,10 @@ export class MockAdapter implements LightKeyIpc {
     if (recoveryCode.replace(/\s/g, "") !== DEMO_RECOVERY_CODE.replace(/\s/g, "")) {
       return delayReject(new VaultInvalidError());
     }
-    if (newPassword.length < 4) {
-      return delayReject(new Error("vault.invalid"));
+    // 新主密码同 vault.init 策略：≥8 位（ipc.md §4；对齐 tauriAdapter 对
+    // vault.weak_password 的 VaultInvalidError 映射，QA P2：原为 <4 位）
+    if (newPassword.length < 8) {
+      return delayReject(new VaultInvalidError());
     }
     // 恢复 = 更换主密码 + 重建库（与守护进程 vault.recover 语义一致：锁定态）
     this.masterPassword = newPassword;
@@ -235,7 +240,10 @@ export class MockAdapter implements LightKeyIpc {
 
   async ruleAdd(input: RuleInput): Promise<AuthRule> {
     this.requireUnlocked();
-    if (!input.projectDir || !input.name || !input.command || !input.keys.length) {
+    // 对齐真实守护进程校验：目录须为绝对路径（浏览器无文件系统，「存在」
+    // 只能由真实侧判定；mock 至少拦截相对路径，保证前端 invalid 分支可达）
+    const isAbsolute = /^([a-zA-Z]:[\\/]|\/)/.test(input.projectDir);
+    if (!input.projectDir || !isAbsolute || !input.name || !input.command || !input.keys.length) {
       return delayReject(new Error("invalid params"));
     }
     const rule: AuthRule = {

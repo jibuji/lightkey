@@ -193,10 +193,19 @@ export const syncStatus: Plugin.Function<Context, SlotComponentConfig> = Object.
           const [lastSync, setLastSync] = useState<string | null>(null);
           const [unlocked, setUnlocked] = useState(ctx.session.unlocked);
           useEffect(() => {
+            const fetchSync = () => {
+              // 解锁时拉取一次同步水位：避免状态点「已同步」与 title「未同步」
+              // 语义不一致（QA P2；lastSync 不再依赖手动触发同步才出现）
+              void ctx.ipc.syncStatus().then((s) => {
+                setLastSync(s.lastSync ?? null);
+              });
+            };
+            if (ctx.session.unlocked) fetchSync();
             const offChanged = ctx.on("item.changed", () => setPending(true));
             const offUnlocked = ctx.on("session.unlocked", () => {
               setUnlocked(true);
               setPending(false);
+              fetchSync();
             });
             const offLocked = ctx.on("session.locked", () => setUnlocked(false));
             return () => {
