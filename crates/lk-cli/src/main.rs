@@ -12,6 +12,10 @@
 //! `--credentials-file` / `--stdin` 导入，存系统钥匙串）、`lk config get`。
 //! M2 命令（rule/inject）保持占位（退出码 2）。
 //!
+//! M2 已实现：授权门（`lk rule add|list|remove`、`lk inject`）。M2.75 新增
+//! 跨子系统桥（cross-subsystem.md §7）：`lk bridge`（stdio 中继）与 Linux 侧
+//! 传输抽象（local / bridge 后端选择，见 `bridge_backend`）。
+//!
 //! 约定：
 //! - 退出码 0 成功 / 1 业务失败（拒绝/超时/冲突）/ 2 用法错误或未实现。
 //! - 敏感输入（主密码/恢复码）不回显（TTY 用 rpassword，脚本用 --stdin）。
@@ -19,6 +23,8 @@
 //!   经 0600 文件在进程间传递（锁定即删除）。
 //! - 错误信息不区分「未解锁/令牌错」（ipc.md §3 语义）。
 
+mod bridge;
+mod bridge_backend;
 mod clipboard;
 
 use lk_daemon as daemon;
@@ -98,6 +104,10 @@ enum Command {
     Inject(Box<InjectArgs>),
     /// 读写本地配置【M1】
     Config(Box<ConfigArgs>),
+    /// 跨子系统 stdio 中继：stdin 一帧 JSON-RPC → 守护实例 → stdout 响应行
+    /// （一进程一请求；WSL 桥的 Windows 侧端点，cross-subsystem.md §7.1）
+    /// 【M2.75】
+    Bridge,
 }
 
 /// `lk config` 参数。
@@ -348,6 +358,7 @@ fn run(cli: &Cli) -> i32 {
         Command::Config(args) => cmd_config(out, &dir, &args.command, cli.json),
         Command::Rule(args) => cmd_rule(out, &dir, &args.command, cli.json),
         Command::Inject(args) => cmd_inject(out, &dir, &args.keys, &args.command),
+        Command::Bridge => bridge::cmd_bridge(out, &dir),
     }
 }
 
@@ -362,6 +373,18 @@ fn rpc_fail(msg: &str, code: i64, data: Option<&Value>) -> i32 {
         .and_then(|d| d.as_str())
         .unwrap_or("");
     let text = match code {
+        bridge::ERR_BRIDGE_NO_DAEMON => format!(
+            "无法连接 Windows 桌面守护实例（bridge.no_daemon）{}",
+            if detail.is_empty() { String::new() } else { format!("：{detail}") }
+        ),
+        bridge::ERR_BRIDGE_VERSION_INCOMPATIBLE => format!(
+            "Windows 桌面应用与本 CLI 协议版本不一致（bridge.version_incompatible），请重装 LightKey 桌面应用{}",
+            if detail.is_empty() { String::new() } else { format!("：{detail}") }
+        ),
+        bridge::ERR_BRIDGE_IO => format!(
+            "bridge 中继失败{}",
+            if detail.is_empty() { String::new() } else { format!("：{detail}") }
+        ),
         ERR_VAULT_INVALID => "解锁失败：主密码错误或库未初始化".to_string(),
         ERR_SESSION_INVALID => "库未解锁或会话已失效，请先运行 lk unlock".to_string(),
         ERR_ITEM_CONFLICT => "条目已被其他设备修改（CAS 冲突），请刷新后重试".to_string(),
@@ -404,8 +427,25 @@ fn rpc_fail(msg: &str, code: i64, data: Option<&Value>) -> i32 {
     1
 }
 
-/// 发送 RPC（自动拉起守护进程；附带会话令牌）。
+/// 发送 RPC（按传输后端分流；附带会话令牌）。
+///
+/// 传输后端选择（cross-subsystem.md §7.2）：`LIGHTKEY_BRIDGE` 显式指定 >
+/// 平台默认（WSL 自动探测 bridge，其余本地 UDS）。探测失败分型在
+/// [`bridge_backend::decide`] 内完成——「装了连不上」为明确报错，绝不静默
+/// 回落本地。
 fn rpc(dir: &std::path::Path, method: &str, params: Value) -> Result<Value, i32> {
+    match bridge_backend::decide() {
+        bridge_backend::Decision::Local => rpc_local(dir, method, params),
+        bridge_backend::Decision::Bridge(target) => rpc_via_bridge(target, method, params),
+        bridge_backend::Decision::Fatal(msg) => {
+            eprintln!("lk: {msg}");
+            Err(1)
+        }
+    }
+}
+
+/// local 后端：UDS 直连本机守护实例（现状行为，自动拉起守护进程）。
+fn rpc_local(dir: &std::path::Path, method: &str, params: Value) -> Result<Value, i32> {
     let ep = transport::ensure_daemon(dir).map_err(|e| {
         eprintln!("lk: 无法连接守护进程：{e}");
         1
@@ -427,7 +467,101 @@ fn rpc(dir: &std::path::Path, method: &str, params: Value) -> Result<Value, i32>
         eprintln!("lk: 守护进程通信失败：{e}");
         1
     })?;
-    let resp: RpcResponse = serde_json::from_str(&line).unwrap_or(RpcResponse {
+    parse_rpc_line(&line)
+}
+
+/// bridge 后端：把请求帧经 `lk.exe bridge` 中继到 Windows 桌面守护实例
+/// （cross-subsystem.md §5/§7.2）。会话令牌仍只在进程内存/令牌文件流转：
+/// Windows 侧守护实例把 token 写在其数据目录（经 drvfs 只读回读），本侧
+/// 不新增任何持久化。主密码交互输入逻辑不变（read_secret 不经此路径改动）。
+fn rpc_via_bridge(
+    target: bridge_backend::BridgeTarget,
+    method: &str,
+    params: Value,
+) -> Result<Value, i32> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut params = params;
+    if let Some(dd) = &target.data_dir {
+        if let Ok(t) = std::fs::read_to_string(dd.join(daemon::SESSION_TOKEN_FILE)) {
+            params["token"] = json!(t.trim());
+        }
+    }
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+
+    // 一请求一子进程：bridge 自身做版本校验并向 stderr 打连接目标提示行
+    // （继承 stderr 直达用户终端）。stdin/stdout 均为原始字节管道。
+    let mut cmd = Command::new(&target.exe);
+    cmd.arg("bridge");
+    if let Some(d) = &target.dir_arg {
+        cmd.arg("--dir").arg(d);
+    }
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()); // stderr 继承（可见性）
+    let mut child = cmd.spawn().map_err(|e| {
+        eprintln!(
+            "lk: 无法启动 bridge 中继程序（{}）：{e}",
+            target.exe.display()
+        );
+        1
+    })?;
+    {
+        let mut stdin = child.stdin.take().expect("stdin 已声明 piped");
+        let frame = req.to_string();
+        stdin
+            .write_all(frame.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
+            .map_err(|e| {
+                eprintln!("lk: 写入 bridge 失败：{e}");
+                1i32
+            })?;
+        // 显式关闭写端：bridge 读到 EOF/一帧后即处理并退出
+        drop(stdin);
+    }
+    let mut stdout = child.stdout.take().expect("stdout 已声明 piped");
+    let mut line = Vec::new();
+    {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(&mut stdout);
+        loop {
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if line.ends_with(b"\n") => break,
+                Ok(_) => continue,
+            }
+        }
+    }
+    let status = child.wait().map_err(|e| {
+        eprintln!("lk: 等待 bridge 退出失败：{e}");
+        1i32
+    })?;
+    if !status.success() && line.is_empty() {
+        eprintln!("lk: bridge 中继程序异常退出（{}）", status);
+        return Err(1);
+    }
+    while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    let line = String::from_utf8(line).map_err(|_| {
+        eprintln!("lk: bridge 响应不是合法 UTF-8");
+        1
+    })?;
+    if line.trim().is_empty() {
+        eprintln!("lk: bridge 无响应（中继程序异常退出 {}）", status);
+        return Err(1);
+    }
+    parse_rpc_line(&line)
+}
+
+/// 解析响应行 → result / 业务错误文案（local 与 bridge 共用）。
+fn parse_rpc_line(line: &str) -> Result<Value, i32> {
+    let resp: RpcResponse = serde_json::from_str(line).unwrap_or(RpcResponse {
         jsonrpc: "2.0".into(),
         id: Value::Null,
         result: None,
@@ -558,6 +692,16 @@ fn cmd_lock(out: &mut impl Write, dir: &std::path::Path) -> i32 {
 }
 
 fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
+    // 连接目标可见性（cross-subsystem.md §7.2）：杜绝「以为在操作本地、
+    // 实际连着 Windows 真库」的语义模糊。探测分型失败 → 明确报错。
+    let on_bridge = match bridge_backend::decide() {
+        bridge_backend::Decision::Local => false,
+        bridge_backend::Decision::Bridge(_) => true,
+        bridge_backend::Decision::Fatal(msg) => {
+            eprintln!("lk: {msg}");
+            return 1;
+        }
+    };
     match rpc(dir, M_VAULT_STATUS, json!({})) {
         Ok(res) => {
             let unlocked = res["unlocked"].as_bool().unwrap_or(false);
@@ -567,7 +711,7 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
                 let _ = writeln!(
                     out,
                     "{}",
-                    json!({ "unlocked": unlocked, "version": version, "syncWatermark": watermark })
+                    json!({ "unlocked": unlocked, "version": version, "syncWatermark": watermark, "target": if on_bridge { "bridge" } else { "local" } })
                 );
             } else {
                 let sync_line = match daemon::read_config(dir).sync {
@@ -581,11 +725,17 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
                     ),
                     None => "未配置（lk config sync set <url> 启用）".to_string(),
                 };
+                let target_line = if on_bridge {
+                    "Windows 桌面守护实例（经 bridge）"
+                } else {
+                    "本地守护实例"
+                };
                 let _ = writeln!(
                     out,
-                    "状态: {} | 版本: {} | 同步: {}",
+                    "状态: {} | 版本: {} | 连接: {} | 同步: {}",
                     if unlocked { "已解锁" } else { "已锁定" },
                     version,
+                    target_line,
                     sync_line
                 );
             }
