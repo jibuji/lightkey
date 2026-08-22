@@ -222,9 +222,11 @@ fn config_get(state: tauri::State<'_, AppState>) -> Result<ConfigView, String> {
 fn config_set(state: tauri::State<'_, AppState>, patch: ConfigPatch) -> Result<(), String> {
     let mut cfg = state.shared.config.read().unwrap().clone();
     if let Some(m) = patch.auto_lock_minutes {
-        // 空闲自动锁定分钟数（1~1440；0 = 禁用空闲锁，设置页不提供）
-        if m == 0 || m > 1440 {
-            return Err("自动锁定分钟数须在 1~1440 之间".into());
+        // 空闲自动锁定分钟数取离散档位（决策 #10：0/1/5/15/30/60；
+        // 0 = 下次请求即锁）
+        const AUTO_LOCK_TIERS: [u64; 6] = [0, 1, 5, 15, 30, 60];
+        if !AUTO_LOCK_TIERS.contains(&m) {
+            return Err("自动锁定分钟数须为 0/1/5/15/30/60（0 = 下次请求即锁）".into());
         }
         cfg.auto_lock_minutes = m;
     }
