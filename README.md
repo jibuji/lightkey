@@ -13,17 +13,18 @@
   Argon2id 独立派生；AES-256-GCM（刻意不同于 Bitwarden 的 CBC+HMAC）。
 - **零知识彻底**：条目/索引全加密；BYO 存储（WebDAV/S3）只见密文文件
   与文件名时间戳。
-- **同步**：加密索引 + 轮询（默认 60s，可配 15s~24h）；CAS + 墓碑，
+- **同步**：加密索引 + 轮询（默认 60s，可配 15s~3600s（1h））；CAS + 墓碑，
   30 天延迟硬删；last-write-wins。
 - **Agent 授权门**：默认拒绝 → 规则白名单 → 弹窗审批（30s 超时拒）；
-  `lk inject -- <cmd>` 只给被批准命令注入 env。
+  `lk inject --keys <name...> -- <cmd>` 只给被批准命令注入 env。
 - **恢复**：40 字符恢复码 + 恢复信封；三通道全丢 = 数据不可恢复（诚实文案）。
 
 ## 仓库结构
 
 ```
 crates/lk-core/    核心库（加密/数据模型/同步/授权门/审计/IPC 类型）
-crates/lk-cli/     CLI `lk`（含 daemon 宿主）
+crates/lk-daemon/  C 层守护进程宿主（CLI 与桌面复用）
+crates/lk-cli/     CLI `lk`（`lk daemon` 入口，复用 lk-core + lk-daemon）
 crates/lk-app/     Tauri 2 桌面壳
 frontend/          React + TypeScript 前端（Vite）
 docs/              实施规格集（docs/README.md 为索引；含前端设计规范与高保真原型）
@@ -32,8 +33,8 @@ docs/              实施规格集（docs/README.md 为索引；含前端设计�
 ## 构建与测试
 
 ```bash
-# 核心 + CLI（任意平台，Linux 上 Tauri 壳需要 webkit2gtk，由 CI 在 Windows 检查）
-cargo test                      # 默认成员 = lk-core + lk-cli
+# 核心 + daemon + CLI（任意平台，Linux 上 Tauri 壳需要 webkit2gtk，由 CI 在 Windows 检查）
+cargo test                      # 默认成员 = lk-core + lk-daemon + lk-cli
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
 
 # 前端

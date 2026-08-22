@@ -38,7 +38,7 @@
 | 命令 | 语义 | 里程碑 |
 |------|------|--------|
 | `lk sync` | 触发一次同步（轮询 + CAS 上传） | M1 |
-| `lk config sync set <url>` | 配置 BYO 存储（WebDAV/S3）与轮询间隔（15s~3600s（1h），默认 60s；上限 1h 见补充拍板 #8，范围校验待实现）；位置参数只接受存储 URL，凭据交互式提示输入（不回显），也可 `--credentials-file <path>` 或 `--stdin` 导入，不接受凭据明文位置参数 | M1 |
+| `lk config sync set <url>` | 配置 BYO 存储（WebDAV/S3）与轮询间隔（15s~3600s（1h），默认 60s；上限 1h 见补充拍板 #8，范围 15s~3600s 已校验、超限拒绝）；位置参数只接受存储 URL，凭据交互式提示输入（不回显），也可 `--credentials-file <path>` 或 `--stdin` 导入，不接受凭据明文位置参数 | M1 |
 | `lk config get <key>` | 读取配置 | M1 |
 
 ## 4. Agent 授权门
