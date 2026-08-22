@@ -849,6 +849,9 @@ impl UnlockedVault {
         };
         let rev = self.next_revision();
         self.write_rule_file(&rule)?;
+        // 复活/替换规则：清理陈旧墓碑（软删后同 id 重建 → 墓碑已失效；否则
+        // 非同步模式的 purge_expired 会把活跃规则连同墓碑一并误删）。
+        fs::remove_file(tomb_file(&self.dir, rule.id)).ok();
         self.index.insert(
             rule.id,
             IndexEntry {
@@ -1979,6 +1982,56 @@ mod tests {
             &blob,
         )
         .is_err());
+    }
+
+    /// M2：软删后同 id 复活规则 → 陈旧墓碑必须清理，否则非同步模式的
+    /// `purge_expired` 会把活跃规则误删。
+    #[test]
+    fn put_rule_clears_stale_tombstone_on_revive() {
+        let (dir, _audit, _code) = temp_vault("rule-revive");
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
+        let proj = std::env::temp_dir()
+            .join("lk-test-proj")
+            .to_string_lossy()
+            .to_string();
+        let rule = v
+            .put_rule(
+                RuleDraft {
+                    project_dir: proj.clone(),
+                    name: "publish".into(),
+                    command: "npm publish".into(),
+                    keys: vec!["NPM_TOKEN".into()],
+                },
+                None,
+            )
+            .unwrap();
+        v.delete_rule(rule.id).unwrap();
+        assert!(dir.path().join(format!("{}.tomb.lk", rule.id)).exists());
+        // 同 id 复活（替换）：陈旧墓碑应被清理
+        v.put_rule(
+            RuleDraft {
+                project_dir: proj,
+                name: "publish2".into(),
+                command: "npm *".into(),
+                keys: vec!["A".into(), "B".into()],
+            },
+            Some(rule.id),
+        )
+        .unwrap();
+        assert!(
+            !dir.path().join(format!("{}.tomb.lk", rule.id)).exists(),
+            "复活规则应清理陈旧墓碑"
+        );
+        assert_eq!(v.list_rules().unwrap().len(), 1);
+        // 过期清理不得删除活跃规则
+        let future = (time::OffsetDateTime::now_utc() + time::Duration::days(31))
+            .format(&time::macros::format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z"
+            ))
+            .unwrap();
+        assert_eq!(v.purge_expired(&future).unwrap(), 0);
+        assert_eq!(v.list_rules().unwrap().len(), 1, "活跃规则不被过期清理误删");
+        assert!(v.get_rule(rule.id).is_ok());
     }
 
     #[test]
