@@ -57,10 +57,12 @@ needs-decision，不得自行变更。
    （原 D2 的「Windows + macOS 双验收」CI 部分不再适用；验收平台 = Windows）。
 5. **加密索引范围扩展（裁定：选项 A，来源：no-mistakes document 阶段发现）**：
    加密索引从「条目最小索引」扩展为「vault 对象最小索引，覆盖条目与规则」
-   （`id`/`revisionDate`/`type`，`type ∈ item/rule`，`deleted` 仅条目）；规则
-   经同一索引/轮询路径发现与增量同步，与
+   （`id`/`revisionDate`/`type`，`type ∈ item/rule`，`deleted` 覆盖条目与规则）；
+   规则经同一索引/轮询路径发现与增量同步，与
    [authorization-gate.md](authorization-gate.md) §4「规则随库同步」声明一致。
-   已修订 [data-model.md](data-model.md) §6 与
+   规则删除态存于加密索引（规则体不含 `deleted`/`revision` 字段，删除态由索引
+   自描述并以墓碑文件承载）。2026-08-22 船长裁定：规则删除统一走软删/墓碑/
+   30 天硬删，与条目同路径。已修订 [data-model.md](data-model.md) §6 与
    [authorization-gate.md](authorization-gate.md) §4（原 D5/D8 其余内容仍然有效）。
 6. **存储类型定案 v2（船长 2026-08-15 定案，四类）**：
    原 D5 的「条目 schema 参照 Bitwarden login/secureNote 映射」不再适用，
@@ -98,5 +100,13 @@ needs-decision，不得自行变更。
 11. **审计 hmac 不进前端模型（裁定：选项 A）**：防篡改校验是守护进程/CLI 侧
    职责；UI 审计事件流为只读展示、不含 `hmac` 字段，前端 `AuditEvent` 类型
    不建模该字段。已修订 [audit.md](audit.md) §2/§3（原 D11 其余内容仍然有效）。
+12. **规则删除语义定案 + #8 待办勾销（2026-08-22 · 来源：文档一致性审查 needs-decision）**：
+   (a) **规则删除语义定案**：规则与条目同走「软删 → 墓碑 → 30 天硬删」（即对
+       #5「`deleted` 覆盖条目与规则」表述的正式修订依据）；配套实现收尾
+       （远端索引重建探测墓碑防复活等）由代码分支落地。
+   (b) **#8 待办勾销**：#8 所记「`lk config` 后续补同范围校验（待办）」已完成——
+       `SyncConfig::validate` 已按 `MAX_SYNC_INTERVAL_SECS=3600` 收敛为 15..=3600
+       并有边界测试（crates/lk-core/src/sync.rs），标记完成。
+   已修订 [data-model.md](data-model.md) §6（原 #5 其余内容仍然有效）。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

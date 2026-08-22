@@ -102,8 +102,9 @@
 ## 6. 加密索引
 
 - `index.lk` 整体加密（K_data），内容为 **vault 对象最小索引，覆盖条目与规则**：
-  `id`、`revisionDate`、`type`（`type ∈ item/rule`）；`deleted` 仅条目
-  （供列表/增量/墓碑判断）。
+  `id`、`revisionDate`、`type`（`type ∈ item/rule`）；`deleted` 覆盖条目与规则
+  （供列表/增量/墓碑判断；规则体不含 `deleted`/`revision` 字段，删除态由索引
+  自描述并以墓碑文件承载）。
 - 规则对象经**同一索引/轮询路径**发现与增量同步（与条目同路径，见
   [authorization-gate.md](authorization-gate.md) §4、[sync.md](sync.md)）。
 - 客户端本地始终有解密态索引缓存；索引用于变更发现与增量拉取（[sync.md](sync.md)），
