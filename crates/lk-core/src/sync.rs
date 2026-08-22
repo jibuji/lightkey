@@ -3,7 +3,7 @@
 //! 设计要点（均为决议拍板，勿自行变更）：
 //!
 //! - BYO 存储（WebDAV / S3 / 本地模拟 `file://`），无推送、无中间态加载、
-//!   静默轮询（默认 60s，可配 15s~24h）。
+//!   静默轮询（默认 60s，可配 15s~1h）。
 //! - 每轮协议：GET 远端 `index.lk`（加密）→ 解密对比本地索引 → 有差异才
 //!   拉取条目（含墓碑）→ 本地较新则 CAS 上传 → 墓碑收敛 → 合并重写远端索引。
 //! - CAS：上传携带 base ETag（存储端 `If-Match`/`If-None-Match`）；校验失败
@@ -56,8 +56,8 @@ use crate::{Error, Result};
 pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 60;
 /// 轮询间隔可配下限：15s。
 pub const MIN_SYNC_INTERVAL_SECS: u64 = 15;
-/// 轮询间隔可配上限：24h。
-pub const MAX_SYNC_INTERVAL_SECS: u64 = 24 * 3600;
+/// 轮询间隔可配上限：1h（补充拍板 #8）。
+pub const MAX_SYNC_INTERVAL_SECS: u64 = 3600;
 /// 冲突风暴阈值：单轮差异（拉+推）超过该值 → 退避轮询频率。
 pub const STORM_THRESHOLD: usize = 64;
 /// 索引 CAS 冲突重试上限（重拉重合并；耗尽则本轮部分完成，下轮继续）。
@@ -71,7 +71,7 @@ pub const MAX_PUSH_RETRIES: usize = 3;
 pub struct SyncConfig {
     /// BYO 存储 URL：`file://`（本地模拟）/ `http(s)://`（WebDAV）/ `s3://`。
     pub url: String,
-    /// 轮询间隔秒数（15~86400，默认 60）。
+    /// 轮询间隔秒数（15~3600，默认 60）。
     pub interval_secs: u64,
 }
 
@@ -1976,6 +1976,17 @@ mod tests {
             interval_secs: 5,
         };
         assert!(bad_interval.validate().is_err());
+        // 补充拍板 #8：上限收敛到 1h——3600 合法，3601 被拒。
+        let max_interval = SyncConfig {
+            url: "https://dav.example.com".into(),
+            interval_secs: MAX_SYNC_INTERVAL_SECS,
+        };
+        assert!(max_interval.validate().is_ok());
+        let over_max_interval = SyncConfig {
+            url: "https://dav.example.com".into(),
+            interval_secs: MAX_SYNC_INTERVAL_SECS + 1,
+        };
+        assert!(over_max_interval.validate().is_err());
         let bad_scheme = SyncConfig {
             url: "ftp://x".into(),
             interval_secs: 60,
