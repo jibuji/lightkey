@@ -152,7 +152,8 @@ struct RuleArgs {
 enum RuleCommand {
     /// 新增白名单规则（入库加密；projectDir 规范化后入库）
     Add {
-        /// 项目目录（规范化绝对路径；须存在）
+        /// 项目目录（规范化绝对路径；须存在。以 / 开头且非现存本机路径时
+        /// 按 WSL 默认发行版解析为 wsl://… 并回显确认）
         project_dir: String,
         /// 具名命令（可 glob，如 "npm *"；含空格需引号）
         command: String,
@@ -1469,7 +1470,8 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
 }
 
 /// `lk rule add <projectDir> <command> --name <name> <keys...>`：
-/// projectDir 规范化（解析符号链接）后入库。
+/// projectDir 规范化（解析符号链接）后入库；以 `/` 开头且非现存本机路径时
+/// 解析为 `wsl://<默认发行版>/…` 并回显确认（cross-subsystem.md §7.4）。
 fn cmd_rule_add(
     out: &mut impl Write,
     dir: &std::path::Path,
@@ -1479,12 +1481,25 @@ fn cmd_rule_add(
     keys: &[String],
     json_out: bool,
 ) -> i32 {
+    use std::io::IsTerminal;
     if keys.is_empty() {
         eprintln!("lk rule add: 至少需要 1 个 key 名（值不可见、名可指名）");
         return 2;
     }
     let canonical = match std::fs::canonicalize(project_dir) {
         Ok(c) => c.to_string_lossy().to_string(),
+        Err(_) if project_dir.starts_with('/') && !std::path::Path::new(project_dir).exists() => {
+            // 以 / 开头且非现存本机路径 → 可能是 WSL 内路径：解析为
+            // wsl://<默认发行版>/... 并回显确认（默认发行版歧义显式化）
+            match resolve_wsl_rule_dir(
+                project_dir,
+                std::io::stdin().is_terminal(),
+                &mut std::io::stdin().lock(),
+            ) {
+                Some(c) => c,
+                None => return 1,
+            }
+        }
         Err(e) => {
             eprintln!("lk rule add: 项目目录无法解析：{project_dir}（{e}）");
             return 1;
@@ -1524,6 +1539,104 @@ fn cmd_rule_add(
         }
         Err(c) => c,
     }
+}
+
+/// 解析「以 `/` 开头且非现存本机路径」的 WSL 项目目录（cross-subsystem.md
+/// §7.4 第 4 条）：`<path>` → `wsl://<默认发行版><path>`，回显解析结果要求
+/// 确认（默认发行版歧义显式化，防静默错配）。
+///
+/// - 交互 TTY：回显 + y/N 确认；
+/// - 非交互（脚本/管道）：明确报错提示改用显式路径重试；
+/// - 默认发行版不可探测 → 明确报错。
+fn resolve_wsl_rule_dir(
+    project_dir: &str,
+    interactive: bool,
+    input: &mut dyn std::io::BufRead,
+) -> Option<String> {
+    let distro = detect_default_wsl_distro()?;
+    confirm_wsl_candidate(project_dir, &distro, interactive, input)
+}
+
+/// 已知默认发行版时的候选拼装 + 回显确认（探测与确认分离，便于测试）。
+fn confirm_wsl_candidate(
+    project_dir: &str,
+    distro: &str,
+    interactive: bool,
+    input: &mut dyn std::io::BufRead,
+) -> Option<String> {
+    let candidate = wsl_candidate(project_dir, distro)?;
+    if !interactive {
+        eprintln!(
+            "lk rule add: 「{project_dir}」不是现存本机路径，按 WSL 默认发行版解析为 {candidate}。\n\
+             当前为非交互环境，无法回显确认（防脚本静默错配）；请改用显式路径重试：\n  \
+             lk rule add {candidate} ..."
+        );
+        return None;
+    }
+    eprintln!("「{project_dir}」不是现存本机路径，已按 WSL 默认发行版解析为：{candidate}");
+    eprint!("确认将该目录入库？(y/N) ");
+    let _ = std::io::stderr().flush();
+    let mut ans = String::new();
+    if input.read_line(&mut ans).ok()? == 0 {
+        return None; // EOF（输入关闭）→ 视为拒绝
+    }
+    match ans.trim() {
+        "y" | "Y" | "yes" | "Yes" => Some(candidate),
+        _ => {
+            eprintln!("lk rule add: 已取消；请改用显式路径重试：\n  lk rule add {candidate} ...");
+            None
+        }
+    }
+}
+
+/// 拼候选规范形 `wsl://<distro>/<rest>`（rest 取自以 `/` 开头的原始输入，
+/// 去尾斜杠；根 `/` → `wsl://<distro>/`）。
+fn wsl_candidate(project_dir: &str, distro: &str) -> Option<String> {
+    let trimmed = project_dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        Some(format!("wsl://{distro}/"))
+    } else {
+        Some(format!("wsl://{distro}{trimmed}"))
+    }
+}
+
+/// 探测 WSL 默认发行版（cross-subsystem.md §7.4）。
+///
+/// 依据：WSL 把默认发行版登记在注册表
+/// `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Lxss` 的
+/// `DefaultDistribution` 值（= 子键 GUID），该子键的 `DistributionName`
+/// 即发行版名。经系统自带 `reg.exe` 查询实现（不引第三方依赖）；在 WSL 内
+/// 运行时经 interop 调用同一 Windows 侧 reg.exe，同样可探测。非 Windows、
+/// 未装 WSL（Lxss 键缺失）或查询失败 → `None`。
+fn detect_default_wsl_distro() -> Option<String> {
+    use std::process::Command;
+    let lxss = r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Lxss";
+    let out = Command::new("reg")
+        .args(["query", lxss, "/v", "DefaultDistribution"])
+        .output()
+        .ok()?;
+    let guid = parse_reg_value(&String::from_utf8_lossy(&out.stdout), "DefaultDistribution")?;
+    let out = Command::new("reg")
+        .args([
+            "query",
+            &format!("{lxss}\\{guid}"),
+            "/v",
+            "DistributionName",
+        ])
+        .output()
+        .ok()?;
+    parse_reg_value(&String::from_utf8_lossy(&out.stdout), "DistributionName")
+}
+
+/// 从 `reg query <key> /v <name>` 输出取含 `<name>` 的行的最后一个空白
+/// 分隔 token（即值；容忍 reg 输出的对齐空白与 UTF-16 混排噪声行）。
+fn parse_reg_value(output: &str, name: &str) -> Option<String> {
+    output
+        .lines()
+        .find(|l| l.contains(name))?
+        .split_whitespace()
+        .last()
+        .map(String::from)
 }
 
 /// `lk rule list`：列出规则（最小字段）。
@@ -1647,4 +1760,80 @@ fn reason_text(reason: &str) -> &'static str {
 
 fn cmd_daemon(dir: &std::path::Path) -> i32 {
     lk_daemon::run(dir)
+}
+
+// ---------------------------------------------------------------------------
+// 测试（WSL 默认发行版解析辅助，cross-subsystem.md §7.4 第 4 条）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod wsl_rule_add_tests {
+    use super::*;
+    use std::io::BufReader;
+
+    fn confirm_with(input: &str, interactive: bool) -> Option<String> {
+        confirm_wsl_candidate(
+            "/home/u/p",
+            "Debian",
+            interactive,
+            &mut BufReader::new(input.as_bytes()),
+        )
+    }
+
+    /// 候选规范形拼接：常规路径 / 尾斜杠 / 根。
+    #[test]
+    fn wsl_candidate_forms() {
+        assert_eq!(
+            wsl_candidate("/home/u/p", "Ubuntu-22.04").as_deref(),
+            Some("wsl://Ubuntu-22.04/home/u/p")
+        );
+        assert_eq!(
+            wsl_candidate("/home/u/p/", "Debian").as_deref(),
+            Some("wsl://Debian/home/u/p")
+        );
+        assert_eq!(
+            wsl_candidate("/", "Debian").as_deref(),
+            Some("wsl://Debian/")
+        );
+    }
+
+    /// reg.exe 输出解析：取含目标值名的行的最后一个 token；
+    /// 缺失该行 → None。
+    #[test]
+    fn reg_value_parsing() {
+        let guid_out = "\r\nHKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Lxss\r\n    DefaultDistribution    REG_SZ    {0123abcd-4567-8901-2345-6789abcdef01}\r\n\r\n";
+        assert_eq!(
+            parse_reg_value(guid_out, "DefaultDistribution").as_deref(),
+            Some("{0123abcd-4567-8901-2345-6789abcdef01}")
+        );
+        let name_out = "\nHKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{0123abcd-4567-8901-2345-6789abcdef01}\n    DistributionName    REG_SZ    Ubuntu-22.04\n";
+        assert_eq!(
+            parse_reg_value(name_out, "DistributionName").as_deref(),
+            Some("Ubuntu-22.04")
+        );
+        assert_eq!(parse_reg_value(guid_out, "NoSuchValue"), None);
+        assert_eq!(parse_reg_value("", "DefaultDistribution"), None);
+    }
+
+    /// 交互确认：y/Y/yes 确认；n/空/EOF 拒绝（拒绝不静默入库）。
+    #[test]
+    fn interactive_confirm_variants() {
+        assert_eq!(
+            confirm_with("y\n", true).as_deref(),
+            Some("wsl://Debian/home/u/p")
+        );
+        assert!(confirm_with("Y\n", true).is_some());
+        assert!(confirm_with("yes\n", true).is_some());
+        assert_eq!(confirm_with("n\n", true), None);
+        assert_eq!(confirm_with("\n", true), None); // 默认拒绝
+        assert_eq!(confirm_with("", true), None); // EOF
+    }
+
+    /// 非交互环境：即使输入流给出 y 也必须拒绝（防脚本静默错配）。
+    #[test]
+    fn non_interactive_never_confirms() {
+        assert_eq!(confirm_with("y\n", false), None);
+        // 探测失败的兜底（resolve 层）：detect 返回 None → 整体 None，
+        // 由调用方报错退出——不产生任何候选入库。
+    }
 }
