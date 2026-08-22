@@ -155,16 +155,24 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
       <ApprovalHost
         current={queue[0] ?? null}
         onResolve={(requestId, decision) => {
-          void ctx.ipc.approvalResult(requestId, decision).then(({ accepted }) => {
-            // accepted=false = 守护进程已超时/伪造 id；弹窗照常关闭
-            if (decision === "allowed") {
-              ctx.toast.show(accepted ? "已允许本次（env 仅注入被批准 key）" : "请求已超时，未生效");
-            } else {
-              ctx.toast.show("已拒绝（已写审计）");
-            }
-            queue.shift();
-            render();
-          });
+          void ctx.ipc
+            .approvalResult(requestId, decision)
+            .then(({ accepted }) => {
+              // accepted=false = 守护进程已超时/伪造 id；弹窗照常关闭
+              if (decision === "allowed") {
+                ctx.toast.show(accepted ? "已允许本次（env 仅注入被批准 key）" : "请求已超时，未生效");
+              } else {
+                ctx.toast.show("已拒绝（已写审计）");
+              }
+            })
+            .catch(() => {
+              // 会话失效等回传失败：弹窗仍须关闭，不能卡死（QA P1）
+              ctx.toast.show("审批回传失败（会话可能已锁定），弹窗已关闭");
+            })
+            .finally(() => {
+              queue.shift();
+              render();
+            });
         }}
         onExpire={() => {
           // 超时：守护进程侧 30s 超时审计 timeout；弹窗关闭、不回传
@@ -175,8 +183,22 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     );
   };
 
-  // 订阅 authz.request：入队 + 弹窗（30s 倒计时由宿主驱动）
+  // 订阅 authz.request：入队 + 弹窗（30s 倒计时由宿主驱动）。
+  // 锁态门控（QA P1）：锁定时不渲染弹窗、不展示任何请求元数据——守护进程侧
+  // 30s 超时默认拒绝照常生效；解锁态才接受弹窗。
+  let unlocked = ctx.session.unlocked;
+  const offUnlocked = ctx.on("session.unlocked", () => {
+    unlocked = true;
+  });
+  const offLocked = ctx.on("session.locked", () => {
+    // 自动锁定/手动锁定时清队列并关弹窗：portal 层独立于锁态整页，
+    // 不随宿主卸载，必须自行响应 session.locked（QA P2）
+    unlocked = false;
+    queue.length = 0;
+    render();
+  });
   ctx.on("authz.request", (payload: AuthzRequestPayload) => {
+    if (!unlocked) return;
     queue.push({ request: payload, remain: APPROVAL_TIMEOUT_SECS });
     mount();
     render();
@@ -184,6 +206,8 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
 
   return () => {
     // 可逆副作用：卸载时移除弹窗层
+    offUnlocked();
+    offLocked();
     if (root) root.unmount();
     if (rootEl) rootEl.remove();
     root = null;
@@ -191,5 +215,5 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     queue.length = 0;
   };
 }, {
-  inject: ["ipc", "toast"],
+  inject: ["ipc", "toast", "session"],
 });

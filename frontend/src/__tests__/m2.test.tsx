@@ -253,6 +253,78 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
     expect(document.body.querySelector(".approval-dialog")).toBeNull();
     expect(spy).not.toHaveBeenCalled();
   });
+
+  it("锁定态收到 authz.request：不弹窗、不展示请求元数据（QA P1 门控）", async () => {
+    const { mock } = await mountHost(); // 不解锁
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-locked",
+        starter: "claude",
+        projectDir: "/work/proj-e",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+      });
+    });
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+    expect(document.body.textContent).not.toContain("/work/proj-e");
+  });
+
+  it("弹窗打开期间 session.locked → 清空队列并关闭弹窗（QA P2 自动锁残留）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-autolock",
+        starter: "claude",
+        projectDir: "/work/proj-f",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+      });
+    });
+    expect(document.body.querySelector(".approval-dialog")).not.toBeNull();
+    act(() => {
+      ctx.emit("session.locked", { reason: "timeout" });
+    });
+    // portal 层独立于锁态整页，必须自行响应锁定：弹窗关闭、队列清空
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+    // 锁定后再来的帧同样不弹
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-after-lock",
+        starter: "claude",
+        projectDir: "/work/proj-g",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+      });
+    });
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+
+  it("approvalResult 回传失败（会话失效 reject）→ 弹窗仍关闭、Toast 提示（QA P1 卡死）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    vi.spyOn(ctx.ipc, "approvalResult").mockRejectedValueOnce(new Error("session.invalid"));
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-reject",
+        starter: "claude",
+        projectDir: "/work/proj-h",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+      });
+    });
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const denyBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("拒绝"),
+    )!;
+    await act(async () => {
+      denyBtn.click();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    // 未被 .then 独占：catch 兜底后 finally 关闭，无 unhandled rejection、无卡死
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+    expect(ctx.toast.all.some((t) => t.text.includes("审批回传失败"))).toBe(true);
+  });
 });
 
 describe("tauri 模式：会话事件去重（本地广播 + 推送帧不双发）", () => {

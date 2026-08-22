@@ -103,13 +103,18 @@ export interface SyncStatusProps {
   onSync: () => void;
 }
 
-/** 同步状态点 + 同步按钮；`item.changed` → 置 pending（三方响应之一：推送侧）。 */
+/** 同步状态点 + 同步按钮；`item.changed` → 置 pending（三方响应之一：推送侧）。
+ *  状态点 aria-label 与 title 同源派生，保证语义一致（QA P2）。 */
 export function SyncStatus({ unlocked, pending, lastSync, onSync }: SyncStatusProps) {
+  const state = !unlocked ? "已锁定" : pending ? "有变更待同步" : lastSync ? "已同步" : "尚未同步";
   return (
-    <div className="topbar-sync" title={lastSync ? `上次同步 ${lastSync}` : "未同步"}>
+    <div
+      className="topbar-sync"
+      title={lastSync && unlocked && !pending ? `上次同步 ${lastSync}` : state}
+    >
       <span
         className={`sync-dot${unlocked ? (pending ? " pending" : " idle") : " locked"}`}
-        aria-label={unlocked ? (pending ? "有变更待同步" : "已同步") : "已锁定"}
+        aria-label={state}
       />
       <button type="button" className="btn btn-ghost btn-sm" disabled={!unlocked} onClick={onSync}>
         同步

@@ -63,6 +63,12 @@ export const THEME_PALETTES: Record<ThemeName, Record<string, string>> = {
 /** 主题偏好键（preference-store）。 */
 export const THEME_PREFERENCE_KEY = "theme";
 
+/** 最近一次向 documentElement 应用主题的插件实例标识（模块级共享状态：
+ *  React.StrictMode dev 双挂载时，首个宿主的 dispose 可能异步晚于第二个
+ *  宿主的 apply；清理须只由「最后应用者」执行，否则会把新实例刚应用的
+ *  tokens 擦掉（QA P2：浅色偏好 reload 后视觉不回显）。 */
+let themeApplierSeq = 0;
+
 export const theme: Plugin.Function<Context, ThemeConfig> = Object.assign(
   (ctx: Context, config: ThemeConfig = {}) => {
     const preference: PreferenceService = ctx.preference;
@@ -71,6 +77,7 @@ export const theme: Plugin.Function<Context, ThemeConfig> = Object.assign(
       config.defaultTheme ??
       "dark";
 
+    const applierId = ++themeApplierSeq;
     const apply = (name: ThemeName) => {
       const palette = THEME_PALETTES[name];
       const root =
@@ -80,6 +87,7 @@ export const theme: Plugin.Function<Context, ThemeConfig> = Object.assign(
           root.style.setProperty(key, value);
         }
         root.dataset.theme = name;
+        themeApplierSeq = applierId; // 本实例成为「最后应用者」
       }
     };
     apply(current);
@@ -101,11 +109,13 @@ export const theme: Plugin.Function<Context, ThemeConfig> = Object.assign(
     };
     ctx.provide("theme", service);
 
-    // 可逆副作用：插件卸载时清除主题变量（Cordis 卸载自动撤销语义 §5.4）
+    // 可逆副作用：插件卸载时清除主题变量（Cordis 卸载自动撤销语义 §5.4）。
+    // 仅「最后应用者」清理：避免 StrictMode 双挂载下旧宿主的 dispose 擦掉
+    // 新宿主刚应用的 tokens（QA P2）。
     ctx.effect(() => {
       return () => {
         const root = typeof document !== "undefined" ? document.documentElement : null;
-        if (root) {
+        if (root && themeApplierSeq === applierId) {
           // 遍历 token 键（与 THEME_PALETTES 同源，避免硬编码列表与 palette 漂移）
           for (const key of Object.keys(THEME_PALETTES.dark)) {
             root.style.removeProperty(key);

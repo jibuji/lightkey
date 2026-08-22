@@ -66,7 +66,9 @@ export function VaultPage({ ctx }: { ctx: Context }) {
   const [revealed, setRevealed] = useState(false);
   const [reloadTick, setReloadTick] = useState(0);
 
-  const [modal, setModal] = useState<{ mode: "create" } | { mode: "edit"; id: string } | null>(null);
+  const [modal, setModal] = useState<
+    { mode: "create"; defaultType: ItemType } | { mode: "edit"; id: string } | null
+  >(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [conflict, setConflict] = useState<{ id: string; draft: ItemDraft } | null>(null);
 
@@ -111,11 +113,13 @@ export function VaultPage({ ctx }: { ctx: Context }) {
   }, [ctx]);
   // topbar 搜索回车 → 空态「未找到，按回车新建」引导
   useEffect(() => {
-    const off = ctx.on("vault.search-enter", () => setModal({ mode: "create" }));
+    const off = ctx.on("vault.search-enter", () =>
+      setModal({ mode: "create", defaultType: filter === "all" ? "login" : filter }),
+    );
     return () => {
       off();
     };
-  }, [ctx]);
+  }, [ctx, filter]);
 
   /* ---------- 列表 ---------- */
   const filtered = useMemo(() => {
@@ -211,7 +215,10 @@ export function VaultPage({ ctx }: { ctx: Context }) {
       <div className="pane-list">
         <div className="pane-list-head">
           <h2 className="pane-title">全部条目</h2>
-          <button className="btn btn-primary btn-sm" onClick={() => setModal({ mode: "create" })}>
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={() => setModal({ mode: "create", defaultType: filter === "all" ? "login" : filter })}
+          >
             <Icon name="plus" size={14} strokeWidth={2.5} />
             新建
           </button>
@@ -235,7 +242,10 @@ export function VaultPage({ ctx }: { ctx: Context }) {
               <div style={{ color: "var(--fg-2)", fontSize: 32 }}>{q ? "🔍" : "🗝️"}</div>
               <div>{q ? "未找到匹配条目，按回车新建" : "还没有条目，添加第一条吧"}</div>
               {!q ? (
-                <button className="btn btn-primary btn-sm" onClick={() => setModal({ mode: "create" })}>
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={() => setModal({ mode: "create", defaultType: filter === "all" ? "login" : filter })}
+                >
                   新建条目
                 </button>
               ) : null}
@@ -287,6 +297,7 @@ export function VaultPage({ ctx }: { ctx: Context }) {
         <ItemForm
           ctx={ctx}
           item={modal.mode === "edit" ? (items?.find((it) => it.id === modal.id) ?? null) : null}
+          defaultType={modal.mode === "create" ? modal.defaultType : undefined}
           onClose={() => setModal(null)}
           onSaved={handleSaved}
           onConflict={handleConflict}
@@ -542,6 +553,7 @@ interface SelectedFile {
 function ItemForm({
   ctx,
   item,
+  defaultType,
   onClose,
   onSaved,
   onConflict,
@@ -549,13 +561,15 @@ function ItemForm({
   ctx: Context;
   /** null = 新建 */
   item: Item | null;
+  /** 新建默认类型：跟随当前筛选标签（全部 → 登录；船长需求）。 */
+  defaultType?: ItemType;
   onClose: () => void;
   onSaved: (item: Item) => void;
   onConflict: (id: string, draft: ItemDraft) => void;
 }) {
   const toast = ctx.toast;
 
-  const [type, setType] = useState<ItemType>(item?.type ?? "login");
+  const [type, setType] = useState<ItemType>(item?.type ?? defaultType ?? "login");
   const [name, setName] = useState(item?.name ?? "");
 
   // login
