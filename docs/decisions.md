@@ -80,4 +80,23 @@ needs-decision，不得自行变更。
    [crypto.md](crypto.md) §4.3 与 [milestones.md](milestones.md) M1
    （原 D6 其余内容仍然有效）。
 
+### 已补充拍板（2026-08-22 · 来源：前端全流程 QA 发现的规格矛盾/空白 needs-decision）
+
+8. **同步轮询间隔上限统一为 1h（裁定：选项 A，替代 D7 的「15s~24h」）**：
+   桌面场景轮询上限取 **3600s（1h）**，与 [design/spec.md](design/spec.md) §6.6
+   及设置页实现一致；`lk config` 后续补同范围校验（待办）。已修订
+   [sync.md](sync.md) §2 与 [cli.md](cli.md) §3（原 D7 其余内容仍然有效）。
+9. **审批超时不暴露设置 UI（裁定：选项 A）**：第 3 层弹窗审批超时保持拍板值
+   **固定 30s**（默认拒绝语义不变）；守护进程 `config.json` 的
+   `approval_timeout_secs` 保留为高级用户调参口（测试可调小），设置页不加项。
+   已修订 [design/spec.md](design/spec.md) §6.6（原 D8 其余内容仍然有效）。
+10. **自动锁定取值为离散档位（裁定：选项 A）**：空闲自动锁定分钟数取离散档位
+   **0 / 1 / 5 / 15 / 30 / 60**（0 = 下次请求即锁，Rust `Config.auto_lock_minutes`
+   注释既有语义），与设置页下拉一致；不接受自由数值。已修订
+   [ipc.md](ipc.md) §5 与 [design/spec.md](design/spec.md) §6.6
+   （原 D10 其余内容仍然有效）。
+11. **审计 hmac 不进前端模型（裁定：选项 A）**：防篡改校验是守护进程/CLI 侧
+   职责；UI 审计事件流为只读展示、不含 `hmac` 字段，前端 `AuditEvent` 类型
+   不建模该字段。已修订 [audit.md](audit.md) §2/§3（原 D11 其余内容仍然有效）。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
