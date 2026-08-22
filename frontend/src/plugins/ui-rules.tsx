@@ -17,6 +17,7 @@ import { Icon } from "../components/Icons";
 import { Modal } from "../components/Modal";
 import type { SlotComponentConfig } from "./skeleton";
 import { slotComponentConfig } from "./skeleton";
+import { formatProjectDir } from "../utils/projectDir";
 
 /** 规则页本体（content 槽位，page=rules）。 */
 export function RulesPage({ ctx }: { ctx: Context }) {
@@ -77,7 +78,7 @@ export function RulesPage({ ctx }: { ctx: Context }) {
                 <div>
                   <div className="rule-cmd">{r.command}</div>
                   <div className="rule-dir">
-                    <Icon name="folder" size={14} /> {r.projectDir}
+                    <Icon name="folder" size={14} /> {formatProjectDir(r.projectDir)}
                     <span style={{ color: "var(--fg-2)" }}>· {r.name}</span>
                   </div>
                 </div>

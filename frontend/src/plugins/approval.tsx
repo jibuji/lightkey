@@ -20,6 +20,7 @@ import type { Context, Plugin } from "@cordisjs/core";
 import type { AuthzRequestPayload } from "../events";
 import { CountdownRing } from "../components/atoms";
 import { Icon } from "../components/Icons";
+import { formatProjectDir } from "../utils/projectDir";
 
 /** 审批超时（秒；与守护进程 `approval_timeout_secs` 默认值对齐）。 */
 export const APPROVAL_TIMEOUT_SECS = 30;
@@ -62,7 +63,7 @@ export function ApprovalDialog({
           <div>
             <div style={{ fontWeight: 600 }}>{req.starter}</div>
             <div style={{ color: "var(--fg-2)", fontSize: "var(--fs-xs)" }}>
-              <Icon name="folder" size={13} /> {req.projectDir}
+              <Icon name="folder" size={13} /> {formatProjectDir(req.projectDir)}
             </div>
           </div>
         </div>
