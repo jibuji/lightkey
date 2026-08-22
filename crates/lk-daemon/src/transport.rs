@@ -12,8 +12,9 @@
 //!   路径据此回溯启动者，**不信任客户端自报字段**。
 //! - socket/pipe 路径含用户级随机组件，且位于用户私有数据目录（0700）——
 //!   防跨用户劫持。
-//! - 守护进程信息（pid + 端点）写入 `daemon.json`；客户端首次访问自动拉起
-//!   守护进程（检测到陈旧端点 → 先杀旧进程再拉起）。
+//! - 守护进程信息（pid + 端点 + `version`）写入 `daemon.json`；客户端首次
+//!   访问自动拉起守护进程（检测到陈旧端点 → 先杀旧进程再拉起）。
+//!   `version` 供协议版本校验（cross-subsystem.md §7.3），旧文件缺省可读。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,10 @@ pub struct Endpoint {
     pub pid: u32,
     /// unix: socket 绝对路径；windows: 完整 pipe 名。
     pub address: String,
+    /// 守护进程版本（cross-subsystem.md §7.3 协议版本校验）。
+    /// 旧格式 `daemon.json` 无此字段 → `None`（serde default，向后兼容）。
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// 请求处理器类型（行 + 对端身份 → 响应行）。
@@ -194,6 +199,7 @@ mod imp {
         let ep = Endpoint {
             pid: std::process::id(),
             address: sock.to_string_lossy().to_string(),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
         write_endpoint(dir, &ep)?;
         Ok(listener)
@@ -427,6 +433,7 @@ mod imp {
         let ep = Endpoint {
             pid: std::process::id(),
             address: pipe_name,
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
         write_endpoint(dir, &ep)?;
         Ok(())
@@ -887,4 +894,50 @@ fn spawn_daemon(dir: &Path) -> std::io::Result<()> {
     }
     cmd.spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 新格式：含 version 字段 → 解析 OK，值正确（§7.3）。
+    #[test]
+    fn parse_with_version() {
+        let raw = format!(
+            r#"{{"pid":123,"address":"/tmp/lk.sock","version":"{}"}}"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        let ep: Endpoint = serde_json::from_str(&raw).expect("新格式可解析");
+        assert_eq!(ep.pid, 123);
+        assert_eq!(ep.address, "/tmp/lk.sock");
+        assert_eq!(ep.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// 旧格式：无 version 字段 → 解析 OK（向后兼容），version 为 None。
+    #[test]
+    fn parse_without_version() {
+        let raw = r#"{"pid":42,"address":"\\\\.\\pipe\\lightkey-user-abcd"}"#;
+        let ep: Endpoint = serde_json::from_str(raw).expect("旧格式可解析");
+        assert_eq!(ep.pid, 42);
+        assert_eq!(ep.address, "\\\\.\\pipe\\lightkey-user-abcd");
+        assert_eq!(ep.version, None);
+    }
+
+    /// 序列化输出含 version 字段（守护进程写入即携带版本）。
+    #[test]
+    fn serialize_contains_version() {
+        let ep = Endpoint {
+            pid: 7,
+            address: "/run/lk.sock".to_string(),
+            version: Some("9.9.9".to_string()),
+        };
+        let out = serde_json::to_string(&ep).expect("可序列化");
+        assert!(
+            out.contains(r#""version":"9.9.9""#),
+            "输出缺 version: {out}"
+        );
+        // 往返一致
+        let back: Endpoint = serde_json::from_str(&out).expect("往返解析");
+        assert_eq!(back.version.as_deref(), Some("9.9.9"));
+    }
 }
