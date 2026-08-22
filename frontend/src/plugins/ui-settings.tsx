@@ -1,7 +1,8 @@
 /**
  * ui-settings 插件（M2；spec §6.6 + 决策 #5 B）。
  *
- * - 安全：自动锁定（空闲）分钟数（1/5/15/30/60）；生物识别宽限开关
+ * - 安全：自动锁定（空闲）分钟数（0/1/5/15/30/60；0 = 下次请求即锁，决策 #10）；
+ *   生物识别宽限开关
  *   **置灰/预留**（决策 #5 B：M2 只做主密码解锁闭环，Windows Hello 留
  *   M2 后快迭代；`session.unlocked.via=biometric` 接口已预留）；
  * - 同步：BYO URL + 轮询间隔（15s~3600s(1h)）；凭据经 `lk config sync
@@ -16,7 +17,7 @@ import type { ConfigView } from "../types";
 import type { SlotComponentConfig } from "./skeleton";
 import { slotComponentConfig } from "./skeleton";
 
-const AUTO_LOCK_OPTIONS = ["1", "5", "15", "30", "60"];
+const AUTO_LOCK_OPTIONS = ["0", "1", "5", "15", "30", "60"];
 const POLL_OPTIONS = ["15", "30", "60", "300", "900", "3600"];
 
 /** 设置页本体（content 槽位，page=settings）。 */
@@ -83,7 +84,7 @@ export function SettingsPage({ ctx }: { ctx: Context }) {
             >
               {AUTO_LOCK_OPTIONS.map((v) => (
                 <option key={v} value={v}>
-                  {v} 分钟
+                  {v === "0" ? "下次请求即锁" : `${v} 分钟`}
                 </option>
               ))}
             </select>
