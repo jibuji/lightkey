@@ -43,8 +43,8 @@
 
 | Job | 平台 | 内容 |
 |-----|------|------|
-| desktop-windows | windows-latest | fmt / clippy(-D warnings) / test（`lk-core` `lk-cli`）/ `cargo check --workspace`（含 Tauri 壳与 Windows 资源生成） |
-| frontend | ubuntu-latest | `npm ci` + `npm run build`（tsc + vite） |
+| desktop-windows | windows-latest | fmt / clippy(-D warnings) / test（`lk-core` + `lk-daemon` + `lk-cli`）/ `cargo check --workspace`（含 Tauri 壳与 Windows 资源生成） |
+| frontend | ubuntu-latest | `npm ci` + `npm test`（vitest D 层单测）+ `npm run build`（tsc + vite） |
 
 - **Windows 是主开发测试平台**（船长本机 Windows WSL）；macOS/Linux 桌面构建
   不再占 CI 矩阵（Linux 冒烟由本地承担）。

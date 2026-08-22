@@ -13,12 +13,13 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 
 ```
 ① 默认拒绝（default-deny）
-    任何未匹配规则的请求 → 拒绝（不弹窗、不留内容，仅审计“拒绝”事件）
+    启动者未知 / cwd 不可得 / 规则库损坏 / 请求 key 无法解析 → 拒绝
+    （不弹窗、不留内容，仅审计“拒绝”事件）
         │ 命中白名单？
         ▼
 ② 规则白名单（vault 内加密、按项目目录绑定）
     命中 → 直接放行（只注入该规则授权的 key 名）
-    未命中 → 进入弹窗
+    未命中 → 进入弹窗审批
         ▼
 ③ 弹窗审批（30 秒超时默认拒绝）
     用户明确允许 → 本次放行
@@ -35,8 +36,11 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   - 回溯发起进程的父进程链（如 `shell → agent → tool`），确定**启动者**
     （可归属的顶层进程，如终端/编辑器/agent 进程）。
   - 工作目录 = 发起命令时的 cwd，用于匹配「项目目录绑定」的规则。
-- 实现：macOS/Linux 走 procfs/sysctl 进程树；Windows 走 Toolhelp/ETW；
-  回溯失败（权限/跨会话）→ 视为未知启动者 → 默认拒绝（fail-closed）。
+- 实现：macOS/Linux 走 procfs/sysctl 进程树；Windows 走 Toolhelp32 快照枚举进程
+  + 读 PEB 取对端 cwd；回溯失败（权限/跨会话）→ 视为未知启动者 → 默认拒绝
+  （fail-closed）。
+- 已知限制：macOS 的对端 cwd 解析（`resolve_peer_cwd`）尚未实现（`starter.rs`
+  注释标注），macOS 上 `lk inject` 因无法确认启动者 cwd 会 fail-closed 拒绝。
 - 结果供审计 `starter` 字段与规则匹配使用。
 
 ## 4. 规则库（D8）
@@ -66,7 +70,8 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 
 ## 5. `lk inject` 语义（D8）
 
-- 形态：`lk inject -- <command...>`，如 `lk inject -- npm publish`。
+- 形态：`lk inject --keys <name...> -- <command...>`（`--keys` 必需），如
+  `lk inject --keys NPM_TOKEN -- npm publish`。
 - 行为：
   1. 进程链回溯 + cwd 判定启动者与项目目录。
   2. 查规则白名单：命中 → 注入该规则授权的 env 变量集（值来自 vault 解密，
@@ -77,12 +82,20 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   - 注入的是子进程环境变量，**绝不进入模型对话环境**（agent 无法通过
     stdout/日志拿回未授权值；agent 拿到的只有「已注入/已拒绝」）。
   - env 变量名（key 名）对 agent 可见，值不可见——除非该 key 已授权。
-- 示例：`NPM_TOKEN=... lk inject -- npm publish` 的等价效果（但经授权门裁决）。
+- 示例：`NPM_TOKEN=... lk inject --keys NPM_TOKEN -- npm publish` 的等价效果（但经授权门裁决）。
 - 内建脱敏：注入值在审计/命令摘要中永不明文（见 [audit.md](audit.md) §2）。
 
 ## 6. 审批通道抽象（D8）
 
-- 审批通道 = 接口（trait）：`request(approval_request) -> Decision`。
+- 审批通道 = 接口（trait）`ApprovalChannel`（本地/远程可切换）；两阶段接口
+  对应守护进程的 G1 三阶段编排（`authz.evaluate` 锁内登记 → 锁外等待 → 重取锁
+  收尾）：
+  - `available()` — 是否有界面可能响应审批（桌面壳已订阅推送连接）；
+    `false` → fail-closed 立即拒绝（不登记、不阻塞）。
+  - `open(req, expires_at)` — 登记待审批 + 广播 `authz.request`（命令锁内、
+    非阻塞）。
+  - `await_decision(request_id, expires_at)` — 命令锁外等待决策，返回
+    `Allowed` / `Denied` / `Timeout`（到期默认拒绝）。
 - **本地通道**（V1）：桌面弹窗/系统通知，30s 超时默认拒绝。
 - **远程通道**（未来，P1 不做）：远程审批中继 = 未来服务端付费点；本阶段
   只留接口与类型，不实现。

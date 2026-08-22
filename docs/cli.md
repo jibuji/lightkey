@@ -19,6 +19,7 @@
 | `lk unlock` | 解锁库（连接守护进程，签发会话令牌） | M0 |
 | `lk lock` | 锁定库（擦除内存密钥，失效令牌） | M0 |
 | `lk status` | 解锁态、同步水位、版本 | M0 |
+| `lk recover` | 恢复：恢复码 + 新主密码（重置主密码，数据保留） | M0 |
 
 ## 2. 条目
 
@@ -30,6 +31,7 @@
 | `lk item edit <id>` | 编辑条目（CAS，见 [data-model.md](data-model.md) §4） | M0 |
 | `lk item delete <id>` | 软删除（墓碑，30 天硬删） | M0 |
 | `lk item copy <id> <field>` | 复制字段到剪贴板（30s 自动清除，见 [browser-fill.md](browser-fill.md) §2 同款行为） | M0 |
+| `lk item export <id> --output <path>` | 导出 file 条目附件到本地文件 | M0 |
 
 ## 3. 同步
 
@@ -43,16 +45,16 @@
 
 | 命令 | 语义 | 里程碑 |
 |------|------|--------|
-| `lk rule add <projectDir> <command> <keys...>` | 新增白名单规则（入库加密） | M2 |
+| `lk rule add <projectDir> <command> --name <name> <keys...>` | 新增白名单规则（入库加密） | M2 |
 | `lk rule list` | 列出规则（最小字段） | M2 |
 | `lk rule remove <id>` | 删除规则 | M2 |
-| `lk inject -- <command...>` | 给具名命令注入被批准 env（三层模型，见 [authorization-gate.md](authorization-gate.md) §5） | M2 |
+| `lk inject --keys <name...> -- <command...>` | 给具名命令注入被批准 env（三层模型，见 [authorization-gate.md](authorization-gate.md) §5；`--keys` 必需） | M2 |
 
 ## 5. 审计与守护进程
 
 | 命令 | 语义 | 里程碑 |
 |------|------|--------|
-| `lk audit` | 查看审计日志（只读；无密钥值） | M0 |
+| `lk audit [--tail <N>] [--verify]` | 查看审计日志（只读；无密钥值；`--tail` 最近 N 条、`--verify` 校验 HMAC 链） | M0 |
 | `lk daemon` | 以守护进程方式常驻（解锁态、密钥仅内存；由客户端自动拉起，也可手动前台运行） | M0 |
 
 ## 6. 行为约束

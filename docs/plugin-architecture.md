@@ -1,8 +1,8 @@
 # 插件化架构规格（plugin-architecture）
 
-- 状态：已拍板（船长插件化定案，2026-08；落地层 = 选项 A；对应决议集映射待补，见 §9）
+- 状态：已拍板（船长插件化定案，2026-08；落地层 = 选项 A；已登记于决议集 D16）
 - 关联：[architecture.md](architecture.md)（边界纪律）· [milestones.md](milestones.md)
-  （M1.5 插件化改造）· [decisions.md](decisions.md)（决议集——本定案尚未登记，见 §9）
+  （M1.5 插件化改造）· [decisions.md](decisions.md)（决议集——本定案已登记于 D16）
   · [design/spec.md](design/spec.md)（tokens/组件/槽位落点）· [ipc.md](ipc.md)（跨进程桥）
 
 > 本文档是纯设计规格，只改 docs/；插件化改造是**边界重组 + 声明式装配**，
@@ -64,7 +64,7 @@
 | sync-engine | 同步 | 变更发现、CAS 冲突收敛、墓碑同步 | vault-store + storage-backend | M1 |
 | authz-gate | 授权门 | 三层模型、规则库、启动者判定 | session + audit | M2 |
 
-### 3.3 C 层 · 宿主（Rust，现位于 `lk-cli` 的 daemon 模块）
+### 3.3 C 层 · 宿主（Rust，共享 crate `crates/lk-daemon`）
 
 | 插件 | 边界 | 能力 |
 |------|------|------|
@@ -134,8 +134,8 @@ desktop-shell / approval / browser-fill  ← ipc-bridge
 ### 4.3 跨进程总览
 
 ```
-┌──────────────────────── Rust（lk-core + lk-cli 宿主）─────────────────────────┐
-│ C 层 宿主 daemon（lk-cli）：装配 A/B、IPC 路由、空闲自动锁定、config.json        │
+┌──────────────────────── Rust（lk-core + lk-daemon 宿主）───────────────────────┐
+│ C 层 宿主 daemon（lk-daemon）：装配 A/B、IPC 路由、空闲自动锁定、config.json      │
 │   ┌──────────────── B 层 能力域 ────────────────┐                            │
 │   │ sync-engine ← vault-store                  │                            │
 │   │ authz-gate(M2) ← session + audit           │                            │
@@ -366,7 +366,7 @@ plugins:
 |------|------|
 | [architecture.md](architecture.md) | 不矛盾。已加 §3 插件化指针；`lk-core` 单一 crate 结论不变（内部重组为 A/B 边界） |
 | [milestones.md](milestones.md) | 已重排：插入 M1.5 插件化改造；M0/M1 保持已完成；M2/M3 标签**不变**（授权门/桌面 = M2，浏览器填充 = M3），内容改为「在插件化骨架上实现」 |
-| [decisions.md](decisions.md) | **待补映射**：本定案（选项 A/四层/事件总线/数据驱动边界/装配机制）尚未登记到决议集。按纪律应由后续会话补一行决议映射（本次不擅改决议集） |
+| [decisions.md](decisions.md) | 已登记 D16：本定案（选项 A/四层/事件总线/数据驱动边界/装配机制）登记于 [decisions.md](decisions.md) D16 |
 | [design/spec.md](design/spec.md) | 已加衔接：§1 默认暗色「tokens 结构化以便扩展浅色」的落点 = theme 插件；§3 组件库的强交互组件 = 手写原子组件；§5 页面结构三栏 = 槽位骨架 |
 | [data-model.md](data-model.md) | 不矛盾。A 层 vault-store 能力（条目/索引/墓碑/附件 CRUD、CAS、30 天延迟硬删）与该文档 §2/§4 一致 |
 | [sync.md](sync.md) | 不矛盾。sync-engine 能力（变更发现、CAS 收敛、墓碑同步）与该文档一致；`item.changed` 推送对应 §3 上传 |
@@ -376,16 +376,16 @@ plugins:
 | [crypto.md](crypto.md) / [recovery.md](recovery.md) | 不矛盾。crypto/recovery 插件能力分别对应两文档的 KDF/AEAD/信封/重加密轮换 |
 | [browser-fill.md](browser-fill.md) | 不矛盾。browser-fill 插件（D）对应 M3 协议，仍为「协议落定、实现 V1 之后」 |
 | [cli.md](cli.md) | 不矛盾。daemon（C 层）对应 `lk daemon`；命令经 IPC 路由不变 |
-| [testing.md](testing.md) | 无矛盾；**待补**：§4 里程碑出口映射尚未列出 M1.5（插件化改造出口 = 行为不回归测试），留待后续指针同步 |
+| [testing.md](testing.md) | 不矛盾。§4 里程碑出口映射已列出 M1.5（行为不回归：M0/M1 全量测试重组后全绿 + D 层事件总线单测） |
 
-### 10.1 里程碑编号决策（待船长确认）
+### 10.1 里程碑编号决策（已落地）
 
-- **推荐**：插件化改造作为**独立里程碑**插入 M1 之后、M2 之前（编号记作 **M1.5**），
+- **已采纳**：插件化改造作为**独立里程碑**插入 M1 之后、M2 之前（编号记作 **M1.5**），
   理由：① 它是「无行为回归的重组」，与 M2「新增授权门+桌面功能」性质不同，合并会
   混同「回归」与「新功能 bug」两种故障；② D 层宿主 + 槽位 + cordis.yml 装配是授权门
   与桌面端共同的地基，先立地基再盖楼。
 - **编号保持 M2/M3 稳定**（不重排为 M3/M4），避免波及 authorization-gate.md /
   browser-fill.md / cli.md / testing.md / design/spec.md / README.md 中数十处
   M2/M3 引用。
-- 此为**位置与编号建议**，标记「待船长确认」；若船长选择与 M2 合并或整体重排，
-  本小节与 [milestones.md](milestones.md) 同步调整。
+- 该编号方案已落地（M1.5 独立里程碑已完成），本小节与 [milestones.md](milestones.md)
+  保持一致。
