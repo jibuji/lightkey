@@ -435,7 +435,7 @@ function renderSettings() {
       <div class="setting-row">
         <div><div class="setting-label">自动锁定（空闲）</div><div class="setting-desc">锁屏或超时后自动锁定，密钥从内存擦除</div></div>
         <select class="select-input" data-set="autoLockMin">
-          ${["1", "5", "15", "30", "60"].map((v) => `<option ${s.autoLockMin === v ? "selected" : ""}>${v} 分钟</option>`).join("")}
+          ${["0", "1", "5", "15", "30", "60"].map((v) => `<option ${s.autoLockMin === v ? "selected" : ""}>${v === "0" ? "下次请求即锁" : v + " 分钟"}</option>`).join("")}
         </select>
       </div>
       <div class="setting-row">
@@ -454,7 +454,7 @@ function renderSettings() {
         <input class="select-input" style="width:260px" value="${esc(s.syncUrl)}" />
       </div>
       <div class="setting-row">
-        <div><div class="setting-label">轮询间隔</div><div class="setting-desc">变更发现靠轮询（无推送）：15s ~ 24h</div></div>
+        <div><div class="setting-label">轮询间隔</div><div class="setting-desc">变更发现靠轮询（无推送）：15s ~ 3600s（1h）</div></div>
         <select class="select-input" data-set="pollSec">
           ${["15", "30", "60", "300", "900", "3600"].map((v) => `<option ${s.pollSec === v ? "selected" : ""}>${v} 秒</option>`).join("")}
         </select>

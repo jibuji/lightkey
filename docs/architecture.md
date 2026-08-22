@@ -9,7 +9,7 @@
 V1 MVP 交付三样东西：
 
 1. **核心库 `lk-core`**（Rust crate）：加密、数据模型、同步、授权门、审计、IPC 协议类型。
-2. **CLI `lk`**（Rust crate）：复用 `lk-core`；含 `lk daemon` 守护进程宿主。
+2. **CLI `lk`**（Rust crate）：复用 `lk-core` + `lk-daemon`；`lk daemon` 入口（`lk_daemon::run(dir)`）。
 3. **桌面应用**（Tauri 2 壳 `lk-app` + React 前端）：复用 `lk-core`。
 
 浏览器扩展是 **M3 里程碑**（V1 之后），本阶段只落协议规格（[browser-fill.md](browser-fill.md)）。
@@ -30,7 +30,7 @@ V1 MVP 交付三样东西：
 │ 桌面应用 lk-app (Tauri 2)            CLI lk                 │
 │  ┌────────────┐   ┌──────────────┐   ┌──────────────────┐   │
 │  │ React 前端  │   │ 壳逻辑       │   │ 子命令 / 服务      │   │
-│  │ (frontend/)│──▶│ 窗口·托盘·审批 │   │ daemon 宿主       │   │
+│  │ (frontend/)│──▶│ 窗口·托盘·审批 │   │ daemon 入口       │   │
 │  └────────────┘   │ 弹窗·IPC 桥   │   └────────┬─────────┘   │
 │                   └──────┬───────┘            │             │
 └──────────────────────────┼────────────────────┼─────────────┘
@@ -55,7 +55,7 @@ V1 MVP 交付三样东西：
 - `lk-core` 保持**单一 crate**，内部按插件边界重组为 **A 层数据平面**（crypto/
 vault-store/recovery/audit/session）与 **B 层能力域**（storage-backend/sync-engine/
 authz-gate），trait 服务 + 事件总线**模拟** Cordis 语义（不移植 Cordis）。
-- **C 层宿主 daemon**（现位于 `lk-cli`）：装配 A/B、IPC 路由、空闲自动锁定、config.json。
+- **C 层宿主 daemon**（共享 crate `crates/lk-daemon`）：装配 A/B、IPC 路由、空闲自动锁定、config.json。
 - **D 层桌面/前端**用**真 Cordis**（`@cordisjs/core` 4.x）+ 薄 React 宿主；插件清单与
   inject 依赖图见 plugin-architecture.md §3/§4。
 - 安全核心（加密/数据/同步/审计）留在 Rust，不重写为 TS；CLI 与 Tauri 壳只做
@@ -65,10 +65,11 @@ authz-gate），trait 服务 + 事件总线**模拟** Cordis 语义（不移植 
 
 ```
 lightkey/
-├── Cargo.toml                 # workspace：members + default-members（core+cli）
+├── Cargo.toml                 # workspace：members + default-members（core+daemon+cli）
 ├── rust-toolchain.toml        # 固定 1.94，本地与 CI 同版本
 ├── crates/
 │   ├── lk-core/               # 核心库（占位模块已声明，M0 起实现）
+│   ├── lk-daemon/             # C 层守护进程宿主（决策 #2 A：下沉共享，CLI 与桌面复用）
 │   ├── lk-cli/                # `lk` 二进制（命令树已声明）
 │   └── lk-app/                # Tauri 2 壳（窗口、tauri.conf.json、capabilities、图标占位）
 ├── frontend/                  # React + TS（Vite；dev 端口 1420 与 tauri devUrl 一致）
@@ -76,8 +77,8 @@ lightkey/
 └── .github/workflows/ci.yml   # CI 骨架（测试策略见 docs/testing.md）
 ```
 
-**default-members 说明**：workspace 默认成员为 `lk-core` + `lk-cli`，因此在任何平台
-`cargo test`/`cargo check`/`cargo clippy` 默认只构建这两个 crate（Linux 上 Tauri 需
+**default-members 说明**：workspace 默认成员为 `lk-core` + `lk-daemon` + `lk-cli`，因此在任何平台
+`cargo test`/`cargo check`/`cargo clippy` 默认只构建这三个 crate（Linux 上 Tauri 需
 webkit2gtk 系统库，不阻塞）；`lk-app` 由 CI 在 Windows 上以 `--workspace`
 显式检查（船长裁定收敛为 Windows 优先，见 [decisions.md](decisions.md) 补充拍板 #4）。
 

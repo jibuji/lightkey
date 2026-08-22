@@ -128,7 +128,7 @@ enum ConfigSyncCommand {
         /// 存储 URL：https://host/dav（WebDAV）/ s3://bucket/prefix（S3）
         /// / file:///abs/path（本地模拟，无需凭据）
         url: String,
-        /// 轮询间隔秒数（15~86400，默认 60）
+        /// 轮询间隔秒数（15~3600，默认 60）
         #[arg(long)]
         interval: Option<u64>,
         /// 凭据从文件读取（第一行用户名，第二行密码）

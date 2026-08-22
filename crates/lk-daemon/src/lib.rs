@@ -1360,7 +1360,7 @@ pub fn serve_embedded(dir: &Path) -> std::result::Result<EmbeddedDaemon, String>
     let shared = daemon.shared();
     let state = Arc::new(Mutex::new(daemon));
     // 后台同步轮询线程（M1）：只在解锁态 + 已配置时执行一轮；锁定即停止。
-    // 间隔 = 配置值 × 2^风暴等级（封顶 24h）；失败静默（下一轮重试）。
+    // 间隔 = 配置值 × 2^风暴等级（封顶 1h）；失败静默（下一轮重试）。
     spawn_sync_poller(Arc::clone(&shared));
     let handler = make_handler(&state, &shared);
     let hub = Some(Arc::clone(&shared.push));

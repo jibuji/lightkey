@@ -1,6 +1,6 @@
 # 里程碑（M0–M3）
 
-- 状态：已拍板（D3）；M1.5 插件化改造为船长插件化定案新增（位置建议待船长确认，见 §M1.5）
+- 状态：已拍板（D3）；M1.5 插件化改造为船长插件化定案新增（已落地，见 §M1.5）
 - 实现顺序严格执行；每个里程碑有明确出口标准，完成后按 [testing.md](testing.md)
   验收并交付。
 - 关联：[plugin-architecture.md](plugin-architecture.md)（M1.5 起）·
@@ -12,7 +12,7 @@
 - 新增 **M1.5 —— 插件化改造**，插入 M1 之后、M2 之前。
 - **M2 / M3 标签保持不变**：M2 = Agent 授权门 + 桌面端（在插件化骨架上），
   M3 = 浏览器填充（V1 之后）。此编号方案避免波及其它文档的 M2/M3 引用，
-  为**待船长确认的里程碑位置/编号建议**（若改与 M2 合并或整体重排，则同步修订）。
+  并已落地（M1.5 独立里程碑已完成）。
 
 ## M0 —— 骨架 + 单机闭环（已完成）
 
@@ -40,14 +40,14 @@
 范围：
 
 - 存储端零知识布局（密文文件，文件名纯 UUID 无时间戳，见 [data-model.md](data-model.md)）
-- 加密索引 + 轮询变更发现（默认 60s，可配 15s~24h），静默、无中间态加载
+- 加密索引 + 轮询变更发现（默认 60s，可配 15s~3600s（1h）），静默、无中间态加载
 - CAS 上传 + 冲突收敛（last-write-wins）+ 墓碑同步与 30 天延迟硬删
 - `lk sync` / `lk config` 同步配置（[cli.md](cli.md)）
 
 **出口**：E2E 双客户端冲突合并用例通过（见 [testing.md](testing.md)）；轮询代价
 在 [sync.md](sync.md) 中如实记录。
 
-## M1.5 —— 插件化改造（Cordis）
+## M1.5 —— 插件化改造（Cordis）（已完成）
 
 **目标**：按 [plugin-architecture.md](plugin-architecture.md) 落地插件化架构——
 Rust 核心按 A/B 层边界重组（trait 服务 + 事件总线，**行为不回归**），D 层 TS 用
@@ -79,11 +79,9 @@ Rust 核心按 A/B 层边界重组（trait 服务 + 事件总线，**行为不�
 - 事件总线：`item.changed` 三方响应、`session.unlocked/locked` 切换、`theme.changed`
   重渲染、`clipboard.copied` Toast + 30s 清除，均有单测/属性测试覆盖。
 
-> **待船长确认**：本里程碑的位置（独立插入 vs 与 M2 合并）与编号（M1.5 vs 整体重排）
-> 为建议项。若与 M2 合并，则本节的 Rust 重组与 D 层骨架并入 M2 范围，M2 出口
-> 增加「行为不回归」条目。
+> 本里程碑已作为独立里程碑落地（编号 M1.5，见 [plugin-architecture.md](plugin-architecture.md) §10.1）。
 
-## M2 —— Agent 授权门 + 桌面端
+## M2 —— Agent 授权门 + 桌面端（已完成）
 
 **目标**：`lk inject` 三层授权可用；桌面应用完整可用（在 M1.5 插件化骨架上实现）。
 

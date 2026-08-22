@@ -39,13 +39,18 @@
 | `vault.init` | 建库：设主密码（**至少 8 位**，弱密码 → `vault.weak_password`）+ 生成恢复码/信封；已存在库 → `vault.exists` | 恢复码（仅展示一次） |
 | `vault.unlock` | 主密码解锁 | 会话令牌 |
 | `vault.lock` | 立即锁定 | 无 |
+| `vault.recover` | 恢复：恢复码 + 新主密码（重置主密码，数据保留） | 新恢复码（仅展示一次） |
 | `item.list` | 索引（解密态最小字段） | id/name/type/revision/deleted |
 | `item.get` | 单条 | 完整解密条目 |
 | `item.put` / `item.delete` | 写 | 新 revision |
+| `item.export` | 导出 file 条目附件（整包下载） | 名称/MIME/大小 + base64 数据 |
 | `sync.trigger` / `sync.poll` | 同步控制 | 变更摘要（不返回内容） |
 | `authz.evaluate` | 授权门判定（M2） | 允许/拒绝 + 最小 env 集 |
+| `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`） | accepted（是否接受） |
+| `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6） | 规则 / 规则列表 / 无 |
 | `audit.list` | 审计查询 | 事件（无密钥值） |
-| `approval.request` | 弹窗审批请求（M2） | 用户决定 |
+| `audit.verify` | 校验审计 HMAC 链 | 已验证事件数 |
+| `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A） | 无 |
 
 - **最小字段原则**：IPC 响应只包含调用方被授权的最小已解密字段——例如
   `authz.evaluate` 只返回「被批准命令的 env 变量」，绝不返回整库内容
