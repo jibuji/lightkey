@@ -169,7 +169,9 @@ export class TauriAdapter implements LightKeyIpc {
 
   async syncStatus(): Promise<SyncStatus> {
     try {
-      return rpc<SyncStatus>("sync.status");
+      // 最近一轮同步摘要与水位（不触发新轮次）；UI 只消费 watermark（上次同步时间）
+      const res = await rpc<{ summary?: unknown; watermark?: string | null }>("sync.poll");
+      return { lastSync: res.watermark ?? null };
     } catch (e) {
       throw mapError(e);
     }
@@ -177,7 +179,9 @@ export class TauriAdapter implements LightKeyIpc {
 
   async syncTrigger(): Promise<SyncStatus> {
     try {
-      return rpc<SyncStatus>("sync.trigger");
+      await rpc("sync.trigger");
+      // sync.trigger 只返回变更摘要（不含水位）；触发后再查一轮水位回填 lastSync
+      return this.syncStatus();
     } catch (e) {
       throw mapError(e);
     }

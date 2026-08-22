@@ -54,8 +54,8 @@
   互斥解耦，见 `crates/lk-daemon/src/lib.rs` 模块文档）
 - [x] M1.5 插件化改造（Cordis）：lk-core A/B 层 trait 服务 + 事件总线
   （`crates/lk-core/src/service.rs` / `bus.rs`；密文格式/存储布局/IPC 协议零变更）；
-  daemon 按 C 层边界拆 `crates/lk-cli/src/daemon/{mod,config,sync}.rs` 并装配
-  总线；D 层真 Cordis 宿主 + `frontend/src/cordis.yml` 装配（theme /
+  daemon 按 C 层边界拆模块并装配总线（现位于 `crates/lk-daemon/src/`，见下方
+  M2 下沉条目）；D 层真 Cordis 宿主 + `frontend/src/cordis.yml` 装配（theme /
   ipc-bridge / preference-store / toast + 槽位骨架），事件契约见
   `frontend/src/events.ts`
 - [x] M2 核心（Rust 授权门 + 推送通道 + daemon 下沉）：

@@ -368,8 +368,8 @@ describe("tauri 模式：会话事件去重（本地广播 + 推送帧不双发�
       throw new Error("n/a");
     });
     remove = vi.fn(async () => undefined);
-    syncStatus = vi.fn(async () => ({ synced: true, pollSec: 60 }));
-    syncTrigger = vi.fn(async () => ({ synced: true, pollSec: 60 }));
+    syncStatus = vi.fn(async () => ({ lastSync: null }));
+    syncTrigger = vi.fn(async () => ({ lastSync: null }));
     auditList = vi.fn(async () => []);
     ruleList = vi.fn(async () => []);
     ruleAdd = vi.fn(async () => {
