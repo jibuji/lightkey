@@ -23,17 +23,24 @@
   （三 crate：lk-core / lk-daemon / lk-cli）
 - 同步 E2E（M1 双客户端）：`bash scripts/e2e_m1.sh [lk-binary-path]`；
   单机回归：`bash scripts/e2e_m0.sh`；授权门 E2E（M2）：`bash scripts/e2e_m2.sh`
-  （都用 `file://` 本地模拟存储，无需凭据）。
+  （都用 `file://` 本地模拟存储，无需凭据）；跨子系统 E2E（M2.75，
+  WSL2+Windows 桌面包前置不满足则 SKIP exit 0）：
+  `bash scripts/e2e_cross_subsystem.sh [lk-binary-path] [--auto-approve]`。
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
   `crates/lk-app/tauri.conf.json` 的 devUrl 一致）；D 层单测 `npm test`
   （vitest；事件总线契约/装配/宿主渲染/审批弹窗）。
 - 桌面壳 Windows 验收：`cargo check --workspace --target x86_64-pc-windows-gnu`
   （本地需 mingw 交叉工具链：conda env `lightkey-mingw`，PATH 前置其 bin；
   Linux 无 webkit2gtk 不编译 lk-app）。
-- CI 骨架：`.github/workflows/ci.yml`；发布流水线：`.github/workflows/release.yml`
-  （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI + 独立 CLI `lk.exe`；tag `v*` → GitHub
-  Release 附件，main push / workflow_dispatch → Actions artifact；资产名版本号 tag 触发时取
+- CI 骨架：`.github/workflows/ci.yml`（Windows 全量 + ubuntu lk-cli clippy/test + frontend）；
+  发布流水线：`.github/workflows/release.yml`
+  （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI；独立 CLI
+  Windows `lk.exe` + Linux `lk` 双产物；tag `v*` → GitHub Release 附件，
+  main push / workflow_dispatch → Actions artifact；资产名版本号 tag 触发时取
   `GITHUB_REF_NAME` 去 v 前缀，否则回退 tauri.conf.json；产物未签名属预期）。
+  注意：桌面包经 bundle.resources 捆绑 `target/release/lk.exe` 进安装目录——
+  手动打版必须先 `cargo build --release -p lk-cli` 再 `cargo tauri build`
+  （顺序颠倒 bundler 会因资源缺失响亮报错）。
 
 ## 交付纪律
 
