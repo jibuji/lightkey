@@ -1,13 +1,24 @@
 # LightKey 发布流水线（2026-08-19 新增，独立于 ci.yml 测试门禁）
 #
-#   - tag v* push          → Windows 打包（NSIS + MSI + 独立 CLI），产物挂到 GitHub Release
+#   - tag v* push          → Windows 打包（NSIS + MSI + 独立 CLI）+ Linux CLI（lk），
+#                            产物挂到 GitHub Release
 #   - main push            → 同样打包，但只留 Actions artifact（最新构建手动下载，不建 Release）
 #   - workflow_dispatch    → 手动打版，行为同 main push（artifact 留存）
-# tag 触发时跳过 artifact 留存，避免同一份产物重复上传。
+# 双 job（build-windows / build-linux-cli）并行；tag 触发时跳过 artifact 留存，
+# 避免同一份产物重复上传。
 # 安装包未做代码签名（暂无证书），Windows SmartScreen 未签名警告属当前预期，不阻塞发布。
 # NSIS / MSI 打包器（NSIS、WiX）由 tauri-bundler 首次构建时自动下载，无需额外准备。
 # 资产名版本号：tag 触发时取 tag（去 v 前缀），否则回退 tauri.conf.json 的 version。
-# 独立 CLI（target/release/lk.exe）随安装包一起分发，无需安装 GUI 即可纯命令行使用。
+# 独立 CLI（lk.exe / Linux lk）随安装包一起分发，无需安装 GUI 即可纯命令行使用。
+#
+# 桌面包捆绑独立 CLI（修复 cross-subsystem.md §4#7「装机目录缺失独立 CLI」）：
+#   - 机制：tauri.conf.json bundle.resources 映射 ../../target/release/lk.exe →
+#     安装目录根（NSIS / MSI 同样生效，资源缺失时 bundler 直接报错——顺序错误
+#     会响亮失败而非静默缺文件）；
+#   - 因此必须先 `cargo build --release -p lk-cli` 再 `cargo tauri build`
+#     （下方步骤已按此排序；本地手动打版同样要先构建 lk-cli）。
+#   - 取舍：未用 NSIS installerHooks（hook 无法把外部文件装进安装器载荷）、
+#     未改 bundler 模板（侵入大）；resources 映射是声明式最小改动。
 
 name: Release
 
@@ -70,12 +81,13 @@ jobs:
           fi
           echo "$RUNNER_TOOL_CACHE/tauri-cli" >> "$GITHUB_PATH"
 
-      - name: Build installers (NSIS + MSI)
-        run: cargo tauri build
-        working-directory: crates/lk-app
-
+      # 先建独立 CLI：tauri.conf.json 的 bundle.resources 把该 exe 捆进安装包
       - name: Build standalone CLI (lk.exe)
         run: cargo build --release -p lk-cli
+
+      - name: Build installers (NSIS + MSI, 捆绑 lk.exe 到安装目录)
+        run: cargo tauri build
+        working-directory: crates/lk-app
 
       - name: Collect artifacts with versioned names
         shell: pwsh
@@ -117,5 +129,55 @@ jobs:
           body: |
             LightKey ${{ github.ref_name }} 发布产物：
 
-            - `LightKey-*-windows-x86_64-setup.exe` / `LightKey-*-windows-x86_64.msi`：Windows 安装包（NSIS / MSI；未签名，SmartScreen 警告属预期）
-            - `lk-cli-*-windows-x86_64.exe`：独立 `lk` 命令行工具——无需安装 GUI，纯命令行使用；`lk --help` 查看全部命令，详见 docs/cli.md
+            - `LightKey-*-windows-x86_64-setup.exe` / `LightKey-*-windows-x86_64.msi`：Windows 安装包（NSIS / MSI；未签名，SmartScreen 警告属预期；安装目录内含独立 `lk.exe`）
+            - `lk-cli-*-windows-x86_64.exe`：独立 `lk` 命令行工具（亦随安装包装入安装目录）——无需安装 GUI，纯命令行使用；`lk --help` 查看全部命令，详见 docs/cli.md
+            - `lk-cli-*-linux-x86_64`：Linux 原生 `lk` CLI（WSL2 内经 bridge 连接 Windows 桌面守护实例，见 docs/cross-subsystem.md）
+
+  build-linux-cli:
+    name: Build Linux CLI (lk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 与 Windows job 缓存隔离（不同 target/OS）
+          key: linux-cli
+
+      - name: Build Linux CLI (x86_64-unknown-linux-gnu)
+        run: cargo build --release -p lk-cli --target x86_64-unknown-linux-gnu
+
+      - name: Collect artifact with versioned name
+        shell: bash
+        run: |
+          # 版本号：与 Windows job 同逻辑——tag 触发取 tag（去 v 前缀），否则回退 tauri.conf.json
+          version="$(jq -r .version crates/lk-app/tauri.conf.json)"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          mkdir artifacts
+          cp target/x86_64-unknown-linux-gnu/release/lk "artifacts/lk-cli-${version}-linux-x86_64"
+          ls -l artifacts/
+
+      - name: Upload artifacts as workflow artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LightKey-linux-cli
+          path: artifacts/
+          if-no-files-found: error
+
+      # 与 Windows job 并行发布同一 Release：action 对已存在的 tag Release 追加上传附件。
+      # 极小概率两 job 同时首次建 Release 触发竞态，失败重跑本 job 即可（幂等）。
+      - name: Publish to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true

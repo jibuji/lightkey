@@ -5,8 +5,11 @@
 #   - desktop-windows：Windows 上执行全部检查——fmt / clippy / test
 #     （core + cli）与全 workspace `cargo check`（含 Tauri 壳，含 icon.ico
 #     的 Windows 资源生成）
+#   - linux-cli：ubuntu 上对 lk-cli 做基本检查（clippy + test）——Linux 是
+#     WSL2 CLI（cross-subsystem.md）的发布目标，且 fmt/clippy/test 在 Windows
+#     job 只覆盖 MSVC 视角；独立 ubuntu job 成本可控（rust-cache 命中后数分钟）
 #   - frontend：ubuntu 上构建 React + TS 前端（保留）
-# Linux 冒烟由本地承担，不再占 CI 矩阵。
+# Linux 全量冒烟仍由本地承担，不占 CI 矩阵。
 # 纯文档修改不触发 CI（船长 2026-08-16 定）：仅 docs/ 与 *.md 变更时跳过整个工作流。
 
 name: CI
@@ -51,6 +54,28 @@ jobs:
 
       - name: Check workspace (incl. Tauri shell)
         run: cargo check --workspace
+
+  linux-cli:
+    name: cli (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-cli
+
+      - name: Clippy (cli)
+        run: cargo clippy -p lk-cli --all-targets -- -D warnings
+
+      - name: Test (cli)
+        run: cargo test -p lk-cli
 
   frontend:
     name: frontend (React + TS)
