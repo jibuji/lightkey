@@ -324,7 +324,8 @@ pub struct AuthzEvaluateParams {
     pub command: String,
     /// 请求注入的 key 名（值不可见、名可指名，决策 #1）。
     pub keys: Vec<String>,
-    /// 审计来源标注（`cli` | `desktop`；缺省 = cli）。
+    /// 审计来源标注（`cli` | `desktop` | `wsl-bridge`；缺省 = cli；
+    /// `wsl-bridge` = WSL 内客户端经 interop 桥，cross-subsystem.md §7.5）。
     #[serde(default)]
     pub channel: Option<String>,
     /// 客户端自报 cwd（**仅供提示，判定一律以对端真实 cwd 为准**）。
@@ -366,13 +367,14 @@ pub struct ApprovalResultOutcome {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleAddParams {
-    /// 规范化绝对路径（守护进程侧 canonicalize 校验）。
+    /// 规范化绝对路径（守护进程侧 canonicalize 校验）；跨命名空间场景为
+    /// `wsl://<distro>/<rest>` 规范形（守护进程侧经 [`crate::path_ns`] 归一化）。
     pub project_dir: String,
     pub name: String,
     /// 具名命令（可 glob）。
     pub command: String,
     pub keys: Vec<String>,
-    /// 审计来源标注（`cli` | `desktop`；缺省 = cli）。
+    /// 审计来源标注（`cli` | `desktop` | `wsl-bridge`；缺省 = cli）。
     #[serde(default)]
     pub channel: Option<String>,
 }
@@ -396,14 +398,16 @@ pub struct RuleListResult {
 #[serde(rename_all = "camelCase")]
 pub struct RuleRemoveParams {
     pub id: Uuid,
-    /// 审计来源标注（`cli` | `desktop`；缺省 = cli）。
+    /// 审计来源标注（`cli` | `desktop` | `wsl-bridge`；缺省 = cli）。
     #[serde(default)]
     pub channel: Option<String>,
 }
 
 /// 规则字段校验（超长/非法 → `Err`，不入库；testing.md 第三层 #19）。
 ///
-/// - `projectDir`：绝对路径且可 canonicalize（存在）；
+/// - `projectDir`：绝对路径且可 canonicalize（存在）；`wsl://<distro>/<rest>`
+///   跨命名空间规范形（[`crate::path_ns`]，守护进程侧已归一化）例外——
+///   非本机文件系统路径，无法 canonicalize，仅接受该形态本身；
 /// - `command`：非空、≤ 1024、无控制字符；
 /// - `name`：非空、≤ 256、无控制字符；
 /// - `keys`：1..=32 个，均为合法环境变量名（`[A-Za-z_][A-Za-z0-9_]*`）。
@@ -413,11 +417,13 @@ pub fn validate_rule_fields(
     command: &str,
     keys: &[String],
 ) -> std::result::Result<(), String> {
-    if project_dir.is_empty() || !std::path::Path::new(project_dir).is_absolute() {
-        return Err("projectDir 必须是绝对路径".into());
-    }
-    if std::fs::canonicalize(project_dir).is_err() {
-        return Err(format!("projectDir 无法解析：{project_dir}"));
+    if !crate::path_ns::is_wsl_canonical(project_dir) {
+        if project_dir.is_empty() || !std::path::Path::new(project_dir).is_absolute() {
+            return Err("projectDir 必须是绝对路径".into());
+        }
+        if std::fs::canonicalize(project_dir).is_err() {
+            return Err(format!("projectDir 无法解析：{project_dir}"));
+        }
     }
     if name.is_empty() || name.len() > 256 || has_control_chars(name) {
         return Err("name 必须是非空、≤256 字符且无控制字符的规则名".into());

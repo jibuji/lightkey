@@ -51,6 +51,10 @@ pub enum AuditChannel {
     Cli,
     Desktop,
     Approval,
+    /// WSL 内客户端经 interop stdio 桥（cross-subsystem.md §7.5；
+    /// 补充拍板 #14）。
+    #[serde(rename = "wsl-bridge")]
+    WslBridge,
 }
 
 /// 审计事件（D11 字段集；轮换事件扩展 `oldKeyId`/`newKeyId`）。
