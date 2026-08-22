@@ -218,12 +218,12 @@ export class MockAdapter implements LightKeyIpc {
 
   async syncStatus(): Promise<SyncStatus> {
     this.requireUnlocked();
-    return delay({ synced: true, pollSec: 60, lastSync: nowStamp() });
+    return delay({ lastSync: nowStamp() });
   }
 
   async syncTrigger(): Promise<SyncStatus> {
     this.requireUnlocked();
-    return delay({ synced: true, pollSec: 60, lastSync: nowStamp() });
+    return delay({ lastSync: nowStamp() });
   }
 
   async auditList(): Promise<AuditEvent[]> {

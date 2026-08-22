@@ -133,11 +133,10 @@ export interface VaultSettings {
   theme: "dark" | "light";
 }
 
+/** 最近一轮同步状态（`sync.poll` 结果映射；UI 只需上次同步时间戳）。 */
 export interface SyncStatus {
-  /** true = 已同步到最新水位 */
-  synced: boolean;
-  pollSec: number;
-  lastSync?: string;
+  /** 上次成功同步时间戳（ISO-8601 UTC；尚未有轮次 = null）。 */
+  lastSync: string | null;
 }
 
 export type PageId = "items" | "rules" | "settings" | "audit";
