@@ -108,5 +108,25 @@ needs-decision，不得自行变更。
        `SyncConfig::validate` 已按 `MAX_SYNC_INTERVAL_SECS=3600` 收敛为 15..=3600
        并有边界测试（crates/lk-core/src/sync.rs），标记完成。
    已修订 [data-model.md](data-model.md) §6（原 #5 其余内容仍然有效）。
+13. **M2 grilling 决议集补登记（2026-08-22 · 来源：文档一致性审查发现「决策 #N」引用不可对位）**：
+    M2 grilling（约 2026-08-16）产出的六项拍板当时未登记入本决议集，而全仓
+    代码注释与文档已广泛引用「决策 #N」（#1~#6，共 57 处代码引用），本条正式
+    补登记使引用可对位，内容如下：
+    - **决策 #1 (A)**：`lk inject --keys <name...>` 的密钥名可指名、值不可见，
+      值只注入被批准命令的子进程 env（commit 69c4189）。
+    - **决策 #2 A**：C 层 daemon 宿主下沉为共享 crate `crates/lk-daemon`
+      （`lk_daemon::run(dir)` CLI 入口 / `serve_embedded` 桌面内嵌入口，行为
+      不回归；commit 69c4189）。
+    - **决策 #3 A**：推送通道 = `transport::PushHub` + `notifier::Notifier`
+      （EventSink），订阅连接收 JSON-RPC notification 帧（`subscribe` 方法；
+      commit 69c4189）。
+    - **决策 #4 A**：桌面窗口/托盘/锁屏（Windows WTS + macOS CGSession）
+      生命周期归 Tauri 壳管理（commit 1a61576）。
+    - **决策 #5 B**：Windows Hello 置灰预留（V1 不接真生物识别；
+      commit 1a61576）。
+    - **决策 #6**：规则对象含 `name` 字段（`model::Rule`/`RuleDraft`；
+      commit 69c4189）。
+    「决策 #10」即补充拍板 #10 的别名；此后新增拍板一律直接进本决议集编号，
+    不再使用游离编号。已修订 [AGENTS.md](../AGENTS.md)（对位指引一行）。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

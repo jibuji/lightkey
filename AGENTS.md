@@ -10,7 +10,8 @@
 ## 规格是唯一权威
 
 - 所有设计决策见 [`docs/decisions.md`](docs/decisions.md)（2026-08-15 拍板，
-  勿自行变更；发现矛盾走 needs-decision 上报）。
+  勿自行变更；发现矛盾走 needs-decision 上报）。历史「决策 #N」编号
+  （M2 grilling 集）见 decisions.md 补充拍板 #13 映射。
 - 文档地图：[`docs/README.md`](docs/README.md)；里程碑：[`docs/milestones.md`](docs/milestones.md)。
 - 文档语言为中文；标识符/命令/协议字段用英文。
 
