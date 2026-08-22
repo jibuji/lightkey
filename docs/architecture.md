@@ -12,6 +12,12 @@ V1 MVP 交付三样东西：
 2. **CLI `lk`**（Rust crate）：复用 `lk-core` + `lk-daemon`；`lk daemon` 入口（`lk_daemon::run(dir)`）。
 3. **桌面应用**（Tauri 2 壳 `lk-app` + React 前端）：复用 `lk-core`。
 
+**产物矩阵补充（跨子系统桥，补充拍板 #14，M2.75）**：同一 workspace 无代码
+分叉，新增 Linux 产物 `lk`（`x86_64-unknown-linux-gnu`，CI ubuntu job 或
+release 补齐），供 WSL 内 agent/用户调用；Windows 侧 `lk.exe` 兼任 bridge
+stdio 中继（随桌面安装包落地到安装目录）。详见
+[cross-subsystem.md](cross-subsystem.md) §6。
+
 浏览器扩展是 **M3 里程碑**（V1 之后），本阶段只落协议规格（[browser-fill.md](browser-fill.md)）。
 
 ## 2. 技术栈（D2）
@@ -90,6 +96,7 @@ webkit2gtk 系统库，不阻塞）；`lk-app` 由 CI 在 Windows 上以 `--work
 | 数据 | 条目级密文 blob + 加密索引；CAS + last-write-wins；30 天墓碑（[data-model.md](data-model.md)） |
 | 同步 | BYO 存储（WebDAV/S3）无服务器；加密索引 + 轮询（默认 60s）；无推送（[sync.md](sync.md)） |
 | 守护进程 | 持解锁态，密钥仅内存；会话令牌随解锁轮换（[ipc.md](ipc.md)） |
+| 跨子系统桥 | WSL Linux `lk` → interop stdio → `lk.exe bridge` → named pipe；无新增监听面，协议零变更（[cross-subsystem.md](cross-subsystem.md)） |
 | 授权门 | 默认拒绝 → 规则白名单 → 弹窗审批（30s 超时拒）（[authorization-gate.md](authorization-gate.md)） |
 | 审计 | 追加式 + HMAC 防篡改；默认永久保留（[audit.md](audit.md)） |
 | 恢复 | 40 字符恢复码 + 恢复信封（Argon2id 派生信封密钥）（[recovery.md](recovery.md)） |

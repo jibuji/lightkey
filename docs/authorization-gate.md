@@ -41,6 +41,13 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   （fail-closed）。
 - 已知限制：macOS 的对端 cwd 解析（`resolve_peer_cwd`）尚未实现（`starter.rs`
   注释标注），macOS 上 `lk inject` 因无法确认启动者 cwd 会 fail-closed 拒绝。
+- **interop 中继链（跨子系统桥，补充拍板 #14）**：WSL 内 Linux `lk` 经
+  `lk.exe bridge` 中继连接 Windows 守护进程时，IPC 对端是 bridge 进程，
+  其父链为 interop 链 `bridge → wsl.exe → wsl.exe → 终端进程 → …`，Windows
+  侧完全可见（本机 Win32_Process 实证），Toolhelp 回溯不会 fail-closed。
+  starter 如实展示中继链顶层（如 `wsl.exe`/终端进程名）；cwd 取 bridge 进程
+  PEB 真实 cwd（interop 继承的调用方项目目录 UNC），足以定位项目。审计
+  `channel = wsl-bridge`。详见 [cross-subsystem.md](cross-subsystem.md) §7.5。
 - 结果供审计 `starter` 字段与规则匹配使用。
 
 ## 4. 规则库（D8）
@@ -109,3 +116,14 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 - 安全专项（[testing.md](testing.md) 第三层）：绕过尝试清单——
   伪造 cwd、符号链接目录、跨会话进程、直连 IPC 调 `authz.evaluate`、
   手动改加密规则文件 → 全部必须失败且留痕。
+- 跨子系统桥安全专项（补充拍板 #14，[cross-subsystem.md](cross-subsystem.md)
+  §10，实现时逐项验证）：
+  - 伪造 `\\wsl.localhost` cwd 变体（大小写 / `wsl$` 别名 / verbatim /
+    尾缀）必须经 `path_ns::canonical_project_dir` 归一化后与规则一致匹配，
+    不得绕过；
+  - interop 被禁用（企业策略，`WSLInterop` 缺失）时必须显式失败并提示，
+    不回退到任何未授权路径；
+  - 版本不匹配（主.次不一致）必须拒绝服务（`bridge.version_incompatible`），
+    绝不静默降级；
+  - bridge 进程伪造/复用会话令牌：令牌仍随每次解锁轮换、仅存于客户端进程
+    内存（D10 不变），不落盘。
