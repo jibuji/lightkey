@@ -30,12 +30,26 @@
 - **审计篡改检测**：改任意字节 → HMAC 校验失败；追加式不可就地修改
   （[audit.md](audit.md) §6）。
 - **IPC 边界**：无令牌请求、错令牌、锁定时请求 → 统一错误，不泄露状态。
+- **跨子系统桥安全专项**（补充拍板 #14，[authorization-gate.md](authorization-gate.md)
+  §7 增补清单）：伪造 `\\wsl.localhost` cwd 变体归一化后一致匹配不绕过 /
+  interop 禁用显式失败 / 版本不匹配拒绝服务 / 会话令牌随解锁轮换、进程内存
+  独占 → 全部 fail-closed 且审计留痕（`channel=wsl-bridge`）。
+
+### 第四层补充：跨子系统 E2E（M2.75，补充拍板 #14）
+
+- `scripts/e2e_cross_subsystem.sh`：宿主需 WSL2 + 桌面包，CI 无 WSL 时跳过。
+  流程：WSL 内 Linux `lk` unlock → item list → `authz.evaluate` 弹窗批准 →
+  Linux 子进程收到注入 env；断言审计含 `wsl-bridge` 事件、探测失败分型与
+  目标可见性（stderr 提示 + `lk status` 目标字段）。规格见
+  [cross-subsystem.md](cross-subsystem.md) §10。
 
 ## 2. 测试数据纪律（D13）
 
 - **测试 fixture 密钥不进仓库**：所有测试密钥/密码/恢复码在测试内生成
   （随机），或从环境变量注入；仓库内不出现任何真实或半真实密钥。
 - 涉及「含密钥」的样例文档（如示例密文）用明显占位符，且不入 CI 断言。
+- 该红线不受跨子系统桥（M2.75）新增测试影响：`e2e_cross_subsystem.sh`
+  同样只在测试内生成密钥或从环境变量注入，仓库不出现任何真实密钥。
 
 ## 3. CI（GitHub Actions，骨架已建）
 
@@ -61,4 +75,5 @@
 | M1.5 | 行为不回归：M0/M1 全量测试（第一层 + E2E e2e_m0.sh / e2e_m1.sh）重组后全绿；密文格式/存储布局/IPC 协议零变更；D 层事件总线单测（item.changed 三方响应、session.unlocked/locked、theme.changed 重渲染、clipboard.copied Toast+30s 清除） |
 | M2 | 第三层安全专项 + 授权门单测 + 桌面验收（Windows） |
 | M2.5 | 首启门控：`vault.status.initialized` 单测（无库/有库）+ 初始化向导四步流单测（弱/强/不一致门控、恢复码勾选门控、完成跳转解锁、统一错误文案）+ 有库启动 → 解锁页回归（host/浏览器 E2E） |
+| M2.75 | 跨子系统桥：`path_ns` 归一化 / bridge 帧透传字节保真 / 版本校验三态单测 + 授权门绕过清单增补四项 + `e2e_cross_subsystem.sh`（宿主无 WSL 时跳过） |
 | M3 | 填充协议集成（扩展 ↔ 守护进程）模拟 |

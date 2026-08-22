@@ -18,7 +18,7 @@
 | `lk init` | 初始化新库：设置主密码、生成恢复码（仅展示一次）与恢复信封 | M0 |
 | `lk unlock` | 解锁库（连接守护进程，签发会话令牌） | M0 |
 | `lk lock` | 锁定库（擦除内存密钥，失效令牌） | M0 |
-| `lk status` | 解锁态、同步水位、版本 | M0 |
+| `lk status` | 解锁态、同步水位、版本、连接目标（本地 daemon / Windows 桌面守护实例经 bridge，补充拍板 #14） | M0 |
 | `lk recover` | 恢复：恢复码 + 新主密码（重置主密码，数据保留） | M0 |
 
 ## 2. 条目
@@ -56,6 +56,23 @@
 |------|------|--------|
 | `lk audit [--tail <N>] [--verify]` | 查看审计日志（只读；无密钥值；`--tail` 最近 N 条、`--verify` 校验 HMAC 链） | M0 |
 | `lk daemon` | 以守护进程方式常驻（解锁态、密钥仅内存；由客户端自动拉起，也可手动前台运行） | M0 |
+| `lk bridge` | （Windows）stdio 中继：stdin 逐行读 JSON-RPC 帧 → named pipe → stdout 回写，一进程一请求后退出；不做业务解析（除版本校验外原样透传）；错误码 `bridge.no_daemon` / `bridge.version_incompatible` / `bridge.io`，退出码非 0。随桌面包安装，供 WSL 侧 Linux `lk` 经 interop 调用 | M2.75 |
+
+## 5.1 跨子系统桥环境变量（补充拍板 #14，M2.75）
+
+- `LIGHTKEY_BRIDGE`：
+  - `off` — 强制本地 daemon（逃生口）；
+  - `<路径>` — 强制用该 `lk.exe` 当中继（跳过探测；Windows 路径或
+    `/mnt/c` 形式均可）；
+  - 未设置 — **auto 默认**：检测到 WSL（`WSLInterop` 存在）→ 自动探测
+    bridge；非 WSL（Linux/macOS 原生）→ 本地 daemon。
+- `LIGHTKEY_BRIDGE_HOME` — 多用户/自定义盘时显式指定 Windows 侧数据目录。
+- 探测失败**分型**：Windows 侧装了 LightKey 但 bridge 连不上（lk.exe 缺失/
+  管道不通/版本不兼容）→ 明确报错，绝不静默回落本地（防「空库错觉」）；
+  Windows 侧没有 lightkey 数据目录 → 静默走本地 daemon。
+- 目标可见性（auto 默认的安全补偿）：每次经 bridge 执行命令向 stderr 打一行
+  「→ 经 bridge 连接 Windows 桌面守护实例（版本 x.y）」；`lk status` 输出
+  连接目标字段。
 
 ## 6. 行为约束
 
@@ -65,3 +82,7 @@
 - 所有敏感输出（密码/令牌）默认不落 stdout 日志；`--json` 输出仅用于机器消费，
   同样遵循最小字段。
 - 错误信息不区分「未解锁/令牌错」（[ipc.md](ipc.md) §3）。
+- 跨子系统桥（M2.75）：`lk`/`lk.exe bridge` 的 stdio 一律按原始字节读写，
+  禁止文本模式转换（UTF-8 与换行保真）；主密码在 WSL 终端交互输入不回显，
+  会话令牌仅存 `lk` 进程内存（D10 不变）。详见
+  [cross-subsystem.md](cross-subsystem.md)。

@@ -23,6 +23,20 @@
 - 首启判定（M2.5）：桌面壳启动时查 `vault.status`——`initialized=false`（无库）
   → 初始化向导；`true`（有库）→ 解锁页；与 `unlocked` 正交（锁态即可响应）。
 
+### 2.1 跨子系统 stdio 桥（补充拍板 #14，M2.75）
+
+- 场景：WSL2 内 Linux 原生 `lk` 连接同机 Windows 桌面守护实例。WSL/Windows
+  边界上 UDS 与 named pipe 互不可达，故增加一条 stdio 中继通道：
+  Linux `lk` 把行 JSON JSON-RPC 帧经 WSL interop 管道交给 `lk.exe bridge`
+  （Windows PE，随桌面包安装），后者原样中继到 named pipe 并回写响应。
+- 协议零变更：帧格式、会话令牌、审批编排全部照旧；bridge 不做任何业务
+  解析（除版本校验外原样透传），决策权始终在守护进程；一进程一请求，
+  首连校验版本主.次一致，不一致 → `bridge.version_incompatible` 拒绝服务。
+- 无新增监听面：bridge 是按需拉起的短命客户端进程，不监听任何端口/套接字；
+  interop 子进程以同一 Windows 用户令牌运行，named pipe「仅本用户」ACL
+  语义不变。
+- 完整规格见 [cross-subsystem.md](cross-subsystem.md)。
+
 ## 3. 会话令牌（D10）
 
 - 解锁成功 → 守护进程签发**会话令牌**（高熵随机，如 256-bit），**随每次解锁轮换**。
@@ -45,7 +59,7 @@
 | `item.put` / `item.delete` | 写 | 新 revision |
 | `item.export` | 导出 file 条目附件（整包下载） | 名称/MIME/大小 + base64 数据 |
 | `sync.trigger` / `sync.poll` | 同步控制 | 变更摘要（不返回内容） |
-| `authz.evaluate` | 授权门判定（M2） | 允许/拒绝 + 最小 env 集 |
+| `authz.evaluate` | 授权门判定（M2）；`channel` 枚举 `cli` \| `desktop` \| `wsl-bridge`（跨子系统桥，补充拍板 #14，审计如实记录） | 允许/拒绝 + 最小 env 集 |
 | `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`） | accepted（是否接受） |
 | `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6） | 规则 / 规则列表 / 无 |
 | `audit.list` | 审计查询 | 事件（无密钥值） |
