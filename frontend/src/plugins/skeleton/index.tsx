@@ -220,10 +220,18 @@ export const syncStatus: Plugin.Function<Context, SlotComponentConfig> = Object.
               pending={pending}
               lastSync={lastSync}
               onSync={() => {
-                void ctx.ipc.syncTrigger().then((s) => {
-                  setLastSync(s.lastSync ?? null);
-                  setPending(false);
-                });
+                void ctx.ipc
+                  .syncTrigger()
+                  .then((s) => {
+                    setLastSync(s.lastSync ?? null);
+                    setPending(false);
+                  })
+                  .catch(() => {
+                    // 同步失败（未配置/凭据/存储错误）：清 pending 并提示，
+                    // 否则状态点会卡在「有变更待同步」。
+                    setPending(false);
+                    ctx.toast.show("同步失败，请重试");
+                  });
               }}
             />
           );
@@ -236,7 +244,7 @@ export const syncStatus: Plugin.Function<Context, SlotComponentConfig> = Object.
     );
   },
   {
-    inject: ["slots", "ipc", "session"],
+    inject: ["slots", "ipc", "session", "toast"],
     Config: validateSlotConfig,
   },
 );

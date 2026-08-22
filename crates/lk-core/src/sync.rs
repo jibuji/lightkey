@@ -1067,10 +1067,13 @@ impl<'a> SyncEngine<'a> {
             }
         }
 
-        // 墓碑（若规则已软删）：随规则上传（删除随同步传播）
+        let tomb_key = format!("{id}.tomb.lk");
+        // 墓碑：规则已软删 → 随规则上传（删除随同步传播）；否则（新建/复活/
+        // 替换为活跃态）清理远端陈旧墓碑——规则体无 revision、删除态只存索引，
+        // 复活后若不清理，远端索引丢失重建时探测到陈旧墓碑会误判 deleted=true
+        // （把已复活规则再标记为删除）。
         if snap_deleted {
             if let Ok(tblob) = view.tomb_blob(id) {
-                let tomb_key = format!("{id}.tomb.lk");
                 let t_expected = self.remote.etag(&tomb_key)?;
                 if let PutOutcome::Conflict =
                     self.remote.put(&tomb_key, &tblob, t_expected.as_deref())?
@@ -1080,6 +1083,8 @@ impl<'a> SyncEngine<'a> {
                         .push(format!("墓碑 {id} 远端较新，本轮不覆盖"));
                 }
             }
+        } else if self.remote.etag(&tomb_key)?.is_some() {
+            self.remote.delete(&tomb_key)?;
         }
         plan.summary.pushed += 1;
         Ok(PushResult::Pushed)
@@ -2085,6 +2090,82 @@ mod tests {
             .find(|e| e.id == rule.id)
             .expect("重建索引应含该规则条目");
         assert!(entry.deleted, "重建索引须保留 deleted=true");
+        drop(fx);
+    }
+
+    /// M2：删除后同 id 复活规则，远端索引丢失重建不得把活跃规则误判为已删。
+    /// 复活推送必须清理远端陈旧墓碑（否则重建探测到墓碑会把活跃规则再标为
+    /// deleted=true），与 `rule_deleted_not_resurrected_on_remote_index_loss`
+    /// 互为镜像。
+    #[test]
+    fn rule_revived_not_falsely_deleted_on_remote_index_loss() {
+        let (fx, mut a, mut b, remote) = fixture();
+        let rule = a
+            .put_rule(
+                crate::model::RuleDraft {
+                    project_dir: fake_abs_proj(),
+                    name: "publish".into(),
+                    command: "npm publish".into(),
+                    keys: vec!["NPM_TOKEN".into()],
+                },
+                None,
+            )
+            .unwrap();
+        sync(&mut a, &remote, &now_iso());
+        let s = sync(&mut b, &remote, &now_iso());
+        assert_eq!(s.pulled, 1);
+        assert_eq!(b.list_rules().unwrap().len(), 1);
+        // A 删除 → 同步（远端墓碑 + 索引 deleted=true）
+        a.delete_rule(rule.id).unwrap();
+        sync(&mut a, &remote, &now_iso());
+        assert!(remote
+            .get(&format!("{}.tomb.lk", rule.id))
+            .unwrap()
+            .is_some());
+        // A 同 id 复活 → 同步（远端陈旧墓碑应被清理）
+        a.put_rule(
+            crate::model::RuleDraft {
+                project_dir: fake_abs_proj(),
+                name: "publish2".into(),
+                command: "npm *".into(),
+                keys: vec!["A".into()],
+            },
+            Some(rule.id),
+        )
+        .unwrap();
+        sync(&mut a, &remote, &now_iso());
+        assert!(
+            remote
+                .get(&format!("{}.tomb.lk", rule.id))
+                .unwrap()
+                .is_none(),
+            "复活推送须清理远端陈旧墓碑"
+        );
+        // 远端索引丢失 → B 全量拉取重建：活跃规则不得被误判为已删
+        remote.delete(INDEX_KEY).unwrap();
+        sync(&mut b, &remote, &now_iso());
+        assert_eq!(b.list_rules().unwrap().len(), 1, "复活规则不得被误删");
+        assert!(
+            !b.tombstones().iter().any(|(id, _)| *id == rule.id),
+            "重建不得伪造删除墓碑"
+        );
+        // 远端重建索引含 deleted=false
+        let idx = remote.get(INDEX_KEY).unwrap().unwrap();
+        let parsed: Vec<IndexEntry> = serde_json::from_slice(
+            &open(
+                b.keys().k_data.as_ref(),
+                SealType::Index,
+                INDEX_KEY,
+                &idx.data,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let entry = parsed
+            .iter()
+            .find(|e| e.id == rule.id)
+            .expect("重建索引应含该规则条目");
+        assert!(!entry.deleted, "重建索引不得把活跃规则标为 deleted");
         drop(fx);
     }
 
