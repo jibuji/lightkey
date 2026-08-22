@@ -8,7 +8,7 @@
  *   unlock   → vault.unlock        lock → vault.lock
  *   list     → item.list           get    → item.get
  *   create/update → item.put（无 id 新建 / 带 expectedRevision 整条替换）   remove → item.delete
- *   syncStatus → sync.status       syncTrigger → sync.trigger
+ *   syncStatus → sync.poll         syncTrigger → sync.trigger
  *   auditList  → audit.list
  *   ruleList/ruleCreate/ruleRemove → rule.*（M2 骨架）
  *
@@ -92,7 +92,7 @@ export interface LightKeyIpc {
   /** item.delete：软删除（墓碑，30 天硬删） */
   remove(id: string): Promise<void>;
 
-  /** sync.status / sync.trigger */
+  /** sync.poll（最近一轮同步摘要与水位，不触发新轮次）/ sync.trigger */
   syncStatus(): Promise<SyncStatus>;
   syncTrigger(): Promise<SyncStatus>;
 
