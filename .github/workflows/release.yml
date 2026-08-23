@@ -136,6 +136,8 @@ jobs:
   build-linux-cli:
     name: Build Linux CLI (lk)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 与 Windows job 对齐：tag 触发时需向 Release 追加上传附件
     steps:
       - uses: actions/checkout@v4
 
