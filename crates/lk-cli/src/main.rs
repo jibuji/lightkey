@@ -1682,8 +1682,9 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
 /// （cross-subsystem.md §7.4）：
 /// - 显式 `wsl://<distro>/...` 规范形直接采用（守护进程侧校验）；
 /// - 以 `/` 开头且非现存本机路径 → 解析为 `wsl://<默认发行版>/…` 并回显确认；
-/// - bridge 后端下解析出的 POSIX 绝对路径同样按默认发行版解析并回显确认
-///   （Windows 守护进程侧无法将裸 POSIX 路径视为绝对路径入库）。
+/// - bridge 后端下解析出的 POSIX 绝对路径折算并回显确认：drvfs 目录
+///   （/mnt/<盘>/…）→ Windows 绝对路径形态（与运行时 cwd 同命名空间）；
+///   其余 → `wsl://<默认发行版>/…`。
 fn cmd_rule_add(
     out: &mut impl Write,
     dir: &std::path::Path,
@@ -1727,22 +1728,30 @@ fn cmd_rule_add(
     };
     // bridge 后端下，canonicalize 成功的 POSIX 绝对路径（WSL 内现存目录，含
     // 相对路径的解析产物）属于 WSL 命名空间：Windows 守护进程无法将其视为
-    // 绝对路径入库，须解析为 `wsl://<distro>/...` 并回显确认后发送
-    // （cross-subsystem.md §7.4；本地后端不受影响，维持 POSIX 原语义）。
+    // 绝对路径入库，须折算后回显确认再发送（cross-subsystem.md §7.4；本地
+    // 后端不受影响，维持 POSIX 原语义）。折算规则：drvfs 目录（/mnt/<盘>/…）
+    // → Windows 绝对路径形态（与 interop bridge 进程继承的 PEB cwd 同命名
+    // 空间，精确匹配）；其余 WSL 原生路径 → wsl://<默认发行版>/… 规范形。
     if canonical.starts_with('/')
         && matches!(
             bridge_backend::decide(),
             bridge_backend::Decision::Bridge(_)
         )
     {
-        match resolve_wsl_rule_dir(
-            &canonical,
-            std::io::stdin().is_terminal(),
-            &mut std::io::stdin().lock(),
-        ) {
-            Some(c) => canonical = c,
-            None => return 1,
-        }
+        let interactive = std::io::stdin().is_terminal();
+        let mut input = std::io::stdin().lock();
+        canonical = match drvfs_rule_windows_form(&canonical) {
+            Some(win) => {
+                match confirm_windows_candidate(&canonical, &win, interactive, &mut input) {
+                    Some(c) => c,
+                    None => return 1,
+                }
+            }
+            None => match resolve_wsl_rule_dir(&canonical, interactive, &mut input) {
+                Some(c) => c,
+                None => return 1,
+            },
+        };
     }
     match rpc(
         dir,
@@ -1782,8 +1791,8 @@ fn cmd_rule_add(
 
 /// 解析需折算为 WSL 命名空间的项目目录（cross-subsystem.md §7.4）：
 /// `<path>` → `wsl://<默认发行版><path>`，回显解析结果要求确认（默认发行版
-/// 歧义显式化，防静默错配）。两个调用点：非现存本机路径的 `/` 开头输入、
-/// bridge 后端下解析出的 POSIX 绝对路径。
+/// 歧义显式化，防静默错配）。调用点：非现存本机路径的 `/` 开头输入、bridge
+/// 后端下解析出的非 drvfs POSIX 绝对路径。
 ///
 /// - 交互 TTY：回显 + y/N 确认；
 /// - 非交互（脚本/管道）：明确报错提示改用显式路径重试；
@@ -1804,6 +1813,40 @@ fn resolve_wsl_rule_dir(
     confirm_wsl_candidate(project_dir, &distro, interactive, input)
 }
 
+/// 跨命名空间折算候选的统一回显确认（探测/折算与确认分离，便于测试）：
+/// 交互 TTY 回显说明行 + y/N 确认；非交互（脚本/管道）明确报错提示改用
+/// 显式路径重试（防脚本静默错配）；拒绝/EOF → None。`line` 为折算说明
+/// （含候选形态），`candidate` 用于确认通过后的返回值与重试提示。
+fn ask_rule_confirm(
+    line: &str,
+    candidate: &str,
+    interactive: bool,
+    input: &mut dyn std::io::BufRead,
+) -> Option<String> {
+    if !interactive {
+        eprintln!(
+            "lk rule add: {line}\n\
+             当前为非交互环境，无法回显确认（防脚本静默错配）；请改用显式路径重试：\n  \
+             lk rule add {candidate} ..."
+        );
+        return None;
+    }
+    eprintln!("{line}");
+    eprint!("确认将该目录入库？(y/N) ");
+    let _ = std::io::stderr().flush();
+    let mut ans = String::new();
+    if input.read_line(&mut ans).ok()? == 0 {
+        return None; // EOF（输入关闭）→ 视为拒绝
+    }
+    match ans.trim() {
+        "y" | "Y" | "yes" | "Yes" => Some(candidate.to_string()),
+        _ => {
+            eprintln!("lk rule add: 已取消；请改用显式路径重试：\n  lk rule add {candidate} ...");
+            None
+        }
+    }
+}
+
 /// 已知默认发行版时的候选拼装 + 回显确认（探测与确认分离，便于测试）。
 fn confirm_wsl_candidate(
     project_dir: &str,
@@ -1812,28 +1855,30 @@ fn confirm_wsl_candidate(
     input: &mut dyn std::io::BufRead,
 ) -> Option<String> {
     let candidate = wsl_candidate(project_dir, distro)?;
-    if !interactive {
-        eprintln!(
-            "lk rule add: 「{project_dir}」按 WSL 默认发行版解析为 {candidate}。\n\
-             当前为非交互环境，无法回显确认（防脚本静默错配）；请改用显式路径重试：\n  \
-             lk rule add {candidate} ..."
-        );
-        return None;
-    }
-    eprintln!("「{project_dir}」已按 WSL 默认发行版解析为：{candidate}");
-    eprint!("确认将该目录入库？(y/N) ");
-    let _ = std::io::stderr().flush();
-    let mut ans = String::new();
-    if input.read_line(&mut ans).ok()? == 0 {
-        return None; // EOF（输入关闭）→ 视为拒绝
-    }
-    match ans.trim() {
-        "y" | "Y" | "yes" | "Yes" => Some(candidate),
-        _ => {
-            eprintln!("lk rule add: 已取消；请改用显式路径重试：\n  lk rule add {candidate} ...");
-            None
-        }
-    }
+    ask_rule_confirm(
+        &format!("「{project_dir}」已按 WSL 默认发行版解析为：{candidate}"),
+        &candidate,
+        interactive,
+        input,
+    )
+}
+
+/// drvfs 目录折算确认：回显 `POSIX → Windows` 转换结果（与运行时 cwd 同
+/// 命名空间），确认语义与 wsl 候选一致（交互 y/N；非交互明确报错）。
+fn confirm_windows_candidate(
+    project_dir: &str,
+    win: &str,
+    interactive: bool,
+    input: &mut dyn std::io::BufRead,
+) -> Option<String> {
+    ask_rule_confirm(
+        &format!(
+            "「{project_dir}」为 Windows 挂载目录（drvfs），折算为 {project_dir} → {win}"
+        ),
+        win,
+        interactive,
+        input,
+    )
 }
 
 /// 拼候选规范形 `wsl://<distro>/<rest>`（rest 取自以 `/` 开头的原始输入，
@@ -1845,6 +1890,14 @@ fn wsl_candidate(project_dir: &str, distro: &str) -> Option<String> {
     } else {
         Some(format!("wsl://{distro}{trimmed}"))
     }
+}
+
+/// bridge 后端下 rule.add 的 drvfs 折算（cross-subsystem.md §7.4）：drvfs
+/// 目录（/mnt/<单盘符>/…）→ Windows 绝对路径形态（与 interop bridge 进程
+/// 继承的 PEB cwd 同命名空间，精确匹配）；其余 POSIX 路径 → None（调用方按
+/// wsl:// 默认发行版折算）。
+fn drvfs_rule_windows_form(posix: &str) -> Option<String> {
+    bridge_backend::to_windows_path(std::path::Path::new(posix))
 }
 
 /// 探测 WSL 默认发行版（cross-subsystem.md §7.4）。
@@ -2082,6 +2135,69 @@ mod wsl_rule_add_tests {
         assert_eq!(confirm_with("y\n", false), None);
         // 探测失败的兜底（resolve 层）：detect 返回 None → 整体 None，
         // 由调用方报错退出——不产生任何候选入库。
+    }
+
+    /// drvfs 折算：/mnt/<盘>/… → Windows 绝对路径形态；非 drvfs（WSL 原生
+    /// 路径 / 非盘符挂载）→ None（走 wsl:// 默认发行版折算）。
+    #[test]
+    fn drvfs_rule_dir_forms() {
+        assert_eq!(
+            drvfs_rule_windows_form("/mnt/c/Users/u/proj").as_deref(),
+            Some(r"C:\Users\u\proj")
+        );
+        assert_eq!(
+            drvfs_rule_windows_form("/mnt/d/Proj").as_deref(),
+            Some(r"D:\Proj")
+        );
+        assert_eq!(drvfs_rule_windows_form("/mnt/c").as_deref(), Some(r"C:\"));
+        // 非 drvfs：WSL 原生路径与非盘符挂载都不折算为 Windows 形态
+        assert_eq!(drvfs_rule_windows_form("/home/u/p"), None);
+        assert_eq!(drvfs_rule_windows_form("/mnt/wsl/docker"), None);
+    }
+
+    /// 折算产物与运行时 cwd（canonical 后）同命名空间命中：相等即命中；
+    /// 子目录祖先命中与目录边界按 Path 组件语义（Windows 侧 \ 分隔；
+    /// Linux 测试宿主用等价 / 写法断言同一逻辑）。
+    #[test]
+    fn drvfs_rule_matches_windows_cwd() {
+        let win = drvfs_rule_windows_form("/mnt/c/Users/u/proj").unwrap();
+        let cwd = lk_core::path_ns::canonical_project_dir(r"C:\Users\u\proj");
+        assert_eq!(win, cwd);
+        assert!(lk_core::authz::project_dir_matches(&win, &cwd));
+        // 祖先命中（子目录内 inject）与目录边界（p2 不得命中）
+        assert!(lk_core::authz::project_dir_matches(
+            &win.replace('\\', "/"),
+            "C:/Users/u/proj/sub"
+        ));
+        assert!(!lk_core::authz::project_dir_matches(
+            &win.replace('\\', "/"),
+            "C:/Users/u/proj2"
+        ));
+        // wsl 原生路径不受影响：仍走 wsl:// 规范形并可命中
+        let wsl = wsl_candidate("/home/u/p", "Debian").unwrap();
+        assert_eq!(wsl, "wsl://Debian/home/u/p");
+        let cwd_wsl =
+            lk_core::path_ns::canonical_project_dir(r"\\wsl.localhost\Debian\home\u\p");
+        assert!(lk_core::authz::project_dir_matches(&wsl, &cwd_wsl));
+    }
+
+    /// Windows 折算确认：交互 y 确认返回 Windows 形态；n/EOF 拒绝；
+    /// 非交互即使输入 y 也拒绝（与 wsl 候选语义一致）。
+    #[test]
+    fn windows_confirm_variants() {
+        let confirm = |input: &str, interactive: bool| {
+            confirm_windows_candidate(
+                "/mnt/c/Users/u/proj",
+                r"C:\Users\u\proj",
+                interactive,
+                &mut BufReader::new(input.as_bytes()),
+            )
+        };
+        assert_eq!(confirm("y\n", true).as_deref(), Some(r"C:\Users\u\proj"));
+        assert!(confirm("Y\n", true).is_some());
+        assert_eq!(confirm("n\n", true), None);
+        assert_eq!(confirm("", true), None); // EOF → 拒绝
+        assert_eq!(confirm("y\n", false), None); // 非交互永不确认
     }
 }
 
