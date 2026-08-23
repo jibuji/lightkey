@@ -10,8 +10,7 @@
 //!
 //! M2：规则与条目同路径同步（视图新增 `rule*` 读取面）。
 
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, RwLock};
 
 use lk_core::crypto::Keys;
 use lk_core::ipc::*;
@@ -23,7 +22,7 @@ use lk_core::Error;
 use serde_json::{json, Value};
 
 use super::config::read_config;
-use super::{extract_token, session_invalid, SharedDaemon};
+use super::SharedDaemon;
 
 /// 同步轮次的失败分类（IPC 错误码映射用）。
 #[derive(Debug)]
@@ -208,41 +207,6 @@ pub fn run_sync_round_with(
     };
     saved.save(&shared.dir);
     Ok(plan.summary)
-}
-
-/// `sync.trigger` 的无锁路径：会话预检（短暂持命令锁）→ 轮次主体在命令锁
-/// 外执行（网络 I/O 不阻塞其他命令；与后台轮询并发安全——数据层 CAS +
-/// vault 短写锁兜底）。非 trigger 请求 → `None`（走常规命令路径）。
-pub fn try_sync_trigger(
-    state: &Mutex<super::Daemon>,
-    shared: &SharedDaemon,
-    line: &str,
-) -> Option<String> {
-    let req: RpcRequest = serde_json::from_str(line).ok()?;
-    if req.method != M_SYNC_TRIGGER {
-        return None;
-    }
-    let id = req.id;
-    let token = extract_token(&req.params);
-    // 会话预检（短暂持命令锁；含空闲超时检查）
-    let session_ok = {
-        let mut guard = state.lock().expect("daemon mutex poisoned");
-        guard.auto_lock_if_idle();
-        guard.trigger_precheck(token.as_deref())
-    };
-    if !session_ok {
-        return Some(serde_json::to_string(&session_invalid(id)).unwrap_or_else(|_| "{}".into()));
-    }
-    // 轮次：命令锁外执行（网络 I/O 期间其他命令照常服务）
-    let resp = match run_sync_round(shared) {
-        Ok(summary) => RpcResponse::ok(id, serde_json::to_value(summary).unwrap_or(Value::Null)),
-        Err(e) => sync_fail_response(id, &e),
-    };
-    // 活动时间戳（命令锁内；与常规路径的 last_activity 语义一致）
-    if let Ok(mut guard) = state.lock() {
-        guard.last_activity = Instant::now();
-    }
-    Some(serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()))
 }
 
 /// 同步失败分类 → IPC 错误响应（与 M1 原有映射一致）。
