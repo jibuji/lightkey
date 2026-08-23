@@ -69,19 +69,24 @@ export function resolveSelection(
  * 名称 / 用户名 / 域名(login uris) / 用途(secret purpose) / 文件备注与
  * 元数据(file note/attachment/fileType)。**密钥明文值与笔记全文绝不入列**。
  * 返回未小写化的拼接串（大小写折叠由 `filterItems` 统一处理）。
+ *
+ * 七槽位布局与重构前 VaultPage 内联实现逐字节一致：槽位顺序固定为
+ * name / username / login uris / purpose / file note / attachment /
+ * fileType，非本类型槽位以空串占位（join 后字段间出现连续空格）——含连续
+ * 空格的查询词等任何输入的可观察命中行为因此与重构前完全等价。
  */
 export function searchableText(item: Item): string {
   switch (item.type) {
     case "login":
-      return [item.name, item.username, item.uris.join(" ")].join(" ");
+      return [item.name, item.username, item.uris.join(" "), "", "", "", ""].join(" ");
     case "note":
       // 笔记全文不可搜（spec §6.2）：仅名称入 haystack
-      return item.name;
+      return [item.name, "", "", "", "", "", ""].join(" ");
     case "secret":
       // 密钥明文 value 永不可搜：仅名称与用途入 haystack
-      return [item.name, item.purpose].join(" ");
+      return [item.name, "", "", item.purpose, "", "", ""].join(" ");
     case "file":
-      return [item.name, item.note, item.attachment, item.fileType].join(" ");
+      return [item.name, "", "", "", item.note, item.attachment, item.fileType].join(" ");
   }
 }
 

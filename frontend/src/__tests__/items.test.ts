@@ -103,6 +103,16 @@ describe("searchableText（spec §6.2 可搜字段白名单）", () => {
     // login 密码同样不可搜
     expect(searchableText(login)).not.toContain("SUPER-SECRET-PASSWORD");
   });
+
+  it("haystack 七槽位占位布局与重构前逐字节一致：连续空格查询词行为不变", () => {
+    // 重构前 hay 为定长七槽位 join(" ")，非本类型槽位为空串 → 字段间存在
+    // 连续空格；含连续空格的查询词（搜索框只 trim 首尾）必须同样命中。
+    // secret：name 与 purpose 之间隔两个空槽位 → 三连空格。
+    expect(filterItems([secret], "all", "令牌   发布")).toHaveLength(1);
+    // 单空格 / 双连空格不命中——与重构前一致
+    expect(filterItems([secret], "all", "令牌 发布")).toHaveLength(0);
+    expect(filterItems([secret], "all", "令牌  发布")).toHaveLength(0);
+  });
 });
 
 describe("filterItems（类型 chips + 查询词）", () => {
