@@ -846,7 +846,7 @@ mod imp {
 
     pub fn pid_alive(pid: u32) -> bool {
         let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if h == INVALID_HANDLE_VALUE {
+        if h.is_null() {
             return false;
         }
         unsafe {
@@ -857,7 +857,7 @@ mod imp {
 
     pub fn kill_pid(pid: u32) {
         let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if h != INVALID_HANDLE_VALUE {
+        if !h.is_null() {
             unsafe {
                 TerminateProcess(h, 1);
                 CloseHandle(h);
