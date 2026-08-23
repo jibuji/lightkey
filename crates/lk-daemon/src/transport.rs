@@ -510,7 +510,7 @@ mod imp {
     struct UserOnlySa {
         attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
         _sd: Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>,
-        _acl: Vec<u8>,
+        _acl: [u64; 32],
     }
 
     fn user_only_sa() -> std::io::Result<UserOnlySa> {
@@ -528,13 +528,16 @@ mod imp {
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let mut user_buf = [0u8; 128];
+            // 缓冲区必须按 8 字节对齐：GetTokenInformation 写入的 TOKEN_USER
+            // 含指针字段，Rust 侧随后按该类型解引用（misaligned deref 会
+            // 触发 debug 运行时检查硬中止）。
+            let mut user_buf = [0u64; 16]; // 128 B
             let mut ret_len: u32 = 0;
             let ok = GetTokenInformation(
                 token,
                 TokenUser,
                 user_buf.as_mut_ptr() as *mut core::ffi::c_void,
-                user_buf.len() as u32,
+                std::mem::size_of_val(&user_buf) as u32,
                 &mut ret_len,
             );
             let _ = CloseHandle(token);
@@ -544,9 +547,10 @@ mod imp {
             let user = &*(user_buf.as_ptr() as *const TOKEN_USER);
             let sid: PSID = user.User.Sid;
 
-            let mut acl_buf = vec![0u8; 256];
+            // ACL 内存 Windows 要求至少 DWORD 对齐（u64 背板保证 8 字节）。
+            let mut acl_buf = [0u64; 32]; // 256 B
             let acl = acl_buf.as_mut_ptr() as *mut ACL;
-            if InitializeAcl(acl, acl_buf.len() as u32, ACL_REVISION) == 0
+            if InitializeAcl(acl, std::mem::size_of_val(&acl_buf) as u32, ACL_REVISION) == 0
                 || AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, sid) == 0
             {
                 return Err(std::io::Error::last_os_error());
