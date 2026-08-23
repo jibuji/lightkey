@@ -2148,12 +2148,15 @@ mod tests {
         let fv: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(fv["method"], "authz.request");
         assert!(fv.get("id").is_none());
+        // projectDir 以对端 cwd 归一化形态广播（§7.4 两侧同函数：canonicalize
+        // 产物再过 canonical_project_dir，Windows 下剥离 verbatim \\?\ 前缀）
         assert_eq!(
             fv["params"]["projectDir"],
-            std::fs::canonicalize(proj.path())
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
+            lk_core::path_ns::canonical_project_dir(
+                &std::fs::canonicalize(proj.path())
+                    .unwrap()
+                    .to_string_lossy()
+            )
         );
         assert_eq!(fv["params"]["command"], "yarn publish");
         assert_eq!(fv["params"]["keys"][0], "NPM_TOKEN");
@@ -2301,11 +2304,13 @@ mod tests {
         let id = rule["id"].as_str().unwrap().to_string();
         assert_eq!(rule["name"], "pub");
         assert_eq!(rule["command"], "npm publish");
-        // projectDir 以 canonical 形态入库（Windows 下含 \\?\ 前缀与短名展开）
-        let canonical_proj = std::fs::canonicalize(proj.path())
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        // projectDir 以 canonical 形态入库（§7.4 两侧同函数：canonicalize 产物
+        // 再过 canonical_project_dir，Windows 下剥离 verbatim \\?\ 前缀）
+        let canonical_proj = lk_core::path_ns::canonical_project_dir(
+            &std::fs::canonicalize(proj.path())
+                .unwrap()
+                .to_string_lossy(),
+        );
         assert_eq!(rule["projectDir"], canonical_proj);
         // 广播 item.changed(kind=rule, deleted=false)（决策 #6）
         let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
