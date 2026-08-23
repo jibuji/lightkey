@@ -13,8 +13,13 @@
 //! - socket/pipe 路径含用户级随机组件，且位于用户私有数据目录（0700）——
 //!   防跨用户劫持。
 //! - 守护进程信息（pid + 端点 + `version`）写入 `daemon.json`；客户端首次
-//!   访问自动拉起守护进程（检测到陈旧端点 → 先杀旧进程再拉起）。
+//!   访问自动拉起守护进程（检测到陈旧端点 → 仅当 pid 不存活直接清理、pid
+//!   存活且连续多次探测失败才杀旧进程再拉起，#31）。
 //!   `version` 供协议版本校验（cross-subsystem.md §7.3），旧文件缺省可读。
+//! - bridge 自证身份（cross-subsystem.md §7.4 修订，#32）：转发帧顶层可选
+//!   `lkBridge` 字段（pid + cwd），守护侧校验 pid 与 IPC 对端一致后采信其
+//!   cwd——interop 进程跨进程 PEB 读取不可行，Windows named pipe 服务端
+//!   常备监听实例 + 客户端 233 短重试（#31）。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -136,6 +141,53 @@ fn subscribe_response_ok(resp: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// bridge 自证身份（cross-subsystem.md §7.4 修订，issue #32）
+// ---------------------------------------------------------------------------
+
+/// 转发帧顶层的 bridge 自证身份字段。bridge 进程（可信捆绑代码）在中继前用
+/// 自身 `GetCurrentDirectoryW` 取 cwd 并**覆写**本字段——WSL 内 Linux 客户端
+/// 无法伪造；普通客户端不带此字段，走既有 PEB/procfs 派生路径。附加字段
+/// 为 JSON-RPC 允许的扩展成员，旧守护进程忽略之（协议兼容性见 §7.3 结论）。
+pub const BRIDGE_IDENTITY_FIELD: &str = "lkBridge";
+
+/// 从请求帧提取 bridge 自证身份 `(pid, cwd)`；字段缺失/形态不合法/pid=0
+/// → `None`（调用方维持既有派生结果）。
+fn extract_bridge_identity(line: &str) -> Option<(u32, String)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let b = v.get(BRIDGE_IDENTITY_FIELD)?;
+    let pid = b.get("pid")?.as_u64()?;
+    let cwd = b.get("cwd")?.as_str()?;
+    if pid == 0 || pid > u32::MAX as u64 || cwd.is_empty() {
+        return None;
+    }
+    Some((pid as u32, cwd.to_string()))
+}
+
+/// canonical 化 bridge 自证 cwd（与 `lk_core::starter::resolve_peer_cwd`
+/// 同一契约：canonical 形态、剥离 `\\?\` 前缀；canonicalize 失败 → `None`
+/// → 授权 fail-closed——目录已不存在等异常场景宁可拒绝）。
+fn canonical_bridge_cwd(cwd: &str) -> Option<String> {
+    let stripped = cwd.strip_prefix(r"\\?\").unwrap_or(cwd);
+    std::fs::canonicalize(stripped)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// 校验并采信 bridge 自证身份：帧内 pid 与 IPC 对端 PID 一致（且对端 PID
+/// 已知非 0）→ 用自证 cwd 覆盖 PEB/procfs 派生值；不一致/未知 → 忽略，
+/// 维持既有 fail-closed 派生结果（interop 场景 PEB 读取失败 → 仍 no_cwd）。
+fn apply_bridge_identity(peer: &mut PeerInfo, line: &str, peer_pid: u32) {
+    if peer_pid == 0 {
+        return;
+    }
+    if let Some((pid, cwd)) = extract_bridge_identity(line) {
+        if pid == peer_pid {
+            peer.cwd = canonical_bridge_cwd(&cwd);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unix domain socket
 // ---------------------------------------------------------------------------
 
@@ -225,9 +277,13 @@ mod imp {
                     std::thread::spawn(move || {
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(300)));
-                        let peer = peer_info(&stream);
                         let mut s = stream;
                         if let Ok(Some(line)) = read_line(&mut s) {
+                            // 对端身份在读到请求行后派生（#32：需按帧内
+                            // lkBridge 自证身份校验后采信 cwd）
+                            let mut peer = peer_info(&s);
+                            let peer_pid = peer.pid;
+                            apply_bridge_identity(&mut peer, &line, peer_pid);
                             // 订阅连接：转入流模式（守护进程主动推送通知帧）
                             if is_subscribe_request(&line) {
                                 let resp = handler(&line, &peer);
@@ -378,6 +434,8 @@ mod imp {
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
     const ERROR_PIPE_BUSY: u32 = 231;
+    /// ERROR_PIPE_NOT_CONNECTED（#31：服务端补位前的瞬态窗口，客户端短重试）。
+    const ERROR_PIPE_NOT_CONNECTED: u32 = 233;
     const ERROR_PIPE_CONNECTED: u32 = 535;
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
@@ -385,6 +443,12 @@ mod imp {
     const PIPE_WAIT: u32 = 0x0000_0000;
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
     const PROCESS_TERMINATE: u32 = 0x0001;
+
+    /// #31 客户端 233 短重试参数：最多 20 次 × 10ms（≈200ms 窗口），足以
+    /// 吸收服务端「补位前」的毫秒级瞬态；`ERROR_FILE_NOT_FOUND`（守护进程
+    /// 未运行）等其余错误码不重试、立即返回。
+    const CONNECT_233_RETRIES: u32 = 20;
+    const CONNECT_233_BACKOFF_MS: u64 = 10;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -515,7 +579,34 @@ mod imp {
         }
     }
 
+    /// 创建一个监听中的 pipe 实例（#31：服务端任意时刻常备 ≥1 个）。
+    fn create_pipe_instance(name: &[u16], sa: &UserOnlySa) -> std::io::Result<HANDLE> {
+        let handle = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                64 * 1024,
+                64 * 1024,
+                0,
+                &sa.attrs as *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(handle)
+        }
+    }
+
     /// 监听并处理连接（每连接一线程；订阅连接转流模式）。
+    ///
+    /// #31：循环外预创建首个监听实例；`ConnectNamedPipe` 返回（客户端已连入）
+    /// 后**先补位**（创建下一个监听实例）**再派发**处理线程——旧实现单实例
+    /// 串行 `CreateNamedPipeW → ConnectNamedPipe`，实例已建但未进监听的窗口
+    /// 期内客户端 `CreateFileW` 可成功拿到句柄，后续 I/O 即 os error 233
+    /// （ERROR_PIPE_NOT_CONNECTED），probe 撞竞态进而误杀健康守护。
     pub fn serve(
         dir: &Path,
         handler: Handler,
@@ -526,39 +617,47 @@ mod imp {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "缺少 daemon.json"))?;
         let name = wide(&ep.address);
         let sa = user_only_sa()?;
+        let mut listening = create_pipe_instance(&name, &sa)?;
         loop {
             if shutdown.load(Ordering::Relaxed) {
+                unsafe {
+                    CloseHandle(listening);
+                }
                 break;
             }
-            let handle = unsafe {
-                CreateNamedPipeW(
-                    name.as_ptr(),
-                    PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    PIPE_UNLIMITED_INSTANCES,
-                    64 * 1024,
-                    64 * 1024,
-                    0,
-                    &sa.attrs as *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-                )
-            };
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(std::io::Error::last_os_error());
-            }
-            let ok = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+            let ok = unsafe { ConnectNamedPipe(listening, std::ptr::null_mut()) };
             if ok == 0 && unsafe { GetLastError() } != ERROR_PIPE_CONNECTED {
+                // 客户端连入后即刻断开等瞬态失败：弃置该实例并重建监听实例
                 unsafe {
-                    CloseHandle(handle);
+                    CloseHandle(listening);
                 }
+                listening = create_pipe_instance(&name, &sa)?;
                 continue;
             }
+            let connected = listening;
+            // 先补位再派发：消除「无监听实例」窗口（补位失败则放弃该连接，
+            // 关闭已连入句柄后向上报错）
+            listening = match create_pipe_instance(&name, &sa) {
+                Ok(h) => h,
+                Err(e) => {
+                    unsafe {
+                        CloseHandle(connected);
+                    }
+                    return Err(e);
+                }
+            };
             let handler = handler.clone();
             let hub = hub.clone();
-            let peer = peer_info(handle);
-            let sh = SendHandle(handle);
+            // 先包装成 SendHandle 再入闭包（裸 HANDLE 非 Send）
+            let sh = SendHandle(connected);
             std::thread::spawn(move || {
                 let mut stream = PipeStream { handle: sh };
                 if let Ok(Some(line)) = read_line(&mut stream) {
+                    // 对端身份在读到请求行后派生（#32：需按帧内 lkBridge
+                    // 自证身份校验后采信 cwd）
+                    let mut peer = peer_info(sh.0);
+                    let peer_pid = peer.pid;
+                    apply_bridge_identity(&mut peer, &line, peer_pid);
                     if is_subscribe_request(&line) {
                         let resp = handler(&line, &peer);
                         let _ = write_line(&mut stream, &resp);
@@ -706,9 +805,11 @@ mod imp {
         stream.flush()
     }
 
-    /// 客户端连接（pipe 忙则等待；不存在视为守护进程未运行）。
+    /// 客户端连接（pipe 忙则等待；233 短重试吸收服务端瞬态窗口 #31；
+    /// 不存在视为守护进程未运行，立即返回）。
     pub fn connect(ep: &Endpoint) -> std::io::Result<PipeStream> {
         let name = wide(&ep.address);
+        let mut transient_failures = 0u32;
         loop {
             let handle = unsafe {
                 CreateFileW(
@@ -732,6 +833,11 @@ mod imp {
                 if ok == 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                continue;
+            }
+            if err == ERROR_PIPE_NOT_CONNECTED && transient_failures < CONNECT_233_RETRIES {
+                transient_failures += 1;
+                std::thread::sleep(Duration::from_millis(CONNECT_233_BACKOFF_MS));
                 continue;
             }
             return Err(std::io::Error::from_raw_os_error(err as i32));
@@ -833,18 +939,26 @@ pub fn request(endpoint: &Endpoint, line: &str) -> std::io::Result<String> {
     }
 }
 
-/// 确保守护进程在跑：探测端点 → 陈旧则杀旧 → 拉起 → 等待就绪。
-/// `dir_override` 为 `lk --dir` 的显式值（透传给子进程）。
+/// 确保守护进程在跑：探测端点 → 陈旧则按 [`stale_verdict`] 处置 → 拉起 →
+/// 等待就绪。`dir_override` 为 `lk --dir` 的显式值（透传给子进程）。
 pub fn ensure_daemon(dir: &Path) -> std::io::Result<Endpoint> {
     if let Some(ep) = read_endpoint(dir) {
-        if probe(&ep) {
-            return Ok(ep);
+        match stale_verdict(probe(&ep), imp::pid_alive(ep.pid)) {
+            StaleVerdict::Healthy => return Ok(ep),
+            StaleVerdict::DeadProcess => {
+                // pid 已不存活：陈旧端点，清理即可（无须 kill）
+                cleanup(dir, &ep);
+            }
+            StaleVerdict::HungProcess => {
+                // #31：pid 存活但单次 probe 失败可能是管道瞬态竞态——先重试，
+                // 连续失败才判定僵死并 kill（绝不因一次 probe 撞竞态误杀健康守护）
+                if probe_with_retry(&ep, PROBE_RETRIES_AFTER_LIVENESS - 1) {
+                    return Ok(ep);
+                }
+                kill_pid(ep.pid);
+                cleanup(dir, &ep);
+            }
         }
-        // 陈旧端点：先杀旧进程再清理
-        if pid_alive(ep.pid) {
-            kill_pid(ep.pid);
-        }
-        cleanup(dir, &ep);
     }
     spawn_daemon(dir)?;
     // 轮询等待就绪（最多 ~5s）
@@ -862,6 +976,29 @@ pub fn ensure_daemon(dir: &Path) -> std::io::Result<Endpoint> {
     ))
 }
 
+/// pid 存活但首探失败后的追加重试次数（含首探共 3 次）。
+const PROBE_RETRIES_AFTER_LIVENESS: usize = 3;
+
+/// 相邻两次探测的间隔。
+const PROBE_RETRY_DELAY: Duration = Duration::from_millis(150);
+
+/// 陈旧端点处置判定（#31）：probe 通过即复用；probe 失败时**仅当 pid 已不
+/// 存活**判死进程（清理即可、无须 kill）；pid 仍存活 → 判疑似僵死（调用方
+/// 先重试探测，连续失败才 kill）。注入式纯逻辑，单测覆盖。
+enum StaleVerdict {
+    Healthy,
+    DeadProcess,
+    HungProcess,
+}
+
+fn stale_verdict(probe_ok: bool, pid_alive: bool) -> StaleVerdict {
+    match (probe_ok, pid_alive) {
+        (true, _) => StaleVerdict::Healthy,
+        (false, false) => StaleVerdict::DeadProcess,
+        (false, true) => StaleVerdict::HungProcess,
+    }
+}
+
 /// 探测端点是否可用（vault.status 无需令牌，锁态也可响应）。
 fn probe(ep: &Endpoint) -> bool {
     let req = serde_json::json!({
@@ -871,6 +1008,20 @@ fn probe(ep: &Endpoint) -> bool {
         "params": {}
     });
     request(ep, &req.to_string()).is_ok()
+}
+
+/// 连续探测 `attempts` 次（首次立即，其后间隔 [`PROBE_RETRY_DELAY`]），
+/// 任一次成功即真。
+fn probe_with_retry(ep: &Endpoint, attempts: usize) -> bool {
+    for i in 0..attempts.max(1) {
+        if i > 0 {
+            std::thread::sleep(PROBE_RETRY_DELAY);
+        }
+        if probe(ep) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 拉起 `lk daemon --dir <dir>`（脱离终端；子进程继承 LIGHTKEY_HOME 等环境）。
@@ -939,5 +1090,190 @@ mod tests {
         // 往返一致
         let back: Endpoint = serde_json::from_str(&out).expect("往返解析");
         assert_eq!(back.version.as_deref(), Some("9.9.9"));
+    }
+
+    // -------------------------------------------------------------------------
+    // #31：陈旧端点处置判定（probe 竞态不误杀）
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn stale_verdict_table() {
+        use StaleVerdict::{DeadProcess, Healthy, HungProcess};
+        assert!(matches!(stale_verdict(true, true), Healthy));
+        assert!(matches!(stale_verdict(true, false), Healthy));
+        // probe 失败 + pid 存活 = 疑似僵死（先重试，绝不单次失败即杀）
+        assert!(matches!(stale_verdict(false, true), HungProcess));
+        // probe 失败 + pid 已死 = 陈旧端点（清理即可，无须 kill）
+        assert!(matches!(stale_verdict(false, false), DeadProcess));
+    }
+
+    /// probe 重试：对「接受后立即关闭」的 socket 连续失败（真实 IO 路径，
+    /// 非 mock），attempts 次后返回 false；对健康 mock 守护首次即真。
+    #[cfg(unix)]
+    #[test]
+    fn probe_with_retry_fails_fast_on_dead_socket_and_hits_healthy_daemon() {
+        // 死 socket：accept 即 drop → request UnexpectedEof → probe 失败
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(tmp.path().join("run/dead.sock")).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let dead_ep = Endpoint {
+            pid: std::process::id(),
+            address: tmp
+                .path()
+                .join("run/dead.sock")
+                .to_string_lossy()
+                .to_string(),
+            version: None,
+        };
+        assert!(!probe_with_retry(&dead_ep, 3));
+
+        // 健康 mock 守护：首探即真
+        spawn_mock_status_daemon(tmp.path());
+        let ep = read_endpoint(tmp.path()).expect("daemon.json 已写入");
+        assert!(probe_with_retry(&ep, 3));
+    }
+
+    /// 进程内 mock 守护：vault.status 秒回；其余帧回显对端身份
+    /// （bridge 自证身份端到端验证用）。
+    #[cfg(unix)]
+    fn spawn_mock_status_daemon(dir: &Path) {
+        let listener = bind_server(dir).expect("bind mock server");
+        let handler: Handler = Arc::new(|line, peer| {
+            serde_json::json!({ "peerPid": peer.pid, "peerCwd": peer.cwd, "echo": line })
+                .to_string()
+        });
+        std::thread::spawn(move || {
+            let _ = serve(listener, handler, None, &SHUTDOWN);
+        });
+    }
+
+    #[cfg(unix)]
+    static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+    /// 经真实 UDS 服务循环的端到端：帧内 lkBridge pid 与对端一致 → 采信其
+    /// cwd（canonical 化）；pid 不符 → 维持 procfs 派生的真实 cwd。
+    #[cfg(unix)]
+    #[test]
+    fn bridge_identity_end_to_end_over_unix_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        spawn_mock_status_daemon(tmp.path());
+        let ep = read_endpoint(tmp.path()).expect("daemon.json 已写入");
+
+        let claimed_dir = tempfile::tempdir().unwrap();
+        let claimed_canonical = std::fs::canonicalize(claimed_dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let self_pid = std::process::id();
+
+        // ① pid 一致 → 采信自证 cwd
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "x", "params": {},
+            BRIDGE_IDENTITY_FIELD: { "pid": self_pid, "cwd": claimed_dir.path() },
+        });
+        let resp = request(&ep, &frame.to_string()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            v["peerCwd"].as_str(),
+            Some(claimed_canonical.as_str()),
+            "pid 一致的自证 cwd 必须被采信"
+        );
+
+        // ② pid 不符 → 忽略自证，维持 procfs 派生值（测试进程真实 cwd）
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "x", "params": {},
+            BRIDGE_IDENTITY_FIELD: { "pid": 999_999, "cwd": claimed_dir.path() },
+        });
+        let resp = request(&ep, &frame.to_string()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let real_cwd = std::fs::canonicalize(std::env::current_dir().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            v["peerCwd"].as_str(),
+            Some(real_cwd.as_str()),
+            "pid 不符的自证 cwd 必须被忽略"
+        );
+
+        // ③ 不带字段 → 行为不变（procfs 派生）
+        let resp = request(&ep, r#"{"jsonrpc":"2.0","id":3,"method":"x","params":{}}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["peerCwd"].as_str(), Some(real_cwd.as_str()));
+    }
+
+    // -------------------------------------------------------------------------
+    // #32：bridge 自证身份提取与采信判定
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn extract_bridge_identity_shapes() {
+        // 合法
+        assert_eq!(
+            extract_bridge_identity(r#"{"lkBridge":{"pid":42,"cwd":"C:\\tmp"}}"#),
+            Some((42u32, r"C:\tmp".to_string()))
+        );
+        // 缺字段 / 形态不合法 / pid=0 / 空 cwd / 非 JSON
+        for bad in [
+            r#"{"jsonrpc":"2.0"}"#,
+            r#"{"lkBridge":{"cwd":"/tmp"}}"#,
+            r#"{"lkBridge":{"pid":1}}"#,
+            r#"{"lkBridge":{"pid":0,"cwd":"/tmp"}}"#,
+            r#"{"lkBridge":{"pid":"7","cwd":"/tmp"}}"#,
+            r#"{"lkBridge":{"pid":1,"cwd":""}}"#,
+            r#"{"lkBridge":{"pid":-1,"cwd":"/tmp"}}"#,
+            "not json",
+        ] {
+            assert_eq!(extract_bridge_identity(bad), None, "case: {bad}");
+        }
+    }
+
+    #[test]
+    fn apply_bridge_identity_only_trusts_matching_pid() {
+        // 一致 → 采信并 canonical 化
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let line = format!(
+            r#"{{"{f}":{{"pid":7,"cwd":{cwd}}}}}"#,
+            f = BRIDGE_IDENTITY_FIELD,
+            cwd = serde_json::to_string(dir.path().to_str().unwrap()).unwrap()
+        );
+        let mut peer = PeerInfo { pid: 7, cwd: None };
+        apply_bridge_identity(&mut peer, &line, 7);
+        assert_eq!(peer.cwd.as_deref(), Some(canonical.as_str()));
+
+        // 不一致 → 忽略（维持派生值）
+        let mut peer = PeerInfo {
+            pid: 8,
+            cwd: Some("/derived".into()),
+        };
+        apply_bridge_identity(&mut peer, &line, 8);
+        assert_eq!(peer.cwd.as_deref(), Some("/derived"));
+
+        // 对端 PID 未知（0）→ 一律不采信（fail-closed）
+        let mut peer = PeerInfo::default();
+        apply_bridge_identity(&mut peer, &line, 0);
+        assert_eq!(peer.cwd, None);
+
+        // canonicalize 失败（不存在目录）→ cwd=None（fail-closed）
+        let line = format!(
+            r#"{{"{f}":{{"pid":7,"cwd":"/nonexistent-lk-bridge-cwd-xyz"}}}}"#,
+            f = BRIDGE_IDENTITY_FIELD
+        );
+        let mut peer = PeerInfo {
+            pid: 7,
+            cwd: Some("/was-derived".into()),
+        };
+        apply_bridge_identity(&mut peer, &line, 7);
+        assert_eq!(peer.cwd, None, "canonicalize 失败必须 fail-closed");
     }
 }
