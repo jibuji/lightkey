@@ -88,8 +88,10 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 - **不新增任何监听面**：bridge 是按需拉起的短命客户端进程，不是服务；
 - **用户边界不变**：interop 子进程以同一 Windows 用户令牌运行，named pipe 的
   「仅本用户」ACL（transport `UserOnlySa`）语义原样成立；
-- **协议零变更**：行 JSON JSON-RPC、会话令牌、G1 三阶段审批、30s 超时默认拒绝
-  全部照旧；服务端（lk-daemon / lk-app）**无需任何改动**。
+- **协议向后兼容的增量扩展**：行 JSON JSON-RPC、会话令牌、G1 三阶段审批、
+  30s 超时默认拒绝全部照旧；bridge 在转发帧顶层附加可选自证身份字段
+  （`lkBridge`，§7.4 修订），守护侧校验后采信（#32）——旧客户端不带该
+  字段行为不变，旧守护进程忽略未知成员。
 
 ## 6. 二进制与编译矩阵
 
@@ -111,6 +113,11 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
   一进程一请求（与现有 `transport::request()` 同构；首版不做长驻会话）。
 - **字节纪律**：stdin/stdout 一律按原始字节读写（`std::io` 默认即如此），
   禁止任何文本模式转换（实证 #3：cmd 文本模式会损坏 UTF-8 与换行）。
+- **自证 cwd（§7.4 修订，issue #32）**：转发帧为合法 JSON 时，bridge 在
+  中继前以顶层 `lkBridge = {"pid": <自身进程号>, "cwd": <GetCurrentDirectoryW
+  结果>}` **覆写**同名字段——WSL 内 Linux 客户端无法伪造；非 JSON 帧
+  原样转发（守护进程按 parse error 拒绝）。`current_dir()` 失败时不带
+  字段转发，守护侧回落既有 fail-closed 派生。
 - **阻塞语义**：`authz.evaluate` 的第③层会在服务端等待至多 30s
   （`approval_timeout_secs`），bridge 必须保持管道打开直到响应到达——
   单请求模式下天然成立（服务端每连接一线程阻塞式处理，实证架构支持）。
@@ -118,8 +125,8 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
   - `bridge.no_daemon`：daemon.json 缺失或管道不可达；
   - `bridge.version_incompatible`：版本校验失败（§7.3）；
   - `bridge.io`：中继 I/O 失败。
-- bridge **不做任何业务解析**（除版本校验外帧原样透传），决策权始终在
-  守护进程——符合「安全流程硬编码在 Rust 守护进程侧」的既定边界。
+- bridge **不做任何业务解析**（除版本校验与自证身份附加外帧原样透传），
+  决策权始终在守护进程——符合「安全流程硬编码在 Rust 守护进程侧」的既定边界。
 
 ### 7.2 Linux `lk` 传输抽象
 
@@ -178,7 +185,36 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
   （`/mnt/<盘>/…`）→ Windows 绝对路径形态（与 interop bridge 进程继承的
   PEB cwd 同命名空间，精确匹配）；其余 → `wsl://<默认发行版>/...`。
 - 归一化在**守护进程侧**执行（对 bridge 传来的 cwd 字符串），客户端自报值
-  仍不被信任——判定依据始终是 bridge 进程的 PEB 真实 cwd（interop 继承）。
+  仍不被信任——判定依据见下「§7.4.1 修订」。
+
+### 7.4.1 bridge 自证 cwd（issue #32 修订，2026-08）
+
+原设计假设 bridge 进程 cwd 可由守护进程经 PEB 跨进程读取（interop 继承的
+UNC 目录）。真机实证推翻该假设：WSL2 interop 启动的 Windows 进程，其 PEB
+地址可取，但任意偏移的 `ReadProcessMemory`/`NtReadVirtualMemory` 均失败
+（err 299 / 5，与 `OpenProcess` 权限无关）；普通 Windows 进程同算法读取
+成功。即**跨进程读 interop 进程 PEB 根本不可行**——原 §7.2 的验证是进程内
+自读，掩盖了该问题。后果：bridge 链路 `inject` 授权恒因无法确定工作目录被
+拒（no_cwd，fail-closed 行为本身正确）。修订机制：
+
+1. **bridge 自证**：bridge 进程在中继前用同进程可行的
+   `GetCurrentDirectoryW()` 取自身 cwd，连同自身 PID 以转发帧顶层可选字段
+   `lkBridge = {"pid": u32, "cwd": string}` **覆写**附加（可信捆绑代码，
+   WSL 内 Linux 客户端无法伪造；普通客户端不带此字段，行为不变）；
+2. **守护侧校验采信**：传输层在读到请求行后派生对端身份——命名管道对端
+   PID 取自 `GetNamedPipeClientProcessId`（UDS 为 `SO_PEERCRED`）；仅当
+   帧内 `lkBridge.pid` 与对端 PID 一致且对端 PID 已知时，采信其 cwd 并按
+   既有契约 canonical 化（canonicalize 失败 → cwd=None → 授权 fail-closed）。
+   pid 不符或字段缺失 → 忽略自证、维持既有 PEB/procfs 派生结果；
+3. **信任边界说明**：pid 校验证明的是「该字段由对端进程自身附加」。同用户
+   本地进程理论上可自带匹配 pid 的字段冒称任意 cwd，但其本就可把真实 cwd
+   切到同一目录（Windows 下可直接 `cd` 入 WSL UNC），无新增越权面；starter
+   回溯仍基于真实 PID 不变。
+
+**协议兼容性结论（不动次版本号）**：`lkBridge` 是 JSON-RPC 允许的顶层扩展
+成员且可选——旧守护进程反序列化忽略未知成员，新客户端照常工作；旧 bridge +
+新守护回落既有派生（interop 场景维持 no_cwd 现状，不产生新的破坏）。两个
+方向均为优雅退化、无帧格式断裂，故主.次版本号维持不变。
 
 ### 7.5 审计与弹窗展示
 
@@ -194,7 +230,7 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 |---|---|
 | 跨用户访问 | interop 子进程继承同一 Windows 用户令牌；named pipe ACL（仅本用户）不变；WSL 默认用户即 Windows 用户 |
 | 新增网络暴露 | 无——bridge 不监听任何端口/套接字 |
-| 伪造启动者/项目目录 | 客户端自报字段仍不信任：PID 取自 `GetNamedPipeClientProcessId`，cwd 取自 bridge 进程 PEB（interop 继承的真实目录） |
+| 伪造启动者/项目目录 | 客户端自报字段仍不信任：PID 取自 `GetNamedPipeClientProcessId`；cwd = bridge 自证（`GetCurrentDirectoryW`，§7.4.1 修订）经对端 PID 一致性校验后采信，本地客户端维持 PEB 派生——interop 进程 PEB 跨进程读取不可行（#32） |
 | 绕过授权门 | 三层模型硬编码在守护进程，bridge 无决策权；fail-closed 语义（未知启动者/无 UI/超时）全部保留 |
 | 密钥泄漏到对话环境 | 注入值仅经 `authz.evaluate` 响应到达 `lk` 进程并直接进子进程 env；审计/摘要永不明文（D11 不变） |
 | 新旧版本静默失配 | §7.3 版本校验，明确报错 |

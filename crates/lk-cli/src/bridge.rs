@@ -17,6 +17,13 @@
 //!   响应 `version` 与自身 `CARGO_PKG_VERSION` 主.次一致（补丁号忽略）；
 //!   不一致或响应缺失（陈旧构建对未知帧静默关闭连接，实证 #7）→
 //!   `bridge.version_incompatible` 明确报错，绝不静默降级。
+//! - **自证 cwd（§7.4 修订，issue #32）**：interop 进程的 PEB 无法跨进程
+//!   读取（任意偏移 ReadProcessMemory 均 err 299/5），守护侧对 bridge 进程
+//!   的既有 PEB cwd 派生恒失败 → inject 恒被 no_cwd 拒绝。故本进程在中继
+//!   前用同进程可行的 `GetCurrentDirectoryW`（[`std::env::current_dir`]）
+//!   取自身 cwd，连同自身 PID 以顶层 `lkBridge` 字段附加到转发帧并**覆写**
+//!   同名字段——WSL 内 Linux 客户端无法伪造；守护侧校验帧内 pid 与命名管道
+//!   对端 PID 一致后采信。普通客户端不带此字段，行为不变。
 //! - 平台说明：本命令跨平台可用——Windows 上连 named pipe（生产路径，
 //!   WSL 桥的目标端）；Linux/macOS 上连 UDS（开发调试用，行为一致）。
 
@@ -173,8 +180,12 @@ fn relay_once(dir: &Path, input: &mut impl BufRead, out: &mut impl Write) -> i32
         return 0;
     }
 
-    // ④ 转发并原样回写响应行。此处阻塞读直到响应到达（第③层审批窗口最长
-    // 30s < 传输层 300s 读超时）；单请求模式进程存活期即管道存活期。
+    // ④ 附加自证身份（§7.4 修订，#32）后转发并原样回写响应行。帧为合法
+    // JSON 时以顶层 `lkBridge`（pid + cwd）**覆写**客户端可能伪造的同名字段；
+    // 非 JSON 帧原样转发（守护进程将以 parse error 拒绝，行为与既往一致）。
+    let frame = attach_bridge_identity(frame);
+    // 此处阻塞读直到响应到达（第③层审批窗口最长 30s < 传输层 300s 读超时）；
+    // 单请求模式进程存活期即管道存活期。
     match transport::request(&ep, &frame) {
         Ok(resp_line) => {
             // 原样写字节 + 行结束符；不做任何再序列化（透传保真）
@@ -207,6 +218,29 @@ fn version_fail(out: &mut impl Write) {
             env!("CARGO_PKG_VERSION")
         ),
     );
+}
+
+/// 附加 bridge 自证身份（#32）：帧为合法 JSON 对象 → 顶层写入
+/// `lkBridge = {pid, cwd}`（cwd 取自同进程 `GetCurrentDirectoryW`，PID 为
+/// 自身进程号；**覆写**语义——客户端自报的任何同名字段一律被替换）。字段
+/// 附加失败（current_dir 失败等）→ 不带字段转发，守护侧回落 PEB 派生
+/// （fail-closed）；非 JSON 帧 → 原样返回。
+fn attach_bridge_identity(frame: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(&frame) else {
+        return frame;
+    };
+    if !v.is_object() {
+        return frame;
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => return frame, // 无 cwd 可证 → 守护侧 fail-closed 判定
+    };
+    v[lk_daemon::transport::BRIDGE_IDENTITY_FIELD] = json!({
+        "pid": std::process::id(),
+        "cwd": cwd,
+    });
+    v.to_string()
 }
 
 #[cfg(test)]
@@ -347,11 +381,56 @@ mod tests {
     fn frame_passthrough_byte_fidelity() {
         let tmp = tempfile::tempdir().unwrap();
         spawn_mock_daemon(tmp.path(), Some(env!("CARGO_PKG_VERSION")));
-        // 多字节 UTF-8、空格、转义——mock 回显原帧，要求逐字节往返一致
+        // 多字节 UTF-8、空格、转义——mock 回显原帧，要求载荷逐字节往返一致
+        //（#32：bridge 附加 lkBridge 身份字段属预期差异，剥离后比较）
         let frame = "{\"params\":{\"note\":\"中文密钥✓\",\"pad\":\"  spaced  \"}}";
         let (code, out) = run_relay(tmp.path(), format!("{frame}\n").as_bytes());
         assert_eq!(code, 0);
-        assert_eq!(String::from_utf8(out).unwrap(), format!("{frame}\n"));
+        let echoed: Value = serde_json::from_slice(&out).expect("回显为合法 JSON");
+        let identity = &echoed[lk_daemon::transport::BRIDGE_IDENTITY_FIELD];
+        assert_eq!(
+            identity["pid"].as_u64(),
+            Some(std::process::id() as u64),
+            "自证 pid 必须为 bridge 自身"
+        );
+        assert_eq!(
+            identity["cwd"].as_str(),
+            Some(std::env::current_dir().unwrap().to_string_lossy().as_ref()),
+            "自证 cwd 必须为 bridge 自身 GetCurrentDirectoryW 结果"
+        );
+        let mut payload = echoed.clone();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove(lk_daemon::transport::BRIDGE_IDENTITY_FIELD);
+        assert_eq!(
+            payload,
+            serde_json::from_str::<Value>(frame).unwrap(),
+            "剥离身份字段后载荷必须与原帧语义一致（含多字节 UTF-8/空格）"
+        );
+    }
+
+    /// #32：客户端自报的 lkBridge 字段必须被 bridge 覆盖（Linux 客户端无法
+    /// 伪造自证身份——可信捆绑代码覆写而非透传）。
+    #[cfg(unix)]
+    #[test]
+    fn client_supplied_identity_is_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        spawn_mock_daemon(tmp.path(), Some(env!("CARGO_PKG_VERSION")));
+        let forged = format!(
+            r#"{{"params":{{}},"{}":{{"pid":123,"cwd":"C:\\forged"}}}}"#,
+            lk_daemon::transport::BRIDGE_IDENTITY_FIELD
+        );
+        let (code, out) = run_relay(tmp.path(), format!("{forged}\n").as_bytes());
+        assert_eq!(code, 0);
+        let echoed: Value = serde_json::from_slice(&out).unwrap();
+        let identity = &echoed[lk_daemon::transport::BRIDGE_IDENTITY_FIELD];
+        assert_eq!(identity["pid"].as_u64(), Some(std::process::id() as u64));
+        assert_ne!(
+            identity["cwd"].as_str(),
+            Some("C:\\forged"),
+            "伪造 cwd 必须被覆盖"
+        );
     }
 
     #[cfg(unix)]
