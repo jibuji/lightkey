@@ -1321,18 +1321,21 @@ mod tests {
         std::thread::spawn(move || {
             let _ = serve(&dir, handler, None, &SHUTDOWN);
         });
-        // serve 线程需要一点时间创建首个监听实例；connect() 自带 233 短重试
-        let mut ep = None;
-        for _ in 0..20 {
-            if let Some(e) = read_endpoint(tmp.path()) {
-                ep = Some(e);
-                break;
+        // bind_server 同步写 daemon.json，早于 serve 线程创建首个监听实例：
+        // 该窗口内 CreateFileW 报 ERROR_FILE_NOT_FOUND(2)，connect() 对此
+        // 不重试（立即失败是守护未运行的语义；生产由 ensure_daemon 探测
+        // 循环兜底），故此处对「读端点 + 连接」整体做有界重试（~2s）。
+        let mut stream = None;
+        for _ in 0..40 {
+            if let Some(ep) = read_endpoint(tmp.path()) {
+                if let Ok(s) = connect(&ep) {
+                    stream = Some(s);
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let ep = ep.expect("daemon.json 已写入");
-
-        let mut stream = connect(&ep).expect("连接 mock 守护");
+        let mut stream = stream.expect("mock 守护监听实例就绪并可连接");
         write_line(
             &mut stream,
             r#"{"jsonrpc":"2.0","id":1,"method":"x","params":{}}"#,
