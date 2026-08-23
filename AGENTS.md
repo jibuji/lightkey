@@ -90,6 +90,13 @@
   (仅 init 响应一次) → 完成解锁；主密码 ≥8 位策略留 Rust（vault.init/
   recover 校验，弱密码/已存在库 UI 统一文案）；浏览器 E2E 用
   `__LIGHTKEY_MOCK__.simulateFreshInstall()` + 重载模拟首启）
+- [x] M2.75 跨子系统 stdio 桥（补充拍板 #14；规格 `docs/cross-subsystem.md`）：
+  `lk.exe bridge` stdio 中继 + Linux `lk` local/bridge 传输抽象（`LIGHTKEY_BRIDGE`
+  探测分型：装了连不上明确报错、没装静默本地，绝不静默回落防空库错觉；
+  连接目标可见）+ 协议版本主.次校验 fail-closed（daemon.json 可选 version）；
+  `lk-core::path_ns` 跨命名空间归一化（`wsl://<distro>/…` 规范形，两侧同函数）
+  + 审计 `channel=wsl-bridge`；release 双产物（Linux `lk` + 桌面包捆绑
+  `lk.exe`）；E2E `scripts/e2e_cross_subsystem.sh`（无 WSL 干净跳过）
 - [ ] M3 浏览器填充
 
 ## Maintaining this file

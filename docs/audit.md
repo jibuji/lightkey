@@ -23,7 +23,7 @@
   "target": "<目标程序>",             // 例如 npm、node、python3
   "command": "<命令摘要>",            // 命令摘要——见「摘要原则」
   "result": "allowed | denied | timeout",
-  "channel": "cli | desktop | approval",   // 来源通道
+  "channel": "cli | desktop | approval | wsl-bridge",   // 来源通道（wsl-bridge = WSL 内客户端经 interop stdio 桥，补充拍板 #14，见 [cross-subsystem.md](cross-subsystem.md) §7.5）
   "hmac": "<base64, HMAC-SHA256(K_audit, 事件规范化字节)>"
 }
 ```

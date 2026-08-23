@@ -19,7 +19,7 @@
 |------|------|-----------|
 | [decisions.md](decisions.md) | Wayfinder 决议集（拍板记录 + 映射） | 全部 |
 | [architecture.md](architecture.md) | 总体架构、组件边界、技术栈、workspace | 全部 |
-| [milestones.md](milestones.md) | M0–M3 里程碑范围与验收 | 全部 |
+| [milestones.md](milestones.md) | M0–M3 里程碑范围与验收（含 M1.5 / M2.5 / M2.75） | 全部 |
 | [crypto.md](crypto.md) | 加密原语、KDF、密钥分叉、自描述密文格式 | M0 |
 | [data-model.md](data-model.md) | 条目/附件/索引/墓碑、CAS、schema | M0 |
 | [ipc.md](ipc.md) | 本地 IPC、守护进程、会话令牌 | M0 |
@@ -27,6 +27,7 @@
 | [recovery.md](recovery.md) | 恢复码、恢复信封、已信任设备宽限 | M0 |
 | [sync.md](sync.md) | BYO 同步、变更发现（轮询）、冲突收敛 | M1 |
 | [authorization-gate.md](authorization-gate.md) | Agent 授权门三层模型、规则库、`lk inject` | M2 |
+| [cross-subsystem.md](cross-subsystem.md) | 跨子系统 stdio 桥（WSL CLI ↔ Windows 桌面守护实例；补充拍板 #14） | M2.75 |
 | [browser-fill.md](browser-fill.md) | 浏览器填充通道协议（Native Messaging） | M3 |
 | [testing.md](testing.md) | 三层测试策略与 CI | 全部 |
 | [cli.md](cli.md) | `lk` CLI 命令参考 | 全部 |

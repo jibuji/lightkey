@@ -1878,9 +1878,7 @@ fn confirm_windows_candidate(
     input: &mut dyn std::io::BufRead,
 ) -> Option<String> {
     ask_rule_confirm(
-        &format!(
-            "「{project_dir}」为 Windows 挂载目录（drvfs），折算为 {project_dir} → {win}"
-        ),
+        &format!("「{project_dir}」为 Windows 挂载目录（drvfs），折算为 {project_dir} → {win}"),
         win,
         interactive,
         input,
@@ -1910,10 +1908,7 @@ fn drvfs_rule_windows_form(posix: &str) -> Option<String> {
 /// 直通入口用；不识别相对路径、无盘符形态与 wsl:// 规范形）。
 fn is_windows_abs(raw: &str) -> bool {
     let b = raw.as_bytes();
-    b.len() >= 3
-        && b[0].is_ascii_alphabetic()
-        && b[1] == b':'
-        && (b[2] == b'\\' || b[2] == b'/')
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
 /// bridge 后端下显式 Windows 绝对路径直通：`X:\…` / `X:/…` 输入跳过本地
@@ -2204,8 +2199,7 @@ mod wsl_rule_add_tests {
         // wsl 原生路径不受影响：仍走 wsl:// 规范形并可命中
         let wsl = wsl_candidate("/home/u/p", "Debian").unwrap();
         assert_eq!(wsl, "wsl://Debian/home/u/p");
-        let cwd_wsl =
-            lk_core::path_ns::canonical_project_dir(r"\\wsl.localhost\Debian\home\u\p");
+        let cwd_wsl = lk_core::path_ns::canonical_project_dir(r"\\wsl.localhost\Debian\home\u\p");
         assert!(lk_core::authz::project_dir_matches(&wsl, &cwd_wsl));
     }
 
@@ -2257,7 +2251,10 @@ mod wsl_rule_add_tests {
             Some(r"C:/Users/u/proj")
         );
         // 本地后端（bridge_mode=false）：行为不变，不直通
-        assert_eq!(bridge_windows_abs_passthrough(r"C:\Users\u\proj", false), None);
+        assert_eq!(
+            bridge_windows_abs_passthrough(r"C:\Users\u\proj", false),
+            None
+        );
         // 非 Windows 形态在 bridge 下也不直通
         assert_eq!(bridge_windows_abs_passthrough("/home/u/p", true), None);
         assert_eq!(

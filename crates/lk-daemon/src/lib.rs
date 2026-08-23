@@ -1951,7 +1951,9 @@ mod tests {
             .expect("规则应入库")
             .to_string();
         let canonical = lk_core::path_ns::canonical_project_dir(
-            &std::fs::canonicalize(proj.path()).unwrap().to_string_lossy(),
+            &std::fs::canonicalize(proj.path())
+                .unwrap()
+                .to_string_lossy(),
         );
         assert_eq!(stored, canonical);
         // 归一化后的存储形态与 evaluate 侧归一化 cwd 祖先匹配命中
