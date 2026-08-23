@@ -510,7 +510,11 @@ mod imp {
     struct UserOnlySa {
         attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
         _sd: Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>,
-        _acl: [u64; 32],
+        // 必须 Box：SetSecurityDescriptorDacl 只在 SD 里存 ACL 指针（不拷贝），
+        // 数组按值返回会整体复制到新地址 → SD 内 Dacl 指针悬垂 →
+        // CreateNamedPipeW 失败 → 服务端无监听实例。Box 移动不搬移目标
+        // 内存，指针跨返回值保持有效；u64 背板同时满足 ACL 的对齐要求。
+        _acl: Box<[u64; 32]>,
     }
 
     fn user_only_sa() -> std::io::Result<UserOnlySa> {
@@ -547,8 +551,9 @@ mod imp {
             let user = &*(user_buf.as_ptr() as *const TOKEN_USER);
             let sid: PSID = user.User.Sid;
 
-            // ACL 内存 Windows 要求至少 DWORD 对齐（u64 背板保证 8 字节）。
-            let mut acl_buf = [0u64; 32]; // 256 B
+            // ACL 内存 Windows 要求至少 DWORD 对齐（u64 背板保证 8 字节）；
+            // 堆分配保证地址稳定（见 UserOnlySa._acl 注释）。
+            let mut acl_buf = Box::new([0u64; 32]); // 256 B
             let acl = acl_buf.as_mut_ptr() as *mut ACL;
             if InitializeAcl(acl, std::mem::size_of_val(&acl_buf) as u32, ACL_REVISION) == 0
                 || AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, sid) == 0
@@ -1330,16 +1335,22 @@ mod tests {
         // 不重试（立即失败是守护未运行的语义；生产由 ensure_daemon 探测
         // 循环兜底），故此处对「读端点 + 连接」整体做有界重试（~2s）。
         let mut stream = None;
+        let mut last_err: Option<std::io::Error> = None;
         for _ in 0..40 {
             if let Some(ep) = read_endpoint(tmp.path()) {
-                if let Ok(s) = connect(&ep) {
-                    stream = Some(s);
-                    break;
+                match connect(&ep) {
+                    Ok(s) => {
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let mut stream = stream.expect("mock 守护监听实例就绪并可连接");
+        let mut stream = stream.unwrap_or_else(|| {
+            panic!("mock 守护监听实例就绪并可连接（最后一次连接错误：{last_err:?}）")
+        });
         write_line(
             &mut stream,
             r#"{"jsonrpc":"2.0","id":1,"method":"x","params":{}}"#,
