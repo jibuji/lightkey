@@ -10,6 +10,8 @@
 
 - M0（单机闭环）、M1（同步）**已完成，现状不重写**。
 - 新增 **M1.5 —— 插件化改造**，插入 M1 之后、M2 之前。
+- 新增 **M2.75 —— 跨子系统 stdio 桥**（补充拍板 #14），插入 M2.5 之后、M3 之前；
+  完整规格见 [cross-subsystem.md](cross-subsystem.md)。
 - **M2 / M3 标签保持不变**：M2 = Agent 授权门 + 桌面端（在插件化骨架上），
   M3 = 浏览器填充（V1 之后）。此编号方案避免波及其它文档的 M2/M3 引用，
   并已落地（M1.5 独立里程碑已完成）。
@@ -120,6 +122,35 @@ M1.5 行为不回归仍保持（插件化骨架上新增功能不破坏既有闭
 启动 → 解锁页（回归）；前端单测覆盖四步流（弱/强/不一致、checkbox 门控、
 完成跳转）+ Rust 库状态检测单测（无库/有库）；`cargo test` + vitest +
 clippy/fmt 全绿；agent_browser 跑通「首启→向导→完成→解锁」全流程。
+
+## M2.75 —— 跨子系统 stdio 桥（已完成）
+
+**目标**：WSL2 内 Linux 原生应用（含 agent 工具链）经 `lk` 命令连接同一台
+Windows 主机上的 LightKey 桌面守护实例——查看条目、请求授权、向 **Linux
+子进程**注入被批准的密钥，全程可审计、默认拒绝语义不变。完整规格见
+[cross-subsystem.md](cross-subsystem.md)（补充拍板 #14）。
+
+范围：
+
+- interop stdio 桥：`lk.exe bridge`（Windows 侧中继，一进程一请求，随桌面
+  包装入安装目录）+ Linux `lk` 传输抽象（local / bridge 后端选择；
+  `LIGHTKEY_BRIDGE` 探测分型——装了连不上明确报错、没装静默本地，绝不静默
+  回落防空库错觉；连接目标可见：stderr 提示 + `lk status` 目标字段）。
+- 协议版本校验（主.次一致，fail-closed，绝不静默降级）；`daemon.json` 可选
+  `version` 字段（旧文件缺省可读）。
+- `lk-core::path_ns` projectDir 跨命名空间归一化（UNC/verbatim →
+  `wsl://<distro>/…` 规范形；规则入库与运行时判定两侧同函数）+ 审计
+  `channel=wsl-bridge` 标注；前端弹窗/规则列表 `wsl://` 形态标注 (WSL)。
+- 发布流水线：Linux `lk` 产物 + 桌面包 bundle.resources 捆绑 `lk.exe`；
+  `scripts/e2e_cross_subsystem.sh`（宿主无 WSL 干净跳过，CI 不阻塞）。
+
+**出口**：`path_ns` 归一化 / bridge 帧透传字节保真 / 版本校验三态单测 + 授权门
+绕过清单增补四项（见 [authorization-gate.md](authorization-gate.md) §7）+
+跨子系统 E2E（见 [testing.md](testing.md) 第四层补充）；五文档回填
+（ipc / authorization-gate / cli / architecture / testing）；Windows 桌面包
+安装目录含独立 `lk.exe`（修复装机目录缺失 CLI 的前科，cross-subsystem.md §4#7）。
+
+> 本里程碑为补充拍板 #14 新增（插入 M2.5 之后、M3 之前），已完成。
 
 ## M3 —— 浏览器填充（V1 之后）
 

@@ -26,6 +26,7 @@
 //! | sync-engine | [`sync`] | BYO 变更发现、轮询、冲突收敛 | `docs/sync.md` |
 //! | authz-gate | [`authz`] | Agent 授权门三层模型、规则库、审批通道 | `docs/authorization-gate.md` |
 //! | starter | [`starter`] | 启动者判定：IPC 对端 PID 进程链回溯 + cwd（fail-closed） | `docs/authorization-gate.md` §3 |
+//! | path-ns | [`path_ns`] | projectDir 跨命名空间归一化（WSL UNC → `wsl://` 规范形） | `docs/cross-subsystem.md` §7.4 |
 //!
 //! ### 共享 / 宿主侧
 //!
@@ -50,6 +51,7 @@ pub mod bus;
 pub mod crypto;
 pub mod ipc;
 pub mod model;
+pub mod path_ns;
 pub mod recovery;
 pub mod service;
 pub mod session;

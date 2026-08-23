@@ -755,14 +755,19 @@ impl Daemon {
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
 
-    /// `rule.add`：校验 → canonicalize → 入库（vault 写锁）+ 审计
-    /// （channel 区分 cli/desktop；testing.md 第三层 #19 超长/非法拒绝）。
+    /// `rule.add`：跨命名空间归一化 → 校验 → canonicalize → 入库（vault
+    /// 写锁）+ 审计（channel 区分 cli/desktop/wsl-bridge；testing.md 第三层
+    /// #19 超长/非法拒绝）。
     fn rule_add(&mut self, id: Value, params: Value) -> RpcResponse {
         let p: RuleAddParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        if let Err(e) = validate_rule_fields(&p.project_dir, &p.name, &p.command, &p.keys) {
+        // projectDir 入库基准（cross-subsystem.md §7.4，两侧同函数）：先过
+        // 跨命名空间归一化——UNC / verbatim 包裹的 WSL 路径折算为
+        // `wsl://<distro>/<rest>` 规范形；常规路径维持原语义。
+        let project_dir_input = lk_core::path_ns::canonical_project_dir(&p.project_dir);
+        if let Err(e) = validate_rule_fields(&project_dir_input, &p.name, &p.command, &p.keys) {
             return RpcResponse::err(
                 id,
                 ERR_INVALID_PARAMS,
@@ -771,16 +776,24 @@ impl Daemon {
             );
         }
         let channel = audit_channel(p.channel.as_deref());
-        // projectDir 以 canonical 形态入库（解析符号链接；与匹配侧同基准）
-        let project_dir = match std::fs::canonicalize(&p.project_dir) {
-            Ok(c) => c.to_string_lossy().to_string(),
-            Err(_) => {
-                return RpcResponse::err(
-                    id,
-                    ERR_INVALID_PARAMS,
-                    "invalid params",
-                    Some(json!({ "detail": format!("projectDir 无法解析：{}", p.project_dir) })),
-                )
+        // wsl:// 规范形直接入库（非本机 fs 路径）；常规路径仍以 canonical
+        // 形态入库（解析符号链接），并经与运行时 cwd 判定同一个归一化函数
+        // 剥离 Windows verbatim 前缀（§7.4 两侧同函数，存储形态 == 判定形态）
+        let project_dir = if lk_core::path_ns::is_wsl_canonical(&project_dir_input) {
+            project_dir_input.clone()
+        } else {
+            match std::fs::canonicalize(&project_dir_input) {
+                Ok(c) => lk_core::path_ns::canonical_project_dir(&c.to_string_lossy()),
+                Err(_) => {
+                    return RpcResponse::err(
+                        id,
+                        ERR_INVALID_PARAMS,
+                        "invalid params",
+                        Some(
+                            json!({ "detail": format!("projectDir 无法解析：{}", p.project_dir) }),
+                        ),
+                    )
+                }
             }
         };
         let draft = RuleDraft {
@@ -910,8 +923,11 @@ impl Daemon {
         let channel = audit_channel(p.channel.as_deref());
         // 启动者判定：守护进程侧从 IPC 对端 PID 回溯（客户端自报字段不信任）
         let starter = derive_starter(peer);
-        // cwd 以对端真实 cwd（canonical）为准；客户端自报 cwd 仅作提示（忽略）
-        let cwd = peer.cwd.clone().unwrap_or_default();
+        // cwd 以对端真实 cwd（canonical）为准；客户端自报 cwd 仅作提示（忽略）。
+        // 跨命名空间归一化（cross-subsystem.md §7.4，两侧同函数）：WSL UNC /
+        // verbatim 形态折算为 `wsl://<distro>/<rest>` 规范形后再做祖先匹配，
+        // 与 rule.add 入库基准一致——伪造 cwd 写法变体不得绕过或漏配。
+        let cwd = lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
         let req = AuthzRequest {
             starter,
             cwd,
@@ -1171,9 +1187,11 @@ fn derive_starter(peer: &PeerInfo) -> String {
 }
 
 /// 审计来源标注（`authz.evaluate`/`rule.*` 的 `channel` 参数；缺省 cli）。
+/// `wsl-bridge` = WSL 内客户端经 interop stdio 桥（cross-subsystem.md §7.5）。
 fn audit_channel(channel: Option<&str>) -> AuditChannel {
     match channel {
         Some("desktop") => AuditChannel::Desktop,
+        Some("wsl-bridge") => AuditChannel::WslBridge,
         _ => AuditChannel::Cli,
     }
 }
@@ -1910,6 +1928,49 @@ mod tests {
         AuditLog::open(dir).unwrap().read().unwrap()
     }
 
+    /// 规则入库形态与运行时 cwd 判定同基准（§7.4 两侧同函数）：rule.add 的
+    /// canonicalize 产物再过 canonical_project_dir 入库；Windows 上该归一化
+    /// 剥离 verbatim 前缀，否则与 evaluate 侧归一化 cwd 不匹配（回归门：
+    /// Windows CI 下此断言直接捕捉存储形态漂移）。
+    #[test]
+    fn rule_add_stores_normalized_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (state, _shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+        let add = rpc_result(&state.lock().unwrap().handle(
+            &rpc_line(
+                M_RULE_ADD,
+                Some(&token),
+                json!({ "projectDir": proj.path(), "name": "p",
+                        "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+            ),
+            &PeerInfo::unknown(),
+        ));
+        let stored = add["rule"]["projectDir"]
+            .as_str()
+            .expect("规则应入库")
+            .to_string();
+        let canonical = lk_core::path_ns::canonical_project_dir(
+            &std::fs::canonicalize(proj.path())
+                .unwrap()
+                .to_string_lossy(),
+        );
+        assert_eq!(stored, canonical);
+        // 归一化后的存储形态与 evaluate 侧归一化 cwd 祖先匹配命中
+        let handler = make_handler(&state, &_shared);
+        let peer = test_peer(Some(proj.path()));
+        let resp = handler(
+            &rpc_line(
+                M_AUTHZ_EVALUATE,
+                Some(&token),
+                json!({ "command": "npm publish", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+            ),
+            &peer,
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["allowed"], true, "规则命中应放行：{resp}");
+    }
+
     /// 规则命中（第 2 层）：env 只含被授权 key 的值；审计 allowed（channel=cli）。
     #[test]
     fn authz_rule_hit_injects_env_and_audits() {
@@ -2087,12 +2148,15 @@ mod tests {
         let fv: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(fv["method"], "authz.request");
         assert!(fv.get("id").is_none());
+        // projectDir 以对端 cwd 归一化形态广播（§7.4 两侧同函数：canonicalize
+        // 产物再过 canonical_project_dir，Windows 下剥离 verbatim \\?\ 前缀）
         assert_eq!(
             fv["params"]["projectDir"],
-            std::fs::canonicalize(proj.path())
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
+            lk_core::path_ns::canonical_project_dir(
+                &std::fs::canonicalize(proj.path())
+                    .unwrap()
+                    .to_string_lossy()
+            )
         );
         assert_eq!(fv["params"]["command"], "yarn publish");
         assert_eq!(fv["params"]["keys"][0], "NPM_TOKEN");
@@ -2240,11 +2304,13 @@ mod tests {
         let id = rule["id"].as_str().unwrap().to_string();
         assert_eq!(rule["name"], "pub");
         assert_eq!(rule["command"], "npm publish");
-        // projectDir 以 canonical 形态入库（Windows 下含 \\?\ 前缀与短名展开）
-        let canonical_proj = std::fs::canonicalize(proj.path())
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        // projectDir 以 canonical 形态入库（§7.4 两侧同函数：canonicalize 产物
+        // 再过 canonical_project_dir，Windows 下剥离 verbatim \\?\ 前缀）
+        let canonical_proj = lk_core::path_ns::canonical_project_dir(
+            &std::fs::canonicalize(proj.path())
+                .unwrap()
+                .to_string_lossy(),
+        );
         assert_eq!(rule["projectDir"], canonical_proj);
         // 广播 item.changed(kind=rule, deleted=false)（决策 #6）
         let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2325,6 +2391,57 @@ mod tests {
             .is_object());
         // 合法 → 入库
         assert!(handle(json!({ "projectDir": std::env::temp_dir(), "name": "n", "command": "c", "keys": ["K"] }))["result"]["rule"]["id"].is_string());
+    }
+
+    /// 跨命名空间归一化（cross-subsystem.md §7.4/§10）：rule.add 收 UNC WSL
+    /// 路径 → 以 `wsl://<distro>/<rest>` 规范形入库；运行时对端 cwd 为伪造
+    /// 写法变体（大写 distro / 尾斜杠）→ 归一化后与规则一致匹配放行；
+    /// `channel=wsl-bridge` 如实审计。
+    #[test]
+    fn rule_add_and_authz_normalize_wsl_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+        // 规则入库：UNC 形态（守护进程侧归一化为规范形）
+        let raw = state.lock().unwrap().handle(
+            &rpc_line(
+                M_RULE_ADD,
+                Some(&token),
+                json!({ "projectDir": r"\\wsl.localhost\Debian\home\u\p", "name": "wsl",
+                        "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "wsl-bridge" }),
+            ),
+            &PeerInfo::unknown(),
+        );
+        let add = rpc_result(&raw);
+        assert_eq!(
+            add["rule"]["projectDir"], "wsl://Debian/home/u/p",
+            "UNC 应归一为 wsl:// 规范形入库：{add}"
+        );
+        // 运行时：对端 cwd 为伪造写法变体（大写 distro + 尾斜杠）→ 命中同一规则
+        let handler = make_handler(&state, &shared);
+        let peer = PeerInfo {
+            pid: std::process::id(),
+            cwd: Some(r"\\wsl.localhost\DEBIAN\home\u\p\".to_string()),
+        };
+        let resp = handler(
+            &rpc_line(
+                M_AUTHZ_EVALUATE,
+                Some(&token),
+                json!({ "command": "npm publish", "keys": ["NPM_TOKEN"], "channel": "wsl-bridge" }),
+            ),
+            &peer,
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["allowed"], true, "归一化后应命中规则：{resp}");
+        // 审计如实记录 channel=wsl-bridge
+        let authz_evs: Vec<_> = audit_events(dir.path())
+            .into_iter()
+            .filter(|e| e.command.starts_with("lk inject"))
+            .collect();
+        assert_eq!(authz_evs.len(), 1);
+        assert_eq!(
+            authz_evs[0].channel,
+            lk_core::audit::AuditChannel::WslBridge
+        );
     }
 
     /// 审批回传伪造 requestId → 忽略（accepted=false；#17）；无令牌 → session.invalid（#18）。

@@ -23,17 +23,24 @@
   （三 crate：lk-core / lk-daemon / lk-cli）
 - 同步 E2E（M1 双客户端）：`bash scripts/e2e_m1.sh [lk-binary-path]`；
   单机回归：`bash scripts/e2e_m0.sh`；授权门 E2E（M2）：`bash scripts/e2e_m2.sh`
-  （都用 `file://` 本地模拟存储，无需凭据）。
+  （都用 `file://` 本地模拟存储，无需凭据）；跨子系统 E2E（M2.75，
+  WSL2+Windows 桌面包前置不满足则 SKIP exit 0）：
+  `bash scripts/e2e_cross_subsystem.sh [lk-binary-path] [--auto-approve]`。
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
   `crates/lk-app/tauri.conf.json` 的 devUrl 一致）；D 层单测 `npm test`
   （vitest；事件总线契约/装配/宿主渲染/审批弹窗）。
 - 桌面壳 Windows 验收：`cargo check --workspace --target x86_64-pc-windows-gnu`
   （本地需 mingw 交叉工具链：conda env `lightkey-mingw`，PATH 前置其 bin；
   Linux 无 webkit2gtk 不编译 lk-app）。
-- CI 骨架：`.github/workflows/ci.yml`；发布流水线：`.github/workflows/release.yml`
-  （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI + 独立 CLI `lk.exe`；tag `v*` → GitHub
-  Release 附件，main push / workflow_dispatch → Actions artifact；资产名版本号 tag 触发时取
+- CI 骨架：`.github/workflows/ci.yml`（Windows 全量 + ubuntu lk-cli clippy/test + frontend）；
+  发布流水线：`.github/workflows/release.yml`
+  （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI；独立 CLI
+  Windows `lk.exe` + Linux `lk` 双产物；tag `v*` → GitHub Release 附件，
+  main push / workflow_dispatch → Actions artifact；资产名版本号 tag 触发时取
   `GITHUB_REF_NAME` 去 v 前缀，否则回退 tauri.conf.json；产物未签名属预期）。
+  注意：桌面包经 bundle.resources 捆绑 `target/release/lk.exe` 进安装目录——
+  手动打版必须先 `cargo build --release -p lk-cli` 再 `cargo tauri build`
+  （顺序颠倒 bundler 会因资源缺失响亮报错）。
 
 ## 交付纪律
 
@@ -83,6 +90,13 @@
   (仅 init 响应一次) → 完成解锁；主密码 ≥8 位策略留 Rust（vault.init/
   recover 校验，弱密码/已存在库 UI 统一文案）；浏览器 E2E 用
   `__LIGHTKEY_MOCK__.simulateFreshInstall()` + 重载模拟首启）
+- [x] M2.75 跨子系统 stdio 桥（补充拍板 #14；规格 `docs/cross-subsystem.md`）：
+  `lk.exe bridge` stdio 中继 + Linux `lk` local/bridge 传输抽象（`LIGHTKEY_BRIDGE`
+  探测分型：装了连不上明确报错、没装静默本地，绝不静默回落防空库错觉；
+  连接目标可见）+ 协议版本主.次校验 fail-closed（daemon.json 可选 version）；
+  `lk-core::path_ns` 跨命名空间归一化（`wsl://<distro>/…` 规范形，两侧同函数）
+  + 审计 `channel=wsl-bridge`；release 双产物（Linux `lk` + 桌面包捆绑
+  `lk.exe`）；E2E `scripts/e2e_cross_subsystem.sh`（无 WSL 干净跳过）
 - [ ] M3 浏览器填充
 
 ## Maintaining this file

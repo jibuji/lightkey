@@ -128,5 +128,43 @@ needs-decision，不得自行变更。
       commit 69c4189）。
     「决策 #10」即补充拍板 #10 的别名；此后新增拍板一律直接进本决议集编号，
     不再使用游离编号。已修订 [AGENTS.md](../AGENTS.md)（对位指引一行）。
+14. **跨子系统访问方案定案：interop stdio 桥（2026-08-22 · 来源：WSL CLI ↔
+    Windows 桌面守护实例场景设计评审，本机实证后船长确认）**：
+    目标 = WSL 内 Linux 原生应用（含 agent）经 `lk` 命令连接同机 Windows
+    LightKey 桌面守护实例，查看密钥、请求授权、注入 **Linux 子进程** env；
+    全程默认拒绝与三层授权门语义不变。完整规格（含架构、安全分析、实现清单、
+    测试计划与本机实证记录）见 [cross-subsystem.md](cross-subsystem.md)，
+    本条登记裁定要点：
+    - **通道选型**：采用 interop stdio 桥——Linux `lk` 把 JSON-RPC 帧经
+      WSL interop 管道交给 `lk.exe bridge` 中继至 named pipe。否决 TCP 监听
+      （依赖用户网络环境 + 新增攻击面）、npiperelay 外部工具、Hyper-V Socket
+      （未文档化且无法取证）；否决「interop 直调 `lk.exe`」作为目标方案
+      （只能注入 Windows 子进程，Linux 工具链拿不到值）。
+    - **bridge 默认开关（2026-08-22 船长改定：体验优先）**：平台默认 =
+      **auto 探测**——检测到 WSL 即自动探测 bridge（interop + Windows 侧
+      daemon.json + lk.exe 安装位置），非 WSL（Linux/macOS 原生）默认本地
+      daemon；`LIGHTKEY_BRIDGE=off` 为逃生口、`<路径>` 强制指定中继。
+      探测失败**分型处理**：Windows 侧装了但连不上 → 明确报错（绝不静默
+      回落本地空库，防「空库错觉」）；Windows 侧未安装 → 静默走本地。
+      连接目标始终可见：bridge 命令 stderr 提示 + `lk status` 输出目标字段。
+      裁定依据：WSL 本地实例无 GUI → 授权门第③层永远 fail-closed（残缺
+      形态），真库与完整授权体验只在 Windows 侧；授权门三层均在守护进程
+      侧硬编码，auto 不降低安全下限。
+    - **projectDir 跨命名空间归一化**：UNC（`\\wsl.localhost\<distro>\…` /
+      `\\wsl$\<distro>\…` / verbatim 前缀）统一归一为 `wsl://<distro>/<rest>`
+      规范形；规则入库与运行时 cwd 判定两侧同函数后再做祖先匹配。
+    - **协议版本校验**：客户端/bridge 首连校验 `vault.status` 的 `version`
+      主.次版本，不一致明确报错拒绝服务、绝不静默降级（来源：实证发现装机
+      旧构建对 HEAD 帧静默关闭）。
+    - **审计与弹窗**：`channel` 扩展枚举值 `wsl-bridge`；starter 如实展示
+      interop 中继链（顶层为 wsl.exe/终端进程），项目目录以 `wsl://` 形态
+      展示并标注 (WSL)。
+    - **安全基线不变**：bridge 无决策权（安全流程硬编码在守护进程）；无新增
+      监听面；用户边界由 interop 同用户令牌 + named pipe ACL 保证；
+      启动者取证经实证可行（interop 进程父链 Windows 侧完全可见）。
+    - **里程碑归属 M2.75**（M3 浏览器填充之前）；交付含 Linux `lk` 产物 +
+      桌面包捆绑 `lk.exe`（当前装机目录缺失独立 CLI，实证发现）。
+    老文档回填（ipc.md / authorization-gate.md / cli.md 等）按
+    [cross-subsystem.md](cross-subsystem.md) §12 清单在实现时执行。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

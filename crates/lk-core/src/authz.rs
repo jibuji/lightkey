@@ -371,9 +371,24 @@ pub fn rule_matches(rule: &Rule, canonical_cwd: &str, command: &str) -> bool {
 /// projectDir 祖先匹配：`cwd` 等于 `project_dir`，或 `cwd` 是 `project_dir`
 /// 的路径前缀（**按路径组件**比较——目录边界 `/a/b/cd` 不匹配 `/a/b/c`；
 /// 分隔符随平台，Windows `C:\\a\\b` 与 `/` 写法均正确）。
+///
+/// 两侧先过 [`crate::path_ns::canonical_project_dir`] 归一化再比较（§7.4
+/// 两侧同函数，幂等）：规则侧历史/同步入库的 verbatim 前缀形态
+/// （`\\?\C:\…`）剥离为常规绝对路径；cwd 侧同样归一化——Windows 上
+/// `fs::canonicalize` 产物本身即 verbatim 形态，未归一化将无法与规则侧命中
+/// （守护进程边界已归一化时此步无副作用，属纵深防御：客户端自报 cwd 不得
+/// 因写法变体绕过或漏配）。`wsl://<distro>/<rest>` 规范形保留原样。
+/// 两侧均为 wsl:// 规范形时改用 wsl 形态匹配：大小写不敏感（NTFS 默认
+/// 语义）、按 `/` 目录边界（cross-subsystem.md §7.4——distro 名保留原样
+/// 但匹配不区分大小写，防伪造 cwd 大小写变体绕过或漏配）。
 pub fn project_dir_matches(project_dir: &str, canonical_cwd: &str) -> bool {
-    let dir = std::path::Path::new(project_dir);
-    let cwd = std::path::Path::new(canonical_cwd);
+    let dir_norm = crate::path_ns::canonical_project_dir(project_dir);
+    let cwd_norm = crate::path_ns::canonical_project_dir(canonical_cwd);
+    if crate::path_ns::is_wsl_canonical(&dir_norm) && crate::path_ns::is_wsl_canonical(&cwd_norm) {
+        return crate::path_ns::wsl_ancestor_matches(&dir_norm, &cwd_norm);
+    }
+    let dir = std::path::Path::new(&dir_norm);
+    let cwd = std::path::Path::new(&cwd_norm);
     cwd == dir || cwd.starts_with(dir)
 }
 
@@ -619,6 +634,32 @@ mod tests {
         assert!(rule_matches(&r, "/proj/sub", "npm publish"));
         assert!(!rule_matches(&r, "/proj-other", "npm publish"));
         assert!(!rule_matches(&r, "/proj/sub", "yarn publish"));
+    }
+
+    /// 跨命名空间（cross-subsystem.md §7.4/§10）：规则录 `wsl://` 规范形，
+    /// 伪造 UNC cwd 变体（大写 distro / 别名 / 尾斜杠）经守护进程侧
+    /// [`crate::path_ns::canonical_project_dir`] 归一化后必须命中同一规则
+    /// （不得绕过、也不得漏配）。
+    #[test]
+    fn wsl_namespace_rule_matches_normalized_cwd() {
+        let vault = FakeVault::new(
+            vec![rule("wsl://Debian/home/u/p", "*", &["A"])],
+            &[("A", "a")],
+        );
+        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let cwd = crate::path_ns::canonical_project_dir(r"\\wsl.localhost\DEBIAN\home\u\p\");
+        assert_eq!(
+            gate.evaluate_layers(&req("starter", &cwd, "npm publish", &["A"]), &vault),
+            LayerResult::Allowed {
+                keys: vec!["A".into()]
+            }
+        );
+        // 目录边界外（p2）不得命中
+        let cwd2 = crate::path_ns::canonical_project_dir(r"\\wsl$\Debian\home\u\p2");
+        assert_eq!(
+            gate.evaluate_layers(&req("starter", &cwd2, "npm publish", &["A"]), &vault),
+            LayerResult::NeedsApproval
+        );
     }
 
     /// 符号链接目录：cwd 已 canonicalize → 与 canonical 规则目录匹配
