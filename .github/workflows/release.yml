@@ -70,11 +70,32 @@ jobs:
           crate_toml="crates/lk-cli/Cargo.toml"
 
           # 解析 crates/lk-cli 的有效 package version（CARGO_PKG_VERSION 口径）：
-          # version.workspace = true 时继承根 Cargo.toml 的 [workspace.package] version
+          # version.workspace = true 时继承根 Cargo.toml 的 [workspace.package] version。
+          # runner 上无 cargo 工具链，不能走 cargo metadata 口径；先定位目标节，
+          # 再取该节内首个 version 赋值行，用纯 shell 参数展开剥引号/空白/行尾
+          # 注释（TOML 双引号基本串与单引号字面串两种写法都认——awk -F'"' 只认
+          # 双引号，遇到 `version = 'X.Y.Z'` 会静默解析成空串）。
           if grep -q '^version\.workspace[[:space:]]*=' "$crate_toml"; then
-            crate_version="$(awk -F'"' '/^\[workspace\.package\]/{p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+            target_toml="Cargo.toml"
+            target_section='^\[workspace\.package\]'
           else
-            crate_version="$(awk -F'"' '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/{print $2; exit}' "$crate_toml")"
+            target_toml="$crate_toml"
+            target_section='^\[package\]'
+          fi
+          version_line="$(awk -v sec="$target_section" '$0 ~ sec {p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/{print; exit}' "$target_toml")"
+          rhs="${version_line#*=}"
+          rhs="${rhs#"${rhs%%[![:space:]]*}"}" # 去左空白
+          dq='"'; sq="'"
+          case "$rhs" in
+            "$dq"*) rhs="${rhs#"$dq"}"; rhs="${rhs%%"$dq"*}" ;; # "X" 或 "X" # 注释
+            "$sq"*) rhs="${rhs#"$sq"}"; rhs="${rhs%%"$sq"*}" ;; # 'X' 或 'X' # 注释
+            *) rhs="${rhs%%[[:space:]#]*}" ;;                   # 裸值（非标准 TOML 写法，兜底）
+          esac
+          crate_version="$rhs"
+
+          if [ -z "$crate_version" ]; then
+            echo "::error::无法从 $target_toml 的 $target_section 节解析出有效 package version——请人工核对该文件后恢复标准写法 version = \"X.Y.Z\"（或修复本步骤的解析逻辑），再重跑。"
+            exit 1
           fi
 
           echo "release tag      : $release_tag (版本号: $expected_version)"

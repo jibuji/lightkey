@@ -1010,13 +1010,13 @@ fn probe(ep: &Endpoint) -> bool {
     request(ep, &req.to_string()).is_ok()
 }
 
-/// 连续探测 `attempts` 次（首次立即，其后间隔 [`PROBE_RETRY_DELAY`]），
-/// 任一次成功即真。
+/// 连续探测 `attempts` 次，任一次成功即真。相邻两次探测之间——含本序列的
+/// 首次与调用方刚失败的那次探测之间——一律间隔 [`PROBE_RETRY_DELAY`]：本函数
+/// 只在一次新鲜失败之后充当重试梯，三次探测必须**等距**铺开（若首发紧贴上次
+/// 失败立即发出，可能落进同一毫秒级管道瞬态窗口，等于只有两次有效采样，#31）。
 fn probe_with_retry(ep: &Endpoint, attempts: usize) -> bool {
-    for i in 0..attempts.max(1) {
-        if i > 0 {
-            std::thread::sleep(PROBE_RETRY_DELAY);
-        }
+    for _ in 0..attempts.max(1) {
+        std::thread::sleep(PROBE_RETRY_DELAY);
         if probe(ep) {
             return true;
         }
@@ -1109,6 +1109,7 @@ mod tests {
 
     /// probe 重试：对「接受后立即关闭」的 socket 连续失败（真实 IO 路径，
     /// 非 mock），attempts 次后返回 false；对健康 mock 守护首次即真。
+    /// （每拍间隔 150ms：死端点共 ~450ms，健康端点首拍即返回。）
     #[cfg(unix)]
     #[test]
     fn probe_with_retry_fails_fast_on_dead_socket_and_hits_healthy_daemon() {
