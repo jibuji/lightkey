@@ -171,6 +171,9 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 - `lk rule add`：传入以 `/` 开头且非现存 Windows 路径时，解析为
   `wsl://<默认发行版>/...` 并**回显解析结果要求确认**（默认发行版歧义显式化，
   防静默错配）；
+- bridge 后端下显式 Windows 绝对路径（`X:\…` / `X:/…`）**直接采用**：跳过
+  本地 fs canonicalize 与 wsl 解析守卫，原样送守护进程由 Windows 侧校验入库
+  （非交互可直录 drvfs 规则）；
 - bridge 后端下解析出的 POSIX 绝对路径同样折算并回显确认：drvfs 目录
   （`/mnt/<盘>/…`）→ Windows 绝对路径形态（与 interop bridge 进程继承的
   PEB cwd 同命名空间，精确匹配）；其余 → `wsl://<默认发行版>/...`。

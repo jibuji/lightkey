@@ -1681,6 +1681,8 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
 /// projectDir 规范化（解析符号链接）后入库。跨命名空间形态
 /// （cross-subsystem.md §7.4）：
 /// - 显式 `wsl://<distro>/...` 规范形直接采用（守护进程侧校验）；
+/// - bridge 后端下显式 Windows 绝对路径（`X:\…` / `X:/…`）直接采用
+///   （Windows 侧校验入库，非交互可直录 drvfs 规则）；
 /// - 以 `/` 开头且非现存本机路径 → 解析为 `wsl://<默认发行版>/…` 并回显确认；
 /// - bridge 后端下解析出的 POSIX 绝对路径折算并回显确认：drvfs 目录
 ///   （/mnt/<盘>/…）→ Windows 绝对路径形态（与运行时 cwd 同命名空间）；
@@ -1701,8 +1703,17 @@ fn cmd_rule_add(
     }
     // 显式 `wsl://<distro>/...` 规范形直接采用（守护进程侧校验形态合法性）——
     // 本函数在默认发行版解析被拒时给出的重试指引就是该形态，必须可用。
+    // bridge 后端下显式 Windows 绝对路径（X:\… / X:/…）同样直通：跳过本地
+    // fs canonicalize 与 wsl 解析守卫，原样送守护进程由 Windows 侧校验入库
+    // （非交互可直录 drvfs 规则；本地后端行为不变）。
+    let bridge_mode = matches!(
+        bridge_backend::decide(),
+        bridge_backend::Decision::Bridge(_)
+    );
     let mut canonical = if lk_core::path_ns::is_valid_wsl_canonical(project_dir) {
         project_dir.to_string()
+    } else if let Some(w) = bridge_windows_abs_passthrough(project_dir, bridge_mode) {
+        w
     } else {
         match std::fs::canonicalize(project_dir) {
             Ok(c) => c.to_string_lossy().to_string(),
@@ -1732,12 +1743,7 @@ fn cmd_rule_add(
     // 后端不受影响，维持 POSIX 原语义）。折算规则：drvfs 目录（/mnt/<盘>/…）
     // → Windows 绝对路径形态（与 interop bridge 进程继承的 PEB cwd 同命名
     // 空间，精确匹配）；其余 WSL 原生路径 → wsl://<默认发行版>/… 规范形。
-    if canonical.starts_with('/')
-        && matches!(
-            bridge_backend::decide(),
-            bridge_backend::Decision::Bridge(_)
-        )
-    {
+    if bridge_mode && canonical.starts_with('/') {
         let interactive = std::io::stdin().is_terminal();
         let mut input = std::io::stdin().lock();
         canonical = match drvfs_rule_windows_form(&canonical) {
@@ -1898,6 +1904,28 @@ fn wsl_candidate(project_dir: &str, distro: &str) -> Option<String> {
 /// wsl:// 默认发行版折算）。
 fn drvfs_rule_windows_form(posix: &str) -> Option<String> {
     bridge_backend::to_windows_path(std::path::Path::new(posix))
+}
+
+/// Windows 盘符绝对路径形态（`X:\…` / `X:/…`）判定（bridge 后端下 rule.add
+/// 直通入口用；不识别相对路径、无盘符形态与 wsl:// 规范形）。
+fn is_windows_abs(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// bridge 后端下显式 Windows 绝对路径直通：`X:\…` / `X:/…` 输入跳过本地
+/// fs canonicalize 与 wsl 解析守卫，原样返回送守护进程（Windows 侧校验入库，
+/// 非交互可直录 drvfs 规则）；本地后端 / 非 Windows 形态 → None（维持既有
+/// 解析路径不变）。
+fn bridge_windows_abs_passthrough(project_dir: &str, bridge_mode: bool) -> Option<String> {
+    if bridge_mode && is_windows_abs(project_dir) {
+        Some(project_dir.to_string())
+    } else {
+        None
+    }
 }
 
 /// 探测 WSL 默认发行版（cross-subsystem.md §7.4）。
@@ -2198,6 +2226,44 @@ mod wsl_rule_add_tests {
         assert_eq!(confirm("n\n", true), None);
         assert_eq!(confirm("", true), None); // EOF → 拒绝
         assert_eq!(confirm("y\n", false), None); // 非交互永不确认
+    }
+
+    /// Windows 盘符绝对路径形态判定（bridge 直通入口）：X:\… / X:/… 识别；
+    /// 相对路径 / 无盘符 / wsl:// 规范形不识别。
+    #[test]
+    fn windows_abs_detection() {
+        assert!(is_windows_abs(r"C:\Users\u\proj"));
+        assert!(is_windows_abs(r"C:/Users/u/proj"));
+        assert!(is_windows_abs(r"c:\x"));
+        assert!(is_windows_abs(r"D:\"));
+        assert!(!is_windows_abs("/home/u/p"));
+        assert!(!is_windows_abs("relative/path"));
+        assert!(!is_windows_abs("C:foo"));
+        assert!(!is_windows_abs("wsl://Debian/home/u/p"));
+        assert!(!is_windows_abs(""));
+    }
+
+    /// bridge 后端下显式 Windows 绝对路径直通：原样返回（跳过本地
+    /// canonicalize / wsl 解析守卫，由 Windows 侧校验入库）；本地后端该输入
+    /// 行为不变（None → 走既有解析路径，Linux 上 canonicalize 失败报错）。
+    #[test]
+    fn bridge_windows_abs_passthrough_forms() {
+        assert_eq!(
+            bridge_windows_abs_passthrough(r"C:\Users\u\proj", true).as_deref(),
+            Some(r"C:\Users\u\proj") // 原样直通，不做本地解析
+        );
+        assert_eq!(
+            bridge_windows_abs_passthrough(r"C:/Users/u/proj", true).as_deref(),
+            Some(r"C:/Users/u/proj")
+        );
+        // 本地后端（bridge_mode=false）：行为不变，不直通
+        assert_eq!(bridge_windows_abs_passthrough(r"C:\Users\u\proj", false), None);
+        // 非 Windows 形态在 bridge 下也不直通
+        assert_eq!(bridge_windows_abs_passthrough("/home/u/p", true), None);
+        assert_eq!(
+            bridge_windows_abs_passthrough("wsl://Debian/home/u/p", true),
+            None
+        );
     }
 }
 

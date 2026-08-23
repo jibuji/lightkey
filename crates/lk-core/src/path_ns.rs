@@ -341,4 +341,24 @@ mod tests {
         // 一侧非 wsl:// 规范形 → 不走该分支（回退普通 Path 比较）
         assert!(!project_dir_matches("/a/b", "wsl://Debian/a/b"));
     }
+
+    /// §7.4 两侧同函数：canonicalize 模拟输出（Windows verbatim `\\?\` 前缀
+    /// 形态）入库的规则与运行时普通 Windows cwd 祖先匹配命中；归一化幂等。
+    #[test]
+    fn verbatim_stored_rule_matches_plain_windows_cwd() {
+        // Windows 上 std::fs::canonicalize 的产物形态（\?\C:\…）
+        let stored = r"\\?\C:\Users\u\proj";
+        let cwd = r"C:\Users\u\proj";
+        assert_eq!(canonical_project_dir(stored), cwd);
+        // 相等即命中（Windows 分隔符形态）
+        assert!(project_dir_matches(stored, cwd));
+        // 子目录祖先命中 / 目录边界 p2 不得命中：用 / 分隔形态断言同一
+        // 组件语义（Linux 测试宿主无 \ 分隔符语义）
+        let norm = canonical_project_dir(stored).replace('\\', "/");
+        assert!(project_dir_matches(&norm, "C:/Users/u/proj/sub"));
+        assert!(!project_dir_matches(&norm, "C:/Users/u/proj2"));
+        // 归一化幂等：canonicalize 产物再归一化不漂移
+        let once = canonical_project_dir(stored);
+        assert_eq!(canonical_project_dir(&once), once);
+    }
 }

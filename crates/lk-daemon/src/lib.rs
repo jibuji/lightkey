@@ -777,12 +777,13 @@ impl Daemon {
         }
         let channel = audit_channel(p.channel.as_deref());
         // wsl:// 规范形直接入库（非本机 fs 路径）；常规路径仍以 canonical
-        // 形态入库（解析符号链接；与匹配侧同基准）
+        // 形态入库（解析符号链接），并经与运行时 cwd 判定同一个归一化函数
+        // 剥离 Windows verbatim 前缀（§7.4 两侧同函数，存储形态 == 判定形态）
         let project_dir = if lk_core::path_ns::is_wsl_canonical(&project_dir_input) {
             project_dir_input.clone()
         } else {
             match std::fs::canonicalize(&project_dir_input) {
-                Ok(c) => c.to_string_lossy().to_string(),
+                Ok(c) => lk_core::path_ns::canonical_project_dir(&c.to_string_lossy()),
                 Err(_) => {
                     return RpcResponse::err(
                         id,
@@ -1925,6 +1926,47 @@ mod tests {
     /// 审计事件（守护进程审计文件读取）。
     fn audit_events(dir: &std::path::Path) -> Vec<lk_core::audit::AuditEvent> {
         AuditLog::open(dir).unwrap().read().unwrap()
+    }
+
+    /// 规则入库形态与运行时 cwd 判定同基准（§7.4 两侧同函数）：rule.add 的
+    /// canonicalize 产物再过 canonical_project_dir 入库；Windows 上该归一化
+    /// 剥离 verbatim 前缀，否则与 evaluate 侧归一化 cwd 不匹配（回归门：
+    /// Windows CI 下此断言直接捕捉存储形态漂移）。
+    #[test]
+    fn rule_add_stores_normalized_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (state, _shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+        let add = rpc_result(&state.lock().unwrap().handle(
+            &rpc_line(
+                M_RULE_ADD,
+                Some(&token),
+                json!({ "projectDir": proj.path(), "name": "p",
+                        "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+            ),
+            &PeerInfo::unknown(),
+        ));
+        let stored = add["rule"]["projectDir"]
+            .as_str()
+            .expect("规则应入库")
+            .to_string();
+        let canonical = lk_core::path_ns::canonical_project_dir(
+            &std::fs::canonicalize(proj.path()).unwrap().to_string_lossy(),
+        );
+        assert_eq!(stored, canonical);
+        // 归一化后的存储形态与 evaluate 侧归一化 cwd 祖先匹配命中
+        let handler = make_handler(&state, &_shared);
+        let peer = test_peer(Some(proj.path()));
+        let resp = handler(
+            &rpc_line(
+                M_AUTHZ_EVALUATE,
+                Some(&token),
+                json!({ "command": "npm publish", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+            ),
+            &peer,
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["allowed"], true, "规则命中应放行：{resp}");
     }
 
     /// 规则命中（第 2 层）：env 只含被授权 key 的值；审计 allowed（channel=cli）。
