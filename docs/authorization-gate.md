@@ -45,9 +45,10 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   `lk.exe bridge` 中继连接 Windows 守护进程时，IPC 对端是 bridge 进程，
   其父链为 interop 链 `bridge → wsl.exe → wsl.exe → 终端进程 → …`，Windows
   侧完全可见（本机 Win32_Process 实证），Toolhelp 回溯不会 fail-closed。
-  starter 如实展示中继链顶层（如 `wsl.exe`/终端进程名）；cwd 取 bridge 进程
-  PEB 真实 cwd（interop 继承的调用方项目目录 UNC），足以定位项目。审计
-  `channel = wsl-bridge`。详见 [cross-subsystem.md](cross-subsystem.md) §7.5。
+  starter 如实展示中继链顶层（如 `wsl.exe`/终端进程名）；cwd = bridge 自证
+  值（对端 PID 校验后采信；interop 进程 PEB 跨进程读取不可行，#32），足以
+  定位项目。审计 `channel = wsl-bridge`。详见
+  [cross-subsystem.md](cross-subsystem.md) §7.5、§7.4.1。
 - 结果供审计 `starter` 字段与规则匹配使用。
 
 ## 4. 规则库（D8）

@@ -56,7 +56,7 @@
 |------|------|--------|
 | `lk audit [--tail <N>] [--verify]` | 查看审计日志（只读；无密钥值；`--tail` 最近 N 条、`--verify` 校验 HMAC 链） | M0 |
 | `lk daemon` | 以守护进程方式常驻（解锁态、密钥仅内存；由客户端自动拉起，也可手动前台运行） | M0 |
-| `lk bridge` | （Windows）stdio 中继：stdin 逐行读 JSON-RPC 帧 → named pipe → stdout 回写，一进程一请求后退出；不做业务解析（除版本校验外原样透传）；错误码 `bridge.no_daemon` / `bridge.version_incompatible` / `bridge.io`，退出码非 0。随桌面包安装，供 WSL 侧 Linux `lk` 经 interop 调用 | M2.75 |
+| `lk bridge` | （Windows）stdio 中继：stdin 逐行读 JSON-RPC 帧 → named pipe → stdout 回写，一进程一请求后退出；不做业务解析（除版本校验与转发帧顶层自证身份字段 `lkBridge` 外原样透传，#32，见 [cross-subsystem.md](cross-subsystem.md) §7.4.1）；错误码 `bridge.no_daemon` / `bridge.version_incompatible` / `bridge.io`，退出码非 0。随桌面包安装，供 WSL 侧 Linux `lk` 经 interop 调用 | M2.75 |
 
 ## 5.1 跨子系统桥环境变量（补充拍板 #14，M2.75）
 

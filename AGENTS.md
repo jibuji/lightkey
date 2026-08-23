@@ -36,7 +36,9 @@
   发布流水线：`.github/workflows/release.yml`
   （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI；独立 CLI
   Windows `lk.exe` + Linux `lk` 双产物；tag `v*` → GitHub Release 附件（两个 build
-  job 均需 `permissions: contents: write`）；main push / workflow_dispatch →
+  job 均需 `permissions: contents: write`，前置 check-version 闸门：发布 tag 去
+  v 前缀须等于 lk-cli package version，不一致显式 fail #34）；main push /
+  workflow_dispatch →
   Actions artifact，dispatch 传 `release_tag` 输入可把产物补发到既有 Release
   （不移动标签）；资产名版本号 tag/dispatch 触发时取对应 ref 去 v 前缀，否则回退
   tauri.conf.json；产物未签名属预期）。

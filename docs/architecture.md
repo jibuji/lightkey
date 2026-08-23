@@ -96,7 +96,7 @@ webkit2gtk 系统库，不阻塞）；`lk-app` 由 CI 在 Windows 上以 `--work
 | 数据 | 条目级密文 blob + 加密索引；CAS + last-write-wins；30 天墓碑（[data-model.md](data-model.md)） |
 | 同步 | BYO 存储（WebDAV/S3）无服务器；加密索引 + 轮询（默认 60s）；无推送（[sync.md](sync.md)） |
 | 守护进程 | 持解锁态，密钥仅内存；会话令牌随解锁轮换（[ipc.md](ipc.md)） |
-| 跨子系统桥 | WSL Linux `lk` → interop stdio → `lk.exe bridge` → named pipe；无新增监听面，协议零变更（[cross-subsystem.md](cross-subsystem.md)） |
+| 跨子系统桥 | WSL Linux `lk` → interop stdio → `lk.exe bridge` → named pipe；无新增监听面；协议向后兼容增量扩展——bridge 自证身份 `lkBridge`（[cross-subsystem.md](cross-subsystem.md) §7.4.1，#32） |
 | 授权门 | 默认拒绝 → 规则白名单 → 弹窗审批（30s 超时拒）（[authorization-gate.md](authorization-gate.md)） |
 | 审计 | 追加式 + HMAC 防篡改；默认永久保留（[audit.md](audit.md)） |
 | 恢复 | 40 字符恢复码 + 恢复信封（Argon2id 派生信封密钥）（[recovery.md](recovery.md)） |

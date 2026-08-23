@@ -29,9 +29,11 @@
   边界上 UDS 与 named pipe 互不可达，故增加一条 stdio 中继通道：
   Linux `lk` 把行 JSON JSON-RPC 帧经 WSL interop 管道交给 `lk.exe bridge`
   （Windows PE，随桌面包安装），后者原样中继到 named pipe 并回写响应。
-- 协议零变更：帧格式、会话令牌、审批编排全部照旧；bridge 不做任何业务
-  解析（除版本校验外原样透传），决策权始终在守护进程；一进程一请求，
-  首连校验版本主.次一致，不一致 → `bridge.version_incompatible` 拒绝服务。
+- 协议向后兼容的增量扩展：帧格式、会话令牌、审批编排全部照旧；bridge 不做
+  任何业务解析（除版本校验与转发帧顶层自证身份字段 `lkBridge` 外原样透传，
+  #32，见 [cross-subsystem.md](cross-subsystem.md) §7.4.1），决策权始终在守护
+  进程；一进程一请求，首连校验版本主.次一致，不一致 →
+  `bridge.version_incompatible` 拒绝服务。
 - 无新增监听面：bridge 是按需拉起的短命客户端进程，不监听任何端口/套接字；
   interop 子进程以同一 Windows 用户令牌运行，named pipe「仅本用户」ACL
   语义不变。
