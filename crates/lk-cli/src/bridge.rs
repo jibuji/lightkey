@@ -213,13 +213,17 @@ fn version_fail(out: &mut impl Write) {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
+    #[cfg(unix)]
     use std::sync::Arc;
 
+    #[cfg(unix)]
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
     /// 进程内 mock 守护实例：vault.status 回带指定版本；其余帧原样回显
     /// （透传保真检查用）。
+    #[cfg(unix)]
     fn spawn_mock_daemon(dir: &Path, status_version: Option<&str>) {
         let listener = transport::bind_server(dir).expect("bind mock server");
         let version = status_version.map(str::to_string);
@@ -244,6 +248,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     fn run_relay(dir: &Path, frames: &[u8]) -> (i32, Vec<u8>) {
         let mut out = Vec::new();
         let mut input = Cursor::new(frames.to_vec());
@@ -283,6 +288,7 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "stdout 必须是单行 JSON-RPC error");
     }
 
+    #[cfg(unix)]
     #[test]
     fn version_mismatch_is_rejected_not_silent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -293,6 +299,7 @@ mod tests {
         assert!(text.contains("bridge.version_incompatible"), "got: {text}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_version_field_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
@@ -304,6 +311,7 @@ mod tests {
             .contains("bridge.version_incompatible"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_build_silent_close_maps_to_version_incompatible() {
         // 实证 #7：陈旧构建对探测帧静默关闭零响应。模拟：指向一个无人监听但
@@ -334,6 +342,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn frame_passthrough_byte_fidelity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -345,6 +354,7 @@ mod tests {
         assert_eq!(String::from_utf8(out).unwrap(), format!("{frame}\n"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn empty_stdin_is_clean_exit() {
         let tmp = tempfile::tempdir().unwrap();
@@ -354,6 +364,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_frame_is_io_error() {
         let tmp = tempfile::tempdir().unwrap();
