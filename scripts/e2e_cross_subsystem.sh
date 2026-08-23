@@ -97,6 +97,10 @@ fi
 # 4) Linux lk 二进制存在且已实现 bridge 后端（M2.75 §9 #2）。
 #    依 §7.2「目标可见性」拍板：经 bridge 的每次调用必向 stderr 打
 #    「经 bridge」提示行——以此区分旧二进制（静默走本地 daemon）。
+#    SKIP/FAIL 边界是「bridge 后端已实现」而非「daemon 可达」：桌面应用
+#    装了但守护实例未运行时，bridge.no_daemon 错误文本同样含 "bridge"，
+#    本前置会照常通过（这正是设计意图——探测目标是区分旧二进制），后续
+#    步骤对 daemon 未运行的失败输出会提示先启动桌面应用。
 [ -x "$LK" ] || skip "lk 二进制不可执行：$LK（先 cargo build -p lk-cli）"
 BRIDGE_NOTE="$(LIGHTKEY_BRIDGE="$RELAY" "$LK" status 2>&1 >/dev/null || true)"
 printf '%s' "$BRIDGE_NOTE" | grep -q "bridge" \
@@ -129,7 +133,13 @@ printf '%s' "$STATUS_ERR" | grep -q "bridge" \
 
 echo "== 2. unlock（会话令牌仅存 lk 进程内存，§7.2）=="
 echo "$MASTER_PW" | "$LK" unlock --stdin >/dev/null 2>"$WORK/unlock.err"
-check "unlock 经 bridge 成功" 0 $?
+UNLOCK_RC=$?
+check "unlock 经 bridge 成功" 0 "$UNLOCK_RC"
+if [ "$UNLOCK_RC" -ne 0 ]; then
+  echo "  提示：如报 bridge.no_daemon，请先启动 Windows 侧 LightKey 桌面应用（守护实例由其持有）再重试" >&2
+  echo "  --- lk stderr ---" >&2
+  sed 's/^/  /' "$WORK/unlock.err" >&2
+fi
 
 echo "== 3. item list（读 Windows 桌面应用的库）=="
 LIST="$("$LK" item list 2>"$WORK/list.err")"

@@ -73,6 +73,12 @@
 - 目标可见性（auto 默认的安全补偿）：每次经 bridge 执行命令向 stderr 打一行
   「→ 经 bridge 连接 Windows 桌面守护实例（版本 x.y）」；`lk status` 输出
   连接目标字段。
+- 配置命令与状态行（补充拍板 #14 裁定）：bridge 后端下 `lk config`
+  （`get` / `sync set`）与 `lk status` 的同步配置行读写 **Windows 侧**数据目录
+  的 `config.json`（定位与读会话令牌同源，`LIGHTKEY_BRIDGE_HOME` 显式指定时
+  以其为准），本地后端行为不变；bridge 模式 `status` 同步行标注
+  「（Windows 桥接）」。凭据仍存本机钥匙串——Windows 守护实例读取的是
+  Windows 侧钥匙串，WebDAV/S3 凭据需在桌面应用或 Windows 侧 `lk.exe` 配置。
 
 ## 6. 行为约束
 

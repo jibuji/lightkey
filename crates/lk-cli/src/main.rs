@@ -703,9 +703,20 @@ fn cmd_lock(out: &mut impl Write, dir: &std::path::Path) -> i32 {
 fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
     // 连接目标可见性（cross-subsystem.md §7.2）：杜绝「以为在操作本地、
     // 实际连着 Windows 真库」的语义模糊。探测分型失败 → 明确报错。
-    let on_bridge = match bridge_backend::decide() {
-        bridge_backend::Decision::Local => false,
-        bridge_backend::Decision::Bridge(_) => true,
+    // 同步配置行与 config 命令同源（补充拍板 #14 裁定）：bridge 后端直读
+    // Windows 侧数据目录的 config.json，不读本地文件（防混合来源显示）。
+    let decision = bridge_backend::decide();
+    let (on_bridge, cfg_dir) = match &decision {
+        bridge_backend::Decision::Local => (false, dir.to_path_buf()),
+        bridge_backend::Decision::Bridge(target) => match &target.data_dir {
+            Some(dd) => (true, dd.clone()),
+            None => {
+                eprintln!(
+                    "lk: bridge 模式下无法定位 Windows 侧数据目录（未指定 LIGHTKEY_BRIDGE_HOME 且探测无果），无法读取 Windows 侧同步配置"
+                );
+                return 1;
+            }
+        },
         bridge_backend::Decision::Fatal(msg) => {
             eprintln!("lk: {msg}");
             return 1;
@@ -723,7 +734,7 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
                     json!({ "unlocked": unlocked, "version": version, "syncWatermark": watermark, "target": if on_bridge { "bridge" } else { "local" } })
                 );
             } else {
-                let sync_line = match daemon::read_config(dir).sync {
+                let mut sync_line = match daemon::read_config(&cfg_dir).sync {
                     Some(cfg) => format!(
                         "已配置 {}（每 {}s 轮询）{}",
                         cfg.url,
@@ -734,6 +745,9 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
                     ),
                     None => "未配置（lk config sync set <url> 启用）".to_string(),
                 };
+                if on_bridge {
+                    sync_line.push_str("（Windows 桥接）");
+                }
                 let target_line = if on_bridge {
                     "Windows 桌面守护实例（经 bridge）"
                 } else {
@@ -1430,6 +1444,26 @@ fn cmd_sync(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 
     }
 }
 
+/// 桥模式下配置命令/状态行的目标数据目录（补充拍板 #14 裁定：bridge 后端
+/// 直写 Windows 侧 config.json，不走新 IPC/协议）。
+/// 本地 → 原 dir（行为完全不变）；Bridge+已定位 → Windows 数据目录；
+/// Bridge 但数据目录不可定位 / 探测失败 → Err（fail-closed，绝不读错目录）。
+fn config_dir_for(
+    decision: &bridge_backend::Decision,
+    local: &std::path::Path,
+) -> Result<PathBuf, String> {
+    match decision {
+        bridge_backend::Decision::Local => Ok(local.to_path_buf()),
+        bridge_backend::Decision::Bridge(target) => match &target.data_dir {
+            Some(dd) => Ok(dd.clone()),
+            None => Err(
+                "bridge 模式下无法定位 Windows 侧数据目录（未指定 LIGHTKEY_BRIDGE_HOME 且探测无果），无法读写 Windows 侧 config.json".to_string(),
+            ),
+        },
+        bridge_backend::Decision::Fatal(msg) => Err(msg.clone()),
+    }
+}
+
 /// `lk config` 入口。
 fn cmd_config(
     out: &mut impl Write,
@@ -1437,6 +1471,15 @@ fn cmd_config(
     cmd: &ConfigCommand,
     json_out: bool,
 ) -> i32 {
+    let decision = bridge_backend::decide();
+    let on_bridge = matches!(decision, bridge_backend::Decision::Bridge(_));
+    let cfg_dir = match config_dir_for(&decision, dir) {
+        Ok(d) => d,
+        Err(msg) => {
+            eprintln!("lk: {msg}");
+            return 1;
+        }
+    };
     match cmd {
         ConfigCommand::Sync { command } => match command {
             ConfigSyncCommand::Set {
@@ -1444,17 +1487,23 @@ fn cmd_config(
                 interval,
                 credentials_file,
                 stdin,
-            } => cmd_config_sync_set(
-                out,
-                dir,
-                url,
-                *interval,
-                credentials_file.as_deref(),
-                *stdin,
-                json_out,
-            ),
+            } => {
+                let code = cmd_config_sync_set(
+                    out,
+                    &cfg_dir,
+                    url,
+                    *interval,
+                    credentials_file.as_deref(),
+                    *stdin,
+                    json_out,
+                );
+                if on_bridge && code == 0 && !url.starts_with("file://") {
+                    eprintln!("lk config: 提示：凭据已存入 WSL 钥匙串，但 Windows 桌面守护实例读取的是 Windows 侧钥匙串——请在 Windows 桌面应用或 Windows 侧 lk.exe 中配置凭据");
+                }
+                code
+            }
         },
-        ConfigCommand::Get { key } => cmd_config_get(out, dir, key, json_out),
+        ConfigCommand::Get { key } => cmd_config_get(out, &cfg_dir, key, json_out),
     }
 }
 
@@ -1498,7 +1547,7 @@ fn cmd_config_sync_set(
     } else if credentials_file.is_some() || stdin {
         eprintln!("lk config: 提示：file:// 本地模拟无需凭据，已忽略凭据输入");
     }
-    // 写配置（原子；守护进程下一轮自动热更新）
+    // 写配置（原子 tmp+rename；Windows 守护进程每轮同步热重读，下一轮生效）
     let mut config = daemon::read_config(dir);
     config.sync = Some(cfg.clone());
     if let Err(e) = daemon::write_config(dir, &config) {
@@ -2033,5 +2082,135 @@ mod wsl_rule_add_tests {
         assert_eq!(confirm_with("y\n", false), None);
         // 探测失败的兜底（resolve 层）：detect 返回 None → 整体 None，
         // 由调用方报错退出——不产生任何候选入库。
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试（补充拍板 #14：桥模式下配置命令直写 Windows 侧 config.json）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod config_bridge_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn bridge_target(data_dir: Option<PathBuf>) -> bridge_backend::BridgeTarget {
+        bridge_backend::BridgeTarget {
+            exe: PathBuf::from("/mnt/c/Users/alice/AppData/Local/LightKey/lk.exe"),
+            data_dir,
+            dir_arg: Some("C:\\Users\\alice\\AppData\\Roaming\\lightkey".into()),
+        }
+    }
+
+    #[test]
+    fn config_dir_local_unchanged() {
+        let local = tempfile::tempdir().unwrap();
+        assert_eq!(
+            config_dir_for(&bridge_backend::Decision::Local, local.path())
+                .unwrap()
+                .as_path(),
+            local.path()
+        );
+    }
+
+    #[test]
+    fn config_dir_bridge_uses_windows_data_dir() {
+        let win = PathBuf::from("/mnt/c/Users/alice/AppData/Roaming/lightkey");
+        let d = config_dir_for(
+            &bridge_backend::Decision::Bridge(bridge_target(Some(win.clone()))),
+            Path::new("/tmp/local"),
+        )
+        .unwrap();
+        assert_eq!(d, win);
+    }
+
+    #[test]
+    fn config_dir_bridge_without_data_dir_fails_closed() {
+        let r = config_dir_for(
+            &bridge_backend::Decision::Bridge(bridge_target(None)),
+            Path::new("/tmp/local"),
+        );
+        assert!(
+            r.is_err(),
+            "bridge 模式数据目录不可定位必须报错，绝不读本地文件"
+        );
+    }
+
+    #[test]
+    fn config_dir_fatal_fails_closed() {
+        assert!(config_dir_for(
+            &bridge_backend::Decision::Fatal("探测失败".into()),
+            Path::new("/tmp/local")
+        )
+        .is_err());
+    }
+
+    /// 桥模式下 config sync set 写到 Windows 目录：以 Windows 数据目录为
+    /// cfg_dir 调用（映射由 config_dir_for 单测覆盖），断言配置落盘且可被
+    /// 守护进程同构解析；原子写无 .tmp 残留。
+    #[test]
+    fn config_sync_set_writes_to_windows_dir_atomically() {
+        let win = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let code = cmd_config_sync_set(
+            &mut out,
+            win.path(),
+            "file:///tmp/store",
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(code, 0);
+        let raw = std::fs::read_to_string(win.path().join(daemon::config::CONFIG_FILE)).unwrap();
+        let parsed: daemon::Config = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.sync.expect("sync 已配置").url, "file:///tmp/store");
+        assert!(
+            !win.path().join("config.json.tmp").exists(),
+            "原子写必须无 .tmp 残留"
+        );
+    }
+
+    /// 桥模式下 get 读回与 set 一致。
+    #[test]
+    fn config_get_reads_back_windows_dir() {
+        let win = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            cmd_config_sync_set(
+                &mut out,
+                win.path(),
+                "file:///tmp/store",
+                None,
+                None,
+                false,
+                false,
+            ),
+            0
+        );
+        let mut out = Vec::new();
+        let code = cmd_config_get(&mut out, win.path(), "sync.url", false);
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "file:///tmp/store\n");
+    }
+
+    /// 本地模式不受影响：写本地目录，且不触碰其他目录。
+    #[test]
+    fn local_mode_writes_local_dir_unaffected() {
+        let local = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let code = cmd_config_sync_set(
+            &mut out,
+            local.path(),
+            "file:///tmp/store",
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(code, 0);
+        assert!(local.path().join(daemon::config::CONFIG_FILE).is_file());
+        assert!(!other.path().join(daemon::config::CONFIG_FILE).exists());
     }
 }

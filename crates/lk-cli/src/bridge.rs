@@ -256,8 +256,11 @@ mod tests {
         // 一致（补丁号忽略）
         assert!(version_compatible("0.2.3", Some("0.2.9")));
         assert!(version_compatible("0.2.0", Some("0.2.0")));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0"); // 当前工作区版本基线
-                                                        // 主.次不符
+        assert!(version_compatible(
+            env!("CARGO_PKG_VERSION"),
+            Some(env!("CARGO_PKG_VERSION"))
+        ));
+        // 主.次不符
         assert!(!version_compatible("0.2.0", Some("0.3.0")));
         assert!(!version_compatible("1.0.0", Some("0.1.0")));
         // 缺 version 字段 / 不可解析
