@@ -11,6 +11,10 @@
 # 安装包未做代码签名（暂无证书），Windows SmartScreen 未签名警告属当前预期，不阻塞发布。
 # NSIS / MSI 打包器（NSIS、WiX）由 tauri-bundler 首次构建时自动下载，无需额外准备。
 # 资产名版本号：tag 触发时取 tag（去 v 前缀），否则回退 tauri.conf.json 的 version。
+# 版本一致性闸门（check-version job，#34）：tag / dispatch 补发路径上先校验发布 tag
+# （去 v 前缀）与 crates/lk-cli 的 package version（即 CARGO_PKG_VERSION 口径，
+# 当前经 workspace 继承自根 Cargo.toml）一致，不一致显式 fail，防止二进制 --version
+# 与 Release tag 混淆。main push / 未带 release_tag 的 dispatch 只留 artifact，跳过校验。
 # 独立 CLI（lk.exe / Linux lk）随安装包一起分发，无需安装 GUI 即可纯命令行使用。
 #
 # 桌面包捆绑独立 CLI（修复 cross-subsystem.md §4#7「装机目录缺失独立 CLI」）：
@@ -41,9 +45,54 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check-version:
+    name: Check release tag vs crate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify release tag matches lk-cli package version
+        env:
+          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          # 发布 tag：tag 触发取 ref，dispatch 补发取 release_tag 输入；其余路径不建 Release，跳过
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            release_tag="$GITHUB_REF_NAME"
+          elif [ -n "$DISPATCH_RELEASE_TAG" ]; then
+            release_tag="$DISPATCH_RELEASE_TAG"
+          else
+            echo "非发布路径（main push / 未带 release_tag 的 dispatch），跳过版本一致性校验。"
+            exit 0
+          fi
+
+          expected_version="${release_tag#v}"
+          crate_toml="crates/lk-cli/Cargo.toml"
+
+          # 解析 crates/lk-cli 的有效 package version（CARGO_PKG_VERSION 口径）：
+          # version.workspace = true 时继承根 Cargo.toml 的 [workspace.package] version
+          if grep -q '^version\.workspace[[:space:]]*=' "$crate_toml"; then
+            crate_version="$(awk -F'"' '/^\[workspace\.package\]/{p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+          else
+            crate_version="$(awk -F'"' '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/{print $2; exit}' "$crate_toml")"
+          fi
+
+          echo "release tag      : $release_tag (版本号: $expected_version)"
+          echo "lk-cli 版本(Cargo): $crate_version"
+
+          if [ "$expected_version" != "$crate_version" ]; then
+            echo "::error::发布 tag '$release_tag'（版本 $expected_version）与 crates/lk-cli 的 package version '$crate_version' 不一致——二进制 --version 输出来自后者，不一致会导致排障混淆（issue #34）。"
+            echo "::error::修复方式二选一："
+            echo "::error::  1) 把版本更新为 $expected_version（当前经 workspace 继承，改根 Cargo.toml [workspace.package] 的 version），提交后删除并重新推送该 tag；"
+            echo "::error::  2) 若 tag 有误，改为推送与 crate 版本一致的 vX.Y.Z tag 后重跑本工作流。"
+            exit 1
+          fi
+          echo "✅ 版本一致：$expected_version == $crate_version"
+
   build-windows:
     name: Build Windows installers
     runs-on: windows-latest
+    needs: check-version
     permissions:
       contents: write # softprops/action-gh-release 创建 Release 并上传附件（仅本 job 需要）
     steps:
@@ -148,6 +197,7 @@ jobs:
   build-linux-cli:
     name: Build Linux CLI (lk)
     runs-on: ubuntu-latest
+    needs: check-version
     permissions:
       contents: write # 与 Windows job 对齐：tag 触发时需向 Release 追加上传附件
     steps:
