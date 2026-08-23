@@ -3,7 +3,9 @@
 #   - tag v* push          → Windows 打包（NSIS + MSI + 独立 CLI）+ Linux CLI（lk），
 #                            产物挂到 GitHub Release
 #   - main push            → 同样打包，但只留 Actions artifact（最新构建手动下载，不建 Release）
-#   - workflow_dispatch    → 手动打版，行为同 main push（artifact 留存）
+#   - workflow_dispatch    → 默认行为同 main push（artifact 留存）；传 release_tag 输入则
+#                            构建后把产物发布到该 tag 的既有 Release（用于补挂缺失附件，
+#                            如某次发布的单个 job 失败后补发），不移动任何标签
 # 双 job（build-windows / build-linux-cli）并行；tag 触发时跳过 artifact 留存，
 # 避免同一份产物重复上传。
 # 安装包未做代码签名（暂无证书），Windows SmartScreen 未签名警告属当前预期，不阻塞发布。
@@ -29,6 +31,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "发布到已存在的 Release（如 v0.1.3）；留空则只留 Actions artifact"
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -91,10 +98,14 @@ jobs:
 
       - name: Collect artifacts with versioned names
         shell: pwsh
+        env:
+          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          # 版本号：tag 触发时取 tag（去 v 前缀，资产名与 Release 一致），否则回退 tauri.conf.json
+          # 版本号：tag 触发取 tag、手动补发取 release_tag（均去 v 前缀），否则回退 tauri.conf.json
           $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
             $env:GITHUB_REF_NAME -replace '^v', ''
+          } elseif ($env:DISPATCH_RELEASE_TAG) {
+            $env:DISPATCH_RELEASE_TAG -replace '^v', ''
           } else {
             (Get-Content 'crates/lk-app/tauri.conf.json' -Raw | ConvertFrom-Json).version
           }
@@ -121,9 +132,10 @@ jobs:
           if-no-files-found: error
 
       - name: Publish to GitHub Release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
           files: artifacts/*
           fail_on_unmatched_files: true
           body: |
@@ -157,11 +169,15 @@ jobs:
 
       - name: Collect artifact with versioned name
         shell: bash
+        env:
+          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          # 版本号：与 Windows job 同逻辑——tag 触发取 tag（去 v 前缀），否则回退 tauri.conf.json
+          # 版本号：与 Windows job 同逻辑——tag 触发取 tag、手动补发取 release_tag（均去 v 前缀），否则回退 tauri.conf.json
           version="$(jq -r .version crates/lk-app/tauri.conf.json)"
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             version="${GITHUB_REF_NAME#v}"
+          elif [ -n "$DISPATCH_RELEASE_TAG" ]; then
+            version="${DISPATCH_RELEASE_TAG#v}"
           fi
           mkdir artifacts
           cp target/x86_64-unknown-linux-gnu/release/lk "artifacts/lk-cli-${version}-linux-x86_64"
@@ -178,8 +194,9 @@ jobs:
       # 与 Windows job 并行发布同一 Release：action 对已存在的 tag Release 追加上传附件。
       # 极小概率两 job 同时首次建 Release 触发竞态，失败重跑本 job 即可（幂等）。
       - name: Publish to GitHub Release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
           files: artifacts/*
           fail_on_unmatched_files: true
