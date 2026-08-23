@@ -135,7 +135,7 @@ jobs:
         if: github.ref_type == 'tag' || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
           files: artifacts/*
           fail_on_unmatched_files: true
           body: |
@@ -197,6 +197,6 @@ jobs:
         if: github.ref_type == 'tag' || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
           files: artifacts/*
           fail_on_unmatched_files: true
