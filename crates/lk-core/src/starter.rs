@@ -344,8 +344,29 @@ fn process_entry(
 /// fail-closed）。步骤：OpenProcess → NtQueryInformationProcess(PEB 地址)
 /// → ReadProcessMemory(ProcessParameters → CurrentDirectory.DosPath)。
 ///
-/// 偏移（同架构）：x64 `PEB+0x20` → `RTL_USER_PROCESS_PARAMETERS+0x30`
-/// CurrentDirectory.DosPath；x86 `PEB+0x10` → `+0x24`。
+/// 偏移（同架构，见 [`PEB_PROCESS_PARAMETERS_OFFSET`] /
+/// [`PROCESS_PARAMETERS_CWD_OFFSET`] 的布局注记）。
+/// PEB → `RTL_USER_PROCESS_PARAMETERS` 指针偏移（x64 `+0x20` / x86 `+0x10`）。
+#[cfg(windows)]
+const PEB_PROCESS_PARAMETERS_OFFSET: usize = if cfg!(target_pointer_width = "64") {
+    0x20
+} else {
+    0x10
+};
+
+/// `RTL_USER_PROCESS_PARAMETERS` → `CurrentDirectory.CURDIR.DosPath` 偏移。
+///
+/// x64 布局（Vista+，`ConsoleFlags` 占 `+0x18`）：StandardError 句柄在
+/// `+0x30`，`CurrentDirectory`（CURDIR = `UNICODE_STRING` + HANDLE）在
+/// **`+0x38`**——#33：旧值 `0x30` 把假句柄当 `DosPath.Length` 读野指针，
+/// 所有 Windows 本地 inject 恒 `no_cwd`。x86 无 8 字节对齐空洞：`+0x24`。
+#[cfg(windows)]
+const PROCESS_PARAMETERS_CWD_OFFSET: usize = if cfg!(target_pointer_width = "64") {
+    0x38
+} else {
+    0x24
+};
+
 #[cfg(windows)]
 pub fn resolve_peer_cwd(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, UNICODE_STRING};
@@ -383,17 +404,6 @@ pub fn resolve_peer_cwd(pid: u32) -> Option<String> {
         unique_process_id: usize,
         inherited_from: usize,
     }
-
-    const PEB_PROCESS_PARAMETERS_OFFSET: usize = if cfg!(target_pointer_width = "64") {
-        0x20
-    } else {
-        0x10
-    };
-    const PROCESS_PARAMETERS_CWD_OFFSET: usize = if cfg!(target_pointer_width = "64") {
-        0x30
-    } else {
-        0x24
-    };
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
@@ -718,6 +728,57 @@ mod tests {
             .to_string_lossy()
             .to_string();
         assert_eq!(cwd, canonical_real, "cwd 必须是解析符号链接后的真实路径");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// #33 回归门（真实路径集成测试）：x64 `RTL_USER_PROCESS_PARAMETERS`
+    /// 的 `CurrentDirectory.CURDIR.DosPath` 在 `+0x38`（旧值 `+0x30` 是
+    /// StandardError 句柄 → 读野指针 → 恒 `no_cwd`）。spawn 真实子进程后
+    /// `resolve_peer_cwd` 必须等于其真实 cwd（canonical 形态）。偏移常量
+    /// 本身也按目标指针宽度断言（防再次回退）。Windows CI / 真机运行；
+    /// 交叉编译（windows-gnu）必须通过。
+    #[cfg(windows)]
+    #[test]
+    fn real_child_cwd_resolved_via_peb() {
+        // 偏移常量与公认布局一致（x64 Vista+ 带 ConsoleFlags 的布局）
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(PROCESS_PARAMETERS_CWD_OFFSET, 0x38);
+            assert_eq!(PEB_PROCESS_PARAMETERS_OFFSET, 0x20);
+        } else {
+            assert_eq!(PROCESS_PARAMETERS_CWD_OFFSET, 0x24);
+            assert_eq!(PEB_PROCESS_PARAMETERS_OFFSET, 0x10);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // cmd + ping 当 sleep（无需额外依赖；ping 存在于所有 Windows 安装）
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 31 127.0.0.1 > nul"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cmd 子进程");
+        // 子进程就绪（PEB ProcessParameters 初始化完成后才可读）
+        let cwd = (|| {
+            for _ in 0..50 {
+                if let Some(c) = resolve_peer_cwd(child.id()) {
+                    return Some(c);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            None
+        })()
+        .expect("resolve_peer_cwd 应读到子进程真实 cwd");
+        let expected = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            cwd, expected,
+            "PEB 解析出的 cwd 必须等于子进程真实 cwd（canonical）"
+        );
         let _ = child.kill();
         let _ = child.wait();
     }
