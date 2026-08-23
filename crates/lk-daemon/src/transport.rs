@@ -1159,7 +1159,8 @@ mod tests {
 
     /// 经真实 UDS 服务循环的端到端：帧内 lkBridge pid 与对端一致 → 采信其
     /// cwd（canonical 化）；pid 不符 → 维持 procfs 派生的真实 cwd。
-    #[cfg(unix)]
+    /// （依赖 SO_PEERCRED 对端 PID + /proc cwd 派生，仅 Linux 可过。）
+    #[cfg(target_os = "linux")]
     #[test]
     fn bridge_identity_end_to_end_over_unix_socket() {
         let tmp = tempfile::tempdir().unwrap();
