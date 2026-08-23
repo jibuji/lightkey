@@ -423,7 +423,9 @@ mod imp {
         CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE,
         INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, WriteFile};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FlushFileBuffers, ReadFile, WriteFile,
+    };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
         WaitNamedPipeW,
@@ -671,7 +673,23 @@ mod imp {
                         let _ = write_line(&mut stream, &resp);
                     }
                 }
+                // 响应阶段竞态（#31 回归）：写完立即 `DisconnectNamedPipe` 会在
+                // 客户端尚未读走管道缓冲区内响应时把数据随断连丢弃（实测服务端
+                // 写完 ~37µs 即断连，客户端读报 os error 233）。named pipe 服务端
+                // 的 `FlushFileBuffers` 阻塞至客户端读走全部已写数据——「确保送达
+                // 再断连」的正确原语。客户端已先行断开时它返回
+                // ERROR_PIPE_NOT_CONNECTED(233)：此时响应本就无人接收，忽略即可；
+                // 其余失败同样不让断连路径卡死。
+                // 阻塞风险取舍：若客户端拿到响应帧后不再读取，本调用无限期阻塞——
+                // 与既有模型一致（连接线程本就以 PIPE_WAIT 无超时阻塞在请求行
+                // 读取，每连接独立线程，不拖垮守护进程主循环），故不加定时器兜底；
+                // 纯 sleep 宽限则是下策：既不能保证送达（慢读者超宽限期仍丢帧），
+                // 又给所有正常请求平添固定延迟。
+                //
+                // TODO(CI): 本行为由下方 windows-only 单测锁定；真机 WSL2 跨子系统
+                // E2E 复测确认 ~8% 响应丢失率归零。
                 unsafe {
+                    let _ = FlushFileBuffers(sh.0);
                     DisconnectNamedPipe(sh.0);
                     CloseHandle(sh.0);
                 }
@@ -1154,7 +1172,8 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
+    /// 进程内 mock 守护共用的停机旗标（unix/windows 测试均用；永不置位——
+    /// 测试进程退出即随之消亡）。
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
     /// 经真实 UDS 服务循环的端到端：帧内 lkBridge pid 与对端一致 → 采信其
@@ -1277,5 +1296,56 @@ mod tests {
         };
         apply_bridge_identity(&mut peer, &line, 7);
         assert_eq!(peer.cwd, None, "canonicalize 失败必须 fail-closed");
+    }
+
+    // -------------------------------------------------------------------------
+    // #31 响应阶段竞态：响应完整送达后才允许断连（Windows named pipe 语义锁定）
+    // -------------------------------------------------------------------------
+
+    /// 慢读客户端回归锁：服务端写完响应后不得在客户端读走之前断连——旧实现
+    /// 写完 ~37µs 即 `DisconnectNamedPipe`，管道缓冲区内响应随断连被系统丢弃，
+    /// 延迟读的客户端拿到 os error 233（ERROR_PIPE_NOT_CONNECTED）。修复后
+    /// 服务端断连前先 `FlushFileBuffers`（阻塞至客户端读走全部已写数据），
+    /// 故此处刻意延迟 150ms 再读仍必须拿到完整响应。
+    ///
+    /// TODO(CI): 本测试仅在 Windows 测试跑中实际执行；本地只做 windows-gnu
+    /// 类型检查，需 CI windows-latest 或真机 WSL2 跨子系统 E2E 复测确认
+    /// ~8% 响应丢失率归零。
+    #[cfg(windows)]
+    #[test]
+    fn response_delivered_before_disconnect_slow_reader_still_gets_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        bind_server(&dir).expect("bind mock server");
+        let handler: Handler = Arc::new(|line, _| serde_json::json!({ "echo": line }).to_string());
+        std::thread::spawn(move || {
+            let _ = serve(&dir, handler, None, &SHUTDOWN);
+        });
+        // serve 线程需要一点时间创建首个监听实例；connect() 自带 233 短重试
+        let mut ep = None;
+        for _ in 0..20 {
+            if let Some(e) = read_endpoint(tmp.path()) {
+                ep = Some(e);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let ep = ep.expect("daemon.json 已写入");
+
+        let mut stream = connect(&ep).expect("连接 mock 守护");
+        write_line(
+            &mut stream,
+            r#"{"jsonrpc":"2.0","id":1,"method":"x","params":{}}"#,
+        )
+        .unwrap();
+        // 刻意慢读：旧实现在此窗口内已断连丢帧 → 本行报 233
+        std::thread::sleep(Duration::from_millis(150));
+        let resp = read_line(&mut stream)
+            .expect("响应必须在服务端断连前仍可完整读出")
+            .expect("连接未提前 EOF");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("响应为合法 JSON");
+        let echo: serde_json::Value =
+            serde_json::from_str(v["echo"].as_str().expect("回显原始帧")).expect("回显为合法 JSON");
+        assert_eq!(echo["id"], 1, "慢读客户端必须拿到完整回显响应");
     }
 }
