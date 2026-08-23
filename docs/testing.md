@@ -41,7 +41,8 @@
   流程：WSL 内 Linux `lk` unlock → item list → `authz.evaluate` 弹窗批准 →
   Linux 子进程收到注入 env；断言审计含 `wsl-bridge` 事件、探测失败分型与
   目标可见性（stderr 提示 + `lk status` 目标字段）。规格见
-  [cross-subsystem.md](cross-subsystem.md) §10。
+  [cross-subsystem.md](cross-subsystem.md) §10；**要执行测试**（下载哪些 Release
+  产物、安装、跑测）→ [testing-cross-subsystem.md](testing-cross-subsystem.md)。
 
 ## 2. 测试数据纪律（D13）
 

@@ -28,6 +28,7 @@
 | [sync.md](sync.md) | BYO 同步、变更发现（轮询）、冲突收敛 | M1 |
 | [authorization-gate.md](authorization-gate.md) | Agent 授权门三层模型、规则库、`lk inject` | M2 |
 | [cross-subsystem.md](cross-subsystem.md) | 跨子系统 stdio 桥（WSL CLI ↔ Windows 桌面守护实例；补充拍板 #14） | M2.75 |
+| [testing-cross-subsystem.md](testing-cross-subsystem.md) | 跨子系统桥测试 Runbook：下载哪些 Release 产物、安装步骤、E2E/手动测试与排障 | M2.75 |
 | [browser-fill.md](browser-fill.md) | 浏览器填充通道协议（Native Messaging） | M3 |
 | [testing.md](testing.md) | 三层测试策略与 CI | 全部 |
 | [cli.md](cli.md) | `lk` CLI 命令参考 | 全部 |
