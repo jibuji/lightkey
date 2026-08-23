@@ -429,6 +429,25 @@ mod tests {
         assert!(matches!(decide_with(i), Decision::Fatal(_)));
     }
 
+    /// `LIGHTKEY_BRIDGE_HOME` 显式指定即视为「装了」（跳过安装扫描）——即使
+    /// KNOWN_EXE_DIRS 找不到 lk.exe 也 fail-closed 明确报错，绝不静默回落本地
+    /// （防空库错觉）。纯逻辑、无文件系统依赖：合成路径两侧均不存在，断言确定。
+    /// 真实 fs 集成（找到 exe → Bridge）见下方 `#[cfg(unix)]` 用例。
+    #[test]
+    fn home_env_counts_as_installed_fail_closed_without_exe() {
+        let mut i = input();
+        i.home_env = Some("/mnt/c/Users/lk-probe-nonexistent/AppData/Roaming/lightkey");
+        assert!(
+            matches!(decide_with(i), Decision::Fatal(_)),
+            "home_env 显式指定后 exe 缺失应 Fatal，而非静默本地"
+        );
+    }
+
+    /// 真实 WSL `/mnt/<盘>` 命名空间探测（home_env → 推导 user_home →
+    /// `find_exe_near` 找到 lk.exe → Bridge）：依赖 POSIX 绝对路径与真实
+    /// 文件树，Windows 原生无 `/mnt` 命名空间且 `to_wsl_path` 会把 `C:\…`
+    /// 折算为不存在的虚拟路径——unix-only（与 bridge.rs 同类门控一致）。
+    #[cfg(unix)]
     #[test]
     fn home_env_counts_as_installed_and_searches_exe() {
         let tmp = tempfile::tempdir().unwrap();
