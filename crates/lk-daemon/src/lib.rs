@@ -227,14 +227,18 @@ impl Daemon {
         // 持锁前提下顺序执行与 route() 相同的 phase 方法（单线程直调下锁
         // 窗口不可观察，请求/响应与主缝一致）。
         if strategy_of(&method) == ExecutionStrategy::ApprovalDeferred {
+            if !self.trigger_precheck(token.as_deref()) {
+                return rpc_string(session_invalid(id));
+            }
             let resp = match self.authz_begin(id.clone(), params, peer) {
                 AuthzBegin::Final(resp) => resp,
                 AuthzBegin::Pending { request_id, .. } => {
                     let decision = self.shared.approvals.await_decision(request_id);
-                    self.authz_finalize(id.clone(), request_id, decision)
+                    let r = self.authz_finalize(id.clone(), request_id, decision);
+                    self.touch_activity();
+                    r
                 }
             };
-            self.touch_activity();
             return resp;
         }
 
@@ -2645,5 +2649,56 @@ mod tests {
             &peer,
         ));
         assert_eq!(sync_resp["error"]["code"], ERR_SYNC_NOT_CONFIGURED);
+    }
+
+    /// 跨缝等价回归：ApprovalDeferred 阶段①的会话预检在两条缝上都生效——
+    /// 无效 token + 第 2 层规则可命中时，直调与生产主缝都必须 session.invalid，
+    /// 绝不放行或泄露注入值。
+    #[test]
+    fn authz_deferred_invalid_token_session_gated_on_both_seams() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+        // 规则：proj 下 npm * 授权 NPM_TOKEN（保证第 2 层对有效会话可命中）
+        let add = rpc_result(&state.lock().unwrap().handle(
+            &rpc_line(
+                M_RULE_ADD,
+                Some(&token),
+                json!({ "projectDir": proj.path(), "name": "publish",
+                        "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+            ),
+            &PeerInfo::unknown(),
+        ));
+        assert!(add["rule"]["id"].as_str().is_some());
+
+        let handler = make_handler(&state, &shared);
+        let peer = test_peer(Some(proj.path()));
+        let line = rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some("bogus-token"),
+            json!({ "command": "npm publish", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+        );
+        let via_handle = rpc_json(&state.lock().unwrap().handle(&line, &peer));
+        let via_route = rpc_json(&handler(&line, &peer));
+        for (seam, resp) in [("handle", via_handle), ("route", via_route)] {
+            assert_eq!(
+                resp["error"]["code"], ERR_SESSION_INVALID,
+                "{seam}: 无效 token 必须 session.invalid: {resp}"
+            );
+            assert!(
+                resp.to_string().find("sekrit").is_none(),
+                "{seam}: 不得泄露注入值"
+            );
+        }
+        // 对照组：同一场景换成有效 token → 第 2 层放行且 env 可见
+        // （证明上面的 session.invalid 来自预检而非规则未命中）。
+        let ok_line = rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(&token),
+            json!({ "command": "npm publish", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+        );
+        let ok = rpc_json(&handler(&ok_line, &peer));
+        assert_eq!(ok["result"]["allowed"], true);
+        assert_eq!(ok["result"]["env"]["NPM_TOKEN"], "sekrit");
     }
 }
