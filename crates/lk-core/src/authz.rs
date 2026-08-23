@@ -372,21 +372,23 @@ pub fn rule_matches(rule: &Rule, canonical_cwd: &str, command: &str) -> bool {
 /// 的路径前缀（**按路径组件**比较——目录边界 `/a/b/cd` 不匹配 `/a/b/c`；
 /// 分隔符随平台，Windows `C:\\a\\b` 与 `/` 写法均正确）。
 ///
-/// 规则侧先过 [`crate::path_ns::canonical_project_dir`] 归一化再比较（§7.4
-/// 两侧同函数）：历史/同步入库的 verbatim 前缀形态（`\\?\C:\…`）剥离为
-/// 与运行时 cwd 一致的常规绝对路径；`wsl://<distro>/<rest>` 规范形保留原样。
+/// 两侧先过 [`crate::path_ns::canonical_project_dir`] 归一化再比较（§7.4
+/// 两侧同函数，幂等）：规则侧历史/同步入库的 verbatim 前缀形态
+/// （`\\?\C:\…`）剥离为常规绝对路径；cwd 侧同样归一化——Windows 上
+/// `fs::canonicalize` 产物本身即 verbatim 形态，未归一化将无法与规则侧命中
+/// （守护进程边界已归一化时此步无副作用，属纵深防御：客户端自报 cwd 不得
+/// 因写法变体绕过或漏配）。`wsl://<distro>/<rest>` 规范形保留原样。
 /// 两侧均为 wsl:// 规范形时改用 wsl 形态匹配：大小写不敏感（NTFS 默认
 /// 语义）、按 `/` 目录边界（cross-subsystem.md §7.4——distro 名保留原样
 /// 但匹配不区分大小写，防伪造 cwd 大小写变体绕过或漏配）。
 pub fn project_dir_matches(project_dir: &str, canonical_cwd: &str) -> bool {
     let dir_norm = crate::path_ns::canonical_project_dir(project_dir);
-    if crate::path_ns::is_wsl_canonical(&dir_norm)
-        && crate::path_ns::is_wsl_canonical(canonical_cwd)
-    {
-        return crate::path_ns::wsl_ancestor_matches(&dir_norm, canonical_cwd);
+    let cwd_norm = crate::path_ns::canonical_project_dir(canonical_cwd);
+    if crate::path_ns::is_wsl_canonical(&dir_norm) && crate::path_ns::is_wsl_canonical(&cwd_norm) {
+        return crate::path_ns::wsl_ancestor_matches(&dir_norm, &cwd_norm);
     }
     let dir = std::path::Path::new(&dir_norm);
-    let cwd = std::path::Path::new(canonical_cwd);
+    let cwd = std::path::Path::new(&cwd_norm);
     cwd == dir || cwd.starts_with(dir)
 }
 
