@@ -4,8 +4,10 @@
 //!
 //! 边界（与 M1.5 一致，仅搬移 + M2 增量）：
 //!
-//! - [`lib`]（本模块）：状态机 + JSON-RPC 分发 + 装配点（[`CoreServices`]：
-//!   事件总线 + 服务）+ 授权门三阶段编排（G1）；
+//! - [`lib`]（本模块）：状态机 + RPC 方法实现 + 装配点（[`CoreServices`]：
+//!   事件总线 + 服务）；
+//! - [`router`]：**执行计划路由**（ADR-0001）——方法 → 执行策略的唯一分发点，
+//!   授权门三阶段 / 两阶段同步的锁纪律在此声明（G1：等待不持命令锁）；
 //! - [`config`]：`config.json` / `sync-state.json` 读写 + 同步凭据钥匙串；
 //! - [`sync`]：同步轮次执行（抓取无锁 → 应用短锁）；
 //! - [`transport`]：本地 IPC 传输（UDS / named pipe）+ 对端身份（PID/cwd）
@@ -24,6 +26,7 @@
 pub mod config;
 pub mod dirs;
 pub mod notifier;
+pub mod router;
 pub mod sync;
 pub mod transport;
 
@@ -53,8 +56,9 @@ use sha2::Digest;
 
 pub use config::*;
 pub use notifier::{frame_for_event, Notifier};
+pub use router::{route, strategy_of, ExecutionStrategy};
 pub use sync::sync_fail_response;
-pub use sync::{run_sync_round, run_sync_round_with, try_sync_trigger};
+pub use sync::{run_sync_round, run_sync_round_with};
 pub use transport::{PeerInfo, PushHub};
 
 /// 会话令牌文件名（0600；CLI 进程间传递，锁定即删除）。
@@ -210,7 +214,7 @@ impl Daemon {
         self.dispatch(req, peer)
     }
 
-    fn dispatch(&mut self, req: RpcRequest, _peer: &PeerInfo) -> String {
+    fn dispatch(&mut self, req: RpcRequest, peer: &PeerInfo) -> String {
         let id = req.id.clone();
         let method = req.method.clone();
         let params = req.params;
@@ -218,6 +222,25 @@ impl Daemon {
 
         // 空闲超时自动锁定（任何请求都会触发检查）
         self.auto_lock_if_idle();
+
+        // 执行计划路由（ADR-0001）：直调形态查同一张策略表——两阶段策略在
+        // 持锁前提下顺序执行与 route() 相同的 phase 方法（单线程直调下锁
+        // 窗口不可观察，请求/响应与主缝一致）。
+        if strategy_of(&method) == ExecutionStrategy::ApprovalDeferred {
+            if !self.trigger_precheck(token.as_deref()) {
+                return rpc_string(session_invalid(id));
+            }
+            let resp = match self.authz_begin(id.clone(), params, peer) {
+                AuthzBegin::Final(resp) => resp,
+                AuthzBegin::Pending { request_id, .. } => {
+                    let decision = self.shared.approvals.await_decision(request_id);
+                    let r = self.authz_finalize(id.clone(), request_id, decision);
+                    self.touch_activity();
+                    r
+                }
+            };
+            return resp;
+        }
 
         let resp = match method.as_str() {
             M_VAULT_STATUS => self.vault_status(id.clone()),
@@ -244,20 +267,10 @@ impl Daemon {
             M_AUDIT_VERIFY => {
                 self.require_session(id.clone(), token, |me| me.audit_verify(id.clone()))
             }
+            // OutsideLock 策略的直调形态：持锁跑同一轮次（route() 的主缝
+            // 形态在命令锁外执行；此处单线程等价，请求/响应一致）
             M_SYNC_TRIGGER => {
-                // 生产路径走 make_handler 的 try_sync_trigger（命令锁外执行轮次）；
-                // 此处为直接 handle() 调用（测试等）的等价回退
-                if self.vault_peek() && self.sessions.validate(token.as_deref().unwrap_or(&[])) {
-                    match run_sync_round(&self.shared) {
-                        Ok(summary) => RpcResponse::ok(
-                            id.clone(),
-                            serde_json::to_value(summary).unwrap_or(Value::Null),
-                        ),
-                        Err(e) => sync_fail_response(id.clone(), &e),
-                    }
-                } else {
-                    session_invalid(id.clone())
-                }
+                self.require_session(id.clone(), token, |me| me.sync_trigger_inline(id.clone()))
             }
             M_SYNC_POLL => self.require_session(id.clone(), token, |me| me.sync_poll(id.clone())),
             // M2：通知订阅（连接转入流模式由传输层处理；此处只做会话校验）
@@ -274,11 +287,8 @@ impl Daemon {
             M_RULE_REMOVE => {
                 self.require_session(id.clone(), token, |me| me.rule_remove(id.clone(), params))
             }
-            // authz.evaluate 走 make_handler 的三阶段特殊路径（G1：等待不持
-            // 命令锁）；直接 handle() 调用不提供（返回 method-not-found）
-            M_AUTHZ_EVALUATE => {
-                RpcResponse::err(id.clone(), ERR_METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None)
-            }
+            // authz.evaluate = ApprovalDeferred 策略（见 dispatch 开头的策略
+            // 分派；此臂仅为表完整性兜底，正常不会到达）
             _ => RpcResponse::err(id.clone(), ERR_METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None),
         };
         self.last_activity = Instant::now();
@@ -491,7 +501,7 @@ impl Daemon {
         }
     }
 
-    fn auto_lock_if_idle(&mut self) {
+    pub(crate) fn auto_lock_if_idle(&mut self) {
         let idle = self.shared.config.read().unwrap().auto_lock_minutes;
         let elapsed = self.last_activity.elapsed();
         let timeout = Duration::from_secs(idle * 60);
@@ -718,9 +728,26 @@ impl Daemon {
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
 
+    /// OutsideLock 策略的直调形态：持命令锁跑完整轮次（会话预检已由
+    /// require_session 完成；单线程场景与 route() 主缝的锁外编排请求/响应
+    /// 一致，仅少了不必要持有的解锁窗口）。
+    fn sync_trigger_inline(&mut self, id: Value) -> RpcResponse {
+        match run_sync_round(&self.shared) {
+            Ok(summary) => {
+                RpcResponse::ok(id, serde_json::to_value(summary).unwrap_or(Value::Null))
+            }
+            Err(e) => sync_fail_response(id, &e),
+        }
+    }
+
     /// `sync.trigger` 无锁路径的会话预检（命令锁内调用）：解锁态 + 令牌有效。
     pub fn trigger_precheck(&self, token: Option<&[u8]>) -> bool {
         self.vault_peek() && self.sessions.validate(token.unwrap_or(&[]))
+    }
+
+    /// 活动时间戳收尾（两阶段策略的锁内第③阶段；与常规路径语义一致）。
+    pub(crate) fn touch_activity(&mut self) {
+        self.last_activity = Instant::now();
     }
 
     // -- M2：规则 / 审批回传 / 订阅 ---------------------------------------
@@ -900,7 +927,7 @@ impl Daemon {
 
     /// 阶段①（命令锁内）：会话预检 + 启动者判定 + 第 1/2 层短路；需要审批
     /// 时登记待审批 + 广播 `authz.request`，返回 Pending（等待移出命令锁）。
-    fn authz_begin(&mut self, id: Value, params: Value, peer: &PeerInfo) -> AuthzBegin {
+    pub(crate) fn authz_begin(&mut self, id: Value, params: Value, peer: &PeerInfo) -> AuthzBegin {
         let p: AuthzEvaluateParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => {
@@ -1008,17 +1035,14 @@ impl Daemon {
                     .lock()
                     .unwrap()
                     .insert(request_id, PendingAuthz { request: req });
-                AuthzBegin::Pending {
-                    request_id,
-                    expires_at,
-                }
+                AuthzBegin::Pending { request_id }
             }
         }
     }
 
     /// 阶段③（重取命令锁）：收决策 → 解密 key 值 → 审计（channel=Approval）
     /// → 返回。等待期间锁定 → `session.invalid`（无法解密/审计）。
-    fn authz_finalize(
+    pub(crate) fn authz_finalize(
         &mut self,
         id: Value,
         request_id: uuid::Uuid,
@@ -1197,16 +1221,14 @@ fn audit_channel(channel: Option<&str>) -> AuditChannel {
 }
 
 /// 阶段① 结果：最终响应（不阻塞）或待审批（等待移出命令锁）。
-enum AuthzBegin {
+/// 到期时刻以登记值为准（审批注册表侧超时默认拒绝），此处不重复携带。
+pub(crate) enum AuthzBegin {
     Final(String),
-    Pending {
-        request_id: uuid::Uuid,
-        expires_at: Instant,
-    },
+    Pending { request_id: uuid::Uuid },
 }
 
 /// RpcResponse → 行（序列化失败兜底 `{}`）。
-fn rpc_string(resp: RpcResponse) -> String {
+pub(crate) fn rpc_string(resp: RpcResponse) -> String {
     serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into())
 }
 
@@ -1218,7 +1240,7 @@ struct RuleListParams {
     channel: Option<String>,
 }
 
-fn extract_token(params: &Value) -> Option<Vec<u8>> {
+pub(crate) fn extract_token(params: &Value) -> Option<Vec<u8>> {
     params
         .get("token")
         .and_then(|t| t.as_str())
@@ -1267,78 +1289,20 @@ pub fn global_shutdown() -> &'static AtomicBool {
 }
 
 // ---------------------------------------------------------------------------
-// 请求 → 响应装配（命令锁 + 无锁特殊路径）
+// 请求 → 响应装配（执行计划路由的唯一生产装配点；ADR-0001）
 // ---------------------------------------------------------------------------
 
-/// 装配请求处理器：`sync.trigger` 与 `authz.evaluate` 走**命令锁外**执行路径
-/// （网络 I/O / 审批等待不阻塞其他命令，G1），其余命令在命令锁内串行。
+/// 装配请求处理器：全部方法经 [`router::route`] 按执行策略编排命令锁
+/// （`sync.trigger` / `authz.evaluate` 的锁外阶段不阻塞其他命令，G1）。
 ///
-/// 生产（`lk daemon` / 桌面内嵌实例）与测试共用本装配，保证行为一致。
+/// 生产（`lk daemon` / 桌面内嵌实例）与测试共用本装配，保证行为一致；
+/// 本函数只是 route 主缝的薄闭包（Arc 克隆 + 转发）。
 pub fn make_handler(state: &Arc<Mutex<Daemon>>, shared: &Arc<SharedDaemon>) -> transport::Handler {
     let handler_state = Arc::clone(state);
     let handler_shared = Arc::clone(shared);
     Arc::new(move |line: &str, peer: &PeerInfo| -> String {
-        // sync.trigger：命令锁外执行轮次（网络 I/O 不阻塞其他命令）
-        if let Some(resp) = try_sync_trigger(&handler_state, &handler_shared, line) {
-            return resp;
-        }
-        // authz.evaluate：三阶段（① 命令锁内第 1/2 层 + 登记审批 →
-        // ② 锁外等待决策（≤30s）→ ③ 重取锁收尾）；等待期间其他命令照常服务
-        if let Some(resp) = try_authz_evaluate(&handler_state, &handler_shared, line, peer) {
-            return resp;
-        }
-        let mut guard = handler_state.lock().expect("daemon mutex poisoned");
-        guard.handle(line, peer)
+        router::route(&handler_state, &handler_shared, line, peer)
     })
-}
-
-/// `authz.evaluate` 的无锁路径（G1 回归：30s 审批等待不持有命令锁）。
-///
-/// ① 命令锁内：会话预检（含空闲超时检查）+ 启动者判定 + 第 1/2 层短路；
-///    需要审批 → 登记待审批 + 广播 `authz.request`；
-/// ② 命令锁外：在待审批注册表上等待决策（最多 `approval_timeout_secs`，
-///    超时默认拒绝）；
-/// ③ 命令锁内：收决策 → 解密 key 值 → 审计（channel=Approval）→ 响应。
-pub fn try_authz_evaluate(
-    state: &Mutex<Daemon>,
-    shared: &SharedDaemon,
-    line: &str,
-    peer: &PeerInfo,
-) -> Option<String> {
-    let req: RpcRequest = serde_json::from_str(line).ok()?;
-    if req.method != M_AUTHZ_EVALUATE {
-        return None;
-    }
-    let id = req.id.clone();
-    let token = extract_token(&req.params);
-    // 阶段①：命令锁内
-    let begin = {
-        let mut guard = state.lock().expect("daemon mutex poisoned");
-        guard.auto_lock_if_idle();
-        if !guard.trigger_precheck(token.as_deref()) {
-            return Some(rpc_string(session_invalid(id)));
-        }
-        guard.authz_begin(id.clone(), req.params, peer)
-    };
-    match begin {
-        AuthzBegin::Final(resp) => Some(resp),
-        AuthzBegin::Pending {
-            request_id,
-            expires_at,
-        } => {
-            // 阶段②：锁外等待（不持命令锁；vault/审批注册表短锁除外）
-            let decision = shared.approvals.await_decision(request_id);
-            let _ = expires_at; // 到期时刻以登记值为准
-                                // 阶段③：重取命令锁收尾
-            let resp = {
-                let mut guard = state.lock().expect("daemon mutex poisoned");
-                let r = guard.authz_finalize(id, request_id, decision);
-                guard.last_activity = Instant::now();
-                r
-            };
-            Some(resp)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,6 +1659,11 @@ mod tests {
 
     fn rpc_result(resp: &str) -> Value {
         serde_json::from_str::<Value>(resp).unwrap()["result"].clone()
+    }
+
+    /// 完整响应对象（含 error；路由表断言用）。
+    fn rpc_json(resp: &str) -> Value {
+        serde_json::from_str::<Value>(resp).unwrap()
     }
 
     /// G1 根治回归（M1.5 既有）：同步轮次进行中（慢网络后端持网络 I/O 窗口），
@@ -2567,5 +2536,169 @@ mod tests {
         assert_eq!(fv["method"], "session.unlocked");
         assert_eq!(fv["params"]["via"], "password");
         assert!(shared.push.subscriber_count() >= 1);
+    }
+
+    // -- 执行计划路由（ADR-0001）-------------------------------------------
+
+    /// 路由表完整性：全部 `M_*` 方法常量经 handle()（直调形态查同一张策略
+    /// 表）均可命中——未解锁态下预期 session.invalid / invalid params 等，
+    /// 但绝不 method-not-found。防「加方法忘登记」退回静默 not-found。
+    #[test]
+    fn routing_table_covers_all_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::start(dir.path()).unwrap();
+        let all_methods = [
+            M_VAULT_STATUS,
+            M_VAULT_INIT,
+            M_VAULT_UNLOCK,
+            M_VAULT_LOCK,
+            M_VAULT_RECOVER,
+            M_ITEM_LIST,
+            M_ITEM_GET,
+            M_ITEM_PUT,
+            M_ITEM_DELETE,
+            M_ITEM_EXPORT,
+            M_AUDIT_LIST,
+            M_AUDIT_VERIFY,
+            M_SYNC_TRIGGER,
+            M_SYNC_POLL,
+            M_AUTHZ_EVALUATE,
+            M_APPROVAL_RESULT,
+            M_RULE_ADD,
+            M_RULE_LIST,
+            M_RULE_REMOVE,
+            M_SUBSCRIBE,
+        ];
+        for method in all_methods {
+            let resp =
+                rpc_json(&daemon.handle(&rpc_line(method, None, json!({})), &PeerInfo::unknown()));
+            let err = &resp["error"];
+            if !err.is_null() {
+                assert_ne!(
+                    err["code"], ERR_METHOD_NOT_FOUND,
+                    "{method} 未在执行计划路由登记（strategy_of 缺臂）"
+                );
+            }
+        }
+        // 对照：未知方法仍然 method-not-found（表完整性断言本身有效）
+        let unknown = rpc_json(&daemon.handle(
+            &rpc_line("nonexistent.method", None, json!({})),
+            &PeerInfo::unknown(),
+        ));
+        assert_eq!(unknown["error"]["code"], ERR_METHOD_NOT_FOUND);
+    }
+
+    /// interface 即测试面：两阶段策略（OutsideLock / ApprovalDeferred）的
+    /// 直调形态与生产主缝（make_handler → route）请求/响应逐字一致。
+    /// 选取无副作用场景（同步未配置 / 无审批界面 fail-closed）以便双路径对跑。
+    #[test]
+    fn special_strategies_direct_call_matches_production_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut audit = AuditLog::open(dir.path()).unwrap();
+        init_vault_with_params(
+            dir.path(),
+            "pw123456",
+            false,
+            &mut audit,
+            &test_kdf_params(),
+        )
+        .unwrap();
+        let mut daemon = Daemon::start(dir.path()).unwrap();
+        daemon
+            .shared()
+            .config
+            .write()
+            .unwrap()
+            .approval_timeout_secs = 1;
+        let unlock = rpc_result(&daemon.handle(
+            &rpc_line(
+                M_VAULT_UNLOCK,
+                None,
+                json!({ "masterPassword": "pw123456" }),
+            ),
+            &PeerInfo::unknown(),
+        ));
+        let token = unlock["token"].as_str().unwrap().to_string();
+
+        let state = Arc::new(std::sync::Mutex::new(daemon));
+        let shared = state.lock().unwrap().shared();
+        let handler = make_handler(&state, &shared);
+        let peer = test_peer(None);
+
+        for (method, params) in [
+            // OutsideLock：同步未配置 → ERR_SYNC_NOT_CONFIGURED
+            (M_SYNC_TRIGGER, json!({ "token": token })),
+            // ApprovalDeferred：无订阅者 = 无审批界面 → fail-closed 立即拒绝
+            (
+                M_AUTHZ_EVALUATE,
+                json!({
+                    "token": token,
+                    "command": "npm run build",
+                    "keys": ["NPM_TOKEN"],
+                }),
+            ),
+        ] {
+            let line = rpc_line(method, Some(&token), params);
+            let via_handle = rpc_json(&state.lock().unwrap().handle(&line, &peer));
+            let via_route = rpc_json(&handler(&line, &peer));
+            assert_eq!(via_handle, via_route, "{method} 直调与生产主缝行为不一致");
+        }
+        // 具体语义抽查：同步未配置的错误码（错误响应走完整对象而非 result）
+        let sync_resp = rpc_json(&handler(
+            &rpc_line(M_SYNC_TRIGGER, Some(&token), json!({ "token": token })),
+            &peer,
+        ));
+        assert_eq!(sync_resp["error"]["code"], ERR_SYNC_NOT_CONFIGURED);
+    }
+
+    /// 跨缝等价回归：ApprovalDeferred 阶段①的会话预检在两条缝上都生效——
+    /// 无效 token + 第 2 层规则可命中时，直调与生产主缝都必须 session.invalid，
+    /// 绝不放行或泄露注入值。
+    #[test]
+    fn authz_deferred_invalid_token_session_gated_on_both_seams() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+        // 规则：proj 下 npm * 授权 NPM_TOKEN（保证第 2 层对有效会话可命中）
+        let add = rpc_result(&state.lock().unwrap().handle(
+            &rpc_line(
+                M_RULE_ADD,
+                Some(&token),
+                json!({ "projectDir": proj.path(), "name": "publish",
+                        "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+            ),
+            &PeerInfo::unknown(),
+        ));
+        assert!(add["rule"]["id"].as_str().is_some());
+
+        let handler = make_handler(&state, &shared);
+        let peer = test_peer(Some(proj.path()));
+        let line = rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some("bogus-token"),
+            json!({ "command": "npm publish", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+        );
+        let via_handle = rpc_json(&state.lock().unwrap().handle(&line, &peer));
+        let via_route = rpc_json(&handler(&line, &peer));
+        for (seam, resp) in [("handle", via_handle), ("route", via_route)] {
+            assert_eq!(
+                resp["error"]["code"], ERR_SESSION_INVALID,
+                "{seam}: 无效 token 必须 session.invalid: {resp}"
+            );
+            assert!(
+                resp.to_string().find("sekrit").is_none(),
+                "{seam}: 不得泄露注入值"
+            );
+        }
+        // 对照组：同一场景换成有效 token → 第 2 层放行且 env 可见
+        // （证明上面的 session.invalid 来自预检而非规则未命中）。
+        let ok_line = rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(&token),
+            json!({ "command": "npm publish", "keys": ["NPM_TOKEN"], "channel": "cli" }),
+        );
+        let ok = rpc_json(&handler(&ok_line, &peer));
+        assert_eq!(ok["result"]["allowed"], true);
+        assert_eq!(ok["result"]["env"]["NPM_TOKEN"], "sekrit");
     }
 }

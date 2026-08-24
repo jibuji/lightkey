@@ -74,8 +74,9 @@
   - 推送通道（决策 #3 A）：`transport::PushHub` + `notifier::Notifier`
     （EventSink），订阅连接收 JSON-RPC notification 帧（`subscribe` 方法）
   - 授权门（`lk-core/src/authz.rs`）：三层模型 + `ApprovalChannel` trait +
-    `PendingApprovals`（30s 超时默认拒绝）；`authz.evaluate` 三阶段编排
-    （`try_authz_evaluate`：等待不持命令锁，G1）
+    `PendingApprovals`（30s 超时默认拒绝）；RPC 分发走**执行计划路由**
+    （ADR-0001：`lk-daemon::router` 唯一分发点，三策略 Inline / OutsideLock /
+    ApprovalDeferred；G1 锁纪律集中一处）
   - 启动者判定（`lk-core/src/starter.rs`）：IPC 对端 PID 进程链回溯
     （Linux procfs / Windows Toolhelp+PEB / macOS sysctl），失败 fail-closed
   - 规则库：`model::Rule`（含 name，决策 #6）+ `{uuid}.rule.lk` 密封 +
@@ -100,6 +101,20 @@
   + 审计 `channel=wsl-bridge`；release 双产物（Linux `lk` + 桌面包捆绑
   `lk.exe`）；E2E `scripts/e2e_cross_subsystem.sh`（无 WSL 干净跳过）
 - [ ] M3 浏览器填充
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as GitHub Issues on `github.com/jibuji/lightkey` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles use their default label strings (e.g. `needs-triage`, `ready-for-agent`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ## Maintaining this file
 

@@ -18,6 +18,7 @@
 | 文档 | 内容 | 关联里程碑 |
 |------|------|-----------|
 | [decisions.md](decisions.md) | Wayfinder 决议集（拍板记录 + 映射） | 全部 |
+| [adr/](adr/) | 架构决策记录（ADR；0001 daemon RPC 单一执行计划路由） | M2 |
 | [architecture.md](architecture.md) | 总体架构、组件边界、技术栈、workspace | 全部 |
 | [milestones.md](milestones.md) | M0–M3 里程碑范围与验收（含 M1.5 / M2.5 / M2.75） | 全部 |
 | [crypto.md](crypto.md) | 加密原语、KDF、密钥分叉、自描述密文格式 | M0 |
