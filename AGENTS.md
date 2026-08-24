@@ -38,7 +38,10 @@
   Windows `lk.exe` + Linux `lk` 双产物；tag `v*` → GitHub Release 附件（两个 build
   job 均需 `permissions: contents: write`）；main push / workflow_dispatch →
   Actions artifact，dispatch 传 `release_tag` 输入可把产物补发到既有 Release
-  （不移动标签）；资产名版本号 tag/dispatch 触发时取对应 ref 去 v 前缀，否则回退
+  （不移动标签）；发布路径（tag / 带 release_tag 的 dispatch）先过 check-version
+  闸门：去 v 前缀的发布 tag 须等于根 Cargo.toml [workspace.package] version
+  （lk-cli 经 workspace 继承），不一致 fail（#34）；bump 版本属发版动作，勿顺手改；
+  资产名版本号 tag/dispatch 触发时取对应 ref 去 v 前缀，否则回退
   tauri.conf.json；产物未签名属预期）。
   注意：桌面包经 bundle.resources 捆绑 `target/release/lk.exe` 进安装目录——
   手动打版必须先 `cargo build --release -p lk-cli` 再 `cargo tauri build`
