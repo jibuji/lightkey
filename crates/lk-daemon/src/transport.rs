@@ -1373,7 +1373,23 @@ mod tests {
         }
         let ep = ep.expect("daemon.json 已写入");
 
-        let mut stream = connect(&ep).expect("连接 mock 守护");
+        // daemon.json 写入与首个管道实例就绪之间存在调度窗口（CI 冷虚拟机上
+        // 可能远超 connect() 内建的 ~200ms 瞬态重试预算）；本测试验证的是慢读
+        // 不丢帧，不是启动时序——以宽松截止轮询连接。
+        let mut stream = None;
+        for _ in 0..100 {
+            match connect(&ep) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(e).expect("连接 mock 守护"),
+            }
+        }
+        let mut stream = stream.expect("5s 截止内连上 mock 守护");
         write_line(
             &mut stream,
             r#"{"jsonrpc":"2.0","id":1,"method":"x","params":{}}"#,
