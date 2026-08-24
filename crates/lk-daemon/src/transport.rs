@@ -13,8 +13,13 @@
 //! - socket/pipe 路径含用户级随机组件，且位于用户私有数据目录（0700）——
 //!   防跨用户劫持。
 //! - 守护进程信息（pid + 端点 + `version`）写入 `daemon.json`；客户端首次
-//!   访问自动拉起守护进程（检测到陈旧端点 → 先杀旧进程再拉起）。
+//!   访问自动拉起守护进程（陈旧端点处置见 [`ensure_daemon`]：pid 不存活
+//!   仅清理；pid 存活须连续多次探测失败才判僵死 kill，绝不单次 probe
+//!   瞬态失败即杀——宁可少杀，不可误杀，#31）。
 //!   `version` 供协议版本校验（cross-subsystem.md §7.3），旧文件缺省可读。
+//! - Windows named pipe 服务端任意时刻常备 ≥1 个监听实例（先补位再派发），
+//!   响应写完先 `FlushFileBuffers` 再断连（#31）；客户端连接对 233 /
+//!   FILE_NOT_FOUND 瞬态窗口做有界短重试。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -367,7 +372,9 @@ mod imp {
         CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE,
         INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, WriteFile};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FlushFileBuffers, ReadFile, WriteFile,
+    };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
         WaitNamedPipeW,
@@ -377,7 +384,7 @@ mod imp {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
-    const ERROR_PIPE_BUSY: u32 = 231;
+    // ERROR_PIPE_BUSY(231) 等连接错误码移至模块级公共区（connect_with_retry）
     const ERROR_PIPE_CONNECTED: u32 = 535;
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
@@ -515,7 +522,36 @@ mod imp {
         }
     }
 
+    /// 创建一个监听中的 pipe 实例（#31：服务端任意时刻常备 ≥1 个）。
+    fn create_pipe_instance(name: &[u16], sa: &UserOnlySa) -> std::io::Result<HANDLE> {
+        let handle = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                64 * 1024,
+                64 * 1024,
+                0,
+                &sa.attrs as *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(handle)
+        }
+    }
+
     /// 监听并处理连接（每连接一线程；订阅连接转流模式）。
+    ///
+    /// #31 实例池化：循环外预创建首个监听实例；`ConnectNamedPipe` 返回
+    /// （客户端已连入）后**先补位**（创建下一个监听实例）**再派发**处理线程。
+    /// 旧实现单实例串行 `CreateNamedPipeW → ConnectNamedPipe`，实例已建但未进
+    /// 监听的窗口期内客户端 `CreateFileW` 可成功拿到句柄，后续 I/O 即 os error
+    /// 233（ERROR_PIPE_NOT_CONNECTED），probe 撞上该竞态进而误杀健康守护。
+    /// 补位失败则关闭已连入句柄并向上报错（宁可让单个客户端失败重试，不留无
+    /// 监听窗口）；协议格式与授权语义零变更。
     pub fn serve(
         dir: &Path,
         handler: Handler,
@@ -526,36 +562,43 @@ mod imp {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "缺少 daemon.json"))?;
         let name = wide(&ep.address);
         let sa = user_only_sa()?;
+        // #31：循环外预创建首个监听实例（bind 写 daemon.json 与首个实例进入
+        // 监听之间不再有窗口）
+        let mut listening = create_pipe_instance(&name, &sa)?;
         loop {
             if shutdown.load(Ordering::Relaxed) {
+                unsafe {
+                    CloseHandle(listening);
+                }
                 break;
             }
-            let handle = unsafe {
-                CreateNamedPipeW(
-                    name.as_ptr(),
-                    PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    PIPE_UNLIMITED_INSTANCES,
-                    64 * 1024,
-                    64 * 1024,
-                    0,
-                    &sa.attrs as *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-                )
-            };
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(std::io::Error::last_os_error());
-            }
-            let ok = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+            let ok = unsafe { ConnectNamedPipe(listening, std::ptr::null_mut()) };
             if ok == 0 && unsafe { GetLastError() } != ERROR_PIPE_CONNECTED {
+                // 客户端连入后即刻断开等瞬态失败：弃置该实例并重建监听实例，
+                // 监听常备性不受影响
                 unsafe {
-                    CloseHandle(handle);
+                    CloseHandle(listening);
                 }
+                listening = create_pipe_instance(&name, &sa)?;
                 continue;
             }
+            let connected = listening;
+            // 先补位再派发：消除「无监听实例」窗口（补位失败则关闭已连入
+            // 句柄并向上报错，由调用方/客户端重试兜底）
+            listening = match create_pipe_instance(&name, &sa) {
+                Ok(h) => h,
+                Err(e) => {
+                    unsafe {
+                        CloseHandle(connected);
+                    }
+                    return Err(e);
+                }
+            };
             let handler = handler.clone();
             let hub = hub.clone();
-            let peer = peer_info(handle);
-            let sh = SendHandle(handle);
+            let peer = peer_info(connected);
+            // 先包装成 SendHandle 再入闭包（裸 HANDLE 非 Send）
+            let sh = SendHandle(connected);
             std::thread::spawn(move || {
                 let mut stream = PipeStream { handle: sh };
                 if let Ok(Some(line)) = read_line(&mut stream) {
@@ -572,7 +615,23 @@ mod imp {
                         let _ = write_line(&mut stream, &resp);
                     }
                 }
+                // 响应阶段竞态（#31）：写完立即 `DisconnectNamedPipe` 会在客户端
+                // 尚未读走管道缓冲区内响应时把数据随断连丢弃（字节模式实测服务端
+                // 写完 ~37µs 即断连，慢读客户端拿到截断响应/UnexpectedEof——再经
+                // probe 放大成误杀）。named pipe 服务端的 `FlushFileBuffers` 阻塞
+                // 至客户端读走全部已写数据，是「确保送达再断连」的正确原语。
+                // 客户端已先行断开时它返回 ERROR_PIPE_NOT_CONNECTED(233)：响应
+                // 本就无人接收，忽略；其余失败同样不阻断断连路径。阻塞风险取舍：
+                // 若客户端拿到响应帧后不再读取，本调用无限期阻塞——与既有模型一致
+                // （连接线程本就以 PIPE_WAIT 无超时阻塞在请求行读取，每连接独立
+                // 线程，不拖垮守护进程主循环），故不加定时器兜底；纯 sleep 宽限是
+                // 下策（不保证送达且平添固定延迟）。
+                //
+                // TODO(CI): Windows named pipe 真实行为无法在 Linux 单测覆盖，
+                // 由下方 windows-only 慢读回归锁单测 + CI windows-latest / 真机
+                // E2E 复测确认归零。
                 unsafe {
+                    let _ = FlushFileBuffers(sh.0);
                     DisconnectNamedPipe(sh.0);
                     CloseHandle(sh.0);
                 }
@@ -706,41 +765,39 @@ mod imp {
         stream.flush()
     }
 
-    /// 客户端连接（pipe 忙则等待；不存在视为守护进程未运行）。
+    /// 客户端连接：注入 [`connect_with_retry`] 驱动（错误码语义见其文档）。
     pub fn connect(ep: &Endpoint) -> std::io::Result<PipeStream> {
         let name = wide(&ep.address);
-        loop {
-            let handle = unsafe {
-                CreateFileW(
-                    name.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    0,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    0,
-                    INVALID_HANDLE_VALUE,
-                )
-            };
-            if handle != INVALID_HANDLE_VALUE {
-                return Ok(PipeStream {
-                    handle: SendHandle(handle),
-                });
-            }
-            let err = unsafe { GetLastError() };
-            if err == ERROR_PIPE_BUSY {
-                let ok = unsafe { WaitNamedPipeW(name.as_ptr(), 10_000) };
-                if ok == 0 {
-                    return Err(std::io::Error::last_os_error());
+        connect_with_retry(
+            || {
+                let handle = unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        0,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        INVALID_HANDLE_VALUE,
+                    )
+                };
+                if handle != INVALID_HANDLE_VALUE {
+                    Ok(PipeStream {
+                        handle: SendHandle(handle),
+                    })
+                } else {
+                    Err(unsafe { GetLastError() })
                 }
-                continue;
-            }
-            return Err(std::io::Error::from_raw_os_error(err as i32));
-        }
+            },
+            || unsafe { WaitNamedPipeW(name.as_ptr(), 10_000) != 0 },
+        )
     }
 
+    /// 进程是否存活（OpenProcess 失败时句柄为 NULL——非
+    /// INVALID_HANDLE_VALUE；对已退出 pid 返回 false）。
     pub fn pid_alive(pid: u32) -> bool {
         let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if h == INVALID_HANDLE_VALUE {
+        if h.is_null() {
             return false;
         }
         unsafe {
@@ -751,7 +808,7 @@ mod imp {
 
     pub fn kill_pid(pid: u32) {
         let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if h != INVALID_HANDLE_VALUE {
+        if !h.is_null() {
             unsafe {
                 TerminateProcess(h, 1);
                 CloseHandle(h);
@@ -819,6 +876,57 @@ fn ensure_user_dir(dir: &Path) -> std::io::Result<()> {
 // 客户端：请求 / 自动拉起
 // ---------------------------------------------------------------------------
 
+/// win32 named pipe 连接错误码（平台无关重试驱动 [`connect_with_retry`] 的
+/// 输入语义；Windows connect 注入真实 CreateFileW 结果）。
+#[cfg(any(windows, test))]
+const ERROR_PIPE_BUSY: u32 = 231;
+/// ERROR_PIPE_NOT_CONNECTED：服务端「实例已建未监听/已连入未派发」瞬态窗口。
+#[cfg(any(windows, test))]
+const ERROR_PIPE_NOT_CONNECTED: u32 = 233;
+/// ERROR_FILE_NOT_FOUND：守护刚拉起、首个监听实例未建的启动窗口。
+#[cfg(any(windows, test))]
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+/// 瞬态错误短重试上限（规格：有界，不无限阻塞 CLI）。
+#[cfg(any(windows, test))]
+const CONNECT_TRANSIENT_RETRIES: u32 = 20;
+
+/// 发起一次 pipe 连接的重试驱动（注入式，#31）。`open` 返回连接或原始
+/// win32 错误码；`wait_busy` 对应 WaitNamedPipeW 语义。处置规则：
+/// - ERROR_PIPE_BUSY → 等待后重试（既有语义不变）；
+/// - 233 / FILE_NOT_FOUND（#31 瞬态窗口：实例补位前 / 守护刚拉起监听未建）
+///   → 有界短重试，至多 [`CONNECT_TRANSIENT_RETRIES`] 次、每次间隔
+///   [`CONNECT_TRANSIENT_BACKOFF`]，超限即上抛（总时长有界，不无限阻塞 CLI）；
+/// - 其余错误码不重试、立即上抛。
+#[cfg(any(windows, test))]
+fn connect_with_retry<T>(
+    mut open: impl FnMut() -> Result<T, u32>,
+    mut wait_busy: impl FnMut() -> bool,
+) -> std::io::Result<T> {
+    let mut transient_failures = 0u32;
+    loop {
+        match open() {
+            Ok(t) => return Ok(t),
+            Err(ERROR_PIPE_BUSY) => {
+                if !wait_busy() {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Err(e)
+                if (e == ERROR_PIPE_NOT_CONNECTED || e == ERROR_FILE_NOT_FOUND)
+                    && transient_failures < CONNECT_TRANSIENT_RETRIES =>
+            {
+                transient_failures += 1;
+                std::thread::sleep(CONNECT_TRANSIENT_BACKOFF);
+            }
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+}
+
+/// 瞬态错误相邻两次尝试的间隔。
+#[cfg(any(windows, test))]
+const CONNECT_TRANSIENT_BACKOFF: Duration = Duration::from_millis(10);
+
 /// 发送一行请求并返回响应行（连接失败返回 Err）。
 pub fn request(endpoint: &Endpoint, line: &str) -> std::io::Result<String> {
     let mut stream = connect(endpoint)?;
@@ -833,18 +941,20 @@ pub fn request(endpoint: &Endpoint, line: &str) -> std::io::Result<String> {
     }
 }
 
-/// 确保守护进程在跑：探测端点 → 陈旧则杀旧 → 拉起 → 等待就绪。
+/// 确保守护进程在跑：探测端点 → 陈旧则按处置规则处理 → 拉起 → 等待就绪。
 /// `dir_override` 为 `lk --dir` 的显式值（透传给子进程）。
 pub fn ensure_daemon(dir: &Path) -> std::io::Result<Endpoint> {
     if let Some(ep) = read_endpoint(dir) {
-        if probe(&ep) {
+        // 注入接缝：探测/存活/kill/清理可替换（单测用假序列驱动）
+        let guard = StaleGuard {
+            probe: &|ep| probe(ep),
+            pid_alive: &|pid| pid_alive(pid),
+            kill: &|pid| kill_pid(pid),
+            cleanup: &|dir, ep| cleanup(dir, ep),
+        };
+        if resolve_existing_daemon(dir, &ep, &guard) {
             return Ok(ep);
         }
-        // 陈旧端点：先杀旧进程再清理
-        if pid_alive(ep.pid) {
-            kill_pid(ep.pid);
-        }
-        cleanup(dir, &ep);
     }
     spawn_daemon(dir)?;
     // 轮询等待就绪（最多 ~5s）
@@ -860,6 +970,65 @@ pub fn ensure_daemon(dir: &Path) -> std::io::Result<Endpoint> {
         std::io::ErrorKind::TimedOut,
         "守护进程启动超时",
     ))
+}
+
+/// 陈旧端点处置的注入接缝：四个副作用边界均可替换——单测喂假 probe 序列并
+/// 观察 kill 是否发生；生产路径由 [`ensure_daemon`] 接真实实现。
+struct StaleGuard<'a> {
+    probe: &'a dyn Fn(&Endpoint) -> bool,
+    pid_alive: &'a dyn Fn(u32) -> bool,
+    kill: &'a dyn Fn(u32),
+    cleanup: &'a dyn Fn(&Path, &Endpoint),
+}
+
+/// 处置既有端点：返回 true 表示端点健康可复用（调用方直接使用）；false 表示
+/// 已完成陈旧处置（调用方拉起新守护进程）。
+///
+/// 判死状态机（#31，fail-safe 方向：宁可少杀，不可误杀）：
+/// - probe 通过 → 健康，复用；
+/// - probe 失败 + **pid 已死** → 陈旧端点，仅清理（PID 可能已易主，绝不 kill）；
+/// - probe 失败 + pid 存活 → 疑似僵死，但单次失败可能是管道瞬态竞态——
+///   先走重试梯（含首探共 [`PROBE_RETRIES_AFTER_LIVENESS`] 次、等距间隔
+///   [`PROBE_RETRY_DELAY`]），任一次恢复即复用；连续失败才 kill。
+fn resolve_existing_daemon(dir: &Path, ep: &Endpoint, g: &StaleGuard) -> bool {
+    if (g.probe)(ep) {
+        return true;
+    }
+    if !(g.pid_alive)(ep.pid) {
+        // pid 已不存活：清理即可，无须也绝不应 kill
+        (g.cleanup)(dir, ep);
+        return false;
+    }
+    // pid 存活：重试梯内恢复即复用，绝不因一次瞬态失败误杀健康守护
+    if probe_retry_ladder(ep, PROBE_RETRIES_AFTER_LIVENESS - 1, g.probe) {
+        return true;
+    }
+    (g.kill)(ep.pid);
+    (g.cleanup)(dir, ep);
+    false
+}
+
+/// pid 存活但首探失败后的追加重试次数（含首探共 3 次）。
+///
+/// 注意：本值是**含首探的总探测次数**；重试梯实际补采 `值 - 1` 次
+/// （首探已由 [`resolve_existing_daemon`] 计入，见调用处）。
+const PROBE_RETRIES_AFTER_LIVENESS: usize = 3;
+
+/// 相邻两次探测的间隔。
+const PROBE_RETRY_DELAY: Duration = Duration::from_millis(150);
+
+/// 重试梯：精确再采样 `attempts` 次（0 = 不补采，立即判失败）。相邻两次探测
+/// 之间——含本梯首次与调用方刚失败的那次探测之间——一律先等
+/// [`PROBE_RETRY_DELAY`]：三次探测必须**等距**铺开（若首发紧贴上次失败立即
+/// 发出，可能落进同一毫秒级管道瞬态窗口，等于只有两次有效采样，#31）。
+fn probe_retry_ladder(ep: &Endpoint, attempts: usize, probe: &dyn Fn(&Endpoint) -> bool) -> bool {
+    for _ in 0..attempts {
+        std::thread::sleep(PROBE_RETRY_DELAY);
+        if probe(ep) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 探测端点是否可用（vault.status 无需令牌，锁态也可响应）。
@@ -939,5 +1108,279 @@ mod tests {
         // 往返一致
         let back: Endpoint = serde_json::from_str(&out).expect("往返解析");
         assert_eq!(back.version.as_deref(), Some("9.9.9"));
+    }
+
+    // -------------------------------------------------------------------------
+    // seam A「守护判死」：陈旧端点处置——注入假 probe 序列，观察 kill 是否发生
+    // -------------------------------------------------------------------------
+
+    /// seam A 假状态：probe 结果序列 + 存活旗标 + kill/cleanup 观察记录。
+    ///
+    /// `probe_calls` 精确记录探测总次数（含首探）——队列耗尽后假 probe 恒返
+    /// false，仅凭「剩余长度」无法察觉多采样/少采样，必须用计数器钉死次数。
+    #[derive(Default)]
+    struct GuardFake {
+        probe_results: std::collections::VecDeque<bool>,
+        probe_calls: usize,
+        alive: bool,
+        killed: Vec<u32>,
+        cleaned: bool,
+    }
+
+    thread_local! {
+        static GUARD_FAKE: std::cell::RefCell<GuardFake> = std::cell::RefCell::new(GuardFake::default());
+    }
+
+    fn fake_guard() -> StaleGuard<'static> {
+        StaleGuard {
+            probe: &|_ep| {
+                GUARD_FAKE.with(|f| {
+                    let mut f = f.borrow_mut();
+                    f.probe_calls += 1;
+                    f.probe_results.pop_front().unwrap_or(false)
+                })
+            },
+            pid_alive: &|_pid| GUARD_FAKE.with(|f| f.borrow().alive),
+            kill: &|pid| GUARD_FAKE.with(|f| f.borrow_mut().killed.push(pid)),
+            cleanup: &|_dir, _ep| GUARD_FAKE.with(|f| f.borrow_mut().cleaned = true),
+        }
+    }
+
+    fn guard_fake_set(probe_results: Vec<bool>, alive: bool) {
+        GUARD_FAKE.with(|f| {
+            *f.borrow_mut() = GuardFake {
+                probe_results: probe_results.into(),
+                alive,
+                ..Default::default()
+            }
+        });
+    }
+
+    fn guard_fake_taken() -> (Vec<u32>, bool, usize) {
+        GUARD_FAKE.with(|f| {
+            let f = f.borrow();
+            (f.killed.clone(), f.cleaned, f.probe_calls)
+        })
+    }
+
+    /// 期望值来自 issue #31 症状规格，不与实现同构重算：任何持有解锁库的
+    /// 守护进程被误杀即本测试失败。
+    fn hazard_ep() -> Endpoint {
+        Endpoint {
+            pid: 4242,
+            address: r"\\.\pipe\lightkey-fake-0badf00d".to_string(),
+            version: None,
+        }
+    }
+
+    /// **issue #31 危害复现（红）**：单次瞬态 probe 失败 + pid 存活 →
+    /// 绝不允许 kill 持有解锁库的守护进程——瞬态失败意味着下一拍即恢复，
+    /// 端点必须被复用而非处死。
+    #[test]
+    fn single_transient_probe_failure_never_kills_live_daemon() {
+        guard_fake_set(vec![false, true], true);
+        let reused = resolve_existing_daemon(Path::new("/tmp/fake"), &hazard_ep(), &fake_guard());
+        let (killed, cleaned, probe_calls) = guard_fake_taken();
+        assert!(reused, "瞬态失败后恢复必须复用健康守护");
+        assert!(
+            killed.is_empty(),
+            "单次瞬态失败绝不杀进程，实际 kill 了 {killed:?}"
+        );
+        assert!(!cleaned, "复用路径不得清理端点");
+        assert_eq!(
+            probe_calls, 2,
+            "首探失败后必须恰好再采样一次（恢复帧被消费）即止：不得一次采样定生死，也不得多采"
+        );
+    }
+
+    /// 连续失败但未达规格阈值（规格：含首探共 3 次连续失败才判僵死）→
+    /// 第 3 拍恢复 → 仍不 kill、复用端点。
+    #[test]
+    fn failures_below_spec_threshold_still_never_kill() {
+        guard_fake_set(vec![false, false, true], true);
+        let reused = resolve_existing_daemon(Path::new("/tmp/fake"), &hazard_ep(), &fake_guard());
+        let (killed, _, probe_calls) = guard_fake_taken();
+        assert!(reused, "阈值内恢复必须复用健康守护");
+        assert!(killed.is_empty());
+        assert_eq!(
+            probe_calls, 3,
+            "含首探共恰好 3 次采样（规格阈值），第 3 拍恢复即止"
+        );
+    }
+
+    /// 连续多次失败达到规格阈值且全程未恢复 + pid 存活 → 判僵死，
+    /// 必须 kill（陈旧守护占位时不能永远不敢杀）。
+    #[test]
+    fn consecutive_probe_failures_beyond_threshold_eventually_kills() {
+        guard_fake_set(vec![false, false, false], true); // 首探已计入，这里供重试梯
+        let reused = resolve_existing_daemon(Path::new("/tmp/fake"), &hazard_ep(), &fake_guard());
+        let (killed, cleaned, probe_calls) = guard_fake_taken();
+        assert!(!reused);
+        assert_eq!(killed, vec![4242], "连续失败达标后必须 kill 僵死进程");
+        assert!(cleaned);
+        assert_eq!(
+            probe_calls, 3,
+            "重试梯必须恰好耗尽（含首探共 3 次）后才允许 kill"
+        );
+    }
+
+    /// probe 失败 + pid 已死 → 陈旧端点：仅清理，绝不 kill（PID 可能已易主）。
+    #[test]
+    fn dead_pid_endpoint_cleans_without_kill() {
+        guard_fake_set(vec![false, false, false], false);
+        let reused = resolve_existing_daemon(Path::new("/tmp/fake"), &hazard_ep(), &fake_guard());
+        let (killed, cleaned, probe_calls) = guard_fake_taken();
+        assert!(!reused);
+        assert!(killed.is_empty(), "pid 已不存活无须也绝不应 kill");
+        assert!(cleaned);
+        assert_eq!(
+            probe_calls, 1,
+            "pid 已死的判定无需耗尽重试梯（首探失败即可清理）"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // seam B「客户端连接重试」：注入 win32 错误序列，观察有界重试行为
+    // -------------------------------------------------------------------------
+
+    /// 期望值来自 issue #31 症状规格：守护刚拉起/实例补位前的瞬态窗口
+    /// （233 / FILE_NOT_FOUND）不得让客户端连接失败；重试次数必须有界。
+    #[test]
+    fn transient_connect_errors_then_success_eventually_succeeds() {
+        let mut script = std::collections::VecDeque::from(vec![
+            Err(ERROR_PIPE_NOT_CONNECTED),
+            Err(ERROR_PIPE_NOT_CONNECTED),
+            Err(ERROR_FILE_NOT_FOUND),
+            Ok(()),
+        ]);
+        let calls = std::cell::Cell::new(0u32);
+        let result = connect_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                script.pop_front().unwrap_or(Err(ERROR_FILE_NOT_FOUND))
+            },
+            || true,
+        );
+        assert!(result.is_ok(), "瞬态错误序列后必须连接成功");
+        let calls = calls.get();
+        assert!(
+            calls <= CONNECT_TRANSIENT_RETRIES + 1,
+            "重试次数不得超过上限 {CONNECT_TRANSIENT_RETRIES}，实际 {calls}"
+        );
+    }
+
+    /// 持续瞬态失败 → 必须报错且总时长有界（规格：不无限阻塞 CLI）。
+    #[test]
+    fn persistent_transient_errors_fail_within_bounded_time() {
+        let start = std::time::Instant::now();
+        let calls = std::cell::Cell::new(0u32);
+        let result = connect_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                Err::<(), u32>(ERROR_FILE_NOT_FOUND)
+            },
+            || true,
+        );
+        assert!(result.is_err(), "持续失败必须报错");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "总时长必须有界，实际 {:?}",
+            start.elapsed()
+        );
+        assert!(
+            calls.get() <= CONNECT_TRANSIENT_RETRIES + 1,
+            "调用次数必须有界，实际 {}",
+            calls.get()
+        );
+    }
+
+    /// 非瞬态错误（如 ACCESS_DENIED）→ 不重试、立即上抛（既有语义）。
+    #[test]
+    fn non_transient_error_fails_immediately() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = connect_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                Err::<(), u32>(5) // ERROR_ACCESS_DENIED
+            },
+            || true,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "非瞬态错误不得重试");
+    }
+
+    /// BUSY → wait_busy 成功后继续（既有语义保持不变）。
+    #[test]
+    fn busy_error_waits_then_retries() {
+        let mut script = std::collections::VecDeque::from(vec![Err(ERROR_PIPE_BUSY), Ok(())]);
+        let waited = std::cell::Cell::new(false);
+        let result = connect_with_retry(
+            || script.pop_front().unwrap_or(Err(ERROR_PIPE_BUSY)),
+            || {
+                waited.set(true);
+                true
+            },
+        );
+        assert!(result.is_ok());
+        assert!(waited.get(), "BUSY 必须先走 WaitNamedPipeW 语义");
+    }
+
+    // -------------------------------------------------------------------------
+    // seam C「响应送达后再断连」（FlushFileBuffers）：Linux 无法真实观察
+    // Windows 管道刷盘顺序，不硬造实现耦合测试——以下 windows-only 回归锁
+    // 仅在 Windows 测试跑中执行，Linux 上只做 windows-gnu 类型检查。
+    // -------------------------------------------------------------------------
+
+    /// 测试进程内 mock 守护共用的停机旗标（永不置位——测试进程退出即随之
+    /// 消亡）。
+    #[cfg(windows)]
+    static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+    /// 慢读客户端回归锁：服务端写完响应后不得在客户端读走之前断连——旧实现
+    /// 写完 ~37µs 即 `DisconnectNamedPipe`，管道缓冲区内响应随断连被系统丢弃，
+    /// 延迟读的客户端拿到截断响应（UnexpectedEof → probe 放大成误杀）。修复后
+    /// 服务端断连前先 `FlushFileBuffers`（阻塞至客户端读走全部已写数据），故
+    /// 此处刻意延迟 150ms 再读仍必须拿到完整响应。
+    ///
+    /// TODO(CI): 本测试仅在 Windows 测试跑中实际执行；需 CI windows-latest 或
+    /// 真机 E2E 复测确认响应丢失率归零。
+    #[cfg(windows)]
+    #[test]
+    fn response_delivered_before_disconnect_slow_reader_still_gets_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        bind_server(tmp.path()).expect("bind mock server");
+        let handler: Handler = Arc::new(|line, _| serde_json::json!({ "echo": line }).to_string());
+        {
+            let dir = tmp.path().to_path_buf();
+            std::thread::spawn(move || {
+                let _ = serve(&dir, handler, None, &SHUTDOWN);
+            });
+        }
+        // serve 线程需要一点时间创建首个监听实例；connect() 自带瞬态短重试
+        let mut ep = None;
+        for _ in 0..20 {
+            if let Some(e) = read_endpoint(tmp.path()) {
+                ep = Some(e);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let ep = ep.expect("daemon.json 已写入");
+
+        let mut stream = connect(&ep).expect("连接 mock 守护");
+        write_line(
+            &mut stream,
+            r#"{"jsonrpc":"2.0","id":1,"method":"x","params":{}}"#,
+        )
+        .unwrap();
+        // 刻意慢读：旧实现在此窗口内已断连丢帧 → 本行报 UnexpectedEof
+        std::thread::sleep(Duration::from_millis(150));
+        let resp = read_line(&mut stream)
+            .expect("响应必须在服务端断连前仍可完整读出")
+            .expect("连接未提前 EOF");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("响应为合法 JSON");
+        let echo: serde_json::Value =
+            serde_json::from_str(v["echo"].as_str().expect("回显原始帧")).expect("回显为合法 JSON");
+        assert_eq!(echo["id"], 1, "慢读客户端必须拿到完整回显响应");
     }
 }
