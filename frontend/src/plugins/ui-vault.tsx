@@ -8,6 +8,10 @@
  *   「已复制，30 秒后自动清除」+ 剪贴板 30s 清除）；
  * - 编辑走 CAS：冲突提示「条目已被其他设备修改」+ 覆盖/取消；
  * - `item.changed` 三方响应之一：ui 刷新（Rust 通知 → 帧 → 本层事件）。
+ *
+ * 条目域逻辑（加载编排 / 过滤搜索白名单 / CAS 冲突处置 / item→draft 转换）
+ * 抽出至 `../items/collection`（架构评审候选 #4：纯 TS 深模块，可不经 DOM
+ * 直接单测）；本组件只保留 DOM 行为、事件订阅与 toast 文案。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -26,8 +30,17 @@ import {
 } from "../components/atoms";
 import type { SlotComponentConfig } from "./skeleton";
 import { slotComponentConfig } from "./skeleton";
+import {
+  filterItems,
+  itemToDraft,
+  loadItems,
+  overwriteConflict,
+  resolveSelection,
+  stashConflict,
+  type ItemFilterValue,
+} from "../items/collection";
 
-export type FilterValue = "all" | ItemType;
+export type FilterValue = ItemFilterValue;
 
 const FILTERS: { value: FilterValue; label: string }[] = [
   { value: "all", label: "全部" },
@@ -78,20 +91,16 @@ export function VaultPage({ ctx }: { ctx: Context }) {
   useEffect(() => {
     let alive = true;
     setItems(null);
-    ctx.ipc
-      .list()
-      .then((summaries) => Promise.all(summaries.map((s) => ctx.ipc.get(s.id))))
-      .then((full) => {
-        if (!alive) return;
-        setItems(full);
-        setSelectedId((prev) => {
-          if (prev && full.some((it) => it.id === prev)) return prev;
-          return full[0]?.id ?? null;
-        });
-      })
-      .catch(() => {
-        if (alive) setItems([]);
-      });
+    // 加载编排（list → 逐个 get）与失败语义在条目域模块；此处只接线 state
+    loadItems(ctx.ipc).then((full) => {
+      if (!alive) return;
+      if (full === null) {
+        setItems([]);
+        return;
+      }
+      setItems(full);
+      setSelectedId((prev) => resolveSelection(full, prev));
+    });
     return () => {
       alive = false;
     };
@@ -122,26 +131,11 @@ export function VaultPage({ ctx }: { ctx: Context }) {
   }, [ctx, filter]);
 
   /* ---------- 列表 ---------- */
-  const filtered = useMemo(() => {
-    if (!items) return null;
-    return items.filter((it) => {
-      if (filter !== "all" && it.type !== filter) return false;
-      if (!q) return true;
-      // spec §6.2：名称/用户名/域名/备注；**不含密钥明文值与笔记全文**
-      const hay = [
-        it.name,
-        it.type === "login" ? it.username : "",
-        it.type === "login" ? it.uris.join(" ") : "",
-        it.type === "secret" ? it.purpose : "",
-        it.type === "file" ? it.note : "",
-        it.type === "file" ? it.attachment : "",
-        it.type === "file" ? it.fileType : "",
-      ]
-        .join(" ")
-        .toLowerCase();
-      return hay.includes(q);
-    });
-  }, [items, filter, q]);
+  // 过滤/搜索（含 §6.2 可搜字段白名单）在条目域模块
+  const filtered = useMemo(
+    () => (items ? filterItems(items, filter, q) : null),
+    [items, filter, q],
+  );
 
   const selected = useMemo(
     () => (items ? items.find((it) => it.id === selectedId) ?? null : null),
@@ -175,13 +169,14 @@ export function VaultPage({ ctx }: { ctx: Context }) {
 
   const handleConflict = useCallback((id: string, draft: ItemDraft) => {
     setModal(null);
-    setConflict({ id, draft });
+    setConflict(stashConflict(id, draft));
   }, []);
 
   const conflictOverwrite = useCallback(async () => {
     if (!conflict) return;
     try {
-      await ctx.ipc.update(conflict.id, conflict.draft);
+      // 覆盖语义（同 id+draft 重发、不带 expectedRevision）在条目域模块
+      await overwriteConflict(ctx.ipc, conflict);
       setConflict(null);
       toast.show("已覆盖其他设备的修改");
       reload();
@@ -569,27 +564,30 @@ function ItemForm({
 }) {
   const toast = ctx.toast;
 
-  const [type, setType] = useState<ItemType>(item?.type ?? defaultType ?? "login");
-  const [name, setName] = useState(item?.name ?? "");
+  // item → 表单初值：经条目域模块的纯转换（字段级双向绑定仍在本组件）
+  const d0 = item ? itemToDraft(item) : null;
+
+  const [type, setType] = useState<ItemType>(d0?.type ?? defaultType ?? "login");
+  const [name, setName] = useState(d0?.name ?? "");
 
   // login
-  const [username, setUsername] = useState(item?.type === "login" ? item.username : "");
-  const [password, setPassword] = useState(item?.type === "login" ? item.password : "");
-  const [uri, setUri] = useState(item?.type === "login" ? item.uris.join(", ") : "");
+  const [username, setUsername] = useState(d0?.type === "login" ? d0.username : "");
+  const [password, setPassword] = useState(d0?.type === "login" ? d0.password : "");
+  const [uri, setUri] = useState(d0?.type === "login" ? d0.uris.join(", ") : "");
   const [custom, setCustom] = useState<CustomField[]>(
-    item?.type === "login" ? item.custom.map((c) => ({ ...c })) : [],
+    d0?.type === "login" ? d0.custom.map((c) => ({ ...c })) : [],
   );
 
   // note
-  const [content, setContent] = useState(item?.type === "note" ? item.content : "");
+  const [content, setContent] = useState(d0?.type === "note" ? d0.content : "");
 
   // secret
-  const [value, setValue] = useState(item?.type === "secret" ? item.value : "");
-  const [purpose, setPurpose] = useState(item?.type === "secret" ? item.purpose : "");
-  const [expiresAt, setExpiresAt] = useState(item?.type === "secret" ? item.expiresAt : "");
+  const [value, setValue] = useState(d0?.type === "secret" ? d0.value : "");
+  const [purpose, setPurpose] = useState(d0?.type === "secret" ? d0.purpose : "");
+  const [expiresAt, setExpiresAt] = useState(d0?.type === "secret" ? d0.expiresAt : "");
 
   // file
-  const [note, setNote] = useState(item?.type === "file" ? item.note : "");
+  const [note, setNote] = useState(d0?.type === "file" ? d0.note : "");
   const [selFile, setSelFile] = useState<SelectedFile | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
