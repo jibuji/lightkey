@@ -446,12 +446,18 @@ mod imp {
         Ok(())
     }
 
+    /// 字节缓冲区显式 8 对齐：整段强转成含指针/u32 成员的 TOKEN_USER / ACL
+    /// 结构引用时，裸 [u8; N]（对齐 1）会产生未对齐引用，新工具链直接 panic
+    /// （misaligned pointer dereference，CI 实测复现）。
+    #[repr(C, align(8))]
+    struct AlignedBuf([u8; 128]);
+
     /// 仅限当前用户的 pipe 安全属性（ipc.md §2「pipe ACL」，A2）。
     ///（M1.5 既有实现：显式 DACL 仅授予当前用户 SID；注释见原实现。）
     struct UserOnlySa {
         attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
         _sd: Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>,
-        _acl: Vec<u8>,
+        _acl: AlignedBuf,
     }
 
     fn user_only_sa() -> std::io::Result<UserOnlySa> {
@@ -469,25 +475,25 @@ mod imp {
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let mut user_buf = [0u8; 128];
+            let mut user_buf = AlignedBuf([0u8; 128]);
             let mut ret_len: u32 = 0;
             let ok = GetTokenInformation(
                 token,
                 TokenUser,
-                user_buf.as_mut_ptr() as *mut core::ffi::c_void,
-                user_buf.len() as u32,
+                user_buf.0.as_mut_ptr() as *mut core::ffi::c_void,
+                user_buf.0.len() as u32,
                 &mut ret_len,
             );
             let _ = CloseHandle(token);
             if ok == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let user = &*(user_buf.as_ptr() as *const TOKEN_USER);
+            let user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
             let sid: PSID = user.User.Sid;
 
-            let mut acl_buf = vec![0u8; 256];
-            let acl = acl_buf.as_mut_ptr() as *mut ACL;
-            if InitializeAcl(acl, acl_buf.len() as u32, ACL_REVISION) == 0
+            let mut acl_buf = AlignedBuf([0u8; 128]);
+            let acl = acl_buf.0.as_mut_ptr() as *mut ACL;
+            if InitializeAcl(acl, acl_buf.0.len() as u32, ACL_REVISION) == 0
                 || AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, sid) == 0
             {
                 return Err(std::io::Error::last_os_error());
