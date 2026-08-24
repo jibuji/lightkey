@@ -68,19 +68,35 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 
 ## 5. 总体架构
 
+> **回填说明（2026-08-24，经船长授权的事实回填）**：下方架构图与本节末
+> 「守护形态与审批通知」为真机实测后的**补充覆盖**——依据 Windows 宿主实测指南
+> [win-host-cross-subsystem-retest.md](agents/win-host-cross-subsystem-retest.md) §0 与
+> 实测报告
+> [win-host-cross-subsystem-retest-report-20260824.md](agents/win-host-cross-subsystem-retest-report-20260824.md)。
+> 仅补充「纯 CLI daemon」守护形态及其审批通知语义；本规格既有拍板结论、决策
+> 编号（decisions.md 补充拍板 #14）与其余章节均不变。
+
 ```
-┌─ WSL2 (Linux) ─────────────────┐           ┌─ Windows host ─────────────────────────┐
-│ agent（Linux 原生，如 shell/CI） │           │                                          │
-│   └─ lk（Linux ELF CLI）        │           │  lk.exe bridge（Windows PE，随桌面包安装） │
-│    RpcClient ── 行 JSON ──────▶  │─interop──▶│    stdin/stdout ↔ named pipe 原样中继     │
-│       ←─ evaluate 返回 env 集    │  字节管道   │    │                                     │
-│       spawn <linux-cmd>（注入）  │           │    ▼                                     │
-│                                 │           │  lk-app.exe 内置守护实例（持钥）            │
-│  会话令牌仅在 lk 进程内存         │           │    ├─ 启动者回溯：bridge→wsl.exe→…→终端    │
-└─────────────────────────────────┘           │    ├─ cwd：bridge 继承 = 调用方项目目录 UNC │
-                                              │    ├─ 三层模型 / 30s 弹窗 → GUI ✓          │
-                                              │    └─ 审计（channel=wsl-bridge）✓          │
-                                              └──────────────────────────────────────────┘
+┌─ WSL2 (Linux) ───────────────────┐           ┌─ Windows host ─────────────────────────────────────────┐
+│ agent（Linux 原生，如 shell/CI） │           │                                                        │
+│   └─ lk（Linux ELF CLI）         │           │  lk.exe bridge（Windows PE，随桌面包安装）             │
+│    RpcClient ── 行 JSON ──────▶  │─interop──▶│    stdin/stdout ↔ named pipe 原样中继                  │
+│       ←─ evaluate 返回 env 集    │ 字节管道  │    │                                                   │
+│       spawn <linux-cmd>（注入）  │           │    ▼ named pipe 端点（两形态同一端点）                 │
+│                                  │           │  守护形态二选一在跑：                                  │
+│  会话令牌仅在 lk 进程内存        │           │  [A] 桌面应用形态：lk-app.exe                          │
+└──────────────────────────────────┘           │      内置守护实例 + 托盘常驻；作为 ApprovalChannel     │
+                                               │      订阅者提供第③层弹窗 GUI（30s 倒计时）✓            │
+                                               │  [B] 纯 CLI daemon 形态：无任何 UI                     │
+                                               │      任一本地 lk.exe 命令经 ensure_daemon() 自动拉起， │
+                                               │      并写 %APPDATA%\lightkey\daemon.json               │
+                                               │      需弹窗而无订阅者 → no_ui fail-closed 拒绝 ✗       │
+                                               │  —— 两形态共享的守护核心（lk-daemon 同源）——           │
+                                               │    ├─ 启动者回溯：bridge→wsl.exe→…→终端                │
+                                               │    ├─ cwd：bridge 继承 = 调用方项目目录 UNC            │
+                                               │    ├─ 三层模型 / 30s 超时默认拒绝                      │
+                                               │    └─ 审计（channel=wsl-bridge）✓                      │
+                                               └────────────────────────────────────────────────────────┘
 ```
 
 要点：
@@ -89,7 +105,34 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 - **用户边界不变**：interop 子进程以同一 Windows 用户令牌运行，named pipe 的
   「仅本用户」ACL（transport `UserOnlySa`）语义原样成立；
 - **协议零变更**：行 JSON JSON-RPC、会话令牌、G1 三阶段审批、30s 超时默认拒绝
-  全部照旧；服务端（lk-daemon / lk-app）**无需任何改动**。
+  全部照旧；服务端（lk-daemon / lk-app）**无需任何改动**；
+- **守护承载形态二选一**（桌面应用 / 纯 CLI daemon），差异只在第③层弹窗的
+  有无——详见下文「守护形态与审批通知」。
+
+**守护形态与审批通知（2026-08-24 回填）**
+
+Windows 侧守护实例有两种承载形态（二选一就位）；named pipe 端点、authz 三层
+模型与审计在两形态完全同源：
+
+| | 形态 A：桌面应用 | 形态 B：纯 CLI daemon |
+|---|---|---|
+| 就位方式 | 启动 `lk-app.exe`：进程内内置守护实例（`serve_embedded`）+ 托盘常驻 | Windows 侧跑任一本地 `lk.exe` 命令经 `ensure_daemon()` 自动拉起，并写 `%APPDATA%\lightkey\daemon.json` |
+| 第③层弹窗 | **有**——桌面端作为 `ApprovalChannel` 订阅者接收 `authz.request` 广播，弹出审批窗（30s 倒计时） | 无任何 UI，没有提醒用户的手段 |
+| 未命中第②层规则白名单时 | 进入第③层弹窗等人裁决 | 立即 fail-closed 拒绝：`no_ui` |
+
+形态 B 的 `no_ui` fail-closed 语义（代码出处）：
+
+- 协议面原因串：`DenyReason::NoUi => "no_ui"`（`crates/lk-core/src/authz.rs`
+  L92）；
+- 服务端分支：第③层无订阅者 → 不阻塞立即拒绝、审计记 denied
+  （`crates/lk-daemon/src/lib.rs` L1010-L1022；测试锚定
+  `authz_denies_without_ui_fast`：同文件 L2068/L2089）；
+- CLI 拒绝文案：「无审批界面（未命中规则且桌面端未运行）」
+  （`crates/lk-cli/src/main.rs` L1969）。
+
+推论：**弹窗只有桌面应用在运行时才存在**；纯 CLI daemon 形态下取密钥的唯一
+途径是第②层规则白名单命中。因此无人值守回归首选形态 B（E2E `--auto-approve`
+走第②层白名单免弹窗），需要验证第③层弹窗的场景必须用形态 A。
 
 ## 6. 二进制与编译矩阵
 

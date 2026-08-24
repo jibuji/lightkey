@@ -294,6 +294,90 @@ cd /tmp && "$LK" inject --keys LK_PROBE_FAKE -- sh -c true
 行 1（设计链路成立），详见
 [agents/win-host-cross-subsystem-retest-report-20260824.md](agents/win-host-cross-subsystem-retest-report-20260824.md)。
 
+### 7.4 GUI 弹窗存在性探测（Agent 可执行；30s 倒计时内）
+
+§7.1 的观察点默认靠人眼；本节给出**客观探针**，让执行测试的 Agent 在 30s
+倒计时窗口内自行判定「Windows 屏幕上审批弹窗确实出现了」。人工观察仍保留为
+兜底（探针异常时以人眼为准）。
+
+**代码取证（探针依据，禁止改写这些字符串）**：
+
+- 审批弹窗不是独立 Tauri 窗口——应用只有一个主窗口（`crates/lk-app/`
+  `tauri.conf.json` 的 `app.windows[0]`：`"title": "LightKey"`），审批对话框是
+  该窗口 webview 内的模态层（`frontend/src/plugins/approval.tsx`：
+  `<div className="modal-overlay" role="dialog" aria-modal="true"
+  aria-label="授权请求审批">` + 标题 `授权请求 · {starter}`）。
+- 因此进程级标题枚举只能证明**必要条件**（LightKey 桌面进程活着、有可见
+  主窗口）；判定「弹窗出现」须用 **Windows UI Automation（UIA）读 WebView2
+  无障碍树**找上述 aria 文案。Tauri 主窗口 label 为 `main`
+  （`crates/lk-app/src/lib.rs` 托盘代码 `get_webview_window("main")`）。
+
+前置条件：LightKey 主窗口处于**显示状态**（托盘关闭只是隐藏窗口——若被隐藏，
+先从托盘菜单点「显示主窗口」，否则 UIA 树里探不到弹窗内容）。
+
+探针脚本（WSL 内直接复制执行；经 interop 调 powershell.exe）：
+
+```bash
+cat > /tmp/lk-popup-probe.ps1 <<'EOF'
+Add-Type -AssemblyName UIAutomationClient
+# 必要条件①：LightKey 进程存活且持可见主窗口
+$proc = Get-Process | Where-Object { $_.MainWindowTitle -eq 'LightKey' } | Select-Object -First 1
+if (-not $proc) { Write-Output 'NECESSARY-FAIL: 无标题为 LightKey 的可见主窗口'; exit 1 }
+Write-Output ("NECESSARY-OK: pid={0} proc={1}" -f $proc.Id, $proc.ProcessName)
+# 判定性断言②：UIA 全桌面搜审批弹窗的 aria 文案
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$cond = New-Object System.Windows.Automation.PropertyCondition(
+  [System.Windows.Automation.AutomationElement]::NameProperty, '授权请求审批')
+$hit = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+if ($hit) {
+  $w = $hit.Current.FrameworkId
+  Write-Output "POPUP-FOUND: 授权请求审批 (framework=$w)"
+  exit 0
+} else {
+  Write-Output 'POPUP-NOT-FOUND'
+  exit 2
+}
+EOF
+# 关键：给脚本加 UTF-8 BOM——Windows PowerShell 5.1 对无 BOM 文件按 ANSI 解码，
+# 中文字符串「授权请求审批」会乱码导致永远 POPUP-NOT-FOUND（假阴性）
+printf '\xef\xbb\xbf' | cat - /tmp/lk-popup-probe.ps1 > /tmp/lk-popup-probe.bom.ps1 \
+  && mv /tmp/lk-popup-probe.bom.ps1 /tmp/lk-popup-probe.ps1
+```
+
+**正向断言（弹窗出现）**——两个终端配合，30s 倒计时内完成：
+
+```bash
+# 终端 1（发起，阻塞等待裁决）：
+cd /tmp && "$LK" inject --keys LK_PROBE_FAKE -- sh -c 'echo -n "$LK_PROBE_FAKE"'
+# 终端 2（立即跑探针，倒计时间内多跑几次直到 POPUP-FOUND 或 inject 返回）：
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w /tmp/lk-popup-probe.ps1)"
+```
+
+完成判据（两条都要）：
+
+1. `NECESSARY-OK: pid=<N> proc=LightKey`（进程名应为 `LightKey`；
+   若为 `lk` 则当前是 CLI daemon 形态，见反向说明）；
+2. `POPUP-FOUND: 授权请求审批 …`——即屏幕上确有审批弹窗。探到后**仍需真人在
+   Windows 屏幕上点批准/拒绝完成闭环**（Agent 无法代点；Esc = 拒绝）。
+
+**反向断言（免弹窗路径探不到）**：
+
+```bash
+# 场景 A：纯 CLI daemon 形态（先退出桌面应用，Windows 侧跑任一 lk.exe 命令拉起 CLI daemon）
+cd /tmp && "$LK" inject --keys LK_PROBE_FAKE -- sh -c true   # 立即被拒（no_ui）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w /tmp/lk-popup-probe.ps1)"
+# 期望：NECESSARY-FAIL 或 NECESSARY-OK(proc=lk) + POPUP-NOT-FOUND —— 印证 §3 表格「形态 B 无弹窗」语义
+
+# 场景 B：规则命中免弹窗（第②层白名单；--auto-approve E2E 即此路径）
+# 按 §7.2 给当前目录录规则后 inject 成功、全程无弹窗 → 探针同样应输出 POPUP-NOT-FOUND
+```
+
+两个场景都探到 `POPUP-FOUND` 才算失败——那是免弹窗路径漏弹窗的证据，上报。
+
+兜底：UIA 探针受 WebView2 渲染进程无障碍树暴露时机影响（个别环境首次触发
+可能延迟数百毫秒），`inject` 尚未返回前可间隔 1s 重试至多 5 次；仍
+`POPUP-NOT-FOUND` 而 `inject` 又在阻塞等裁决时，转人工看屏确认并留档差异。
+
 ## 8. 审计断言
 
 ```bash
@@ -332,5 +416,6 @@ printf '%s' "$AUDIT_JSON" | grep -q "$SECRET_VALUE" \
 | unlock 成功但后续命令报「库未解锁或会话已失效」 | `LIGHTKEY_BRIDGE` 显式指定了中继但数据目录没定位到，会话令牌读不回（§4）→ `export LIGHTKEY_BRIDGE_HOME=<Windows 数据目录>` 后重试 |
 | 弹窗超时（拒绝原因 `timeout`） | 30s 倒计时内没人点 → 重跑该命令并守在 Windows 屏幕前，或改 §6 模式 B |
 | 拒绝原因 `no_ui` | 纯 CLI daemon 无审批界面，未命中规则的交互审批被拒——**属预期**；要验证弹窗须切换到桌面应用形态（§3） |
+| §7.4 探针 `POPUP-NOT-FOUND`（但人眼可见弹窗） | UIA 树未暴露：主窗口被隐藏到托盘（先托盘「显示主窗口」）、WebView2 无障碍树延迟（1s 间隔重试至多 5 次）、或窗口标题版本差异（探针字符串以本节代码取证为准）→ 转人工观察兜底 |
 | status 没有「经 bridge」提示（以为在测桥实际在测本地） | 二进制旧 / `LIGHTKEY_BRIDGE=off` / 未设且没装 → 换新二进制并显式 export `LIGHTKEY_BRIDGE`（§4 纪律） |
 | `多余参数：<arg>`（exit 2）／`--auto-approve 需要 LK_CROSS_MASTER_PW`（exit 2） | 用法错误 → 只传一个位置参数 + 可选 `--auto-approve`；无人值守先 export 主密码 |
