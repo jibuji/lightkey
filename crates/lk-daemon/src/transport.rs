@@ -457,7 +457,9 @@ mod imp {
     struct UserOnlySa {
         attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
         _sd: Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>,
-        _acl: AlignedBuf,
+        /// 必须走堆（Box）：`SetSecurityDescriptorDacl` 已把 ACL 地址写进
+        /// `_sd`，本结构按值移动时内联缓冲会连带搬家、令描述符内的指针悬空。
+        _acl: Box<AlignedBuf>,
     }
 
     fn user_only_sa() -> std::io::Result<UserOnlySa> {
@@ -523,7 +525,7 @@ mod imp {
             Ok(UserOnlySa {
                 attrs,
                 _sd: sd,
-                _acl: acl_buf,
+                _acl: Box::new(acl_buf),
             })
         }
     }
@@ -1356,10 +1358,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         bind_server(tmp.path()).expect("bind mock server");
         let handler: Handler = Arc::new(|line, _| serde_json::json!({ "echo": line }).to_string());
+        let (serve_tx, serve_rx) = std::sync::mpsc::channel();
         {
             let dir = tmp.path().to_path_buf();
             std::thread::spawn(move || {
-                let _ = serve(&dir, handler, None, &SHUTDOWN);
+                let _ = serve_tx.send(serve(&dir, handler, None, &SHUTDOWN));
             });
         }
         // serve 线程需要一点时间创建首个监听实例；connect() 自带瞬态短重试
@@ -1389,7 +1392,18 @@ mod tests {
                 Err(e) => panic!("连接 mock 守护: {e}"),
             }
         }
-        let mut stream = stream.expect("5s 截止内连上 mock 守护");
+        let mut stream = match stream {
+            Some(s) => s,
+            None => {
+                // 超时先看 serve 线程是否已带错退出（如 CreateNamedPipeW 失败），
+                // 把根因带进 panic 而非只报「连不上」。
+                let serve_result = serve_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .ok()
+                    .and_then(|r| r.err());
+                panic!("5s 截止内未连上 mock 守护，serve 错误: {serve_result:?}");
+            }
+        };
         write_line(
             &mut stream,
             r#"{"jsonrpc":"2.0","id":1,"method":"x","params":{}}"#,
