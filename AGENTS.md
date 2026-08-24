@@ -28,7 +28,7 @@
   `bash scripts/e2e_cross_subsystem.sh [lk-binary-path] [--auto-approve]`。
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
   `crates/lk-app/tauri.conf.json` 的 devUrl 一致）；D 层单测 `npm test`
-  （vitest；事件总线契约/装配/宿主渲染/审批弹窗）。
+  （vitest；事件总线契约/装配/宿主渲染/审批弹窗/条目域纯函数）。
 - 桌面壳 Windows 验收：`cargo check --workspace --target x86_64-pc-windows-gnu`
   （本地需 mingw 交叉工具链：conda env `lightkey-mingw`，PATH 前置其 bin；
   Linux 无 webkit2gtk 不编译 lk-app）。
