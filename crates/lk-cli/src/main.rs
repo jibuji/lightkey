@@ -25,6 +25,7 @@
 
 mod bridge;
 mod bridge_backend;
+mod client;
 mod clipboard;
 
 use lk_daemon as daemon;
@@ -35,8 +36,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use lk_core::ipc::*;
-use lk_core::model::{CustomField, ItemDraft, ItemSummary};
+use client::{RpcClient, RpcError};
+use lk_core::ipc::{M_AUTHZ_EVALUATE, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE};
+use lk_core::model::ItemDraft;
 use serde_json::{json, Value};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -363,45 +365,39 @@ fn run(cli: &Cli) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// RPC 客户端辅助
+// RPC 客户端辅助（协议知识已收进 [`client`]，此处只做传输适配与错误呈现）
 // ---------------------------------------------------------------------------
 
-/// 业务错误 → 退出码 1 的统一文案映射。
-fn rpc_fail(msg: &str, code: i64, data: Option<&Value>) -> i32 {
-    let detail = data
-        .and_then(|d| d.get("detail"))
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
-    let text = match code {
-        bridge::ERR_BRIDGE_NO_DAEMON => format!(
+/// [`RpcError`] → 用户可见文案（只做呈现；措辞与重构前逐字一致）。
+fn rpc_fail_text(err: &RpcError) -> String {
+    match err {
+        RpcError::BridgeNoDaemon { detail } => format!(
             "无法连接 Windows 桌面守护实例（bridge.no_daemon）{}",
             if detail.is_empty() { String::new() } else { format!("：{detail}") }
         ),
-        bridge::ERR_BRIDGE_VERSION_INCOMPATIBLE => format!(
+        RpcError::BridgeVersionIncompatible { detail } => format!(
             "Windows 桌面应用与本 CLI 协议版本不一致（bridge.version_incompatible），请重装 LightKey 桌面应用{}",
             if detail.is_empty() { String::new() } else { format!("：{detail}") }
         ),
-        bridge::ERR_BRIDGE_IO => format!(
+        RpcError::BridgeIo { detail } => format!(
             "bridge 中继失败{}",
             if detail.is_empty() { String::new() } else { format!("：{detail}") }
         ),
-        ERR_VAULT_INVALID => "解锁失败：主密码错误或库未初始化".to_string(),
-        ERR_SESSION_INVALID => "库未解锁或会话已失效，请先运行 lk unlock".to_string(),
-        ERR_ITEM_CONFLICT => "条目已被其他设备修改（CAS 冲突），请刷新后重试".to_string(),
-        ERR_ITEM_NOT_FOUND => "条目不存在".to_string(),
-        ERR_LIMIT => format!("超出限制：{detail}"),
-        ERR_RATE_LIMITED => {
-            let secs = data
-                .and_then(|d| d.get("retryAfterSeconds"))
-                .and_then(|d| d.as_u64())
-                .unwrap_or(0);
-            format!("尝试过于频繁，请在 {secs} 秒后重试")
+        RpcError::VaultInvalid => "解锁失败：主密码错误或库未初始化".to_string(),
+        RpcError::SessionInvalid => "库未解锁或会话已失效，请先运行 lk unlock".to_string(),
+        RpcError::ItemConflict => {
+            "条目已被其他设备修改（CAS 冲突），请刷新后重试".to_string()
         }
-        ERR_VAULT_EXISTS => {
+        RpcError::ItemNotFound => "条目不存在".to_string(),
+        RpcError::Limit { detail } => format!("超出限制：{detail}"),
+        RpcError::RateLimited { retry_after_seconds } => {
+            format!("尝试过于频繁，请在 {retry_after_seconds} 秒后重试")
+        }
+        RpcError::VaultExists => {
             "库已存在（如需重置请使用 lk init --force，旧数据不可恢复）".to_string()
         }
-        ERR_WEAK_PASSWORD => "主密码至少 8 位（建库/恢复时校验）".to_string(),
-        ERR_SYNC_NOT_CONFIGURED => format!(
+        RpcError::WeakPassword => "主密码至少 8 位（建库/恢复时校验）".to_string(),
+        RpcError::SyncNotConfigured { detail } => format!(
             "未配置同步存储，请先运行 lk config sync set <url>{}",
             if detail.is_empty() {
                 String::new()
@@ -409,46 +405,60 @@ fn rpc_fail(msg: &str, code: i64, data: Option<&Value>) -> i32 {
                 format!("（{detail}）")
             }
         ),
-        ERR_SYNC_STORAGE => format!("同步失败（存储端错误）：{detail}"),
-        ERR_SYNC_ANOMALY => {
+        RpcError::SyncStorage { detail } => format!("同步失败（存储端错误）：{detail}"),
+        RpcError::SyncAnomaly { detail } => {
             format!("同步数据异常：{detail}；已放弃本轮，未覆盖本地数据")
         }
-        ERR_SYNC_CREDENTIALS => format!("同步凭据不可用：{detail}"),
-        _ => format!(
-            "{msg}{}",
+        RpcError::SyncCredentials { detail } => format!("同步凭据不可用：{detail}"),
+        // 未知业务码：保留服务端 message + detail（同重构前兜底文案）
+        RpcError::Other { message, detail, .. } => format!(
+            "{message}{}",
             if detail.is_empty() {
                 String::new()
             } else {
                 format!("（{detail}）")
             }
         ),
-    };
-    eprintln!("lk: {text}");
+        // 传输层 / 响应层失败的 message 已是完整文案，原样输出
+        RpcError::Transport { message } | RpcError::BadResponse { message } => message.clone(),
+    }
+}
+
+/// 业务失败统一出口：打印文案 + 退出码 1。
+fn rpc_fail(err: &RpcError) -> i32 {
+    eprintln!("lk: {}", rpc_fail_text(err));
     1
 }
 
-/// 发送 RPC（按传输后端分流；附带会话令牌）。
+/// 生产传输适配（[`client::RpcClient`] 的注入点）：按探测分型分流 local /
+/// bridge。会话令牌注入、bridge 的 channel 覆写都在此层完成。
 ///
 /// 传输后端选择（cross-subsystem.md §7.2）：`LIGHTKEY_BRIDGE` 显式指定 >
 /// 平台默认（WSL 自动探测 bridge，其余本地 UDS）。探测失败分型在
 /// [`bridge_backend::decide`] 内完成——「装了连不上」为明确报错，绝不静默
 /// 回落本地。
-fn rpc(dir: &std::path::Path, method: &str, params: Value) -> Result<Value, i32> {
-    match bridge_backend::decide() {
+fn production_transport(
+    dir: &std::path::Path,
+) -> impl FnMut(&str, Value) -> Result<Value, RpcError> + '_ {
+    move |method, params| match bridge_backend::decide() {
         bridge_backend::Decision::Local => rpc_local(dir, method, params),
         bridge_backend::Decision::Bridge(target) => rpc_via_bridge(target, method, params),
-        bridge_backend::Decision::Fatal(msg) => {
-            eprintln!("lk: {msg}");
-            Err(1)
-        }
+        bridge_backend::Decision::Fatal(msg) => Err(RpcError::Transport { message: msg }),
     }
 }
 
+/// 组装指向 `dir` 的 typed 客户端（每次组装重新探测传输后端，与原 `rpc()`
+/// 每次调用的行为一致）。
+fn client_for(
+    dir: &std::path::Path,
+) -> RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + '_> {
+    RpcClient::new(production_transport(dir))
+}
+
 /// local 后端：UDS 直连本机守护实例（现状行为，自动拉起守护进程）。
-fn rpc_local(dir: &std::path::Path, method: &str, params: Value) -> Result<Value, i32> {
-    let ep = transport::ensure_daemon(dir).map_err(|e| {
-        eprintln!("lk: 无法连接守护进程：{e}");
-        1
+fn rpc_local(dir: &std::path::Path, method: &str, params: Value) -> Result<Value, RpcError> {
+    let ep = transport::ensure_daemon(dir).map_err(|e| RpcError::Transport {
+        message: format!("无法连接守护进程：{e}"),
     })?;
     // 会话令牌：CLI 进程间经 0600 文件传递（守护进程锁定即删除）
     let token_path = dir.join(daemon::SESSION_TOKEN_FILE);
@@ -463,11 +473,10 @@ fn rpc_local(dir: &std::path::Path, method: &str, params: Value) -> Result<Value
         "method": method,
         "params": params,
     });
-    let line = transport::request(&ep, &req.to_string()).map_err(|e| {
-        eprintln!("lk: 守护进程通信失败：{e}");
-        1
+    let line = transport::request(&ep, &req.to_string()).map_err(|e| RpcError::Transport {
+        message: format!("守护进程通信失败：{e}"),
     })?;
-    parse_rpc_line(&line)
+    client::parse_response_line(&line)
 }
 
 /// bridge 后端：把请求帧经 `lk.exe bridge` 中继到 Windows 桌面守护实例
@@ -478,7 +487,7 @@ fn rpc_via_bridge(
     target: bridge_backend::BridgeTarget,
     method: &str,
     params: Value,
-) -> Result<Value, i32> {
+) -> Result<Value, RpcError> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
@@ -512,12 +521,8 @@ fn rpc_via_bridge(
         cmd.arg("--dir").arg(d);
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()); // stderr 继承（可见性）
-    let mut child = cmd.spawn().map_err(|e| {
-        eprintln!(
-            "lk: 无法启动 bridge 中继程序（{}）：{e}",
-            target.exe.display()
-        );
-        1
+    let mut child = cmd.spawn().map_err(|e| RpcError::Transport {
+        message: format!("无法启动 bridge 中继程序（{}）：{e}", target.exe.display()),
     })?;
     {
         let mut stdin = child.stdin.take().expect("stdin 已声明 piped");
@@ -526,9 +531,8 @@ fn rpc_via_bridge(
             .write_all(frame.as_bytes())
             .and_then(|_| stdin.write_all(b"\n"))
             .and_then(|_| stdin.flush())
-            .map_err(|e| {
-                eprintln!("lk: 写入 bridge 失败：{e}");
-                1i32
+            .map_err(|e| RpcError::Transport {
+                message: format!("写入 bridge 失败：{e}"),
             })?;
         // 显式关闭写端：bridge 读到 EOF/一帧后即处理并退出
         drop(stdin);
@@ -546,48 +550,26 @@ fn rpc_via_bridge(
             }
         }
     }
-    let status = child.wait().map_err(|e| {
-        eprintln!("lk: 等待 bridge 退出失败：{e}");
-        1i32
+    let status = child.wait().map_err(|e| RpcError::Transport {
+        message: format!("等待 bridge 退出失败：{e}"),
     })?;
     if !status.success() && line.is_empty() {
-        eprintln!("lk: bridge 中继程序异常退出（{}）", status);
-        return Err(1);
+        return Err(RpcError::Transport {
+            message: format!("bridge 中继程序异常退出（{status}）"),
+        });
     }
     while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
         line.pop();
     }
-    let line = String::from_utf8(line).map_err(|_| {
-        eprintln!("lk: bridge 响应不是合法 UTF-8");
-        1
+    let line = String::from_utf8(line).map_err(|_| RpcError::BadResponse {
+        message: "bridge 响应不是合法 UTF-8".to_string(),
     })?;
     if line.trim().is_empty() {
-        eprintln!("lk: bridge 无响应（中继程序异常退出 {}）", status);
-        return Err(1);
+        return Err(RpcError::BadResponse {
+            message: format!("bridge 无响应（中继程序异常退出 {status}）"),
+        });
     }
-    parse_rpc_line(&line)
-}
-
-/// 解析响应行 → result / 业务错误文案（local 与 bridge 共用）。
-fn parse_rpc_line(line: &str) -> Result<Value, i32> {
-    let resp: RpcResponse = serde_json::from_str(line).unwrap_or(RpcResponse {
-        jsonrpc: "2.0".into(),
-        id: Value::Null,
-        result: None,
-        error: Some(RpcError {
-            code: ERR_PARSE,
-            message: "响应解析失败".into(),
-            data: None,
-        }),
-    });
-    match (resp.result, resp.error) {
-        (Some(result), _) => Ok(result),
-        (None, Some(err)) => Err(rpc_fail(&err.message, err.code, err.data.as_ref())),
-        (None, None) => {
-            eprintln!("lk: 空响应");
-            Err(1)
-        }
-    }
+    client::parse_response_line(&line)
 }
 
 /// 读取一行敏感输入（不回显；`--stdin` 时从 stdin 读）。
@@ -650,13 +632,8 @@ fn cmd_init(
             return 1;
         }
     }
-    match rpc(
-        dir,
-        M_VAULT_INIT,
-        json!({ "masterPassword": pw1, "force": force }),
-    ) {
-        Ok(res) => {
-            let code = res["recoveryCode"].as_str().unwrap_or_default().to_string();
+    match client_for(dir).vault_init(&pw1, force) {
+        Ok(code) => {
             if json_out {
                 let _ = writeln!(out, "{}", json!({ "recoveryCode": code }));
             } else {
@@ -672,7 +649,7 @@ fn cmd_init(
             }
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -681,22 +658,22 @@ fn cmd_unlock(out: &mut impl Write, dir: &std::path::Path, stdin: bool) -> i32 {
         Ok(p) => p,
         Err(c) => return c,
     };
-    match rpc(dir, M_VAULT_UNLOCK, json!({ "masterPassword": pw })) {
+    match client_for(dir).vault_unlock(&pw) {
         Ok(_) => {
             let _ = writeln!(out, "已解锁");
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
 fn cmd_lock(out: &mut impl Write, dir: &std::path::Path) -> i32 {
-    match rpc(dir, M_VAULT_LOCK, json!({})) {
+    match client_for(dir).vault_lock() {
         Ok(_) => {
             let _ = writeln!(out, "已锁定（内存密钥已擦除）");
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -722,11 +699,11 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
             return 1;
         }
     };
-    match rpc(dir, M_VAULT_STATUS, json!({})) {
-        Ok(res) => {
-            let unlocked = res["unlocked"].as_bool().unwrap_or(false);
-            let version = res["version"].as_str().unwrap_or_default().to_string();
-            let watermark = res["syncWatermark"].as_str().map(|s| s.to_string());
+    match client_for(dir).vault_status() {
+        Ok(status) => {
+            let unlocked = status.unlocked;
+            let version = status.version;
+            let watermark = status.sync_watermark;
             if json_out {
                 let _ = writeln!(
                     out,
@@ -764,7 +741,7 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
             }
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -816,13 +793,8 @@ fn cmd_recover(
             return 1;
         }
     }
-    match rpc(
-        dir,
-        M_VAULT_RECOVER,
-        json!({ "recoveryCode": code, "newPassword": pw1 }),
-    ) {
-        Ok(res) => {
-            let new_code = res["recoveryCode"].as_str().unwrap_or_default().to_string();
+    match client_for(dir).vault_recover(&code, &pw1) {
+        Ok(new_code) => {
             if json_out {
                 let _ = writeln!(out, "{}", json!({ "recoveryCode": new_code }));
             } else {
@@ -835,7 +807,7 @@ fn cmd_recover(
             }
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -844,11 +816,10 @@ fn cmd_recover(
 // ---------------------------------------------------------------------------
 
 fn cmd_item(out: &mut impl Write, dir: &std::path::Path, cmd: &ItemCommand, json_out: bool) -> i32 {
+    let mut c = client_for(dir);
     match cmd {
-        ItemCommand::List => match rpc(dir, M_ITEM_LIST, json!({})) {
-            Ok(res) => {
-                let items: Vec<ItemSummary> =
-                    serde_json::from_value(res["items"].clone()).unwrap_or_default();
+        ItemCommand::List => match c.item_list() {
+            Ok(items) => {
                 if json_out {
                     let _ = writeln!(
                         out,
@@ -874,62 +845,46 @@ fn cmd_item(out: &mut impl Write, dir: &std::path::Path, cmd: &ItemCommand, json
                 }
                 0
             }
-            Err(c) => c,
+            Err(e) => rpc_fail(&e),
         },
-        ItemCommand::Get { id } => match rpc(dir, M_ITEM_GET, json!({ "id": id })) {
+        ItemCommand::Get { id } => match c.item_get(id) {
             Ok(item) => print_item(out, &item, json_out),
-            Err(c) => c,
+            Err(e) => rpc_fail(&e),
         },
-        ItemCommand::Add { kind } => cmd_item_add(out, dir, kind),
+        ItemCommand::Add { kind } => cmd_item_add(out, &mut c, kind),
         ItemCommand::Edit(args) => cmd_item_edit(
             out,
-            dir,
+            &mut c,
             &args.id,
             &args.fields,
             args.expected_revision.as_deref(),
         ),
-        ItemCommand::Delete { id } => match rpc(dir, M_ITEM_DELETE, json!({ "id": id })) {
+        ItemCommand::Delete { id } => match c.item_delete(id) {
             Ok(_) => {
                 let _ = writeln!(out, "已删除（软删除，30 天后硬删）");
                 0
             }
-            Err(c) => c,
+            Err(e) => rpc_fail(&e),
         },
-        ItemCommand::Copy { id, field } => cmd_item_copy(out, dir, id, field),
-        ItemCommand::Export { id, output } => match rpc(dir, M_ITEM_EXPORT, json!({ "id": id })) {
-            Ok(res) => {
-                use base64::Engine as _;
-                let data = match res["data"].as_str() {
-                    Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            eprintln!("lk: 附件数据解码失败：{e}");
-                            return 1;
-                        }
-                    },
-                    None => {
-                        eprintln!("lk: 附件数据缺失");
-                        return 1;
-                    }
-                };
-                match std::fs::write(output, &data) {
-                    Ok(_) => {
-                        let _ =
-                            writeln!(out, "已导出到 {}（{} 字节）", output.display(), data.len());
-                        0
-                    }
-                    Err(e) => {
-                        eprintln!("lk: 写入失败：{e}");
-                        1
-                    }
+        ItemCommand::Copy { id, field } => cmd_item_copy(out, &mut c, id, field),
+        ItemCommand::Export { id, output } => match c.item_export(id) {
+            Ok(data) => match std::fs::write(output, &data) {
+                Ok(_) => {
+                    let _ = writeln!(out, "已导出到 {}（{} 字节）", output.display(), data.len());
+                    0
                 }
-            }
-            Err(c) => c,
+                Err(e) => {
+                    eprintln!("lk: 写入失败：{e}");
+                    1
+                }
+            },
+            Err(e) => rpc_fail(&e),
         },
     }
 }
 
-fn print_item(out: &mut impl Write, item: &Value, json_out: bool) -> i32 {
+fn print_item(out: &mut impl Write, item: &lk_core::model::Item, json_out: bool) -> i32 {
+    use lk_core::model::Item;
     if json_out {
         let _ = writeln!(
             out,
@@ -938,78 +893,78 @@ fn print_item(out: &mut impl Write, item: &Value, json_out: bool) -> i32 {
         );
         return 0;
     }
-    let id = item["id"].as_str().unwrap_or_default();
-    let ty = item["type"].as_str().unwrap_or_default();
-    let name = item["name"].as_str().unwrap_or_default();
-    let revision = item["revision"].as_str().unwrap_or_default();
-    let deleted = item["deleted"].as_bool().unwrap_or(false);
+    let id = item.id();
+    let ty = item.kind().as_str();
+    let name = item.name();
+    let revision = item.revision();
+    let deleted = item.deleted();
     let _ = writeln!(
         out,
         "{id}  [{ty}] {name}{}",
         if deleted { " [deleted]" } else { "" }
     );
     let _ = writeln!(out, "  revision: {revision}");
-    match ty {
-        "login" => {
-            let _ = writeln!(
-                out,
-                "  username: {}",
-                item["username"].as_str().unwrap_or("")
-            );
-            let _ = writeln!(
-                out,
-                "  password: {}",
-                item["password"].as_str().unwrap_or("")
-            );
-            for u in item["uris"].as_array().unwrap_or(&vec![]) {
-                let _ = writeln!(out, "  uri: {}", u.as_str().unwrap_or(""));
+    match item {
+        Item::Login {
+            username,
+            password,
+            uris,
+            custom,
+            ..
+        } => {
+            let _ = writeln!(out, "  username: {username}");
+            let _ = writeln!(out, "  password: {password}");
+            for u in uris {
+                let _ = writeln!(out, "  uri: {u}");
             }
-            for f in item["custom"].as_array().unwrap_or(&vec![]) {
+            for f in custom {
                 let _ = writeln!(
                     out,
                     "  custom: {} = {}{}",
-                    f["name"].as_str().unwrap_or(""),
-                    f["value"].as_str().unwrap_or(""),
-                    if f["hidden"].as_bool().unwrap_or(false) {
-                        " (hidden)"
-                    } else {
-                        ""
-                    }
+                    f.name,
+                    f.value,
+                    if f.hidden { " (hidden)" } else { "" }
                 );
             }
         }
-        "note" => {
-            let _ = writeln!(out, "  content: {}", item["content"].as_str().unwrap_or(""));
+        Item::Note { content, .. } => {
+            let _ = writeln!(out, "  content: {content}");
         }
-        "secret" => {
-            let _ = writeln!(out, "  value: {}", item["value"].as_str().unwrap_or(""));
-            let _ = writeln!(out, "  purpose: {}", item["purpose"].as_str().unwrap_or(""));
+        Item::Secret {
+            value,
+            purpose,
+            expires_at,
+            ..
+        } => {
+            let _ = writeln!(out, "  value: {value}");
+            let _ = writeln!(out, "  purpose: {purpose}");
             let _ = writeln!(
                 out,
                 "  expiresAt: {}",
-                item["expiresAt"].as_str().unwrap_or("")
+                expires_at.clone().unwrap_or_default()
             );
         }
-        "file" => {
-            let _ = writeln!(out, "  note: {}", item["note"].as_str().unwrap_or(""));
-            let _ = writeln!(out, "  size: {} bytes", item["size"].as_u64().unwrap_or(0));
-            let _ = writeln!(
-                out,
-                "  fileType: {}",
-                item["fileType"].as_str().unwrap_or("")
-            );
-            let _ = writeln!(
-                out,
-                "  attachment: {}",
-                item["attachment"].as_str().unwrap_or("")
-            );
+        Item::File {
+            note,
+            size,
+            file_type,
+            attachment,
+            ..
+        } => {
+            let _ = writeln!(out, "  note: {note}");
+            let _ = writeln!(out, "  size: {size} bytes");
+            let _ = writeln!(out, "  fileType: {file_type}");
+            let _ = writeln!(out, "  attachment: {attachment}");
         }
-        _ => {}
     }
     0
 }
 
-fn cmd_item_add(out: &mut impl Write, dir: &std::path::Path, kind: &AddKind) -> i32 {
+fn cmd_item_add<'a>(
+    out: &mut impl Write,
+    c: &mut RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + 'a>,
+    kind: &AddKind,
+) -> i32 {
     let draft = match kind {
         AddKind::Login {
             name,
@@ -1124,10 +1079,9 @@ fn cmd_item_add(out: &mut impl Write, dir: &std::path::Path, kind: &AddKind) -> 
             }
         }
     };
-    match rpc(dir, M_ITEM_PUT, json!({ "item": draft })) {
-        Ok(res) => {
-            let item: Value = res["item"].clone();
-            let id = item["id"].as_str().unwrap_or_default().to_string();
+    match c.item_put(&draft) {
+        Ok(item) => {
+            let id = item.id().to_string();
             let _ = writeln!(out, "已创建: {id}");
             if std::env::var("LK_ECHO_ITEM").is_ok() {
                 let _ = writeln!(
@@ -1138,7 +1092,7 @@ fn cmd_item_add(out: &mut impl Write, dir: &std::path::Path, kind: &AddKind) -> 
             }
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -1160,13 +1114,14 @@ fn guess_mime(name: &str) -> Option<String> {
     Some(mime.to_string())
 }
 
-fn cmd_item_edit(
+fn cmd_item_edit<'a>(
     out: &mut impl Write,
-    dir: &std::path::Path,
+    c: &mut RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + 'a>,
     id: &str,
     fields: &EditFields,
     expected_revision: Option<&str>,
 ) -> i32 {
+    use lk_core::model::Item;
     let any = fields.name.is_some()
         || fields.username.is_some()
         || fields.password.is_some()
@@ -1181,164 +1136,136 @@ fn cmd_item_edit(
         eprintln!("lk: edit 至少需要一个变更字段（如 --name / --username / --content）");
         return 2;
     }
-    // CAS：缺省先取当前条目（base revision），再整条替换
-    let current = match rpc(dir, M_ITEM_GET, json!({ "id": id })) {
-        Ok(v) => v,
-        Err(c) => return c,
+    // 拆分逗号分隔的 uri 列表（与 add 同规则）
+    let split_uris = |raw: &str| -> Vec<String> {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     };
-    let ty = current["type"].as_str().unwrap_or_default().to_string();
-    let mut draft =
-        match ty.as_str() {
-            "login" => {
-                let custom: Vec<CustomField> =
-                    serde_json::from_value(current["custom"].clone()).unwrap_or_default();
-                ItemDraft::Login {
-                    name: fields.name.clone().unwrap_or_else(|| {
-                        current["name"].as_str().unwrap_or_default().to_string()
-                    }),
-                    username: fields.username.clone().unwrap_or_else(|| {
-                        current["username"].as_str().unwrap_or_default().to_string()
-                    }),
-                    password: fields.password.clone().unwrap_or_else(|| {
-                        current["password"].as_str().unwrap_or_default().to_string()
-                    }),
-                    uris: fields
-                        .uris
-                        .clone()
-                        .map(|u| {
-                            u.split(',')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect()
-                        })
-                        .unwrap_or_else(|| {
-                            serde_json::from_value(current["uris"].clone()).unwrap_or_default()
-                        }),
-                    custom,
-                }
-            }
-            "note" => {
-                ItemDraft::Note {
-                    name: fields.name.clone().unwrap_or_else(|| {
-                        current["name"].as_str().unwrap_or_default().to_string()
-                    }),
-                    content: fields.content.clone().unwrap_or_else(|| {
-                        current["content"].as_str().unwrap_or_default().to_string()
-                    }),
-                }
-            }
-            "secret" => {
-                ItemDraft::Secret {
-                    name: fields.name.clone().unwrap_or_else(|| {
-                        current["name"].as_str().unwrap_or_default().to_string()
-                    }),
-                    value: fields.value.clone().unwrap_or_else(|| {
-                        current["value"].as_str().unwrap_or_default().to_string()
-                    }),
-                    purpose: fields.purpose.clone().unwrap_or_else(|| {
-                        current["purpose"].as_str().unwrap_or_default().to_string()
-                    }),
-                    expires_at: fields.expires_at.clone().or_else(|| {
-                        serde_json::from_value(current["expiresAt"].clone()).unwrap_or(None)
-                    }),
-                }
-            }
-            "file" => {
-                let file_data = match &fields.file {
-                    Some(path) => match std::fs::read(path) {
-                        Ok(d) => {
-                            if d.len() as u64 > 50 * 1024 * 1024 {
-                                eprintln!("lk: 附件超过 50MB 上限");
-                                return 1;
-                            }
-                            use base64::Engine as _;
-                            Some(base64::engine::general_purpose::STANDARD.encode(d))
-                        }
-                        Err(e) => {
-                            eprintln!("lk: 读取附件失败：{e}");
+    // CAS：缺省先取当前条目（base revision），再整条替换
+    let current = match c.item_get(id) {
+        Ok(v) => v,
+        Err(e) => return rpc_fail(&e),
+    };
+    let mut draft = match &current {
+        Item::Login {
+            name,
+            username,
+            password,
+            uris,
+            custom,
+            ..
+        } => ItemDraft::Login {
+            name: fields.name.clone().unwrap_or_else(|| name.clone()),
+            username: fields.username.clone().unwrap_or_else(|| username.clone()),
+            password: fields.password.clone().unwrap_or_else(|| password.clone()),
+            uris: fields
+                .uris
+                .clone()
+                .map(|u| split_uris(&u))
+                .unwrap_or_else(|| uris.clone()),
+            custom: custom.clone(),
+        },
+        Item::Note { name, content, .. } => ItemDraft::Note {
+            name: fields.name.clone().unwrap_or_else(|| name.clone()),
+            content: fields.content.clone().unwrap_or_else(|| content.clone()),
+        },
+        Item::Secret {
+            name,
+            value,
+            purpose,
+            expires_at,
+            ..
+        } => ItemDraft::Secret {
+            name: fields.name.clone().unwrap_or_else(|| name.clone()),
+            value: fields.value.clone().unwrap_or_else(|| value.clone()),
+            purpose: fields.purpose.clone().unwrap_or_else(|| purpose.clone()),
+            expires_at: fields.expires_at.clone().or_else(|| expires_at.clone()),
+        },
+        Item::File {
+            name,
+            note,
+            size,
+            file_type,
+            attachment,
+            attach_id,
+            ..
+        } => {
+            let file_data = match &fields.file {
+                Some(path) => match std::fs::read(path) {
+                    Ok(d) => {
+                        if d.len() as u64 > 50 * 1024 * 1024 {
+                            eprintln!("lk: 附件超过 50MB 上限");
                             return 1;
                         }
-                    },
-                    None => None,
-                };
-                let attach_id: Option<uuid::Uuid> =
-                    serde_json::from_value(current["attachmentId"].clone()).unwrap_or(None);
-                ItemDraft::File {
-                    name: fields.name.clone().unwrap_or_else(|| {
-                        current["name"].as_str().unwrap_or_default().to_string()
-                    }),
-                    note: fields.note.clone().unwrap_or_else(|| {
-                        current["note"].as_str().unwrap_or_default().to_string()
-                    }),
-                    size: current["size"].as_u64().unwrap_or(0),
-                    file_type: current["fileType"].as_str().unwrap_or_default().to_string(),
-                    attachment: current["attachment"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    attach_id,
-                    file_data,
-                }
-            }
-            _ => {
-                eprintln!("lk: 未知条目类型：{ty}");
-                return 1;
-            }
-        };
-    // file 替换附件时更新文件名/MIME
-    if ty == "file" {
-        if let (
-            Some(path),
+                        use base64::Engine as _;
+                        Some(base64::engine::general_purpose::STANDARD.encode(d))
+                    }
+                    Err(e) => {
+                        eprintln!("lk: 读取附件失败：{e}");
+                        return 1;
+                    }
+                },
+                None => None,
+            };
             ItemDraft::File {
-                attachment,
-                file_type,
-                ..
-            },
-        ) = (&fields.file, &mut draft)
-        {
-            if let Some(name) = path.file_name() {
-                *attachment = name.to_string_lossy().to_string();
+                name: fields.name.clone().unwrap_or_else(|| name.clone()),
+                note: fields.note.clone().unwrap_or_else(|| note.clone()),
+                size: *size,
+                file_type: file_type.clone(),
+                attachment: attachment.clone(),
+                attach_id: *attach_id,
+                file_data,
             }
-            if fields.mime.is_none() {
-                if let Some(m) = guess_mime(&path.to_string_lossy()) {
-                    *file_type = m;
-                }
+        }
+    };
+    // file 替换附件时更新文件名/MIME
+    if let (
+        Some(path),
+        ItemDraft::File {
+            attachment,
+            file_type,
+            ..
+        },
+    ) = (&fields.file, &mut draft)
+    {
+        if let Some(name) = path.file_name() {
+            *attachment = name.to_string_lossy().to_string();
+        }
+        if fields.mime.is_none() {
+            if let Some(m) = guess_mime(&path.to_string_lossy()) {
+                *file_type = m;
             }
         }
     }
-    let base_revision = expected_revision
-        .map(|r| r.to_string())
-        .unwrap_or_else(|| current["revision"].as_str().unwrap_or_default().to_string());
-    match rpc(
-        dir,
-        M_ITEM_PUT,
-        json!({ "id": id, "item": draft, "expectedRevision": base_revision }),
-    ) {
-        Ok(res) => {
-            let item: Value = res["item"].clone();
-            let _ = writeln!(
-                out,
-                "已更新: {} (revision {})",
-                item["id"].as_str().unwrap_or_default(),
-                item["revision"].as_str().unwrap_or_default()
-            );
+    let base_revision = expected_revision.unwrap_or(current.revision()).to_string();
+    match c.item_update(id, &draft, &base_revision) {
+        Ok(item) => {
+            let _ = writeln!(out, "已更新: {} (revision {})", item.id(), item.revision());
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
-fn cmd_item_copy(out: &mut impl Write, dir: &std::path::Path, id: &str, field: &str) -> i32 {
-    let item = match rpc(dir, M_ITEM_GET, json!({ "id": id })) {
+fn cmd_item_copy<'a>(
+    out: &mut impl Write,
+    c: &mut RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + 'a>,
+    id: &str,
+    field: &str,
+) -> i32 {
+    use lk_core::model::Item;
+    let item = match c.item_get(id) {
         Ok(v) => v,
-        Err(c) => return c,
+        Err(e) => return rpc_fail(&e),
     };
-    let ty = item["type"].as_str().unwrap_or_default();
-    let value = match (ty, field) {
-        ("login", "username") => item["username"].as_str(),
-        ("login", "password") => item["password"].as_str(),
-        ("note", "content") => item["content"].as_str(),
-        ("secret", "value") => item["value"].as_str(),
+    let ty = item.kind().as_str();
+    let value: Option<&str> = match (&item, field) {
+        (Item::Login { username, .. }, "username") => Some(username.as_str()),
+        (Item::Login { password, .. }, "password") => Some(password.as_str()),
+        (Item::Note { content, .. }, "content") => Some(content.as_str()),
+        (Item::Secret { value, .. }, "value") => Some(value.as_str()),
         _ => None,
     };
     let Some(value) = value else {
@@ -1372,18 +1299,18 @@ fn cmd_audit(
     verify: bool,
     json_out: bool,
 ) -> i32 {
-    let res = match rpc(dir, M_AUDIT_LIST, json!({ "limit": tail })) {
+    let mut c = client_for(dir);
+    let page = match c.audit_list(tail) {
         Ok(v) => v,
-        Err(c) => return c,
+        Err(e) => return rpc_fail(&e),
     };
-    let events: Vec<lk_core::audit::AuditEvent> =
-        serde_json::from_value(res["events"].clone()).unwrap_or_default();
-    let total = res["total"].as_u64().unwrap_or(0);
+    let events = &page.events;
+    let total = page.total;
     if json_out {
         let _ = writeln!(
             out,
             "{}",
-            serde_json::to_string_pretty(&events).unwrap_or_default()
+            serde_json::to_string_pretty(events).unwrap_or_default()
         );
     } else {
         let _ = writeln!(
@@ -1391,22 +1318,21 @@ fn cmd_audit(
             "审计事件（共 {total} 条{}）",
             tail.map(|t| format!("，显示最近 {t}")).unwrap_or_default()
         );
-        for e in &events {
+        for e in events {
             let result = serde_json::to_string(&e.result).unwrap_or_default();
             let _ = writeln!(out, "{}  {}  {}  {}", e.ts, e.command, result, e.starter);
         }
     }
     if verify {
-        match rpc(dir, M_AUDIT_VERIFY, json!({})) {
-            Ok(res) => {
-                let verified = res["verified"].as_u64().unwrap_or(0);
+        match c.audit_verify() {
+            Ok(verified) => {
                 if json_out {
                     let _ = writeln!(out, "{}", json!({ "verified": verified }));
                 } else {
                     let _ = writeln!(out, "HMAC 链校验：{} 条事件验证通过", verified);
                 }
             }
-            Err(c) => return c,
+            Err(e) => return rpc_fail(&e),
         }
     }
     0
@@ -1418,10 +1344,8 @@ fn cmd_audit(
 
 /// `lk sync`：触发一轮同步（轮询 + CAS 上传），返回变更摘要。
 fn cmd_sync(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
-    match rpc(dir, M_SYNC_TRIGGER, json!({})) {
-        Ok(res) => {
-            let summary: lk_core::sync::SyncSummary =
-                serde_json::from_value(res).unwrap_or_default();
+    match client_for(dir).sync_trigger() {
+        Ok(summary) => {
             if json_out {
                 let _ = writeln!(
                     out,
@@ -1440,7 +1364,7 @@ fn cmd_sync(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 
             }
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -1759,27 +1683,8 @@ fn cmd_rule_add(
             },
         };
     }
-    match rpc(
-        dir,
-        M_RULE_ADD,
-        json!({
-            "projectDir": canonical,
-            "name": name,
-            "command": command,
-            "keys": keys,
-            "channel": "cli",
-        }),
-    ) {
-        Ok(res) => {
-            let rule: lk_core::model::Rule = serde_json::from_value(res["rule"].clone())
-                .unwrap_or_else(|_| lk_core::model::Rule {
-                    id: uuid::Uuid::nil(),
-                    project_dir: canonical,
-                    name: name.to_string(),
-                    command: command.to_string(),
-                    keys: keys.to_vec(),
-                    created: String::new(),
-                });
+    match client_for(dir).rule_add(&canonical, name, command, keys) {
+        Ok(rule) => {
             if json_out {
                 let _ = writeln!(
                     out,
@@ -1791,7 +1696,7 @@ fn cmd_rule_add(
             }
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -1964,10 +1869,8 @@ fn parse_reg_value(output: &str, name: &str) -> Option<String> {
 
 /// `lk rule list`：列出规则（最小字段）。
 fn cmd_rule_list(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
-    match rpc(dir, M_RULE_LIST, json!({ "channel": "cli" })) {
-        Ok(res) => {
-            let rules: Vec<lk_core::model::Rule> =
-                serde_json::from_value(res["rules"].clone()).unwrap_or_default();
+    match client_for(dir).rule_list() {
+        Ok(rules) => {
             if json_out {
                 let _ = writeln!(
                     out,
@@ -1992,19 +1895,19 @@ fn cmd_rule_list(out: &mut impl Write, dir: &std::path::Path, json_out: bool) ->
             }
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
 /// `lk rule remove <id>`：软删除（墓碑；删除随同步传播）。
 fn cmd_rule_remove(out: &mut impl Write, dir: &std::path::Path, id: &str, json_out: bool) -> i32 {
-    match rpc(dir, M_RULE_REMOVE, json!({ "id": id, "channel": "cli" })) {
+    match client_for(dir).rule_remove(id) {
         Ok(_) => {
             let _ = writeln!(out, "已删除规则 {id}（软删除，30 天后硬删）");
             let _ = json_out;
             0
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -2025,21 +1928,14 @@ fn cmd_inject(
     let command_str = command.join(" ");
     // 不传 starter/cwd：守护进程以 IPC 对端真实 PID 回溯 + 真实 cwd 判定
     // （客户端自报字段一律不信任，伪造 cwd 必须失败）。
-    match rpc(
-        dir,
-        M_AUTHZ_EVALUATE,
-        json!({ "command": command_str, "keys": keys, "channel": "cli" }),
-    ) {
-        Ok(res) => {
-            let allowed = res["allowed"].as_bool().unwrap_or(false);
-            if !allowed {
-                let reason = res["reason"].as_str().unwrap_or("denied");
-                eprintln!("lk inject: 已拒绝（{}）", reason_text(reason));
+    match client_for(dir).authz_evaluate(&command_str, keys) {
+        Ok(decision) => {
+            if !decision.allowed {
+                eprintln!("lk inject: 已拒绝（{}）", reason_text(&decision.reason));
                 return 1;
             }
             // 只含被授权 key 的 env（值在此刻才离开守护进程，且只进子进程）
-            let env: std::collections::BTreeMap<String, String> =
-                serde_json::from_value(res["env"].clone()).unwrap_or_default();
+            let env = decision.env;
             if env.is_empty() {
                 eprintln!("lk inject: 无可注入的 key（请求的 key 未被授权）");
                 return 1;
@@ -2059,7 +1955,7 @@ fn cmd_inject(
                 }
             }
         }
-        Err(c) => c,
+        Err(e) => rpc_fail(&e),
     }
 }
 
@@ -2391,5 +2287,156 @@ mod config_bridge_tests {
         assert_eq!(code, 0);
         assert!(local.path().join(daemon::config::CONFIG_FILE).is_file());
         assert!(!other.path().join(daemon::config::CONFIG_FILE).exists());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试（错误呈现层：RpcError 变体 → 中文文案，措辞钉死）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod rpc_fail_text_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// 业务变体 → 文案逐字一致（与重构前「错误码→文案」映射对齐）。
+    #[test]
+    fn business_variant_texts() {
+        assert_eq!(
+            rpc_fail_text(&RpcError::VaultInvalid),
+            "解锁失败：主密码错误或库未初始化"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::SessionInvalid),
+            "库未解锁或会话已失效，请先运行 lk unlock"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::ItemConflict),
+            "条目已被其他设备修改（CAS 冲突），请刷新后重试"
+        );
+        assert_eq!(rpc_fail_text(&RpcError::ItemNotFound), "条目不存在");
+        assert_eq!(
+            rpc_fail_text(&RpcError::Limit {
+                detail: "附件 > 50MB".into()
+            }),
+            "超出限制：附件 > 50MB"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::RateLimited {
+                retry_after_seconds: 30
+            }),
+            "尝试过于频繁，请在 30 秒后重试"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::VaultExists),
+            "库已存在（如需重置请使用 lk init --force，旧数据不可恢复）"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::WeakPassword),
+            "主密码至少 8 位（建库/恢复时校验）"
+        );
+    }
+
+    /// 同步 / bridge 变体：detail 空与非空两种形态。
+    #[test]
+    fn sync_and_bridge_variant_texts() {
+        assert_eq!(
+            rpc_fail_text(&RpcError::SyncNotConfigured { detail: "".into() }),
+            "未配置同步存储，请先运行 lk config sync set <url>"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::SyncNotConfigured { detail: "x".into() }),
+            "未配置同步存储，请先运行 lk config sync set <url>（x）"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::SyncStorage {
+                detail: "5xx".into()
+            }),
+            "同步失败（存储端错误）：5xx"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::SyncAnomaly {
+                detail: "hmac".into()
+            }),
+            "同步数据异常：hmac；已放弃本轮，未覆盖本地数据"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::SyncCredentials {
+                detail: "钥匙串".into()
+            }),
+            "同步凭据不可用：钥匙串"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::BridgeNoDaemon { detail: "".into() }),
+            "无法连接 Windows 桌面守护实例（bridge.no_daemon）"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::BridgeNoDaemon {
+                detail: "缺少 daemon.json（桌面应用未运行？）".into()
+            }),
+            "无法连接 Windows 桌面守护实例（bridge.no_daemon）：缺少 daemon.json（桌面应用未运行？）"
+        );
+        assert!(rpc_fail_text(&RpcError::BridgeVersionIncompatible {
+            detail: "".into()
+        })
+        .starts_with(
+            "Windows 桌面应用与本 CLI 协议版本不一致（bridge.version_incompatible），请重装 LightKey 桌面应用"
+        ));
+        assert_eq!(
+            rpc_fail_text(&RpcError::BridgeIo {
+                detail: "io".into()
+            }),
+            "bridge 中继失败：io"
+        );
+    }
+
+    /// 兜底 / 传输 / 响应变体：message + detail 组合。
+    #[test]
+    fn fallback_transport_response_texts() {
+        assert_eq!(
+            rpc_fail_text(&RpcError::Other {
+                message: "method not found".into(),
+                detail: "".into()
+            }),
+            "method not found"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::Other {
+                message: "boom".into(),
+                detail: "d".into()
+            }),
+            "boom（d）"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::Transport {
+                message: "无法连接守护进程：no socket".into()
+            }),
+            "无法连接守护进程：no socket"
+        );
+        assert_eq!(
+            rpc_fail_text(&RpcError::BadResponse {
+                message: "空响应".into()
+            }),
+            "空响应"
+        );
+    }
+
+    /// classify → 变体 → 文案全链路：错误码 -32006 经 fake data 得到限流文案。
+    #[test]
+    fn classify_to_text_end_to_end() {
+        let err = RpcError::classify(
+            -32006,
+            "rate.limited".into(),
+            Some(&json!({ "retryAfterSeconds": 7 })),
+        );
+        assert!(matches!(
+            err,
+            RpcError::RateLimited {
+                retry_after_seconds: 7
+            }
+        ));
+        assert_eq!(rpc_fail_text(&err), "尝试过于频繁，请在 7 秒后重试");
+        // BTreeMap 仅用于确认 authz env 类型可构造（呈现层不触碰其内容）
+        let _: BTreeMap<String, String> = BTreeMap::new();
     }
 }
