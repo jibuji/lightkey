@@ -344,8 +344,16 @@ fn process_entry(
 /// fail-closed）。步骤：OpenProcess → NtQueryInformationProcess(PEB 地址)
 /// → ReadProcessMemory(ProcessParameters → CurrentDirectory.DosPath)。
 ///
-/// 偏移（同架构）：x64 `PEB+0x20` → `RTL_USER_PROCESS_PARAMETERS+0x30`
-/// CurrentDirectory.DosPath；x86 `PEB+0x10` → `+0x24`。
+/// 偏移（同架构）：x64 `PEB+0x20` → `RTL_USER_PROCESS_PARAMETERS+0x38`
+/// CurrentDirectory.DosPath；x86 `PEB+0x10` → `+0x24`。x64 布局中
+/// `+0x30` 是 StandardError 句柄而非 CurrentDirectory——若读错位置，
+/// 句柄低 16 位会被当作 Length、DosPath 结构头会被当作 Buffer（垃圾小
+/// 指针）：两道防线都 fail-closed（长度 sanity check + ReadProcessMemory
+/// 对垃圾指针必然失败）。真实 PEB 回归测试见 mod tests。
+/// （依据：RTL_USER_PROCESS_PARAMETERS x64 布局
+/// MaximumLength@0x00/Length@0x04/…/StandardError@0x30/
+/// CurrentDirectory.CURDIR{DosPath@0x38, Handle@0x48}；
+/// 参考 Geoff Chappell 结构研究 / MS Learn winternl.h。）
 #[cfg(windows)]
 pub fn resolve_peer_cwd(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, UNICODE_STRING};
@@ -389,11 +397,19 @@ pub fn resolve_peer_cwd(pid: u32) -> Option<String> {
     } else {
         0x10
     };
+    // CurrentDirectory.DosPath（UNICODE_STRING）：x64 @ +0x38（+0x30 是
+    // StandardError 句柄）；x86 @ +0x24。
     const PROCESS_PARAMETERS_CWD_OFFSET: usize = if cfg!(target_pointer_width = "64") {
-        0x30
+        0x38
     } else {
         0x24
     };
+    // DosPath 长度上限（字节）：Windows 路径硬上限 32767 个 UTF-16 码元
+    // （长路径形态的极限），×2 得字节数——合法 cwd 不可能超限，超出即视为
+    // 读到错误位置 → fail-closed，不拿垃圾长度做第二次跨进程读取。
+    // （注意：错位读到的小句柄值不会触发此上限，由下方 ReadProcessMemory
+    // 对垃圾指针必然失败而兜底。）
+    const MAX_CWD_DOS_PATH_BYTES: u16 = 32767 * 2;
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
@@ -439,7 +455,9 @@ pub fn resolve_peer_cwd(pid: u32) -> Option<String> {
             {
                 return None;
             }
-            if cwd.Buffer.is_null() || cwd.Length == 0 {
+            // Sanity check：Length 为 0 或超出 Windows 路径硬上限都视为读到
+            // 错误位置 → fail-closed。
+            if cwd.Buffer.is_null() || cwd.Length == 0 || cwd.Length > MAX_CWD_DOS_PATH_BYTES {
                 return None;
             }
             let mut buf = vec![0u16; (cwd.Length as usize).div_ceil(2)];
@@ -720,5 +738,44 @@ mod tests {
         assert_eq!(cwd, canonical_real, "cwd 必须是解析符号链接后的真实路径");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// Windows x64 真实 PEB 解析：spawn 一个保持存活的子进程
+    /// （`cmd /c ping -n 30 127.0.0.1`，约 29s 存活，防退出过快读取不稳），
+    /// 走真实 `resolve_peer_cwd`（NtQueryInformationProcess + PEB 偏移 +
+    /// ReadProcessMemory），断言读到子进程真实 cwd。覆盖 issue #33 的
+    /// x64 CurrentDirectory.DosPath @ +0x38 偏移。
+    #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
+    #[test]
+    fn real_peb_cwd_reads_child_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "ping -n 30 127.0.0.1 > nul"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // 子进程初始化需要时间；有界重试，防 CI 慢启动时偶发 None。
+        let expected = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let cwd = loop {
+            assert!(child.try_wait().unwrap().is_none(), "子进程提前退出");
+            if let Some(cwd) = resolve_peer_cwd(child.id()) {
+                break cwd;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "10s 内未能从 PEB 读出子进程 cwd"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(cwd, expected, "PEB 读出的 cwd 必须等于子进程真实目录");
     }
 }
