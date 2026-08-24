@@ -2297,7 +2297,6 @@ mod config_bridge_tests {
 #[cfg(test)]
 mod rpc_fail_text_tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     /// 业务变体 → 文案逐字一致（与重构前「错误码→文案」映射对齐）。
     #[test]
@@ -2436,7 +2435,5 @@ mod rpc_fail_text_tests {
             }
         ));
         assert_eq!(rpc_fail_text(&err), "尝试过于频繁，请在 7 秒后重试");
-        // BTreeMap 仅用于确认 authz env 类型可构造（呈现层不触碰其内容）
-        let _: BTreeMap<String, String> = BTreeMap::new();
     }
 }
