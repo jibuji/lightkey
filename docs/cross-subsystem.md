@@ -72,7 +72,7 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 ┌─ WSL2 (Linux) ─────────────────┐           ┌─ Windows host ─────────────────────────┐
 │ agent（Linux 原生，如 shell/CI） │           │                                          │
 │   └─ lk（Linux ELF CLI）        │           │  lk.exe bridge（Windows PE，随桌面包安装） │
-│       rpc() ── 行 JSON ──────▶  │─interop──▶│    stdin/stdout ↔ named pipe 原样中继     │
+│    RpcClient ── 行 JSON ──────▶  │─interop──▶│    stdin/stdout ↔ named pipe 原样中继     │
 │       ←─ evaluate 返回 env 集    │  字节管道   │    │                                     │
 │       spawn <linux-cmd>（注入）  │           │    ▼                                     │
 │                                 │           │  lk-app.exe 内置守护实例（持钥）            │
@@ -123,7 +123,8 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 
 ### 7.2 Linux `lk` 传输抽象
 
-- `rpc()` 增加后端选择：
+- RPC 出口（`lk-cli/src/main.rs` `production_transport`，装配进 `client.rs`
+  的 typed 客户端）增加后端选择：
   - `local`（现状）：UDS 直连 WSL 内守护实例，行为完全不变；
   - `bridge`：经 `lk.exe bridge` 中继到 Windows 守护实例。
 - 配置解析优先级：显式环境变量 `LIGHTKEY_BRIDGE` > 平台默认：
@@ -209,7 +210,8 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 ## 9. 实现清单
 
 1. `lk-cli`（双平台）：`bridge` 子命令（§7.1）+ 版本校验（§7.3）；
-2. `lk-cli`（Linux）：`rpc()` 传输抽象 + `LIGHTKEY_BRIDGE` 解析与探测（§7.2）；
+2. `lk-cli`（Linux）：RPC 传输抽象（`production_transport`）+ `LIGHTKEY_BRIDGE`
+   解析与探测（§7.2）；
 3. `lk-core`：`path_ns` 模块 + 授权门/`rule.add` 接线（§7.4）；
 4. `lk-core::ipc`：`channel` 枚举扩展 `wsl-bridge`（§7.5）；
 5. `lk-daemon`：`daemon.json` 可选 `version` 字段；
