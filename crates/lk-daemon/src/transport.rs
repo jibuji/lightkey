@@ -1386,7 +1386,7 @@ mod tests {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(e) => return Err(e).expect("连接 mock 守护"),
+                Err(e) => panic!("连接 mock 守护: {e}"),
             }
         }
         let mut stream = stream.expect("5s 截止内连上 mock 守护");
