@@ -493,7 +493,11 @@ mod imp {
             let user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
             let sid: PSID = user.User.Sid;
 
-            let mut acl_buf = AlignedBuf([0u8; 128]);
+            // ACL 必须先落到堆上稳定地址，InitializeAcl/AddAccessAllowedAce 与
+            // SetSecurityDescriptorDacl 都直接作用于这份堆缓冲；之后只移动
+            // Box 智能指针本身（堆地址不变）。任何「先在栈上构造再 Box::new
+            // 拷贝」的写法都会让 SD 内的 ACL 指针悬空（CI 实测 ERROR_INVALID_ACL）。
+            let mut acl_buf = Box::new(AlignedBuf([0u8; 128]));
             let acl = acl_buf.0.as_mut_ptr() as *mut ACL;
             if InitializeAcl(acl, acl_buf.0.len() as u32, ACL_REVISION) == 0
                 || AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, sid) == 0
@@ -525,7 +529,7 @@ mod imp {
             Ok(UserOnlySa {
                 attrs,
                 _sd: sd,
-                _acl: Box::new(acl_buf),
+                _acl: acl_buf,
             })
         }
     }
