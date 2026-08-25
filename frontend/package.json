@@ -1,7 +1,7 @@
 {
   "name": "lightkey-frontend",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "description": "LightKey 桌面应用前端（React + TypeScript，Vite 构建）",
   "scripts": {
