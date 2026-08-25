@@ -125,8 +125,8 @@ Windows 侧守护实例有两种承载形态（二选一就位）；named pipe �
 - 协议面原因串：`DenyReason::NoUi => "no_ui"`（`crates/lk-core/src/authz.rs`
   L92）；
 - 服务端分支：第③层无订阅者 → 不阻塞立即拒绝、审计记 denied
-  （`crates/lk-daemon/src/lib.rs` L1010-L1022；测试锚定
-  `authz_denies_without_ui_fast`：同文件 L2068/L2089）；
+  （`crates/lk-daemon/src/daemon/authz.rs`；测试锚定
+  `authz_denies_without_ui_fast`：`crates/lk-daemon/src/tests/authz.rs`）；
 - CLI 拒绝文案：「无审批界面（未命中规则且桌面端未运行）」
   （`crates/lk-cli/src/main.rs` L1969）。
 
