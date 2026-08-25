@@ -82,17 +82,19 @@ fi
   || skip "Windows 侧未安装 LightKey 桌面应用（未找到 AppData/Roaming/lightkey/daemon.json；可用 LIGHTKEY_BRIDGE_HOME 指定）"
 
 # 3) bridge 中继 lk.exe（§7.2 已知安装位置清单，与 lk-cli bridge_backend
-#    KNOWN_EXE_DIRS 对齐；Program Files 为 per-machine 安装兜底）
+#    KNOWN_EXE_DIRS / KNOWN_EXE_MACHINE_DIRS 对齐；Program Files 为 per-machine
+#    安装兜底）
 RELAY="${LIGHTKEY_BRIDGE:-}"
 if [ -z "$RELAY" ]; then
   for c in /mnt/*/Users/*/AppData/Local/LightKey/lk.exe \
            /mnt/*/Users/*/AppData/Local/Programs/LightKey/lk.exe \
+           /mnt/*/Users/*/AppData/Roaming/LightKey/lk.exe \
            /mnt/*/Program\ Files/LightKey/lk.exe; do
     [ -x "$c" ] && RELAY="$c" && break
   done
 fi
 [ -n "$RELAY" ] && [ -x "$RELAY" ] \
-  || skip "未找到 Windows 侧 lk.exe（已查 %LOCALAPPDATA%\\LightKey\\ 与 Program Files；可用 LIGHTKEY_BRIDGE=<路径> 指定）"
+  || skip "未找到 Windows 侧 lk.exe（已查 %LOCALAPPDATA%\\LightKey\\、%APPDATA%\\LightKey\\ 与 Program Files；可用 LIGHTKEY_BRIDGE=<路径> 指定）"
 
 # 4) Linux lk 二进制存在且已实现 bridge 后端（M2.75 §9 #2）。
 #    依 §7.2「目标可见性」拍板：经 bridge 的每次调用必向 stderr 打

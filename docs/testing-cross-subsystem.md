@@ -110,9 +110,13 @@ Linux `lk` 的 RPC 出口二选一：local（UDS 直连 WSL 本地守护实例�
 | 未设 + 非 WSL | 本地 daemon（无跨子系统概念） |
 | 未设 + WSL | 自动探测：找到 `/mnt/<盘>/Users/*/AppData/Roaming/lightkey/daemon.json`（=「装了」）→ 在已知安装位置找 lk.exe |
 
-已知安装位置：`%LOCALAPPDATA%\LightKey\`（桌面包捆绑落地处）、
-`%LOCALAPPDATA%\Programs\LightKey\`、`%APPDATA%\LightKey\`（CLI 探测清单
-`KNOWN_EXE_DIRS`）；E2E 脚本另查 `C:\Program Files\LightKey\` 作 per-machine 兜底。
+已知安装位置（CLI 探测清单与 E2E 脚本 relay 探测**两侧一致**，由
+`lk-cli` 单测锚定防漂移，见 #47）：
+- 用户主目录相对：`%LOCALAPPDATA%\LightKey\`（桌面包捆绑落地处）、
+  `%LOCALAPPDATA%\Programs\LightKey\`、`%APPDATA%\LightKey\`（CLI 清单
+  `KNOWN_EXE_DIRS`）；
+- per-machine：`C:\Program Files\LightKey\`（MSI all-users 兜底，CLI 清单
+  `KNOWN_EXE_MACHINE_DIRS` 挂盘符根解析；E2E 脚本同查）。
 
 **探测失败分型（防「空库错觉」——最危险的失败模式）**：
 

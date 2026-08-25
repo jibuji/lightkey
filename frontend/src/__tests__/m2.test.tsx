@@ -61,6 +61,13 @@ async function unlock(ctx: Context) {
   await p;
 }
 
+/** 审批入队为异步（enqueue 先读 config 再渲染）；flush 掉 mock 300ms configGet 延迟。 */
+async function flushApproval() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(300);
+  });
+}
+
 describe("ipc-bridge 通知翻译（Rust 事件 → IPC 通知 → 本层重新 emit）", () => {
   it("authz.request 帧 → Cordis 事件（负载字段对齐契约，无密钥值）", async () => {
     const { ctx, mock } = await mountHost();
@@ -133,6 +140,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         keys: ["NPM_TOKEN", "GH_TOKEN"],
       });
     });
+    await flushApproval();
     // approval 插件自挂 root 到 body
     const dialog = document.body.querySelector(".approval-dialog");
     expect(dialog).not.toBeNull();
@@ -148,6 +156,75 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
     expect(dialog!.querySelector(".ring-num")!.textContent).toBe("30");
   });
 
+  it("倒计时取自 config approvalTimeoutSecs（120 → 120s，非硬编码 30）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    vi.spyOn(ctx.ipc, "configGet").mockResolvedValue({
+      autoLockMinutes: 5,
+      approvalTimeoutSecs: 120,
+      sync: null,
+    });
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-120",
+        starter: "claude",
+        projectDir: "/work/proj-i",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+      });
+    });
+    await flushApproval();
+    const ring = document.body.querySelector(".approval-dialog")!.querySelector(".ring-num")!;
+    expect(ring.textContent).toBe("120");
+    // 真实 120s 倒计时（非 30s 钳制）：1 秒后 → 119
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(document.body.querySelector(".ring-num")!.textContent).toBe("119");
+  });
+
+  it("config 读不到 approvalTimeoutSecs（configGet 异常）→ 默认 30s", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    vi.spyOn(ctx.ipc, "configGet").mockRejectedValue(new Error("config unavailable"));
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-fallback",
+        starter: "claude",
+        projectDir: "/work/proj-j",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+      });
+    });
+    await flushApproval();
+    expect(
+      document.body.querySelector(".approval-dialog")!.querySelector(".ring-num")!.textContent,
+    ).toBe("30");
+  });
+
+  it("config approvalTimeoutSecs=0 → 对齐守护进程 .max(1) 显示 1s（非 30）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    vi.spyOn(ctx.ipc, "configGet").mockResolvedValue({
+      autoLockMinutes: 5,
+      approvalTimeoutSecs: 0,
+      sync: null,
+    });
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-zero",
+        starter: "claude",
+        projectDir: "/work/proj-k",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+      });
+    });
+    await flushApproval();
+    expect(
+      document.body.querySelector(".approval-dialog")!.querySelector(".ring-num")!.textContent,
+    ).toBe("1");
+  });
+
   it("允许本次 → approvalResult(allowed) 回传 + 弹窗关闭 + Toast", async () => {
     const { ctx, mock } = await mountHost();
     await unlock(ctx);
@@ -161,6 +238,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         keys: ["NPM_TOKEN"],
       });
     });
+    await flushApproval();
     const dialog = document.body.querySelector(".approval-dialog")!;
     const allowBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
       b.textContent?.includes("允许本次"),
@@ -189,6 +267,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         keys: ["GH_TOKEN"],
       });
     });
+    await flushApproval();
     const dialog = document.body.querySelector(".approval-dialog")!;
     const denyBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
       b.textContent?.includes("拒绝"),
@@ -218,6 +297,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         keys: ["AWS_ACCESS_KEY_ID"],
       });
     });
+    await flushApproval();
     expect(document.body.querySelector(".approval-dialog")).not.toBeNull();
     act(() => {
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
@@ -242,6 +322,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         keys: ["NPM_TOKEN"],
       });
     });
+    await flushApproval();
     expect(document.body.querySelector(".approval-dialog")).not.toBeNull();
     // 30s 倒计时（分步推进以触发每秒 tick）
     for (let i = 0; i < 31; i += 1) {
@@ -281,6 +362,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         keys: ["NPM_TOKEN"],
       });
     });
+    await flushApproval();
     expect(document.body.querySelector(".approval-dialog")).not.toBeNull();
     act(() => {
       ctx.emit("session.locked", { reason: "timeout" });
@@ -313,6 +395,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         keys: ["NPM_TOKEN"],
       });
     });
+    await flushApproval();
     const dialog = document.body.querySelector(".approval-dialog")!;
     const denyBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
       b.textContent?.includes("拒绝"),

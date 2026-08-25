@@ -3,9 +3,9 @@
  *
  * 订阅 `authz.request`（Rust authz-gate → 通知桥 → 帧 → 本层事件）→ 渲染
  * 审批弹窗：启动者 · 项目目录 · 命令（等宽）· 请求 key 名 Tag 集 ·
- * **30s 倒计时环形（默认拒绝）** · 「允许本次」「拒绝」；Esc = 拒绝；
- * 超时自动关闭（守护进程侧 30s 超时审计 `timeout`，弹窗本地倒计时到期
- * 即关闭，不重复回传）。
+ * **倒计时环形（默认拒绝；时长取自 config `approvalTimeoutSecs`，缺省 30s）**
+ * · 「允许本次」「拒绝」；Esc = 拒绝；超时自动关闭（守护进程侧超时审计
+ * `timeout`，弹窗本地倒计时到期即关闭，不重复回传）。
  *
  * 决策权始终在 Rust 侧（plugin-architecture.md §5.3）：本插件只把用户
  * 选择经 `approval.result` 回传，不持有裁决权；伪造/已超时 requestId →
@@ -22,13 +22,31 @@ import { CountdownRing } from "../components/atoms";
 import { Icon } from "../components/Icons";
 import { formatProjectDir } from "../utils/projectDir";
 
-/** 审批超时（秒；与守护进程 `approval_timeout_secs` 默认值对齐）。 */
-export const APPROVAL_TIMEOUT_SECS = 30;
+/** 审批超时默认值（秒；与守护进程 `approval_timeout_secs` 默认值对齐）。
+ *  仅作缺省兜底——实际倒计时取自 config `approvalTimeoutSecs`（#50）。 */
+export const DEFAULT_APPROVAL_TIMEOUT_SECS = 30;
+
+/** 读取审批超时秒数：config `approvalTimeoutSecs`（缺省/异常 → 默认 30）。
+ *  与守护进程 `approval_timeout_secs.max(1)` 逐值对齐（0 → 1s，UI 与决策
+ *  窗口不漂移）；负数 / 非有限值 / 缺省 → 默认 30。 */
+async function readApprovalTimeoutSecs(ctx: Context): Promise<number> {
+  try {
+    const cfg = await ctx.ipc.configGet();
+    const t = cfg?.approvalTimeoutSecs;
+    return typeof t === "number" && Number.isFinite(t) && t >= 0
+      ? Math.max(1, t)
+      : DEFAULT_APPROVAL_TIMEOUT_SECS;
+  } catch {
+    return DEFAULT_APPROVAL_TIMEOUT_SECS;
+  }
+}
 
 interface ApprovalItem {
   request: AuthzRequestPayload;
   /** 剩余秒数（倒计时环形）。 */
   remain: number;
+  /** 倒计时总秒数（config `approvalTimeoutSecs`，入队时读取）。 */
+  total: number;
 }
 
 /** 弹窗本体（手写 React：倒计时环形为原子组件，不拆内部结构）。 */
@@ -76,7 +94,7 @@ export function ApprovalDialog({
           ))}
         </div>
         <div className="approval-timer">
-          <CountdownRing total={APPROVAL_TIMEOUT_SECS} remain={item.remain} />
+          <CountdownRing total={item.total} remain={item.remain} />
           <span>
             超时默认<b style={{ color: "var(--danger)" }}>拒绝</b> · 剩余{" "}
             <b>{item.remain}</b> 秒
@@ -96,7 +114,7 @@ export function ApprovalDialog({
 }
 
 /** 弹窗宿主：队列消费 + 倒计时（每秒 tick；到期自动关闭不回传——守护进程
- * 侧 30s 超时审计 timeout）。 */
+ * 侧超时审计 timeout）。 */
 function ApprovalHost({
   current,
   onResolve,
@@ -176,7 +194,7 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
             });
         }}
         onExpire={() => {
-          // 超时：守护进程侧 30s 超时审计 timeout；弹窗关闭、不回传
+          // 超时：守护进程侧超时审计 timeout；弹窗关闭、不回传
           queue.shift();
           render();
         }}
@@ -184,9 +202,9 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     );
   };
 
-  // 订阅 authz.request：入队 + 弹窗（30s 倒计时由宿主驱动）。
+  // 订阅 authz.request：入队 + 弹窗（倒计时由宿主驱动，时长取自 config）。
   // 锁态门控（QA P1）：锁定时不渲染弹窗、不展示任何请求元数据——守护进程侧
-  // 30s 超时默认拒绝照常生效；解锁态才接受弹窗。
+  // 超时默认拒绝照常生效；解锁态才接受弹窗。
   let unlocked = ctx.session.unlocked;
   const offUnlocked = ctx.on("session.unlocked", () => {
     unlocked = true;
@@ -200,9 +218,15 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
   });
   ctx.on("authz.request", (payload: AuthzRequestPayload) => {
     if (!unlocked) return;
-    queue.push({ request: payload, remain: APPROVAL_TIMEOUT_SECS });
-    mount();
-    render();
+    // 入队前读 config（#50）：倒计时 total/remain 取自 approvalTimeoutSecs，
+    // 与守护进程决策窗口同源；读取期间锁定则不入队。
+    void (async () => {
+      const total = await readApprovalTimeoutSecs(ctx);
+      if (!unlocked) return;
+      queue.push({ request: payload, remain: total, total });
+      mount();
+      render();
+    })();
   });
 
   return () => {
