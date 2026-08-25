@@ -368,10 +368,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE,
-        INVALID_HANDLE_VALUE,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FlushFileBuffers, ReadFile, WriteFile,
     };
@@ -379,7 +376,7 @@ mod imp {
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
         WaitNamedPipeW,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, TerminateProcess};
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess};
 
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -408,27 +405,6 @@ mod imp {
             None
         };
         PeerInfo { pid, cwd }
-    }
-
-    /// 复制句柄（订阅连接 writer 线程与主线程各持一份）。
-    fn dup_handle(h: HANDLE) -> Option<HANDLE> {
-        unsafe {
-            let mut dup: HANDLE = std::ptr::null_mut();
-            let ok = DuplicateHandle(
-                GetCurrentProcess(),
-                h,
-                GetCurrentProcess(),
-                &mut dup,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            );
-            if ok == 0 {
-                None
-            } else {
-                Some(dup)
-            }
-        }
     }
 
     /// 生成 pipe 名：`\\.\pipe\lightkey-<user>-<随机8hex>`（用户级随机组件防劫持）。
@@ -613,13 +589,16 @@ mod imp {
             let sh = SendHandle(connected);
             std::thread::spawn(move || {
                 let mut stream = PipeStream { handle: sh };
+                let mut stream_closed = false;
                 if let Ok(Some(line)) = read_line(&mut stream) {
                     if is_subscribe_request(&line) {
                         let resp = handler(&line, &peer);
                         let _ = write_line(&mut stream, &resp);
                         if subscribe_response_ok(&resp) {
                             if let Some(hub) = hub {
-                                serve_push_stream(&mut stream, &hub);
+                                // 流模式：句柄移入 writer 线程，收尾在其内完成
+                                serve_push_stream(stream, &hub);
+                                stream_closed = true;
                             }
                         }
                     } else {
@@ -643,8 +622,11 @@ mod imp {
                 // 由下方 windows-only 慢读回归锁单测 + CI windows-latest / 真机
                 // E2E 复测确认归零。
                 unsafe {
-                    let _ = FlushFileBuffers(sh.0);
-                    DisconnectNamedPipe(sh.0);
+                    // 订阅流模式已在 serve_push_stream 内收尾，不重复触碰句柄
+                    if !stream_closed {
+                        let _ = FlushFileBuffers(sh.0);
+                        DisconnectNamedPipe(sh.0);
+                    }
                     CloseHandle(sh.0);
                 }
             });
@@ -652,25 +634,24 @@ mod imp {
         Ok(())
     }
 
-    /// 订阅连接流模式（Windows：DuplicateHandle 拆读写两端）。
-    fn serve_push_stream(stream: &mut PipeStream, hub: &Arc<PushHub>) {
-        let Some(writer_handle) = dup_handle(stream.handle.0) else {
-            return;
-        };
+    /// 订阅连接流模式（Windows）：writer 线程**独占**原句柄写通知帧，
+    /// 无并发读。同步（非 overlapped）named pipe 实例同一时刻只允许一个
+    /// 未决 I/O——旧实现「主线程阻塞 ReadFile 等断连 + 复制句柄 WriteFile」
+    /// 的读写拆分会让 writer 的写永远排在挂起读之后（订阅后客户端不再发
+    /// 数据，读永不完成），帧全部滞留、外部订阅者饿死（#49 排障实证：
+    /// 原句柄在进入读循环前写入的帧立即可达，之后的写全部不可达）。现改为
+    /// 与桌面进程内 PushStream 同构的纯 writer 设计：断连靠写失败惰性检测
+    /// （下一次广播时 WriteFile 报错 → 退订；外部订阅者仅测试/未来扩展使用，
+    /// 惰性检测的代价可忽略）。流模式结束时在本函数内完成 Flush/Disconnect/
+    /// Close 收尾（句柄已移入 writer 线程，调用方不再触碰）。
+    fn serve_push_stream(mut stream: PipeStream, hub: &Arc<PushHub>) {
         let (id, rx) = hub.subscribe();
-        let closed = Arc::new(AtomicBool::new(false));
         let hub = Arc::clone(hub);
-        let c = Arc::clone(&closed);
-        let sh = SendHandle(writer_handle); // 先包装再入闭包（裸句柄非 Send）
         let writer = std::thread::spawn(move || {
-            let mut ws = PipeStream { handle: sh };
             loop {
-                if c.load(Ordering::Relaxed) {
-                    break;
-                }
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(frame) => {
-                        if write_line(&mut ws, &frame).is_err() {
+                        if write_line(&mut stream, &frame).is_err() {
                             break;
                         }
                     }
@@ -678,20 +659,14 @@ mod imp {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+            // 流模式收尾（与常规请求连接同一套原语：确保送达再断连）
             unsafe {
-                CloseHandle(sh.0);
+                let _ = FlushFileBuffers(stream.handle.0);
+                DisconnectNamedPipe(stream.handle.0);
+                CloseHandle(stream.handle.0);
             }
             hub.unsubscribe(id);
         });
-        // 主线程：读（忽略内容）直到对端关闭
-        let mut buf = [0u8; 4096];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
-            }
-        }
-        closed.store(true, Ordering::Relaxed);
         let _ = writer.join();
     }
 

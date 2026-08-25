@@ -1445,8 +1445,13 @@ mod tests {
     use lk_core::sync::SyncConfig;
     use lk_core::vault::init_vault_with_params;
     use std::sync::mpsc;
+    use std::sync::Mutex;
     use std::time::Duration;
     use std::time::Instant;
+
+    /// 串行化触碰 global_shutdown / 真实传输层的测试（并行测试互相置位
+    /// shutdown 标志会打断对方的 serve 循环，且负载下时间断言易误报）。
+    static TRANSPORT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// M1.5 事件总线装配回归：守护进程解锁 → `session.unlocked(password)`、
     /// 写条目 → `item.changed`、锁定 → `session.locked(manual)`。
@@ -2085,10 +2090,12 @@ mod tests {
             ),
             &test_peer(Some(proj.path())),
         );
-        assert!(
-            t0.elapsed() < Duration::from_millis(300),
-            "无界面必须立即拒绝"
-        );
+        // 阈值语义：粗上界，只防「误入审批等待」（m2_daemon 审批窗口=1s，
+        // 默认窗口=30s，误等任一都会超此界）；不是延迟 SLA。更紧的常数在
+        // 并行测试负载下不可靠：Windows 启动者进程链回溯（Toolhelp+PEB）
+        // 单机实测 ~440ms、满载 >1s，与本测试意图无关（功能面由下方
+        // reason=no_ui 断言锁定：走审批等待的结果是 timeout 而非 no_ui）。
+        assert!(t0.elapsed() < Duration::from_secs(5), "无界面必须立即拒绝");
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["allowed"], false);
         assert_eq!(v["result"]["reason"], "no_ui");
@@ -2166,6 +2173,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn authz_response_returns_on_initiating_connection_over_real_transport() {
+        let _lock = TRANSPORT_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
         let handler = make_handler(&state, &shared);
@@ -2229,6 +2237,141 @@ mod tests {
         global_shutdown().store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = serve_thread.join();
     }
+    /// #49 回归（Windows named pipe 形态）：与上方 UDS 版同构——决策产生于
+    /// 一条连接（`approval.result`），必须写回**发起** `authz.evaluate` 的那条
+    /// 真实 named pipe 连接（生产 WSL bridge 路径即此形态）。
+    #[cfg(windows)]
+    #[test]
+    fn authz_response_returns_on_initiating_connection_over_named_pipe() {
+        let _lock = TRANSPORT_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+        // 审批窗口放宽到 10s：本测试锁定「投递」段而非超时边界，避免 CI 慢机
+        // 上 1s 默认窗口把健康路径误判为 timeout（UDS 版用默认 1s 是历史现状）
+        shared.config.write().unwrap().approval_timeout_secs = 10;
+        let handler = make_handler(&state, &shared);
+
+        // 桌面壳订阅（进程内）：available()=true → 第 3 层走审批而非 no_ui
+        let (_sid, rx) = shared.push.subscribe();
+
+        // 真实 named pipe 服务端（与生产 serve 主循环同一条路径）
+        transport::bind_server(dir.path()).unwrap();
+        global_shutdown().store(false, std::sync::atomic::Ordering::Relaxed);
+        let hub = Some(Arc::clone(&shared.push));
+        let serve_dir = dir.path().to_path_buf();
+        let serve_thread = std::thread::spawn(move || {
+            let _ = transport::serve(&serve_dir, handler, hub, global_shutdown());
+        });
+
+        let ep = transport::read_endpoint(dir.path()).expect("bind 后应写入 daemon.json");
+
+        // 发起连接：authz.evaluate（阻塞至审批回传；channel=wsl-bridge 覆盖）
+        let eval_line = rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(&token),
+            json!({ "command": "yarn publish", "keys": ["NPM_TOKEN"], "channel": "wsl-bridge" }),
+        );
+        let eval_thread = std::thread::spawn({
+            let ep = ep.clone();
+            move || transport::request(&ep, &eval_line)
+        });
+
+        // 订阅通道收到 authz.request 帧 → 取 requestId（桌面壳视角）
+        let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let fv: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(fv["method"], "authz.request");
+        let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+
+        // 审批回传走「另一条连接」（approval.result）
+        let approve_resp = transport::request(
+            &ep,
+            &rpc_line(
+                M_APPROVAL_RESULT,
+                Some(&token),
+                json!({ "requestId": request_id, "decision": "allowed" }),
+            ),
+        )
+        .unwrap();
+        let av: Value = serde_json::from_str(&approve_resp).unwrap();
+        assert_eq!(av["result"]["accepted"], true);
+
+        // 发起连接收到写回的响应：allowed + env
+        let resp = eval_thread.join().unwrap().expect("evaluate 应收到响应行");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["allowed"], true, "响应应写回发起连接：{resp}");
+        assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit");
+
+        // 审计：channel=Approval（第 3 层结果；与生产一致）
+        let authz_evs = inject_audit_events(dir.path());
+        assert_eq!(authz_evs.len(), 1);
+        assert_eq!(authz_evs[0].channel, lk_core::audit::AuditChannel::Approval);
+        assert_eq!(authz_evs[0].result, lk_core::audit::AuditResult::Allowed);
+
+        // 收尾：置位 shutdown；serve 主循环可能阻塞在 ConnectNamedPipe
+        // （Windows 无非阻塞轮询，与生产「进程退出即回收」语义一致），不 join
+        global_shutdown().store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(serve_thread);
+    }
+
+    /// Windows named pipe 推送路径验证：真实 serve + 外部订阅连接（
+    /// transport::connect）应能收到 subscribe 响应与后续 notification 帧
+    /// （桌面壳进程内订阅不走此路径，外部订阅者唯一入口）。#49 排障发现的
+    /// 真实缺陷：旧实现「主线程阻塞 ReadFile + 复制句柄 WriteFile」在同步
+    /// named pipe 上把 writer 的写串行化在挂起读之后，帧全部滞留、订阅者
+    /// 饿死——本测试锁定回归。
+    #[cfg(windows)]
+    #[test]
+    fn push_stream_delivers_frames_over_real_named_pipe() {
+        let _lock = TRANSPORT_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+        let handler = make_handler(&state, &shared);
+        transport::bind_server(dir.path()).unwrap();
+        global_shutdown().store(false, std::sync::atomic::Ordering::Relaxed);
+        let hub = Some(Arc::clone(&shared.push));
+        let serve_dir = dir.path().to_path_buf();
+        let serve_thread = std::thread::spawn(move || {
+            let _ = transport::serve(&serve_dir, handler, hub, global_shutdown());
+        });
+        let ep = transport::read_endpoint(dir.path()).unwrap();
+
+        // 订阅连接：subscribe → ok 响应 → 转流模式等通知帧
+        let mut sub = transport::connect(&ep).unwrap();
+        transport::write_line(
+            &mut sub,
+            &rpc_line(M_SUBSCRIBE, None, json!({ "token": token })),
+        )
+        .unwrap();
+        let sub_resp = transport::read_line(&mut sub).unwrap().unwrap();
+        let v: Value = serde_json::from_str(&sub_resp).unwrap();
+        assert!(v.get("error").is_none(), "subscribe 应成功：{sub_resp}");
+
+        // 触发 item.changed 事件（另一条连接的常规命令）
+        let _ = transport::request(
+            &ep,
+            &rpc_line(
+                M_ITEM_PUT,
+                Some(&token),
+                json!({ "item": {
+                    "type": "secret", "name": "PUSH_TEST", "value": "v",
+                    "purpose": "", "expiresAt": null
+                } }),
+            ),
+        )
+        .unwrap();
+
+        // 订阅连接必须收到 item.changed 通知帧（修复前：永远收不到）
+        let frame = transport::read_line(&mut sub)
+            .unwrap()
+            .expect("订阅连接应收到通知帧");
+        let fv: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(fv["method"], "item.changed", "got: {frame}");
+
+        global_shutdown().store(true, std::sync::atomic::Ordering::Relaxed);
+        // serve 主循环可能阻塞在 ConnectNamedPipe，不 join（测试进程退出即回收）
+        drop(serve_thread);
+    }
+
     #[test]
     fn authz_approval_timeout_denies_and_audits() {
         let dir = tempfile::tempdir().unwrap();
