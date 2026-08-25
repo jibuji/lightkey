@@ -106,7 +106,7 @@ needs-decision，不得自行变更。
        （远端索引重建探测墓碑防复活等）由代码分支落地。
    (b) **#8 待办勾销**：#8 所记「`lk config` 后续补同范围校验（待办）」已完成——
        `SyncConfig::validate` 已按 `MAX_SYNC_INTERVAL_SECS=3600` 收敛为 15..=3600
-       并有边界测试（crates/lk-core/src/sync.rs），标记完成。
+       并有边界测试（crates/lk-core/src/sync/tests.rs），标记完成。
    已修订 [data-model.md](data-model.md) §6（原 #5 其余内容仍然有效）。
 13. **M2 grilling 决议集补登记（2026-08-22 · 来源：文档一致性审查发现「决策 #N」引用不可对位）**：
     M2 grilling（约 2026-08-16）产出的六项拍板当时未登记入本决议集，而全仓

@@ -64,7 +64,8 @@
   trait + 本地模拟/WebDAV/S3 实现；E2E `scripts/e2e_m1.sh`）
 - [x] M1 并发结构（G1 根治）：同步轮次 = 抓取无锁 + 应用短锁两阶段；命令与
   后台同步并发，网络 I/O 不持守护进程锁；vault 内存用读写锁（权限层与数据层
-  互斥解耦，见 `crates/lk-daemon/src/lib.rs` 模块文档）
+  互斥解耦，见 docs/sync.md §2.3 与 `crates/lk-daemon/src/daemon/mod.rs` 的
+  `SharedDaemon` 文档）
 - [x] M1.5 插件化改造（Cordis）：lk-core A/B 层 trait 服务 + 事件总线
   （`crates/lk-core/src/service.rs` / `bus.rs`；密文格式/存储布局/IPC 协议零变更）；
   daemon 按 C 层边界拆模块并装配总线（现位于 `crates/lk-daemon/src/`，见下方

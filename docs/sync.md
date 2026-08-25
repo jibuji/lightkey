@@ -44,8 +44,8 @@
 （拉取索引/差异密文）不持守护进程锁，只有「把变更写入 vault」的应用阶段短暂取锁。
 因此用户命令与后台同步可并发执行，网络 I/O 不阻塞命令。vault 内存用读写锁：命令侧
 读多写少（读锁）、同步仅在应用阶段短写（写锁）。权限层（判定/会话）与数据层
-（vault 读写）的互斥解耦，锁只保护数据层内存一致性——详见 `crates/lk-daemon/src/lib.rs`
-模块文档。
+（vault 读写）的互斥解耦，锁只保护数据层内存一致性——详见
+`crates/lk-daemon/src/daemon/mod.rs` 的 `SharedDaemon` 文档。
 
 ## 3. 上传：CAS + last-write-wins（D5/D7）
 
