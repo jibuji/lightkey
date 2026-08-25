@@ -21,7 +21,7 @@ fn daemon_emits_session_and_item_events_on_bus() {
     let mut daemon = Daemon::start(dir.path()).unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
     let e = Arc::clone(&events);
-    daemon.core.bus().subscribe(Arc::new(FnSink::new(move |ev| {
+    daemon.bus().subscribe(Arc::new(FnSink::new(move |ev| {
         e.lock().unwrap().push(ev.clone());
     })));
 

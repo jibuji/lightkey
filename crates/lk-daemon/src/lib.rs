@@ -24,7 +24,7 @@
 //!   客户端自报字段一律不信任。
 
 pub mod config;
-pub mod daemon;
+mod daemon;
 pub mod dirs;
 pub mod notifier;
 pub mod router;
@@ -39,7 +39,7 @@ pub use sync::{run_sync_round, run_sync_round_with};
 pub use transport::{PeerInfo, PushHub};
 
 // —— daemon 核心的对外面（路径与拆分前一致）——
-pub use daemon::lifecycle::{global_shutdown, make_handler, run, serve_embedded};
+pub use daemon::lifecycle::{global_shutdown, make_handler, run, serve_embedded, EmbeddedDaemon};
 pub use daemon::{Daemon, SharedDaemon, SESSION_TOKEN_FILE};
 
 // —— crate 内部旧路径兼容（router.rs 等兄弟模块引用）——

@@ -242,6 +242,4 @@ impl Daemon {
             transport::cleanup(&self.shared.dir, &ep);
         }
     }
-
-    // -- 条目 / 审计 -----------------------------------------------------
 }

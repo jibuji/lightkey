@@ -16,6 +16,9 @@ crates/lk-app/gen/
 # 日志
 *.log
 
+# 临时 / 审查产物（.rev_* 为一次性 diff/对比脚本与转储，勿提交）
+.rev_*
+
 # OS
 .DS_Store
 Thumbs.db
