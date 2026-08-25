@@ -249,5 +249,3 @@ fn push_channel_notifies_session_and_item_events() {
     assert_eq!(fv["params"]["via"], "password");
     assert!(shared.push.subscriber_count() >= 1);
 }
-
-// -- 执行计划路由（ADR-0001）-------------------------------------------
