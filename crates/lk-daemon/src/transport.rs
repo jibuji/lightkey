@@ -622,12 +622,14 @@ mod imp {
                 // 由下方 windows-only 慢读回归锁单测 + CI windows-latest / 真机
                 // E2E 复测确认归零。
                 unsafe {
-                    // 订阅流模式已在 serve_push_stream 内收尾，不重复触碰句柄
+                    // 订阅流模式已在 serve_push_stream 内完成全部收尾
+                    // （含 CloseHandle）；句柄值会被系统急切复用，重复关闭
+                    // 可能命中已易主的活跃管道实例，绝不可再触碰。
                     if !stream_closed {
                         let _ = FlushFileBuffers(sh.0);
                         DisconnectNamedPipe(sh.0);
+                        CloseHandle(sh.0);
                     }
-                    CloseHandle(sh.0);
                 }
             });
         }
