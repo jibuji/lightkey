@@ -92,6 +92,11 @@ pub const KNOWN_EXE_DIRS: [&str; 3] = [
     "AppData/Roaming/LightKey",
 ];
 
+/// per-machine 安装位置（相对**盘符根**而非用户主目录；MSI all-users 兜底，
+/// 见 #47：per-machine 安装不进用户主目录，须由 [`exe_candidate_dirs`] 挂到
+/// 盘符根下解析）。
+const KNOWN_EXE_MACHINE_DIRS: [&str; 1] = ["Program Files/LightKey"];
+
 const EXE_NAME: &str = "lk.exe";
 
 /// 判定核心（纯逻辑；文件系统事实全部来自注入输入）。
@@ -250,11 +255,23 @@ impl FoundInstall {
     }
 }
 
-/// 在用户主目录下的已知安装位置找 lk.exe。
+/// 给定 Windows 用户主目录，返回全部已知候选安装目录（用户主目录相对 +
+/// per-machine）。`user_home` 形如 `<盘符根>/Users/<用户>`，per-machine 目录
+/// 挂在盘符根下（`<盘符根>/Program Files/...`）。探测顺序：用户主目录各位置
+/// 优先，per-machine 兜底。
+fn exe_candidate_dirs(user_home: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = KNOWN_EXE_DIRS.iter().map(|d| user_home.join(d)).collect();
+    if let Some(drive_root) = user_home.ancestors().nth(2) {
+        dirs.extend(KNOWN_EXE_MACHINE_DIRS.iter().map(|d| drive_root.join(d)));
+    }
+    dirs
+}
+
+/// 在已知安装位置找 lk.exe（含 per-machine 兜底）。
 pub fn find_exe_near(user_home: &Path) -> Option<PathBuf> {
-    KNOWN_EXE_DIRS
+    exe_candidate_dirs(user_home)
         .iter()
-        .map(|d| user_home.join(d).join(EXE_NAME))
+        .map(|d| d.join(EXE_NAME))
         .find(|p| p.is_file())
 }
 
@@ -467,6 +484,73 @@ mod tests {
         };
         assert_eq!(t.data_dir.as_deref(), Some(data_dir.as_path()));
         assert_eq!(t.exe, exe_dir.join("lk.exe"));
+    }
+
+    /// per-machine（MSI all-users）安装位置 `Program Files/LightKey` 兜底：
+    /// 该目录不在用户主目录下，而挂在盘符根——`find_exe_near` 必须也能找到。
+    #[test]
+    fn find_exe_near_covers_per_machine_program_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_home = tmp.path().join("c/Users/alice");
+        std::fs::create_dir_all(&user_home).unwrap();
+        let machine = tmp.path().join("c/Program Files/LightKey");
+        std::fs::create_dir_all(&machine).unwrap();
+        std::fs::write(machine.join("lk.exe"), b"MZ").unwrap();
+
+        assert_eq!(find_exe_near(&user_home), Some(machine.join("lk.exe")));
+    }
+
+    /// #47 锚：`exe_candidate_dirs` 输出 = 4 个已知安装位置（3 用户主目录相对 +
+    /// 1 per-machine）。纯路径拼接断言，跨平台可运行。
+    #[test]
+    fn exe_candidate_dirs_cover_user_home_and_per_machine() {
+        let dirs = exe_candidate_dirs(Path::new("/mnt/c/Users/alice"));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/mnt/c/Users/alice/AppData/Local/LightKey"),
+                PathBuf::from("/mnt/c/Users/alice/AppData/Local/Programs/LightKey"),
+                PathBuf::from("/mnt/c/Users/alice/AppData/Roaming/LightKey"),
+                PathBuf::from("/mnt/c/Program Files/LightKey"),
+            ]
+        );
+    }
+
+    /// #47 双向漂移锚：E2E 脚本 relay 探测清单与 Rust 侧已知安装位置**集合
+    /// 相等**——任一侧增删而不同步另一侧 → 本测试失败（CI 响亮报错）。
+    #[test]
+    fn e2e_script_relay_probe_covers_all_known_exe_dirs() {
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/e2e_cross_subsystem.sh");
+        let text = std::fs::read_to_string(&script)
+            .expect("scripts/e2e_cross_subsystem.sh 应存在（仓库内 cargo test）");
+        // 提取脚本中全部 `/mnt/.../lk.exe` 候选 glob → 反推相对目录集合。
+        // `\ `（shell 转义空格，如 `Program\ Files`）先换成哨兵再按空白分词，
+        // 避免把转义空格误当分隔符；脚本里仅 relay 探测出现 `/lk.exe` 结尾 glob。
+        let mut script_dirs = std::collections::BTreeSet::new();
+        for raw in text.replace("\\ ", "\u{0}").split_whitespace() {
+            let tok = raw.replace('\u{0}', " ");
+            // 末项 glob 后紧跟 `; do`（无续行反斜杠），去掉尾随分号再比对
+            let tok = tok.trim_end_matches(';');
+            let Some(glob) = tok.strip_suffix("/lk.exe") else {
+                continue;
+            };
+            let rel = glob
+                .strip_prefix("/mnt/*/Users/*/")
+                .or_else(|| glob.strip_prefix("/mnt/*/"));
+            if let Some(r) = rel {
+                script_dirs.insert(r.to_string());
+            }
+        }
+        let rust_dirs: std::collections::BTreeSet<String> = KNOWN_EXE_DIRS
+            .iter()
+            .chain(KNOWN_EXE_MACHINE_DIRS.iter())
+            .map(|d| d.to_string())
+            .collect();
+        assert_eq!(
+            script_dirs, rust_dirs,
+            "E2E 脚本 relay 探测清单与 KNOWN_EXE_DIRS/KNOWN_EXE_MACHINE_DIRS 漂移"
+        );
     }
 
     #[test]

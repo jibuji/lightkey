@@ -1897,6 +1897,14 @@ mod tests {
         AuditLog::open(dir).unwrap().read().unwrap()
     }
 
+    /// 审计中 `lk inject` 事件（第 1/2/3 层授权结果；测试断言用）。
+    fn inject_audit_events(dir: &std::path::Path) -> Vec<lk_core::audit::AuditEvent> {
+        audit_events(dir)
+            .into_iter()
+            .filter(|e| e.command.starts_with("lk inject"))
+            .collect()
+    }
+
     /// 规则入库形态与运行时 cwd 判定同基准（§7.4 两侧同函数）：rule.add 的
     /// canonicalize 产物再过 canonical_project_dir 入库；Windows 上该归一化
     /// 剥离 verbatim 前缀，否则与 evaluate 侧归一化 cwd 不匹配（回归门：
@@ -2011,10 +2019,7 @@ mod tests {
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["allowed"], false);
         assert_eq!(v["result"]["reason"], "unknown_starter");
-        let authz_evs: Vec<_> = audit_events(dir.path())
-            .into_iter()
-            .filter(|e| e.command.starts_with("lk inject"))
-            .collect();
+        let authz_evs = inject_audit_events(dir.path());
         assert_eq!(authz_evs.len(), 1);
         assert_eq!(authz_evs[0].result, lk_core::audit::AuditResult::Denied);
     }
@@ -2148,16 +2153,82 @@ mod tests {
         assert_eq!(v["result"]["allowed"], true);
         assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit");
         // 审计：channel=Approval（第 3 层结果）
-        let authz_evs: Vec<_> = audit_events(dir.path())
-            .into_iter()
-            .filter(|e| e.command.starts_with("lk inject"))
-            .collect();
+        let authz_evs = inject_audit_events(dir.path());
         assert_eq!(authz_evs.len(), 1);
         assert_eq!(authz_evs[0].channel, lk_core::audit::AuditChannel::Approval);
         assert_eq!(authz_evs[0].result, lk_core::audit::AuditResult::Allowed);
     }
 
-    /// 审批超时 → 默认拒绝 + 审计 timeout（channel=Approval）。
+    /// #49 回归：决策产生于一条连接（`approval.result`），必须写回**发起**
+    /// `authz.evaluate` 的那条连接。走真实 UDS 传输层（bind + serve +
+    /// `transport::request`），而非仅 `make_handler` 直调——覆盖「响应写回
+    /// 发起连接」投递段（#49 断点所在：finalize 已生成响应却未达客户端）。
+    #[cfg(unix)]
+    #[test]
+    fn authz_response_returns_on_initiating_connection_over_real_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+        let handler = make_handler(&state, &shared);
+
+        // 桌面壳订阅（进程内）：available()=true → 第 3 层走审批而非 no_ui
+        let (_sid, rx) = shared.push.subscribe();
+
+        // 真实 UDS 服务端（与生产 serve 主循环同一条路径）
+        let listener = transport::bind_server(dir.path()).unwrap();
+        global_shutdown().store(false, std::sync::atomic::Ordering::Relaxed);
+        let hub = Some(Arc::clone(&shared.push));
+        let serve_thread = std::thread::spawn(move || {
+            let _ = transport::serve(listener, handler, hub, global_shutdown());
+        });
+
+        let ep = transport::read_endpoint(dir.path()).expect("bind 后应写入 daemon.json");
+
+        // 发起连接：authz.evaluate（阻塞至审批回传；channel=wsl-bridge 覆盖）
+        let eval_line = rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(&token),
+            json!({ "command": "yarn publish", "keys": ["NPM_TOKEN"], "channel": "wsl-bridge" }),
+        );
+        let eval_thread = std::thread::spawn({
+            let ep = ep.clone();
+            move || transport::request(&ep, &eval_line)
+        });
+
+        // 订阅通道收到 authz.request 帧 → 取 requestId（桌面壳视角）
+        let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let fv: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(fv["method"], "authz.request");
+        let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+
+        // 审批回传走「另一条连接」（approval.result）
+        let approve_resp = transport::request(
+            &ep,
+            &rpc_line(
+                M_APPROVAL_RESULT,
+                Some(&token),
+                json!({ "requestId": request_id, "decision": "allowed" }),
+            ),
+        )
+        .unwrap();
+        let av: Value = serde_json::from_str(&approve_resp).unwrap();
+        assert_eq!(av["result"]["accepted"], true);
+
+        // 发起连接收到写回的响应：allowed + env
+        let resp = eval_thread.join().unwrap().unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["allowed"], true, "响应应写回发起连接：{resp}");
+        assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit");
+
+        // 审计：channel=Approval（第 3 层结果；与生产一致）
+        let authz_evs = inject_audit_events(dir.path());
+        assert_eq!(authz_evs.len(), 1);
+        assert_eq!(authz_evs[0].channel, lk_core::audit::AuditChannel::Approval);
+        assert_eq!(authz_evs[0].result, lk_core::audit::AuditResult::Allowed);
+
+        // 收尾：置位 shutdown 让 serve 循环退出后 join（tempdir 再回收 socket）
+        global_shutdown().store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = serve_thread.join();
+    }
     #[test]
     fn authz_approval_timeout_denies_and_audits() {
         let dir = tempfile::tempdir().unwrap();
@@ -2195,10 +2266,7 @@ mod tests {
         );
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["accepted"], false);
-        let authz_evs: Vec<_> = audit_events(dir.path())
-            .into_iter()
-            .filter(|e| e.command.starts_with("lk inject"))
-            .collect();
+        let authz_evs = inject_audit_events(dir.path());
         assert_eq!(authz_evs.len(), 1);
         assert_eq!(authz_evs[0].result, lk_core::audit::AuditResult::Timeout);
         assert_eq!(authz_evs[0].channel, lk_core::audit::AuditChannel::Approval);
@@ -2402,10 +2470,7 @@ mod tests {
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["allowed"], true, "归一化后应命中规则：{resp}");
         // 审计如实记录 channel=wsl-bridge
-        let authz_evs: Vec<_> = audit_events(dir.path())
-            .into_iter()
-            .filter(|e| e.command.starts_with("lk inject"))
-            .collect();
+        let authz_evs = inject_audit_events(dir.path());
         assert_eq!(authz_evs.len(), 1);
         assert_eq!(
             authz_evs[0].channel,
