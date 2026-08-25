@@ -21,7 +21,7 @@ fn daemon_emits_session_and_item_events_on_bus() {
     let mut daemon = Daemon::start(dir.path()).unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
     let e = Arc::clone(&events);
-    daemon.core.bus().subscribe(Arc::new(FnSink::new(move |ev| {
+    daemon.bus().subscribe(Arc::new(FnSink::new(move |ev| {
         e.lock().unwrap().push(ev.clone());
     })));
 
@@ -249,5 +249,3 @@ fn push_channel_notifies_session_and_item_events() {
     assert_eq!(fv["params"]["via"], "password");
     assert!(shared.push.subscriber_count() >= 1);
 }
-
-// -- 执行计划路由（ADR-0001）-------------------------------------------

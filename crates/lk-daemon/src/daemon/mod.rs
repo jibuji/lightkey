@@ -101,7 +101,7 @@ pub struct Daemon {
     /// 跨线程共享状态（命令线程与同步轮询线程并发访问）。
     shared: Arc<SharedDaemon>,
     /// C 层装配（事件总线 + 无状态地基服务；session/vault 经其挂总线）。
-    pub(crate) core: CoreServices,
+    core: CoreServices,
     /// 授权门（第 1/2 层短路 + 第 3 层审批编排）。
     gate: AuthzGate,
     /// 进行中的授权判定（第 3 层等待期间持有；request_id → 请求原文）。
