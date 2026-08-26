@@ -1033,7 +1033,13 @@ fn probe(ep: &Endpoint) -> bool {
 
 /// 拉起 `lk daemon --dir <dir>`（脱离终端；子进程继承 LIGHTKEY_HOME 等环境）。
 fn spawn_daemon(dir: &Path) -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
+    spawn_daemon_exe(&std::env::current_exe()?, dir)
+}
+
+/// 以指定可执行文件拉起守护进程。生产路径传 [`std::env::current_exe`]
+/// （见 [`spawn_daemon`]）；测试注入真实 `lk` 二进制以便回归验证（#59）。
+#[doc(hidden)]
+pub fn spawn_daemon_exe(exe: &Path, dir: &Path) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon").arg("--dir").arg(dir);
     cmd.stdin(std::process::Stdio::null())
@@ -1050,8 +1056,76 @@ fn spawn_daemon(dir: &Path) -> std::io::Result<()> {
             });
         }
     }
+    #[cfg(windows)]
+    let _inherit_guard = std_inherit::InheritGuard::acquire();
     cmd.spawn()?;
     Ok(())
+}
+
+/// Windows：spawn 期间临时摘除本进程 std 三句句柄的继承标志（#59）。
+///
+/// Git Bash（MSYS）会把 CLI 的 stdin/stdout/stderr 设成**带继承标志**的管道
+/// 句柄；`Command::spawn` 走 `CreateProcess` 且 `bInheritHandles = TRUE`，会把
+/// 所有可继承句柄复制进 daemon——daemon 因此持有 CLI stdout 管道写端副本，
+/// 消费 CLI 输出的进程（`cat`/`jq`/`tail`）永远等不到 EOF。拉起前临时摘除
+/// 继承标志，spawn 返回后恢复（Drop）。
+///
+/// 只针对 std 三句（正是 MSYS 管道端所在）；Guard 生效窗口内当前进程若并发
+/// spawn 子进程会丢失 std 继承——调用方（ensure_daemon 路径）为单线程，无风险。
+#[cfg(windows)]
+mod std_inherit {
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    pub(super) struct InheritGuard {
+        /// 已被摘除标志、待恢复的句柄。
+        stripped: Vec<HANDLE>,
+    }
+
+    impl InheritGuard {
+        /// 摘除 std 三句的可继承标志；必须在 spawn 后 Drop 以恢复。
+        pub(super) fn acquire() -> Self {
+            // 任何一步失败都跳过该句柄（best-effort，不阻断拉起）。
+            let mut guard = InheritGuard {
+                stripped: Vec::new(),
+            };
+            for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let h = unsafe { GetStdHandle(std_handle) };
+                if h.is_null() || h == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                let mut flags: u32 = 0;
+                if unsafe { GetHandleInformation(h, &mut flags) } == 0
+                    || flags & HANDLE_FLAG_INHERIT == 0
+                {
+                    continue;
+                }
+                // stdout/stderr 可能指向同一句柄（`2>&1`）：去重，避免恢复时重复写。
+                if guard.stripped.contains(&h) {
+                    continue;
+                }
+                if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                    guard.stripped.push(h);
+                }
+            }
+            guard
+        }
+    }
+
+    impl Drop for InheritGuard {
+        fn drop(&mut self) {
+            for &h in &self.stripped {
+                unsafe {
+                    SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

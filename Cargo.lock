@@ -2412,6 +2412,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 
