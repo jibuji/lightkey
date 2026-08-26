@@ -337,6 +337,12 @@ struct EditFields {
 }
 
 fn main() {
+    // 中文提示直写 UTF-8 字节；Windows 默认控制台代码页（如 cp936）会按 GBK
+    // 解码成乱码。仅对真实控制台生效，重定向到文件/管道时字节不变。
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
+    }
     let cli = Cli::parse();
     let code = run(&cli);
     std::process::exit(code);

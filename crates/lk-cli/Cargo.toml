@@ -28,5 +28,9 @@ zeroize.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# main() 启动时设控制台输出代码页为 UTF-8（SetConsoleOutputCP）
+windows-sys.workspace = true
+
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys.workspace = true
