@@ -24,6 +24,7 @@ rpassword.workspace = true
 arboard.workspace = true
 hex.workspace = true
 zeroize.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -199,4 +199,29 @@ needs-decision，不得自行变更。
     实现：crates/lk-core/src/authz.rs / lk-daemon transport::PushHub +
     notifier + daemon/session.rs + dispatch 门；前端 approval 插件透传。
 
+17. **`lk inject` secret 值内存生命周期加固：策略 B+C（2026-08-27 · 来源：
+    issue #76（SEC HIGH）核实，船长拍板）**：核实属实——`lk inject` 的值经
+    daemon `authz.evaluate` 响应 → CLI 物化 `decision.env`（`BTreeMap<String,
+    String>` 明文）→ `child.envs(&env)`，secret 值在 lk CLI 进程内存明文持有，
+    暴露给 core dump（`ulimit -c`）/WER/ptrace。采纳 **B（保守加固，backward
+    compatible）+ C（文档/承诺如实降级）** 组合；执行计划路由/授权门语义零变更，
+    不动 daemon 侧 authz/approval/审计归因。
+    - **B CLI 侧加固（不改 IPC 与 daemon 行为）**：
+      - `decision.env` 值在 `child.envs(&env)` 之后**立即 zeroize**（`zeroize`
+        crate 对 `String` 的内建实现，原地擦除堆缓冲；`memguard::zeroize_env`）；
+      - Linux：CLI 启动即 `prctl(PR_SET_DUMPABLE, 0)`（经 libc），禁 core dump
+        落下明文，且限制非相关进程直接 ptrace；进程级一次性设置，放 main 早期；
+      - Windows：`SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)`
+        尽力抑制 WER 错误框（不做过度工程；Windows 分支补 cfg 编译 + 单元测试，
+        验收以 Linux 为主）。
+    - **威胁模型边界如实声明**：**不防同用户调试器**——ptrace/inject 读取
+      进程内存仍由同用户身份可完成，同用户进程互信已在补充拍板 #15 划在
+      防护边界外；本项加固只缩短明文存续、降低 core dump/WER 落下磁盘的成功面。
+    - **C 文档/承诺如实降级**：`docs/cli.md` inject 节、`cmd_inject` 注释、
+      `lk inject --help` 同步表达「值会经 lk CLI 进程内存传递一次（已做
+      zeroize + 防 dump 加固），仅排除 stdout/日志/审计；不防同用户调试器」。
+    实现：crates/lk-cli/src/memguard.rs（`harden_process` / `zeroize_env` /
+    测试）+ crates/lk-cli/src/main.rs（`main()` 启动加固、`cmd_inject` 注入后
+    zeroize、--help 文案）+ 文档。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
