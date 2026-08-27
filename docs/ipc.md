@@ -42,7 +42,16 @@
 - 解锁成功 → 守护进程签发**会话令牌**（高熵随机，如 256-bit），**随每次解锁轮换**。
 - 后续所有请求必须携带令牌；令牌错误/过期 → `-32601` 风格错误（统一为
   `session.invalid`），客户端不得据此区分「库未解锁」与「令牌错」（防探测）。
-- 令牌仅存在于客户端进程内存，不落盘。
+- 令牌存放（**A1 取舍**，2026-08 规格矛盾裁决沿用）：CLI 每次调用是独立
+  进程，令牌须经进程间传递才能跨命令复用解锁态——守护进程把令牌 hex 写入
+  数据目录 `session.token`（unix 权限 0600；Windows 显式 DACL 仅当前用户，
+  不依赖目录继承），**锁定/超时/守护进程退出即删除**，生命周期 = 解锁窗口。
+  风险面收窄到**同用户本地进程**——该边界已拍板承认：同用户进程互信是
+  个人单机工具的威胁模型基线（对标 ssh-agent / `gh auth` / aws credentials
+  等同类凭据的存放模型），「跨命令复用解锁态」与 bridge 跨子系统复用桌面
+  解锁态均为既定特性（#71/#74/#77 据此定案，补充拍板 #15）。
+  「令牌仅存于客户端进程内存、不落盘」的
+  形态以桌面/浏览器等常驻客户端为前提，属后续解锁通道一体化的设计项。
 - 锁定/超时/守护进程退出 → 令牌立即失效。
 
 ## 4. 方法与最小字段原则（D10）
@@ -60,11 +69,11 @@
 | `item.export` | 导出 file 条目附件（整包下载） | 名称/MIME/大小 + base64 数据 |
 | `sync.trigger` / `sync.poll` | 同步控制 | 变更摘要（不返回内容） |
 | `authz.evaluate` | 授权门判定（M2）；`channel` 枚举 `cli` \| `desktop` \| `wsl-bridge`（跨子系统桥，补充拍板 #14，审计如实记录） | 允许/拒绝 + 最小 env 集 |
-| `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`） | accepted（是否接受） |
+| `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`）。**仅桌面内嵌直调可提交**——socket/pipe 连接 → `channel.forbidden`（-32014）；params 含 `challenge`（`authz.request` 帧下发的一次性应答值，错值 → `accepted=false` 且条目保留；#72/#78 / 补充拍板 #16） | accepted（是否接受） |
 | `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6） | 规则 / 规则列表 / 无 |
 | `audit.list` | 审计查询 | 事件（无密钥值） |
 | `audit.verify` | 校验审计 HMAC 链 | 已验证事件数 |
-| `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A） | 无 |
+| `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A）。来源标签：桌面壳为进程内直调订阅，socket 流连接为普通订阅——后者**不计入审批界面判定、也收不到 `authz.request` 帧**（#72/#78：帧内 challenge 是审批应答凭据，只走桌面通道） | 无 |
 
 - **最小字段原则**：IPC 响应只包含调用方被授权的最小已解密字段——例如
   `authz.evaluate` 只返回「被批准命令的 env 变量」，绝不返回整库内容

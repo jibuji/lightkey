@@ -3,17 +3,16 @@
 use super::*;
 
 impl Daemon {
-    pub(crate) fn item_list(&mut self, id: Value) -> RpcResponse {
+    pub(crate) fn item_list(&mut self, id: Value, caller: &CallerId) -> RpcResponse {
         // list() 需 &mut（索引自愈）→ 写锁；锁只保护内存一致性，本地操作
         let shared = Arc::clone(&self.shared);
         let mut guard = shared.vault.write().unwrap();
         let me = guard.as_mut().unwrap();
         match me.list() {
             Ok(items) => {
-                let _ = self.audit.append(
-                    me.keys(),
-                    &EventInput::new("lk", "item.list", AuditResult::Allowed),
-                );
+                let _ = self
+                    .audit
+                    .append(me.keys(), &caller.event("item.list", AuditResult::Allowed));
                 let result = ItemListResult { items };
                 RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
             }
@@ -21,7 +20,7 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn item_get(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn item_get(&mut self, id: Value, params: Value, caller: &CallerId) -> RpcResponse {
         let p: ItemGetParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
@@ -33,7 +32,7 @@ impl Daemon {
             Ok(item) => {
                 let _ = self.audit.append(
                     me.keys(),
-                    &EventInput::new("lk", &format!("item.get {}", p.id), AuditResult::Allowed),
+                    &caller.event(format!("item.get {}", p.id), AuditResult::Allowed),
                 );
                 RpcResponse::ok(id, serde_json::to_value(item).unwrap_or(Value::Null))
             }
@@ -41,7 +40,7 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn item_put(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn item_put(&mut self, id: Value, params: Value, caller: &CallerId) -> RpcResponse {
         let p: ItemPutParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
@@ -54,9 +53,8 @@ impl Daemon {
             Ok(item) => {
                 let _ = self.audit.append(
                     me.keys(),
-                    &EventInput::new(
-                        "lk",
-                        &format!("item.put {} <redacted>", kind),
+                    &caller.event(
+                        format!("item.put {} <redacted>", kind),
                         AuditResult::Allowed,
                     ),
                 );
@@ -67,7 +65,12 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn item_delete(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn item_delete(
+        &mut self,
+        id: Value,
+        params: Value,
+        caller: &CallerId,
+    ) -> RpcResponse {
         let p: ItemDeleteParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
@@ -79,7 +82,7 @@ impl Daemon {
             Ok(_tomb) => {
                 let _ = self.audit.append(
                     me.keys(),
-                    &EventInput::new("lk", &format!("item.delete {}", p.id), AuditResult::Allowed),
+                    &caller.event(format!("item.delete {}", p.id), AuditResult::Allowed),
                 );
                 RpcResponse::ok(id, json!({}))
             }
@@ -87,7 +90,12 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn item_export(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn item_export(
+        &mut self,
+        id: Value,
+        params: Value,
+        caller: &CallerId,
+    ) -> RpcResponse {
         let p: ItemExportParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
@@ -99,7 +107,7 @@ impl Daemon {
             Ok(bundle) => {
                 let _ = self.audit.append(
                     me.keys(),
-                    &EventInput::new("lk", &format!("item.export {}", p.id), AuditResult::Allowed),
+                    &caller.event(format!("item.export {}", p.id), AuditResult::Allowed),
                 );
                 let result = ItemExportResult {
                     name: bundle.name,
@@ -113,7 +121,12 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn audit_list(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn audit_list(
+        &mut self,
+        id: Value,
+        params: Value,
+        caller: &CallerId,
+    ) -> RpcResponse {
         let p: AuditListParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
@@ -122,10 +135,9 @@ impl Daemon {
         let guard = shared.vault.read().unwrap();
         let me = guard.as_ref().unwrap();
         let events = self.audit.read();
-        let _ = self.audit.append(
-            me.keys(),
-            &EventInput::new("lk", "audit.list", AuditResult::Allowed),
-        );
+        let _ = self
+            .audit
+            .append(me.keys(), &caller.event("audit.list", AuditResult::Allowed));
         match events {
             Ok(all) => {
                 let total = all.len();

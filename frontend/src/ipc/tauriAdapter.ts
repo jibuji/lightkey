@@ -222,9 +222,14 @@ export class TauriAdapter implements LightKeyIpc {
   async approvalResult(
     requestId: string,
     decision: "allowed" | "denied",
+    challenge: string,
   ): Promise<{ accepted: boolean }> {
     try {
-      return rpc<{ accepted: boolean }>("approval.result", { requestId, decision });
+      return rpc<{ accepted: boolean }>("approval.result", {
+        requestId,
+        decision,
+        challenge,
+      });
     } catch (e) {
       throw mapError(e);
     }

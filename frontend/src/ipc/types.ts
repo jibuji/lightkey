@@ -104,10 +104,15 @@ export interface LightKeyIpc {
   ruleAdd(input: RuleInput): Promise<AuthRule>;
   ruleRemove(id: string): Promise<void>;
 
-  /** approval.result：审批回传（allowed | denied；超时由守护进程侧产生） */
+  /**
+   * approval.result：审批回传（allowed | denied；超时由守护进程侧产生）。
+   * `challenge` 为 `authz.request` 帧携带的一次性应答值（#78），必须原样
+   * 回带；仅桌面壳直调可提交（socket 来源 → channel.forbidden）。
+   */
   approvalResult(
     requestId: string,
     decision: "allowed" | "denied",
+    challenge: string,
   ): Promise<{ accepted: boolean }>;
 
   /** config.get / config.set（ui-settings；config.json 非敏感运行时配置） */

@@ -11,7 +11,7 @@
  * | `session.locked` | `{ reason }` | Rust session → IPC 通知 → 本层重新 emit | ui 各插件（回解锁页）· sync-engine（暂停轮询） |
  * | `theme.changed` | `{ theme }` | theme 插件（TS 内 emit，不跨进程） | 所有 ui 插件（重渲染） |
  * | `clipboard.copied` | `{ source, field, clearedAt }` | ui 组件（TS 内 emit，不跨进程） | Toast（提示）· 30s 清除计时 |
- * | `authz.request` | `{ requestId, starter, projectDir, command, keys[] }` | Rust authz-gate → IPC 通知 | approval 弹窗（**M2 已接入**） |
+ * | `authz.request` | `{ requestId, starter, projectDir, command, keys[], challenge }` | Rust authz-gate → IPC 通知（仅桌面订阅者可见） | approval 弹窗（**M2 已接入**） |
  * | `vault.search` | `{ query }` | topbar 搜索框（TS 内 emit，300ms 防抖） | ui-vault（过滤列表） |
  * | `vault.search-enter` | `{ query }` | topbar 搜索框回车（TS 内 emit） | ui-vault（空态引导新建） |
  * | `vault.initialized` | `{ initialized }` | ipc-bridge（守护进程 `vault.status` 探测结果，TS 内 emit，不跨进程） | 宿主（锁态整页互斥门控：无库→onboarding / 有库→unlock） |
@@ -66,6 +66,9 @@ export interface AuthzRequestPayload {
   command: string;
   /** 仅 key 名，密钥值永不进事件负载。 */
   keys: string[];
+  /** 一次性审批挑战（#78）：回传 `approval.result` 时必须原样带回；
+   *  该值仅经桌面通知通道下发（socket 订阅者不可见）。 */
+  challenge: string;
 }
 
 /** `vault.search` 负载（topbar 搜索框 → ui-vault；300ms 防抖）。 */

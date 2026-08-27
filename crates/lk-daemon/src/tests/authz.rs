@@ -150,16 +150,17 @@ fn authz_denies_without_ui_fast() {
     assert_eq!(v["result"]["reason"], "no_ui");
 }
 
-/// 第 3 层完整闭环：订阅连接存在 → evaluate 阻塞等审批 →
-/// 广播 authz.request 帧 → approval.result 回传 → 放行 + 审计(Approval)。
+/// 第 3 层完整闭环：桌面订阅连接存在 → evaluate 阻塞等审批 →
+/// 广播 authz.request 帧（含一次性 challenge，仅投桌面订阅者）→
+/// approval.result（桌面直调 + 原样回带挑战）→ 放行 + 审计(Approval)。
 #[test]
 fn authz_approval_roundtrip_via_push_and_result() {
     let dir = tempfile::tempdir().unwrap();
     let proj = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     let handler = make_handler(&state, &shared);
-    // 订阅连接（桌面壳模拟）
-    let (_sid, rx) = shared.push.subscribe();
+    // 订阅连接（桌面壳模拟：进程内登记 = desktop 来源）
+    let (_sid, rx) = shared.push.subscribe(true);
     assert_eq!(shared.push.subscriber_count(), 1);
     // 线程内发起 evaluate（阻塞至审批回传）
     let peer = test_peer(Some(proj.path()));
@@ -173,7 +174,7 @@ fn authz_approval_roundtrip_via_push_and_result() {
         let peer = peer.clone();
         move || handler(&line, &peer)
     });
-    // 推送通道收到 authz.request 帧（含 requestId；无密钥值）
+    // 推送通道收到 authz.request 帧（含 requestId + challenge；无密钥值）
     let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
@@ -190,16 +191,23 @@ fn authz_approval_roundtrip_via_push_and_result() {
     );
     assert_eq!(fv["params"]["command"], "yarn publish");
     assert_eq!(fv["params"]["keys"][0], "NPM_TOKEN");
+    assert!(
+        fv["params"]["challenge"]
+            .as_str()
+            .is_some_and(|c| !c.is_empty()),
+        "authz.request 必须携带一次性挑战（#78 方案 B）：{fv}"
+    );
     assert!(!frame.contains("sekrit"), "authz.request 不含密钥值");
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
-    // 审批回传（approval.result；走常规请求连接）
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    // 审批回传（approval.result）：仅桌面内嵌直调可提交（#78 方案 A）
     let resp = state.lock().unwrap().handle(
         &rpc_line(
             M_APPROVAL_RESULT,
             Some(&token),
-            json!({ "requestId": request_id, "decision": "allowed" }),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
         ),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     );
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["accepted"], true);
@@ -228,7 +236,7 @@ fn authz_response_returns_on_initiating_connection_over_real_transport() {
     let handler = make_handler(&state, &shared);
 
     // 桌面壳订阅（进程内）：available()=true → 第 3 层走审批而非 no_ui
-    let (_sid, rx) = shared.push.subscribe();
+    let (_sid, rx) = shared.push.subscribe(true);
 
     // 真实 UDS 服务端（与生产 serve 主循环同一条路径）
     let listener = transport::bind_server(dir.path()).unwrap();
@@ -251,24 +259,24 @@ fn authz_response_returns_on_initiating_connection_over_real_transport() {
         move || transport::request(&ep, &eval_line)
     });
 
-    // 订阅通道收到 authz.request 帧 → 取 requestId（桌面壳视角）
+    // 订阅通道收到 authz.request 帧 → 取 requestId/challenge（桌面壳视角）
     let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
 
-    // 审批回传走「另一条连接」（approval.result）
-    let approve_resp = transport::request(
-        &ep,
+    // 审批回传经桌面内嵌直调（#78 方案 A：socket 不再是合法提交面）——
+    // 决策产生在与发起连接不同的线程，响应仍必须写回发起的 socket 连接
+    let approve_resp = rpc_json(&state.lock().unwrap().handle(
         &rpc_line(
             M_APPROVAL_RESULT,
             Some(&token),
-            json!({ "requestId": request_id, "decision": "allowed" }),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
         ),
-    )
-    .unwrap();
-    let av: Value = serde_json::from_str(&approve_resp).unwrap();
-    assert_eq!(av["result"]["accepted"], true);
+        &PeerInfo::desktop(),
+    ));
+    assert_eq!(approve_resp["result"]["accepted"], true);
 
     // 发起连接收到写回的响应：allowed + env
     let resp = eval_thread.join().unwrap().unwrap();
@@ -302,7 +310,7 @@ fn authz_response_returns_on_initiating_connection_over_named_pipe() {
     let handler = make_handler(&state, &shared);
 
     // 桌面壳订阅（进程内）：available()=true → 第 3 层走审批而非 no_ui
-    let (_sid, rx) = shared.push.subscribe();
+    let (_sid, rx) = shared.push.subscribe(true);
 
     // 真实 named pipe 服务端（与生产 serve 主循环同一条路径）
     transport::bind_server(dir.path()).unwrap();
@@ -326,24 +334,24 @@ fn authz_response_returns_on_initiating_connection_over_named_pipe() {
         move || transport::request(&ep, &eval_line)
     });
 
-    // 订阅通道收到 authz.request 帧 → 取 requestId（桌面壳视角）
+    // 订阅通道收到 authz.request 帧 → 取 requestId/challenge（桌面壳视角）
     let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
 
-    // 审批回传走「另一条连接」（approval.result）
-    let approve_resp = transport::request(
-        &ep,
+    // 审批回传经桌面内嵌直调（#78 方案 A：socket 不再是合法提交面）——
+    // 决策产生在与发起连接不同的线程，响应仍必须写回发起的 pipe 连接
+    let approve_resp = rpc_json(&state.lock().unwrap().handle(
         &rpc_line(
             M_APPROVAL_RESULT,
             Some(&token),
-            json!({ "requestId": request_id, "decision": "allowed" }),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
         ),
-    )
-    .unwrap();
-    let av: Value = serde_json::from_str(&approve_resp).unwrap();
-    assert_eq!(av["result"]["accepted"], true);
+        &PeerInfo::desktop(),
+    ));
+    assert_eq!(approve_resp["result"]["accepted"], true);
 
     // 发起连接收到写回的响应：allowed + env
     let resp = eval_thread.join().unwrap().expect("evaluate 应收到响应行");
@@ -428,7 +436,7 @@ fn authz_approval_timeout_denies_and_audits() {
     let proj = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     let handler = make_handler(&state, &shared);
-    let (_sid, rx) = shared.push.subscribe();
+    let (_sid, rx) = shared.push.subscribe(true);
     let peer = test_peer(Some(proj.path()));
     let line = rpc_line(
         M_AUTHZ_EVALUATE,
@@ -443,19 +451,20 @@ fn authz_approval_timeout_denies_and_audits() {
     let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
     // 不回传 → 1s 后超时默认拒绝
     let resp = h.join().unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["allowed"], false);
     assert_eq!(v["result"]["reason"], "timeout");
-    // 超时后回传 → 忽略（条目已清理）
+    // 超时后回传（桌面直调 + 帧内挑战）→ 忽略（条目已清理）
     let resp = state.lock().unwrap().handle(
         &rpc_line(
             M_APPROVAL_RESULT,
             Some(&token),
-            json!({ "requestId": request_id, "decision": "allowed" }),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
         ),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     );
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["accepted"], false);
@@ -463,6 +472,13 @@ fn authz_approval_timeout_denies_and_audits() {
     assert_eq!(authz_evs.len(), 1);
     assert_eq!(authz_evs[0].result, lk_core::audit::AuditResult::Timeout);
     assert_eq!(authz_evs[0].channel, lk_core::audit::AuditChannel::Approval);
+    // 失败提交的独立审计（#78：审批提交行为可归因；不计入 inject 事件）
+    let submissions: Vec<_> = audit_events(dir.path())
+        .into_iter()
+        .filter(|e| e.command == "approval.result")
+        .collect();
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].result, lk_core::audit::AuditResult::Denied);
 }
 
 /// G1 回归：authz.evaluate 在第 3 层等待审批期间，其他命令不被阻塞
@@ -473,7 +489,7 @@ fn authz_wait_does_not_block_other_commands() {
     let proj = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     let handler = make_handler(&state, &shared);
-    let (_sid, rx) = shared.push.subscribe();
+    let (_sid, rx) = shared.push.subscribe(true);
     // 发起 evaluate（阻塞等待审批）
     let line = rpc_line(
         M_AUTHZ_EVALUATE,
@@ -489,6 +505,7 @@ fn authz_wait_does_not_block_other_commands() {
     let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
     // 等待期间：其他命令必须及时返回（命令锁未被 30s 等待占用）
     let t0 = Instant::now();
     let resp = state.lock().unwrap().handle(
@@ -505,24 +522,29 @@ fn authz_wait_does_not_block_other_commands() {
     shared.approvals.resolve(
         uuid::Uuid::parse_str(&request_id).unwrap(),
         ApprovalDecision::Allowed,
+        &challenge,
     );
     let resp = h.join().unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["allowed"], true);
 }
 
-/// 审批回传伪造 requestId → 忽略（accepted=false；#17）；无令牌 → session.invalid（#18）。
+/// 审批回传校验矩阵（#17/#72/#78）：伪造 requestId → 忽略（accepted=false）；
+/// 无令牌 → session.invalid；socket 来源 → channel.forbidden；
+/// 缺 challenge 参数 → invalid params。
 #[test]
 fn approval_result_rejects_forged_and_unauthenticated() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _shared, token) = m2_daemon(dir.path(), None);
+    // 伪造 requestId（桌面直调语义下走完整校验链 → resolve 忽略）
     let resp = state.lock().unwrap().handle(
         &rpc_line(
             M_APPROVAL_RESULT,
             Some(&token),
-            json!({ "requestId": uuid::Uuid::new_v4(), "decision": "allowed" }),
+            json!({ "requestId": uuid::Uuid::new_v4(), "decision": "allowed",
+                    "challenge": "whatever" }),
         ),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     );
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["accepted"], false);
@@ -531,9 +553,10 @@ fn approval_result_rejects_forged_and_unauthenticated() {
         &rpc_line(
             M_APPROVAL_RESULT,
             None,
-            json!({ "requestId": uuid::Uuid::new_v4(), "decision": "allowed" }),
+            json!({ "requestId": uuid::Uuid::new_v4(), "decision": "allowed",
+                    "challenge": "whatever" }),
         ),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     );
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["error"]["message"], MSG_SESSION_INVALID);
@@ -542,12 +565,211 @@ fn approval_result_rejects_forged_and_unauthenticated() {
         &rpc_line(
             M_APPROVAL_RESULT,
             Some(&token),
-            json!({ "requestId": uuid::Uuid::new_v4(), "decision": "maybe" }),
+            json!({ "requestId": uuid::Uuid::new_v4(), "decision": "maybe",
+                    "challenge": "whatever" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], ERR_INVALID_PARAMS);
+    // 缺 challenge 字段 → invalid params（#78：挑战必填）
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            Some(&token),
+            json!({ "requestId": uuid::Uuid::new_v4(), "decision": "allowed" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], ERR_INVALID_PARAMS);
+}
+
+/// #78 方案 A（对抗性回归）：持有效令牌的 **socket** 进程即使拿到正确的
+/// requestId/challenge，提交审批也必须被专用错误码拒绝，且不得消耗/清掉
+/// 真实的待审批条目——随后真正的桌面回传照常生效。
+#[test]
+fn approval_result_rejected_from_socket_origin_keeps_pending_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        Some(&token),
+        json!({ "command": "yarn publish", "keys": ["NPM_TOKEN"] }),
+    );
+    let h = std::thread::spawn({
+        let handler = handler.clone();
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+
+    // socket 进程（ PeerInfo::unknown()）+ 完整正确参数 → 仍必须拒绝
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            Some(&token),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
         ),
         &PeerInfo::unknown(),
     );
     let v: Value = serde_json::from_str(&resp).unwrap();
-    assert_eq!(v["error"]["code"], ERR_INVALID_PARAMS);
+    assert_eq!(
+        v["error"]["code"], ERR_CHANNEL_FORBIDDEN,
+        "socket 提交审批必须 channel.forbidden：{resp}"
+    );
+
+    // 待审批条目未被消耗：真正的桌面回传照常放行
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            Some(&token),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["allowed"], true);
+}
+
+/// #78 方案 B（对抗性回归）：挑战值不符 → 忽略且条目保留（伪回传不能
+/// 打掉真用户的待审批请求），失败提交写审计；随后原样回带 → 放行。
+#[test]
+fn approval_result_with_wrong_challenge_is_ignored_but_request_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        Some(&token),
+        json!({ "command": "yarn publish", "keys": ["NPM_TOKEN"] }),
+    );
+    let h = std::thread::spawn({
+        let handler = handler.clone();
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+
+    // 挑战不符 → accepted=false（错挑战不是超时竞态）
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            Some(&token),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": "forged" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], false);
+    // 失败提交审计（命令名 approval.result）
+    let submissions: Vec<_> = audit_events(dir.path())
+        .into_iter()
+        .filter(|e| e.command == "approval.result")
+        .collect();
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].result, lk_core::audit::AuditResult::Denied);
+
+    // 条目保留：原样回带挑战 → 放行
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            Some(&token),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["allowed"], true);
+}
+
+/// #78 方案 A（订阅面）：仅有 socket 订阅者时不算「有界面」（no_ui 立即拒绝，
+/// 与旧语义 subscriber_count>0 的差异点）；有桌面订阅者并存时——authz.request
+/// 帧**只投桌面**通道，socket 订阅者拿不到帧（也就拿不到 challenge）。
+#[test]
+fn socket_subscribers_are_not_ui_and_receive_no_authz_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    let handler = make_handler(&state, &shared);
+
+    // 场景 1：只有 socket 订阅者（模拟持令牌攻击进程自行 subscribe）→
+    // has_ui 仍为 false → 第 3 层立即 fail-closed
+    let (_sock_sid, sock_rx) = shared.push.subscribe(false);
+    assert_eq!(shared.push.subscriber_count(), 1);
+    assert_eq!(shared.push.desktop_subscriber_count(), 0);
+    let resp = handler(
+        &rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(&token),
+            json!({ "command": "yarn publish", "keys": ["NPM_TOKEN"] }),
+        ),
+        &test_peer(Some(proj.path())),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["reason"], "no_ui");
+    // socket 订阅者也收不到被拒请求的任何帧
+    assert!(sock_rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+    // 场景 2：socket + 桌面订阅者并存 → 帧只达桌面；审批后两者自然结束
+    let (desk_sid, desk_rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        Some(&token),
+        json!({ "command": "cargo publish", "keys": ["NPM_TOKEN"] }),
+    );
+    let h = std::thread::spawn({
+        let handler = handler.clone();
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    // 桌面通道收到帧（含挑战）
+    let frame = desk_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(fv["method"], "authz.request");
+    assert!(fv["params"]["challenge"].as_str().is_some());
+    // socket 通道无帧投递
+    assert!(
+        sock_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "authz.request 帧绝不能投给 socket 订阅者"
+    );
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            Some(&token),
+            json!({ "requestId": request_id, "decision": "denied", "challenge": challenge }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["reason"], "rejected");
+    drop(desk_rx);
+    shared.push.unsubscribe(desk_sid);
 }
 
 /// 请求的 key 无法解析（不存在）→ 第 1 层拒绝（missing_keys；不弹窗）。

@@ -44,6 +44,16 @@ pub struct Endpoint {
 /// 请求处理器类型（行 + 对端身份 → 响应行）。
 pub type Handler = Arc<dyn Fn(&str, &PeerInfo) -> String + Send + Sync>;
 
+/// IPC 对端来源（审计归因用，#66）：socket 客户端 vs 桌面内嵌直调。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PeerOrigin {
+    /// socket / named pipe 客户端（CLI、bridge）——审计 starter 走进程链回溯。
+    #[default]
+    Socket,
+    /// 桌面内嵌直调（lk-app command 桥，无 IPC 对端）——审计记 desktop 通道。
+    Desktop,
+}
+
 /// IPC 对端身份（传输层在连接建立时派生；授权路径据此判定启动者与 cwd）。
 #[derive(Debug, Clone, Default)]
 pub struct PeerInfo {
@@ -51,6 +61,9 @@ pub struct PeerInfo {
     pub pid: u32,
     /// 对端进程真实 cwd（canonical 形态；`None` = 未知 → 授权 fail-closed）。
     pub cwd: Option<String>,
+    /// 对端来源（审计归因；授权路径不看此字段——desktop 直调 pid=0 照样
+    /// fail-closed）。
+    pub origin: PeerOrigin,
 }
 
 impl PeerInfo {
@@ -58,16 +71,35 @@ impl PeerInfo {
     pub fn unknown() -> PeerInfo {
         PeerInfo::default()
     }
+
+    /// 桌面内嵌直调对端（无 IPC 对端；审计 starter/channel 记 `desktop`）。
+    pub fn desktop() -> PeerInfo {
+        PeerInfo {
+            origin: PeerOrigin::Desktop,
+            ..PeerInfo::default()
+        }
+    }
 }
 
 /// 通知订阅注册表（跨线程：命令线程广播 → 每订阅连接一个 writer 线程排空）。
+///
+/// 订阅者带**来源标签**（#72/#78 方案 A）：桌面内嵌直调订阅（lk-app
+/// `start_push_stream`）= desktop；socket/pipe 流模式连接 = socket。
+/// 审批界面判定与 `authz.request` 帧（含一次性 challenge）只认 desktop
+/// 标签——持令牌的 socket 进程既不算「有界面」也拿不到挑战，无法自我批准。
 ///
 /// [`PushHub::broadcast`] 只做内存 channel 投递（**非阻塞**，符合总线契约）；
 /// socket 写入由订阅连接自己的 writer 线程承担。客户端慢/死 → 内存队列
 /// 增长（桌面持续读取；死连接写入失败即退订）。
 pub struct PushHub {
-    subs: Mutex<std::collections::HashMap<u64, mpsc::Sender<String>>>,
+    subs: Mutex<std::collections::HashMap<u64, SubEntry>>,
     next_id: AtomicU64,
+}
+
+struct SubEntry {
+    tx: mpsc::Sender<String>,
+    /// 桌面内嵌直调订阅 = true；socket 流模式连接 = false。
+    desktop: bool,
 }
 
 impl PushHub {
@@ -79,10 +111,15 @@ impl PushHub {
     }
 
     /// 登记订阅者，返回 (订阅者 id, 帧接收端)。writer 线程排空接收端。
-    pub fn subscribe(&self) -> (u64, mpsc::Receiver<String>) {
+    /// `desktop` = 来源标签：桌面内嵌直调传 true，socket 流模式连接传 false
+    /// （#72/#78 方案 A：审批界面判定与 `authz.request` 帧只认 desktop）。
+    pub fn subscribe(&self, desktop: bool) -> (u64, mpsc::Receiver<String>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
-        self.subs.lock().unwrap().insert(id, tx);
+        self.subs
+            .lock()
+            .unwrap()
+            .insert(id, SubEntry { tx, desktop });
         (id, rx)
     }
 
@@ -93,15 +130,48 @@ impl PushHub {
 
     /// 广播一帧给全部订阅者（非阻塞内存投递）。
     pub fn broadcast(&self, frame: &str) {
-        let subs: Vec<mpsc::Sender<String>> = self.subs.lock().unwrap().values().cloned().collect();
+        let subs: Vec<mpsc::Sender<String>> = self
+            .subs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.tx.clone())
+            .collect();
         for tx in subs {
             let _ = tx.send(frame.to_string());
         }
     }
 
-    /// 订阅连接数（0 = 桌面壳未运行 = 无审批界面 → 第 3 层 fail-closed）。
+    /// 广播一帧给**桌面来源**订阅者（#72/#78：`authz.request` 携带一次性
+    /// 审批挑战，不得离开受信桌面通道）。
+    pub fn broadcast_desktop(&self, frame: &str) {
+        let subs: Vec<mpsc::Sender<String>> = self
+            .subs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.desktop)
+            .map(|e| e.tx.clone())
+            .collect();
+        for tx in subs {
+            let _ = tx.send(frame.to_string());
+        }
+    }
+
+    /// 订阅连接数（含非桌面；通知可达面统计用）。
     pub fn subscriber_count(&self) -> usize {
         self.subs.lock().unwrap().len()
+    }
+
+    /// 桌面来源订阅数（0 = 无审批界面 → 第 3 层 fail-closed；#72/#78：
+    /// socket 订阅者不计入——订阅存在不等于「有人类可批准」）。
+    pub fn desktop_subscriber_count(&self) -> usize {
+        self.subs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.desktop)
+            .count()
     }
 }
 
@@ -185,7 +255,11 @@ mod imp {
         } else {
             None
         };
-        PeerInfo { pid, cwd }
+        PeerInfo {
+            pid,
+            cwd,
+            origin: PeerOrigin::Socket,
+        }
     }
 
     /// 绑定监听 socket：`<dir>/run/lk-<随机8hex>.sock`（0700 目录 + 0600 socket）。
@@ -261,7 +335,8 @@ mod imp {
     /// 订阅连接流模式：writer 线程排空通知帧写 socket；主线程读到对端关闭
     /// 即退出（writer 线程随后退订）。
     fn serve_push_stream(stream: UnixStream, hub: &Arc<PushHub>) {
-        let (id, rx) = hub.subscribe();
+        // socket 流模式订阅：非桌面来源（#72/#78——收不到 authz.request 帧）
+        let (id, rx) = hub.subscribe(false);
         let closed = Arc::new(AtomicBool::new(false));
         let writer_stream = match stream.try_clone() {
             Ok(c) => c,
@@ -404,7 +479,11 @@ mod imp {
         } else {
             None
         };
-        PeerInfo { pid, cwd }
+        PeerInfo {
+            pid,
+            cwd,
+            origin: PeerOrigin::Socket,
+        }
     }
 
     /// 生成 pipe 名：`\\.\pipe\lightkey-<user>-<随机8hex>`（用户级随机组件防劫持）。
@@ -432,22 +511,24 @@ mod imp {
     ///（M1.5 既有实现：显式 DACL 仅授予当前用户 SID；注释见原实现。）
     struct UserOnlySa {
         attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-        _sd: Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>,
-        /// 必须走堆（Box）：`SetSecurityDescriptorDacl` 已把 ACL 地址写进
-        /// `_sd`，本结构按值移动时内联缓冲会连带搬家、令描述符内的指针悬空。
+        _sd: UserOnlySd,
+    }
+
+    /// 仅当前用户的安全描述符（DACL 单 ACE：当前用户全权）。
+    /// SD 与 ACL 缓冲必须同生命周期（SD 内嵌 ACL 指针）。
+    struct UserOnlySd {
+        sd: Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>,
         _acl: Box<AlignedBuf>,
     }
 
-    fn user_only_sa() -> std::io::Result<UserOnlySa> {
+    /// 当前用户 SID + 承载它的对齐缓冲（SID 指进缓冲内部，**两者必须同
+    /// 生命周期**——缓冲被移动/释放后指针即失效；TOKEN_USER 缓冲 8 对齐
+    /// 见 `AlignedBuf`）。
+    fn current_user_sid() -> std::io::Result<(AlignedBuf, windows_sys::Win32::Security::PSID)> {
         use windows_sys::Win32::Security::{
-            AddAccessAllowedAce, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
-            SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION, PSECURITY_DESCRIPTOR, PSID,
-            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+            GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
         };
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        const GENERIC_ALL: u32 = 0x1000_0000;
-        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
-
         unsafe {
             let mut token: HANDLE = std::ptr::null_mut();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
@@ -466,13 +547,23 @@ mod imp {
             if ok == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let user = &*(user_buf.0.as_ptr() as *const TOKEN_USER);
-            let sid: PSID = user.User.Sid;
+            let sid = (&*(user_buf.0.as_ptr() as *const TOKEN_USER)).User.Sid;
+            Ok((user_buf, sid))
+        }
+    }
 
-            // ACL 必须先落到堆上稳定地址，InitializeAcl/AddAccessAllowedAce 与
-            // SetSecurityDescriptorDacl 都直接作用于这份堆缓冲；之后只移动
-            // Box 智能指针本身（堆地址不变）。任何「先在栈上构造再 Box::new
-            // 拷贝」的写法都会让 SD 内的 ACL 指针悬空（CI 实测 ERROR_INVALID_ACL）。
+    /// 仅当前用户的 DACL（单 ACE：当前用户全权）。
+    ///
+    /// ACL 必须落到堆上稳定地址，InitializeAcl/AddAccessAllowedAce 直接
+    /// 作用于这份堆缓冲；之后只移动 Box 智能指针本身（堆地址不变）。任何
+    /// 「先在栈上构造再 Box::new 拷贝」的写法都会让引用它的 SD/调用方
+    /// 拿到悬空指针（CI 实测 ERROR_INVALID_ACL）。
+    fn user_only_acl() -> std::io::Result<Box<AlignedBuf>> {
+        use windows_sys::Win32::Security::{AddAccessAllowedAce, InitializeAcl, ACL, ACL_REVISION};
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        unsafe {
+            // SID 缓冲必须活到 AddAccessAllowedAce 拷贝完成（ACE 内嵌 SID 副本）
+            let (_sid_buf, sid) = current_user_sid()?;
             let mut acl_buf = Box::new(AlignedBuf([0u8; 128]));
             let acl = acl_buf.0.as_mut_ptr() as *mut ACL;
             if InitializeAcl(acl, acl_buf.0.len() as u32, ACL_REVISION) == 0
@@ -480,7 +571,19 @@ mod imp {
             {
                 return Err(std::io::Error::last_os_error());
             }
+            Ok(acl_buf)
+        }
+    }
 
+    fn user_only_sd() -> std::io::Result<UserOnlySd> {
+        use windows_sys::Win32::Security::{
+            InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL, PSECURITY_DESCRIPTOR,
+            SECURITY_DESCRIPTOR,
+        };
+        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+        unsafe {
+            let acl_buf = user_only_acl()?;
+            let acl = acl_buf.0.as_ptr() as *mut ACL;
             let mut sd: Box<SECURITY_DESCRIPTOR> = Box::new(std::mem::zeroed());
             if InitializeSecurityDescriptor(
                 sd.as_mut() as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
@@ -495,18 +598,54 @@ mod imp {
             {
                 return Err(std::io::Error::last_os_error());
             }
+            Ok(UserOnlySd { sd, _acl: acl_buf })
+        }
+    }
 
-            let attrs = SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: sd.as_mut() as *mut SECURITY_DESCRIPTOR
-                    as *mut core::ffi::c_void,
-                bInheritHandle: 0,
-            };
-            Ok(UserOnlySa {
-                attrs,
-                _sd: sd,
-                _acl: acl_buf,
-            })
+    fn user_only_sa() -> std::io::Result<UserOnlySa> {
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        let mut owned = user_only_sd()?;
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: owned.sd.as_mut()
+                as *mut windows_sys::Win32::Security::SECURITY_DESCRIPTOR
+                as *mut core::ffi::c_void,
+            bInheritHandle: 0,
+        };
+        Ok(UserOnlySa { attrs, _sd: owned })
+    }
+
+    /// 把已存在文件的 DACL 收紧为仅当前用户（session.token 显式 ACL，
+    /// ipc.md §3「A1 取舍」：不依赖目录继承，覆盖任意数据目录位置）。
+    pub(super) fn restrict_file_to_user(path: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let acl_buf = user_only_acl()?;
+        // 路径走 encode_wide（无损），不经 lossy UTF-8 折算
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl_buf.0.as_ptr() as *const ACL,
+                std::ptr::null(),
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            Err(std::io::Error::from_raw_os_error(rc as i32))
+        } else {
+            Ok(())
         }
     }
 
@@ -647,7 +786,8 @@ mod imp {
     /// 惰性检测的代价可忽略）。流模式结束时在本函数内完成 Flush/Disconnect/
     /// Close 收尾（句柄已移入 writer 线程，调用方不再触碰）。
     fn serve_push_stream(mut stream: PipeStream, hub: &Arc<PushHub>) {
-        let (id, rx) = hub.subscribe();
+        // socket 流模式订阅：非桌面来源（#72/#78——收不到 authz.request 帧）
+        let (id, rx) = hub.subscribe(false);
         let hub = Arc::clone(hub);
         let writer = std::thread::spawn(move || {
             loop {
@@ -828,6 +968,14 @@ pub fn bind_server(dir: &Path) -> std::io::Result<std::os::unix::net::UnixListen
 pub fn bind_server(dir: &Path) -> std::io::Result<()> {
     ensure_user_dir(dir)?;
     imp::bind(dir)
+}
+
+/// 把已存在文件的 DACL 收紧为仅当前用户（Windows；session.token 显式
+/// ACL，ipc.md §3「A1 取舍」的风险收窄项——不依赖目录继承）。unix 侧由
+/// 调用方以 0600 权限位控制，无此函数。
+#[cfg(windows)]
+pub fn restrict_file_to_user(path: &Path) -> std::io::Result<()> {
+    imp::restrict_file_to_user(path)
 }
 
 /// 服务主循环。

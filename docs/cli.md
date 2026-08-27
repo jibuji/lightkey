@@ -48,7 +48,7 @@
 | `lk rule add <projectDir> <command> --name <name> <keys...>` | 新增白名单规则（入库加密） | M2 |
 | `lk rule list` | 列出规则（最小字段） | M2 |
 | `lk rule remove <id>` | 删除规则 | M2 |
-| `lk inject --keys <name...> -- <command...>` | 给具名命令注入被批准 env（三层模型，见 [authorization-gate.md](authorization-gate.md) §5；`--keys` 必需） | M2 |
+| `lk inject --keys <name...> -- <command...>` | 给具名命令注入被批准 env（三层模型，见 [authorization-gate.md](authorization-gate.md) §5；`--keys` 必需，且只可指名 **secret 类型条目**的名称——login/note/file 条目不支持注入，与「不存在」同样拒绝、不另行区分，不泄露库内 key 名单） | M2 |
 
 ## 5. 审计与守护进程
 

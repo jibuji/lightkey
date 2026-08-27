@@ -71,6 +71,7 @@ tempfile = "3"                                  # 测试用临时 vault 目录
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",               # SetNamedSecurityInfoW（session.token 显式 DACL，#68）
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",

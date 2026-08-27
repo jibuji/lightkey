@@ -63,8 +63,10 @@ impl AppState {
 
     /// 建立推送流（`subscribe` 命令：令牌已由守护进程校验通过）。
     /// 替换旧流：先停旧 writer 线程再登记新订阅（同进程只有一个订阅者）。
+    /// 来源标签 desktop=true（#72/#78 方案 A）：审批界面判定与
+    /// `authz.request` 挑战帧只认桌面来源订阅者。
     pub fn start_push_stream(&self, app: &tauri::AppHandle) -> Result<(), String> {
-        let (id, rx) = self.shared.push.subscribe();
+        let (id, rx) = self.shared.push.subscribe(true);
         let stop = Arc::new(AtomicBool::new(false));
         {
             let mut guard = self.push.lock().unwrap();
@@ -138,9 +140,10 @@ impl AppState {
         }
     }
 
-    /// 桌面侧请求的对端身份：未知（pid=0）——授权路径 fail-closed
-    /// （`authz.evaluate` 走 CLI 对端回溯；桌面前端不调用该方法）。
+    /// 桌面侧请求的对端身份：无 IPC 对端（pid=0）——授权路径照旧 fail-closed
+    /// （`authz.evaluate` 走 CLI 对端回溯，桌面前端不调用该方法）；审计归因
+    /// 按对端来源记 `starter=desktop` / `channel=desktop`（#66）。
     pub fn desktop_peer() -> PeerInfo {
-        PeerInfo::unknown()
+        PeerInfo::desktop()
     }
 }

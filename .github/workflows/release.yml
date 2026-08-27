@@ -1,11 +1,21 @@
 # LightKey 发布流水线（2026-08-19 新增，独立于 ci.yml 测试门禁）
 #
-#   - tag v* push          → Windows 打包（NSIS + MSI + 独立 CLI）+ Linux CLI（lk），
+#   - tag v* push          → 质量门禁（fmt/clippy/test/frontend）→ Windows 打包
+#                            （NSIS + MSI + 独立 CLI）+ Linux CLI（lk），
 #                            产物挂到 GitHub Release
-#   - main push            → 同样打包，但只留 Actions artifact（最新构建手动下载，不建 Release）
-#   - workflow_dispatch    → 默认行为同 main push（artifact 留存）；传 release_tag 输入则
-#                            构建后把产物发布到该 tag 的既有 Release（用于补挂缺失附件，
-#                            如某次发布的单个 job 失败后补发），不移动任何标签
+#   - workflow_dispatch    → 默认行为同 tag 构建，但只留 Actions artifact；
+#                            传 release_tag 输入则构建后把产物发布到该 tag 的
+#                            既有 Release（用于补挂缺失附件），不移动任何标签
+#
+# 【2026-08-27 变更（船长裁定）：CI 只在 release 时运行】
+#   原 .github/workflows/ci.yml（main push / 全部 pull_request 触发）删除，
+#   全部质量检查收敛为本流水线的**构建前置门禁**——发布前必须绿：
+#     - Windows job：cargo fmt --check、clippy -D warnings（三 crate）、
+#       cargo test（三 crate）、前端 npm test（D 层单测）
+#     - Linux job：clippy + test（lk-cli）
+#   每日开发提交不在 GitHub 侧跑任何 workflow（本地承担：Windows 全量 +
+#   WSL/Linux 侧 lk-core/lk-daemon/lk-cli，见 AGENTS.md「常用命令」）。
+#
 # 双 job（build-windows / build-linux-cli）并行；tag 触发时跳过 artifact 留存，
 # 避免同一份产物重复上传。
 # 安装包未做代码签名（暂无证书），Windows SmartScreen 未签名警告属当前预期，不阻塞发布。
@@ -14,7 +24,7 @@
 # 版本一致性闸门（check-version job，#34）：tag / dispatch 补发路径上先校验发布 tag
 # （去 v 前缀）与 crates/lk-cli 的 package version（即 CARGO_PKG_VERSION 口径，
 # 当前经 workspace 继承自根 Cargo.toml）一致，不一致显式 fail，防止二进制 --version
-# 与 Release tag 混淆。main push / 未带 release_tag 的 dispatch 只留 artifact，跳过校验。
+# 与 Release tag 混淆。未带 release_tag 的 dispatch 只留 artifact，跳过校验。
 # 独立 CLI（lk.exe / Linux lk）随安装包一起分发，无需安装 GUI 即可纯命令行使用。
 #
 # 桌面包捆绑独立 CLI（修复 cross-subsystem.md §4#7「装机目录缺失独立 CLI」）：
@@ -32,8 +42,6 @@ on:
   push:
     tags:
       - "v*"
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       release_tag:
@@ -62,7 +70,7 @@ jobs:
           elif [ -n "$DISPATCH_RELEASE_TAG" ]; then
             release_tag="$DISPATCH_RELEASE_TAG"
           else
-            echo "非发布路径（main push / 未带 release_tag 的 dispatch），跳过版本一致性校验。"
+            echo "非发布路径（未带 release_tag 的 dispatch），跳过版本一致性校验。"
             exit 0
           fi
 
@@ -100,9 +108,21 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      # ---- 质量门禁（2026-08-27 起 CI 只在 release 运行，检查前置）----
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (core + daemon + cli)
+        run: cargo clippy -p lk-core -p lk-daemon -p lk-cli --all-targets -- -D warnings
+
+      - name: Test (core + daemon + cli)
+        run: cargo test -p lk-core -p lk-daemon -p lk-cli
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -113,6 +133,10 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+        working-directory: frontend
+
+      - name: Test frontend (D 层事件总线单测)
+        run: npm test
         working-directory: frontend
 
       - name: Build frontend
@@ -207,12 +231,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu
+          components: clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           # 与 Windows job 缓存隔离（不同 target/OS）
           key: linux-cli
+
+      # ---- 质量门禁（2026-08-27 起 CI 只在 release 运行，检查前置；
+      # Linux 是 WSL2 CLI 的发布目标，MSVC 视角覆盖不到，检查随构建做）----
+      - name: Clippy (cli)
+        run: cargo clippy -p lk-cli --all-targets -- -D warnings
+
+      - name: Test (cli)
+        run: cargo test -p lk-cli
 
       - name: Build Linux CLI (x86_64-unknown-linux-gnu)
         run: cargo build --release -p lk-cli --target x86_64-unknown-linux-gnu

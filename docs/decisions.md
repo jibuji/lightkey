@@ -167,4 +167,36 @@ needs-decision，不得自行变更。
     老文档回填（ipc.md / authorization-gate.md / cli.md 等）按
     [cross-subsystem.md](cross-subsystem.md) §12 清单在实现时执行。
 
+15. **同用户进程互信边界承认（2026-08-27 · 来源：安全 triage 第二波 #71/#74/#77
+    核实，船长拍板）**：`session.token` 文件令牌使**同用户任意进程**在解锁窗口内
+    复用解锁态（含 WSL 经 bridge 跨子系统方向），据此被标为 SEC CRITICAL/HIGH。
+    核实属实，但该行为是两个既有拍板的直接后果（A1 取舍——CLI 靠文件令牌跨命令
+    复用解锁态；补充拍板 #14——WSL 复用桌面解锁态），且与本仓库个人单机工具的
+    威胁模型一致：**同用户进程互信为防护边界之外**，与 ssh-agent / `gh auth` /
+    aws credentials 等同类凭据存放模型同基线；「有意的同用户攻击者」任何软件
+    方案均只能提高成本，不构成边界内威胁模型（Windows 同用户进程可互相注入/
+    读取内存）。裁定：
+    - `lk unlock` 后同用户进程复用解锁态 = intended behavior，#71/#74/#77 以
+      wontfix 关闭（不做会话绑定/token 翻转）；ipc.md §3 / authorization-gate.md
+      §7 补边界声明；
+    - 若未来威胁模型升级（多 Agent 互不信任成为产品前提），收紧路径 = 按调用方
+      区分能力面（#65-A）+ 常驻进程持令牌/连接绑定 token（#68 选项 2）+
+      审批一体化（#67）**打包立 spec**，不单独零敲；
+    - 本轮不改变 0600/DACL/锁定即删等风险收窄措施（PR #70 已落）。
+16. **审批通道信任绑定方案 A+B（2026-08-27 · 来源：安全 triage 第二波
+    #72/#78 核实，船长拍板）**：核实属实——`has_ui` 仅看订阅数>0、
+    `approval.result` 仅过 require_session，持令牌 socket 进程可「自行订阅 +
+    自行回传批准」使第 3 层审批形同虚设。采纳 issue #78 的 A+B 组合：
+    - **A 连接标签**：推送订阅登记带来源（桌面内嵌直调 / socket 流连接）；
+      `approval.result` 仅接受桌面内嵌直调提交，socket 一律
+      `channel.forbidden`（-32014）；`has_ui` 只数 desktop 订阅者；
+      `authz.request` 帧（含挑战）只投 desktop 订阅者。
+    - **B 一次性 challenge**：`ApprovalChannel::open` 生成高熵随机挑战，
+      仅随通知帧下发、回传必须原样带回（错值 → 忽略且条目保留），
+      作为连接标签之上的纵深防御。
+    - 失败提交写审计（command=`approval.result`）；协议扩展字段
+      `approval.result.challenge` 为必填（自端封闭实现，无兼容包袱）。
+    实现：crates/lk-core/src/authz.rs / lk-daemon transport::PushHub +
+    notifier + daemon/session.rs + dispatch 门；前端 approval 插件透传。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

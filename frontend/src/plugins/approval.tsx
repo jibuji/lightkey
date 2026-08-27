@@ -55,10 +55,17 @@ export function ApprovalDialog({
   onResolve,
 }: {
   item: ApprovalItem;
-  onResolve: (requestId: string, decision: "allowed" | "denied") => void;
+  onResolve: (
+    requestId: string,
+    decision: "allowed" | "denied",
+    challenge: string,
+  ) => void;
 }) {
   const req = item.request;
-  const deny = useCallback(() => onResolve(req.requestId, "denied"), [onResolve, req.requestId]);
+  const deny = useCallback(
+    () => onResolve(req.requestId, "denied", req.challenge),
+    [onResolve, req.requestId, req.challenge],
+  );
 
   // Esc = 拒绝（spec §6.5；弹窗存在期间生效）
   useEffect(() => {
@@ -104,7 +111,7 @@ export function ApprovalDialog({
           <button className="btn btn-ghost" onClick={deny}>
             拒绝
           </button>
-          <button className="btn btn-primary" onClick={() => onResolve(req.requestId, "allowed")}>
+          <button className="btn btn-primary" onClick={() => onResolve(req.requestId, "allowed", req.challenge)}>
             允许本次
           </button>
         </div>
@@ -121,7 +128,11 @@ function ApprovalHost({
   onExpire,
 }: {
   current: ApprovalItem | null;
-  onResolve: (requestId: string, decision: "allowed" | "denied") => void;
+  onResolve: (
+    requestId: string,
+    decision: "allowed" | "denied",
+    challenge: string,
+  ) => void;
   onExpire: () => void;
 }) {
   // 回调经 ref 持有：插件每次 render() 会新建闭包，但倒计时只随 current 重启
@@ -173,11 +184,11 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     root.render(
       <ApprovalHost
         current={queue[0] ?? null}
-        onResolve={(requestId, decision) => {
+        onResolve={(requestId, decision, challenge) => {
           void ctx.ipc
-            .approvalResult(requestId, decision)
+            .approvalResult(requestId, decision, challenge)
             .then(({ accepted }) => {
-              // accepted=false = 守护进程已超时/伪造 id；弹窗照常关闭
+              // accepted=false = 守护进程已超时/伪造 id/挑战不符；弹窗照常关闭
               if (decision === "allowed") {
                 ctx.toast.show(accepted ? "已允许本次（env 仅注入被批准 key）" : "请求已超时，未生效");
               } else {

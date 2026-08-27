@@ -88,6 +88,8 @@ describe("ipc-bridge 通知翻译（Rust 事件 → IPC 通知 → 本层重新 
         projectDir: "/work/proj-a",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+        // mock 缺省注入的固定挑战（真实守护进程为一次性随机值，#78）
+        challenge: "mock-challenge",
       },
     ]);
   });
@@ -249,7 +251,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(300);
     });
-    expect(spy).toHaveBeenCalledWith("req-allow", "allowed");
+    expect(spy).toHaveBeenCalledWith("req-allow", "allowed", "mock-challenge");
     // 弹窗关闭 + Toast 提示已允许（mock 登记过 → accepted=true）
     expect(document.body.querySelector(".approval-dialog")).toBeNull();
     expect(ctx.toast.all.some((t) => t.text.includes("已允许本次"))).toBe(true);
@@ -272,7 +274,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
     const denyBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
       b.textContent?.includes("拒绝"),
     )!;
-    const p = ctx.ipc.approvalResult("req-deny", "denied");
+    const p = ctx.ipc.approvalResult("req-deny", "denied", "mock-challenge");
     act(() => {
       denyBtn.click();
     });
@@ -305,7 +307,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(300);
     });
-    expect(spy).toHaveBeenCalledWith("req-esc", "denied");
+    expect(spy).toHaveBeenCalledWith("req-esc", "denied", "mock-challenge");
     expect(document.body.querySelector(".approval-dialog")).toBeNull();
   });
 
