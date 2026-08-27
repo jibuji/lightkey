@@ -165,17 +165,45 @@ impl Daemon {
         let me = guard.as_ref().unwrap();
         let keys = me.keys();
         // 仅当前密钥可验证的部分（轮换点前事件需旧钥，M0 如实报告）
-        match self.audit.verify(keys, &|_| None) {
-            Ok(verified) => {
-                let result = AuditVerifyResult { verified };
-                RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
+        let verified = match self.audit.verify(keys, &|_| None) {
+            Ok(v) => v,
+            Err(e) => {
+                return RpcResponse::err(
+                    id,
+                    ERR_AUDIT_VERIFY,
+                    MSG_AUDIT_VERIFY,
+                    Some(json!({ "detail": e.to_string() })),
+                )
             }
-            Err(e) => RpcResponse::err(
-                id,
-                ERR_AUDIT_VERIFY,
-                MSG_AUDIT_VERIFY,
-                Some(json!({ "detail": e.to_string() })),
+        };
+        // 锚点交叉核对（issue #75）：读链尾 ordinal/last_hmac → 对比锚点。
+        // 截断/锚点缺失 → 报 truncated，CLI 据此退出非零。
+        let events = self.audit.read().unwrap_or_default();
+        let chain_ordinal = events.len();
+        let last_hmac = events.last().map(|e| e.hmac.clone()).unwrap_or_default();
+        let (anchor_value, anchor_degraded) = match self.anchor.load() {
+            Ok(a) => (a, self.anchor.degraded()),
+            Err(_) => (None, true),
+        };
+        let truncated = !matches!(
+            lk_core::audit_anchor::check_anchor(
+                chain_ordinal as u64,
+                &last_hmac,
+                anchor_value.as_ref(),
             ),
-        }
+            lk_core::audit_anchor::AnchorCheck::Ok
+                | lk_core::audit_anchor::AnchorCheck::AnchorBehind(_)
+        );
+        let anchor_ok = !truncated;
+        let anchor_ordinal = anchor_value.map(|a| a.ordinal);
+        let result = AuditVerifyResult {
+            verified,
+            anchor_ok,
+            anchor_degraded,
+            truncated,
+            chain_ordinal,
+            anchor_ordinal,
+        };
+        RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
 }

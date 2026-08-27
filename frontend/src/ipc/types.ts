@@ -70,8 +70,13 @@ export interface LightKeyIpc {
   /** 适配器种类（mock = 内存模拟；tauri = 真实守护进程桥）。 */
   readonly kind: "mock" | "tauri";
 
-  /** vault.status：解锁态、库是否已初始化（无库 = 首启 → 初始化向导）、同步水位 */
-  status(): Promise<{ unlocked: boolean; initialized: boolean }>;
+  /** vault.status：解锁态、库是否已初始化（无库 = 首启 → 初始化向导）、同步水位、审计锚点状态 */
+  status(): Promise<{
+    unlocked: boolean;
+    initialized: boolean;
+    /** issue #75：审计锚点可用且链未被截断；缺省 unknown（旧守护进程可能不返回） */
+    auditAnchorOk?: boolean;
+  }>;
   /** vault.unlock：主密码解锁；错误统一为 VaultInvalidError */
   unlock(masterPassword: string): Promise<void>;
   /** vault.init：建库（设主密码 + 生成恢复码/信封）；恢复码仅此一次返回 */

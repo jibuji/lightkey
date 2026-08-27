@@ -180,7 +180,7 @@ needs-decision，不得自行变更。
       wontfix 关闭（不做会话绑定/token 翻转）；ipc.md §3 / authorization-gate.md
       §7 补边界声明；
     - 若未来威胁模型升级（多 Agent 互不信任成为产品前提），收紧路径 = 按调用方
-      区分能力面（#65-A）+ 常驻进程持令牌/连接绑定 token（#68 选项 2）+
+      区分能力面（#65-B）+ 常驻进程持令牌/连接绑定 token（#68 选项 2）+
       审批一体化（#67）**打包立 spec**，不单独零敲；
     - 本轮不改变 0600/DACL/锁定即删等风险收窄措施（PR #70 已落）。
 16. **审批通道信任绑定方案 A+B（2026-08-27 · 来源：安全 triage 第二波
@@ -198,5 +198,55 @@ needs-decision，不得自行变更。
       `approval.result.challenge` 为必填（自端封闭实现，无兼容包袱）。
     实现：crates/lk-core/src/authz.rs / lk-daemon transport::PushHub +
     notifier + daemon/session.rs + dispatch 门；前端 approval 插件透传。
+
+17. **`lk inject` secret 值内存生命周期加固：策略 B+C（2026-08-27 · 来源：
+    issue #76（SEC HIGH）核实，船长拍板）**：核实属实——`lk inject` 的值经
+    daemon `authz.evaluate` 响应 → CLI 物化 `decision.env`（`BTreeMap<String,
+    String>` 明文）→ `child.envs(&env)`，secret 值在 lk CLI 进程内存明文持有，
+    暴露给 core dump（`ulimit -c`）/WER/ptrace。采纳 **B（保守加固，backward
+    compatible）+ C（文档/承诺如实降级）** 组合；执行计划路由/授权门语义零变更，
+    不动 daemon 侧 authz/approval/审计归因。
+    - **B CLI 侧加固（不改 IPC 与 daemon 行为）**：
+      - `decision.env` 值在 `child.envs(&env)` 之后**立即 zeroize**（`zeroize`
+        crate 对 `String` 的内建实现，原地擦除堆缓冲；`memguard::zeroize_env`）；
+      - Linux：CLI 启动即 `prctl(PR_SET_DUMPABLE, 0)`（经 libc），禁 core dump
+        落下明文，且限制非相关进程直接 ptrace；进程级一次性设置，放 main 早期；
+      - Windows：`SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)`
+        尽力抑制 WER 错误框（不做过度工程；Windows 分支补 cfg 编译 + 单元测试，
+        验收以 Linux 为主）。
+    - **威胁模型边界如实声明**：**不防同用户调试器**——ptrace/inject 读取
+      进程内存仍由同用户身份可完成，同用户进程互信已在补充拍板 #15 划在
+      防护边界外；本项加固只缩短明文存续、降低 core dump/WER 落下磁盘的成功面。
+    - **C 文档/承诺如实降级**：`docs/cli.md` inject 节、`cmd_inject` 注释、
+      `lk inject --help` 同步表达「值会经 lk CLI 进程内存传递一次（已做
+      zeroize + 防 dump 加固），仅排除 stdout/日志/审计；不防同用户调试器」。
+    实现：crates/lk-cli/src/memguard.rs（`harden_process` / `zeroize_env` /
+    测试）+ crates/lk-cli/src/main.rs（`main()` 启动加固、`cmd_inject` 注入后
+    zeroize、--help 文案）+ 文档。
+18. **审计文件外锚点（截断可证明）（2026-08-27 · 来源：issue #75（SEC MEDIUM）
+    核实 + 实现，船长拍板）**：核实属实——审计链是逐事件 HMAC-SHA256 链，但
+    文件系统层面只是 0600 追加式文件，**无文件外可信锚点**：同用户攻击者可截尾
+    尾部抹掉近期事件、或删文件让守护进程重建空链，截断后的链仍能通过
+    `audit.verify`（验证器只走首尾 HMAC，「篡改可检测」≠「篡改可证明」）。裁定
+    设计取向为**「截断可证明」，而非「截断可预防」**（同用户总能写数据目录）：
+    - 锚点值 = 链尾 `{ordinal, last_hmac}`（最后一条事件 HMAC + 序号）；
+    - 写入点：解锁/锁定/恢复（密钥轮换）/守护进程干净关闭低频同步写 + 后台
+      60s 异步 flush（**热路径非阻塞**，不得持 vault 写锁——G1 纪律）；
+    - 平台存储：Windows Credential Manager / macOS Keychain / Linux
+      secret-service·keyutils（经 keyring crate；失败统一映射 Unavailable，
+      无 panic）；平台不可用 → **fail-open** 降级到数据目录 0600 原子写侧写
+      `audit.anchor` 并告警，**绝不阻断 vault 解锁**；降级 ≠ 可信，文档明示更弱；
+    - `lk audit --verify` 交叉核对锚点：截尾 / 锚点缺失 / 锚定事件被替换 →
+      报「truncation detected」语义错误且 CLI **退出非零**；链长于锚点的
+      「锚点后追加」不误报；
+    - `vault.status` 暴露可选 `auditAnchorOk`（`false` 覆盖「降级/截断/缺失」
+      三态，桌面 UI 告警通道；前端类型向后兼容可选字段）；
+    - 锚点值无需 K_audit（只读链尾）→ 锁定态也可写锚点；
+    - 同用户边界衔接补充拍板 #15：截断可证明 ≠ 可预防，不做防同用户删除的
+      虚假承诺。
+    实现：crates/lk-core/src/audit_anchor.rs + crates/lk-daemon/src/audit_anchor.rs
+    （KeyringAuditAnchor + Composite + FileAnchorSidecar）+ daemon（sync_anchor /
+    flusher / 启动自检 / vault.status.auditAnchorOk）+ lk-cli（audit --verify
+    截断检测）+ 前端（auditAnchorOk 可选字段）+ docs/audit.md §3.2。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

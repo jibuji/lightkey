@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use lk_core::audit::{AuditChannel, AuditLog, AuditResult, EventInput};
+use lk_core::audit_anchor::{AnchorCheck, CompositeAuditAnchor};
 use lk_core::authz::{
     ApprovalChannel, ApprovalDecision, ApprovalRequest, AuthzGate, AuthzRequest, DenyReason,
     LayerResult, LocalApprovalChannel, PendingApprovals,
@@ -95,6 +96,16 @@ pub struct SharedDaemon {
 pub struct Daemon {
     sessions: SessionManager,
     audit: AuditLog,
+    /// 审计锚点（issue #75）：平台 keychain + 侧写降级；文件外可信锚点。
+    anchor: Arc<CompositeAuditAnchor>,
+    /// 锚点状态（供 `vault.status.auditAnchorOk`）：平台级锚点可用**且**链未被
+    /// 截断 = true。降级到侧写（平台 keychain 不可用）、锚点缺失或检测到截断
+    /// = false——桌面 UI 据此提示「审计链可能被截断/防篡改能力减弱」
+    /// （`ipc::StatusResult.audit_anchor_ok` 同语义；降级单独由
+    /// `audit.verify.anchorDegraded` 细粒度暴露）。
+    anchor_ok: std::sync::atomic::AtomicBool,
+    /// 组合锚点当前是否处于降级（平台 keychain 不可用）——`vault.status` 可选。
+    anchor_degraded: std::sync::atomic::AtomicBool,
     unlock_guard: AuthGuard,
     recover_guard: AuthGuard,
     last_activity: Instant,
@@ -121,6 +132,7 @@ impl Daemon {
     pub fn start(dir: &Path) -> std::result::Result<Daemon, String> {
         let dir = dir.to_path_buf();
         let audit = AuditLog::open(&dir).map_err(|e| e.to_string())?;
+        let anchor = crate::audit_anchor::make_audit_anchor(&dir);
         let config = load_config(&dir);
         let sync = SyncRuntime::load(&dir);
         install_shutdown_handlers();
@@ -151,9 +163,12 @@ impl Daemon {
             approvals,
             push,
         });
-        Ok(Daemon {
+        let daemon = Daemon {
             sessions,
             audit,
+            anchor,
+            anchor_ok: std::sync::atomic::AtomicBool::new(false),
+            anchor_degraded: std::sync::atomic::AtomicBool::new(false),
             unlock_guard: AuthGuard::default(),
             recover_guard: AuthGuard::default(),
             last_activity: Instant::now(),
@@ -161,7 +176,109 @@ impl Daemon {
             core,
             gate,
             pending_authz: Mutex::new(HashMap::new()),
-        })
+        };
+        // 启动自检：锚点 vs 链（截断检测，无需 K_audit），置 `anchor_ok`。
+        daemon.anchor_selfcheck();
+        Ok(daemon)
+    }
+
+    /// 启动自检：锚点 vs 链（截断检测）＋降级状态，置 `anchor_ok`/`anchor_degraded`。
+    /// 锁定态也能跑（只读链尾 ordinal/hmac + 组合锚点读取，不需要 K_audit）。
+    pub(crate) fn anchor_selfcheck(&self) {
+        let clean = self.anchor_continues_clean();
+        let degraded = self.anchor.degraded();
+        self.anchor_degraded
+            .store(degraded, std::sync::atomic::Ordering::Relaxed);
+        // 降级到侧写（平台不可用）也计为不 ok：`vault.status.auditAnchorOk`
+        // 的唯一告警通道（嵌入式 daemon 的 stderr 用户不可见）。
+        self.anchor_ok
+            .store(clean && !degraded, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 判断当前链相对锚点是否未被截断（锚点缺失也计为不 ok：
+    /// 「截断可证明」语义下无法证明 → 报不安全，UI 据此告警）。
+    fn anchor_continues_clean(&self) -> bool {
+        let events = match self.audit.read() {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        let ordinal = events.len() as u64;
+        let last_hmac = events.last().map(|e| e.hmac.clone()).unwrap_or_default();
+        let anchor = match self.anchor.load() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        matches!(
+            lk_core::audit_anchor::check_anchor(ordinal, &last_hmac, anchor.as_ref()),
+            AnchorCheck::Ok | AnchorCheck::AnchorBehind(_)
+        )
+    }
+
+    /// 同步写锚点（读链尾 → 写组合锚点）。返回是否降级（`Ok(true)` = 平台不可用、
+    /// 已落到侧写文件）。**调用方不得持有 vault 写锁**（本方法含同步 I/O：
+    /// 读审计文件 + keyring 写入，G1 锁纪律）。锚点写入失败**不阻断**调用方
+    /// （fail-open）：只降 degraded 状态、记日志、向调用方返回错误。
+    pub(crate) fn sync_anchor(
+        &self,
+        warn_degraded: bool,
+    ) -> std::result::Result<bool, lk_core::audit_anchor::AuditAnchorError> {
+        // 读链尾：锁定态 / 解锁态均可（不依赖 K_audit）
+        let events = match self.audit.read() {
+            Ok(e) => e,
+            Err(e) => {
+                self.anchor_degraded
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.anchor_ok
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(lk_core::audit_anchor::AuditAnchorError::Io(e.to_string()));
+            }
+        };
+        let value = lk_core::audit_anchor::anchor_from_chain(&events);
+        let degraded = self.anchor.store(&value)?;
+        self.anchor_degraded
+            .store(degraded, std::sync::atomic::Ordering::Relaxed);
+        // 写入后链 = 锚点，理应一致；降级（平台不可用）时 anchor_ok = false，
+        // 由 status 暴露「防篡改能力减弱」告警（ipc.rs `audit_anchor_ok` 语义）。
+        self.anchor_ok
+            .store(!degraded, std::sync::atomic::Ordering::Relaxed);
+        if degraded && warn_degraded {
+            eprintln!(
+                "lk daemon: 警告：平台 keychain 不可用，审计锚点已降级到数据目录侧写文件（{}）；防篡改能力减弱（issue #75）",
+                self.anchor_sidecar_display()
+            );
+        }
+        Ok(degraded)
+    }
+
+    fn anchor_sidecar_display(&self) -> String {
+        // 诊断/文案用：侧写路径
+        self.shared
+            .dir
+            .join(lk_core::audit_anchor::AUDIT_ANCHOR_SIDECAR)
+            .display()
+            .to_string()
+    }
+
+    /// 当前锚点状态读取（`vault.status` / 诊断）。
+    pub(crate) fn anchor_status(&self) -> (bool, bool) {
+        (
+            self.anchor_ok.load(std::sync::atomic::Ordering::Relaxed),
+            self.anchor_degraded
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// 组件锚点引用（后台 flush 线程用）。
+    pub(crate) fn anchor(&self) -> Arc<CompositeAuditAnchor> {
+        Arc::clone(&self.anchor)
+    }
+
+    /// 注入测试锚点（`lk-lib` 集成测试夹具：替换平台/侧写组合为可控 fake）。
+    /// 生产路径不调用；替换后立即自检更新 `anchor_ok`。
+    #[cfg(test)]
+    pub(crate) fn set_anchor(&mut self, anchor: Arc<CompositeAuditAnchor>) {
+        self.anchor = anchor;
+        self.anchor_selfcheck();
     }
 
     /// 跨线程共享状态引用（命令线程 / 轮询线程共用）。

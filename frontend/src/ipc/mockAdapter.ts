@@ -114,8 +114,16 @@ export class MockAdapter implements LightKeyIpc {
   /* ---------- vault ---------- */
 
   /** vault.status：解锁态、库是否已初始化（M2.5 首启门控：无库 → 向导） */
-  async status(): Promise<{ unlocked: boolean; initialized: boolean }> {
-    return delay({ unlocked: this.unlocked, initialized: this.initialized });
+  async status(): Promise<{
+    unlocked: boolean;
+    initialized: boolean;
+    auditAnchorOk?: boolean;
+  }> {
+    return delay({
+      unlocked: this.unlocked,
+      initialized: this.initialized,
+      auditAnchorOk: true, // mock 恒健康
+    });
   }
 
   async init(masterPassword: string): Promise<{ recoveryCode: string }> {

@@ -172,6 +172,11 @@ pub struct StatusResult {
     pub version: String,
     /// 同步水位（M1 起有值；M0 恒为 null）。
     pub sync_watermark: Option<String>,
+    /// 审计锚点状态（issue #75）：锚点可用且链未被截断 = true。降级到
+    /// 侧写 / 锚点缺失 / 检测到截断 = false。桌面 UI 可据此给用户警告。
+    /// 可选字段（旧守护进程/协议兼容；缺省 = 未知，前端按 undefined 处理）。
+    #[serde(default)]
+    pub audit_anchor_ok: bool,
 }
 
 /// `vault.init` 参数（初始化新库：设置主密码、生成恢复码/信封）。
@@ -291,11 +296,23 @@ pub struct RecoverResult {
     pub recovery_code: String,
 }
 
-/// `audit.verify` 结果：成功验证的事件数（含轮换链语义）。
+/// `audit.verify` 结果：成功验证的事件数（含轮换链语义）+ 锚点交叉核对结果。
+/// `truncated` 为 true 时表示链比可信锚点短（或锚点缺失）——截断检测，调用方
+/// 应报错并退出非零（issue #75）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditVerifyResult {
     pub verified: usize,
+    /// 锚点是否建立且与链一致（true）。降级侧写仍可 true（有锚点但不是平台）。
+    pub anchor_ok: bool,
+    /// 锚点当前是否降级到侧写文件（平台 keychain 不可用）。
+    pub anchor_degraded: bool,
+    /// 检测到截断 / 锚点缺失（调用方须报「truncation detected」）。
+    pub truncated: bool,
+    /// 校验时链的事件总数。
+    pub chain_ordinal: usize,
+    /// 锚点记录的 ordinal（无锚点 = null）。
+    pub anchor_ordinal: Option<u64>,
 }
 
 /// `sync.trigger` 参数（空；触发一轮同步并阻塞至完成）。

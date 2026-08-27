@@ -1,8 +1,8 @@
 # 审计日志规格（audit）
 
-- 状态：已拍板（D11）
+- 状态：已拍板（D11）＋补充拍板 #11；审计锚点（issue #75）为 M2.75 后增强
 - 关联：[crypto.md](crypto.md)（K_audit）· [ipc.md](ipc.md)（守护进程写审计）
-  · [authorization-gate.md](authorization-gate.md)（事件来源之一）
+  · [authorization-gate.md](authorization-gate.md)（事件来源之一）· [cli.md](cli.md)（`lk audit --verify`）
 
 ## 1. 定位
 
@@ -73,6 +73,39 @@
 - 验证链语义：**新密钥验证轮换点之后的新事件**；**旧事件通过链条追溯到
   轮换事件**（轮换事件本身由旧密钥签名）——旧日志全程可验证，永久保留与
   防篡改语义不变。
+
+### 3.2 文件外锚点（截断可证明，issue #75）
+
+- **问题**：审计日志只是本地 0600 追加式文件，没有任何**文件外可信锚点**。
+  同用户攻击者可截尾抹掉近期事件、或删掉整文件让守护进程重建空链，截断后的
+  链仍能通过「第一条到最后一条」的 HMAC 校验。设计取向：同用户总能写数据目录，
+  目标是**截断可证明**（truncation is provable），不是截断可预防。
+- **锚点值**：`{ ordinal, last_hmac }`——`ordinal` = 锚点建立时链的事件总数；
+  `last_hmac` = 最后一条事件的 `hmac`（均从日志文件直接读出，**无需 K_audit**，
+  因此锁定态/解锁态都能写锚点）。
+- **写入点**：在**解锁 / 锁定 / 恢复（密钥轮换）/ 守护进程干净关闭**时同步写入
+  （低频点），并由后台线程每 60s **异步 flush** 一次——不在热路径（同步触发 /
+  密钥轮换 / 审批）上同步阻塞；断开顺序无关紧要，idempotent 覆盖。
+- **平台存储**：优先写入平台安全存储——Windows Credential Manager / macOS
+  Keychain / Linux secret-service·keyutils（经 `keyring` 抽象）。**降级原则**：
+  平台不可用 → **fail-open** 降级到数据目录 0600 侧写文件 `audit.anchor`
+  （`FileAnchorSidecar`，原子写），并给出明确「锚点不可用、防篡改能力减弱」
+  警告——**绝不阻断 vault 解锁**。侧写更弱（同用户可改写文件本身），但能证明
+  「链被整体重写/截尾」，比没有强（文档标注为最弱档）。
+- **校验语义**（`AuditLog::verify` HMAC 链 + `check_anchor` 交叉核对额外执行）：
+  - 链 `ordinal <` 锚点 `ordinal` → **截断**（tail 被抹），definite；
+  - 链与锚点 ordinal 相等但 `last_hmac` 不同 → **锚定事件被换/伪造**；
+  - 锚点缺失（平台与侧写都没有）→ 无法证明完整，同样计为截断；
+  - 链 `ordinal >` 锚点 `ordinal` → 锚点落后于链尾（锚点后追加的事件），**不是
+    截断**，HMAC 链自身已校验，只在结果里提示「锚点未覆盖尾部 N 条」。
+- **`lk audit --verify`**（经 `audit.verify` RPC / `audit_verify()`）交叉核对锚点：
+  HMAC 链校验通过后，若有截断/锚点缺失/锚定事件被篡改 → 明确报
+  「截断检测（truncation detected）」，**退出非零**（[cli.md](cli.md)）。
+- **`vault.status`**：暴露可选字段 `auditAnchorOk: bool`（`#[serde(default)]`；
+  前端类型 `auditAnchorOk?: boolean`）。守护进程启动/解锁时做「锚点 vs 链自检」，
+  锚点可用且链未被截断 = `true`；降级到侧写（平台不可用）或检测到截断/锚点缺失 =
+  `false`。桌面 UI 可据此给用户「审计链可能被截断/防篡改能力减弱」警告；旧守护
+  进程不返回该字段时前端按未知处理（不误报）。
 
 ## 4. 写入方与查询
 

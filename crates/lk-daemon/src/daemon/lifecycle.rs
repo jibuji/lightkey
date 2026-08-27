@@ -8,6 +8,9 @@ use crate::config::read_config;
 use crate::config::CONFIG_FILE;
 use crate::sync::run_sync_round;
 use crate::{router, transport};
+
+/// 后台锚点 flush 间隔（异步低频；热路径不阻塞）。
+const ANCHOR_FLUSH_INTERVAL_SECS: u64 = 60;
 pub(crate) fn load_config(dir: &Path) -> Config {
     let path = dir.join(CONFIG_FILE);
     match std::fs::read(&path) {
@@ -100,11 +103,16 @@ pub fn serve_embedded(dir: &Path) -> std::result::Result<EmbeddedDaemon, String>
         Ok(d) => d,
         Err(e) => return Err(format!("启动失败：{e}")),
     };
+    let anchor = daemon.anchor();
     let shared = daemon.shared();
     let state = Arc::new(Mutex::new(daemon));
     // 后台同步轮询线程（M1）：只在解锁态 + 已配置时执行一轮；锁定即停止。
     // 间隔 = 配置值 × 2^风暴等级（封顶 1h）；失败静默（下一轮重试）。
     spawn_sync_poller(Arc::clone(&shared));
+    // 后台审计锚点 flush（issue #75）：异步低频把链尾写入锚点，保证即使未
+    // 触发轮换/锁定/关闭，长解锁会话的链尾也被锚定。非阻塞热路径。
+    let flush_dir = dir.to_path_buf();
+    spawn_anchor_flusher(flush_dir, anchor);
     let handler = make_handler(&state, &shared);
     let hub = Some(Arc::clone(&shared.push));
     let serve_state = Arc::clone(&state);
@@ -132,6 +140,44 @@ pub fn serve_embedded(dir: &Path) -> std::result::Result<EmbeddedDaemon, String>
         })
         .map_err(|e| format!("守护线程启动失败：{e}"))?;
     Ok((thread, state, shared))
+}
+
+/// 后台审计锚点 flush（issue #75）：直接持有组合锚点 + 数据目录，周期读
+/// 链尾写锚点。与命令线程（`Mutex<Daemon>`）解耦——热路径 append 不会因为
+/// 这里写 keychain 而阻塞（异步低频）。`global_shutdown` 置位后退出。
+fn spawn_anchor_flusher(
+    dir: std::path::PathBuf,
+    anchor: Arc<lk_core::audit_anchor::CompositeAuditAnchor>,
+) {
+    std::thread::Builder::new()
+        .name("lk-anchor-flush".into())
+        .spawn(move || {
+            // 独立 AuditLog 句柄（append/open 幂等；flush 线程与命令线程并发
+            // 读写同一 0600 日志文件，read 按需 open 新 fd 保证新鲜）。
+            let log = match lk_core::audit::AuditLog::open(&dir) {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(ANCHOR_FLUSH_INTERVAL_SECS));
+                if SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let events = match log.read() {
+                    Ok(e) => e,
+                    Err(_) => continue, // 下一轮重试
+                };
+                let value = lk_core::audit_anchor::anchor_from_chain(&events);
+                // 平台不可用：store 内部降到侧写（fail-open），这里只在完全
+                // 失败（连侧写都写不进）时告警一次，不阻塞、不 panic。
+                if let Err(e) = anchor.store(&value) {
+                    eprintln!(
+                        "lk daemon: 警告：后台审计锚点写入失败（{e}）——防篡改能力减弱（issue #75）"
+                    );
+                }
+            }
+        })
+        .expect("审计锚点 flush 线程可启动");
 }
 
 /// 后台同步轮询线程（解锁态 + 已配置时按风暴退避间隔执行轮次）。

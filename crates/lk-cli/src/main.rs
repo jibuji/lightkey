@@ -27,6 +27,7 @@ mod bridge;
 mod bridge_backend;
 mod client;
 mod clipboard;
+mod memguard;
 
 use lk_daemon as daemon;
 use lk_daemon::dirs;
@@ -182,6 +183,9 @@ enum RuleCommand {
 }
 
 /// `lk inject` 参数（决策 #1 A：`--keys` 指名，值不可见）。
+///
+/// 值会经 lk CLI 进程内存传递一次（已做 zeroize + 防 core dump/WER 加固），
+/// 仅排除 stdout/日志/审计；不防同用户调试器（补充拍板 #15/#17）。
 #[derive(clap::Args)]
 struct InjectArgs {
     /// 请求注入的 key 名（agent 已知名字，只是不知道值；须为 secret 类型
@@ -344,6 +348,10 @@ fn main() {
     unsafe {
         windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
     }
+    // 进程启动早期做内存加固：禁用 core dump / 尽力抑制 WER，缩短 secret 值
+    // 明文在本进程内存的暴露面（issue #76；不防同用户调试器，见 memguard 模块
+    // 与 decisions.md 补充拍板 #17）。
+    memguard::harden_process();
     let cli = Cli::parse();
     let code = run(&cli);
     std::process::exit(code);
@@ -1332,11 +1340,72 @@ fn cmd_audit(
     }
     if verify {
         match c.audit_verify() {
-            Ok(verified) => {
+            Ok(r) => {
+                if r.truncated {
+                    // 截断检测（issue #75）：链比可信锚点短 / 锚定事件被换 /
+                    // 锚点缺失——任意一种都退出非零（docs/cli.md §5.0）。
+                    let msg = match r.anchor_ordinal {
+                        Some(ao) if ao > r.chain_ordinal => format!(
+                            "截断检测（truncation detected）：审计链 {} 条事件，但可信锚点记录 {} 条——链尾可能被抹除",
+                            r.chain_ordinal, ao
+                        ),
+                        Some(_) => format!(
+                            "截断检测（truncation detected）：审计链 {} 条事件与锚点记录的条数相同，但链尾 HMAC 与锚点不一致——锚定事件可能被替换",
+                            r.chain_ordinal
+                        ),
+                        None => {
+                            "截断检测（truncation detected）：无可用审计锚点，无法证明链未被截断"
+                                .to_string()
+                        }
+                    };
+                    if json_out {
+                        let _ = writeln!(
+                            out,
+                            "{}",
+                            json!({
+                                "verified": r.verified,
+                                "truncated": true,
+                                "message": msg,
+                            })
+                        );
+                    } else {
+                        // HMAC 链本身仍自洽（verified 条通过）；失败在锚点核对
+                        let _ = writeln!(out, "审计校验失败：{}", msg);
+                    }
+                    eprintln!("lk: {msg}");
+                    return 1;
+                }
+                let behind = r
+                    .anchor_ordinal
+                    .filter(|ao| *ao < r.chain_ordinal)
+                    .map(|ao| r.chain_ordinal - ao);
                 if json_out {
-                    let _ = writeln!(out, "{}", json!({ "verified": verified }));
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        json!({
+                            "verified": r.verified,
+                            "truncated": false,
+                            "anchorOk": r.anchor_ok,
+                            "anchorDegraded": r.anchor_degraded,
+                            "anchorOrdinal": r.anchor_ordinal,
+                            "anchorBehind": behind,
+                        })
+                    );
                 } else {
-                    let _ = writeln!(out, "HMAC 链校验：{} 条事件验证通过", verified);
+                    // 锚点覆盖范围提示（cli.md §5.0）：锚点后追加的事件不是截断
+                    let mut note = String::new();
+                    if let Some(ao) = r.anchor_ordinal {
+                        note.push_str(&format!("（锚点覆盖至第 {ao} 条事件"));
+                        if let Some(n) = behind {
+                            note.push_str(&format!("，其后 {n} 条为锚点后追加——非截断"));
+                        }
+                        note.push('）');
+                    }
+                    if r.anchor_degraded {
+                        note.push_str("（注意：锚点已降级到数据目录侧写文件——防篡改能力减弱）");
+                    }
+                    let _ = writeln!(out, "HMAC 链校验：{} 条事件验证通过{}", r.verified, note);
                 }
             }
             Err(e) => return rpc_fail(&e),
@@ -1921,6 +1990,9 @@ fn cmd_rule_remove(out: &mut impl Write, dir: &std::path::Path, id: &str, json_o
 /// `lk inject --keys <name...> -- <cmd...>`：三层授权 → 注入子进程 env。
 ///
 /// - 注入的是子进程环境变量（值只进子进程，**绝不进 lk 自身 stdout/日志/审计**）；
+/// - 值会经 lk CLI 进程内存传递一次：已做 zeroize（注入后立即擦除）+ 防 core dump
+///   加固（启动见 `main()` 的 `memguard::harden_process`），**不防同用户调试器**
+///   （同用户进程互信在防护边界外，见 decisions.md 补充拍板 #15/#17）；
 /// - 拒绝/超时 → 非零退出码 + 审计留痕（authorization-gate.md §5）。
 fn cmd_inject(
     out: &mut impl Write,
@@ -1945,14 +2017,18 @@ fn cmd_inject(
                 return 1;
             }
             // 只含被授权 key 的 env（值在此刻才离开守护进程，且只进子进程）
-            let env = decision.env;
+            let mut env = decision.env;
             if env.is_empty() {
                 eprintln!("lk inject: 无可注入的 key（请求的 key 未被授权）");
                 return 1;
             }
             let mut child = std::process::Command::new(&command[0]);
             child.args(&command[1..]);
+            // Command::envs 只是借用——子进程所需值已被拷贝进 Command 内部存储；
+            // 调用后 env 仍归本函数所有，立即 zeroize 擦除明文再随 drop 释放
+            // （值不再需要，缩短明文在 CLI 进程内存的存续时间，issue #76）。
             child.envs(&env);
+            memguard::zeroize_env(&mut env);
             match child.status() {
                 Ok(status) => {
                     let code = status.code().unwrap_or(1);
