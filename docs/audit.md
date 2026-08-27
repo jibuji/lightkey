@@ -35,10 +35,21 @@
 - 敏感参数（如可能为 secret 的长参数）替换为 `<redacted>`；规则见
   [authorization-gate.md](authorization-gate.md) 的脱敏约定。
 
-### 启动者判定
+### 启动者判定与来源通道
 
 - `starter` 取自 [authorization-gate.md](authorization-gate.md) 的
   **进程链回溯**结果（顶层可归属进程），`target` 为最终被调用命令。
+- **常规命令（`item.*` / `vault.*` / `rule.*` 等）同样记录真实调用方**
+  （#66）：守护进程在分发层按 IPC 对端派生一次，随命令写入审计——
+  - socket 客户端（CLI / WSL bridge）：starter = 对端进程链回溯结果
+    （bridge 对端回溯出 interop 链顶层，可与本地 CLI 区分）；
+  - 桌面内嵌直调（桌面壳 command 桥，无 IPC 对端）：`starter=desktop`、
+    `channel=desktop`；
+  - 守护进程自身触发（空闲自动锁定等）：`starter=daemon`
+    （channel 沿用 `cli` 枚举——该字段建模客户端通道，无独立 daemon 值）；
+  - 回溯失败如实记 `unknown`（与授权门 fail-closed 同一判定路径）。
+- `channel` 缺省 `cli`；`rule.*` / `authz.evaluate` 支持客户端参数标注
+  （`desktop` / `wsl-bridge`，仅审计来源标注），未标注时按对端来源。
 
 ## 3. 防篡改（D11）
 

@@ -10,7 +10,7 @@ use lk_core::bus::LockReason;
 use lk_core::ipc::*;
 use lk_core::vault::UnlockedVault;
 
-use crate::{make_handler, Daemon, PeerInfo, SharedDaemon};
+use crate::{make_handler, Daemon, PeerInfo, PeerOrigin, SharedDaemon};
 use lk_core::audit::AuditLog;
 use lk_core::bus::{FnSink, SessionVia, VaultEvent};
 use lk_core::crypto::test_kdf_params;
@@ -106,6 +106,7 @@ fn test_peer(cwd: Option<&std::path::Path>) -> PeerInfo {
                 .map(|c| c.to_string_lossy().to_string())
                 .unwrap_or_else(|_| p.to_string_lossy().to_string())
         }),
+        origin: PeerOrigin::Socket,
     }
 }
 
@@ -122,8 +123,10 @@ fn inject_audit_events(dir: &std::path::Path) -> Vec<lk_core::audit::AuditEvent>
         .collect()
 }
 
+mod audit_attribution;
 mod authz;
 mod rules;
+mod session_token;
 mod sync_race;
 
 /// 慢网络后端（G1 回归夹具，同 M1.5）。

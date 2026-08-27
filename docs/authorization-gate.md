@@ -79,6 +79,11 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 
 - 形态：`lk inject --keys <name...> -- <command...>`（`--keys` 必需），如
   `lk inject --keys NPM_TOKEN -- npm publish`。
+- **`--keys` 语义**（#69 澄清）：key 名 = 库内 **secret 类型条目**的名称
+  （决策 #1 A 的「密钥」即 secret 条目）；login/note/file 条目不支持注入，
+  请求后按第 1 层 `missing_keys` 拒绝——与「不存在」**不区分**（不泄露库内
+  有哪些 key / 某名字是否为不可注入类型条目；防枚举）。login 条目字段映射
+  注入（如 `name.password`）属未拍板的产品缺口，见 issue #69。
 - 行为：
   1. 进程链回溯 + cwd 判定启动者与项目目录。
   2. 查规则白名单：命中 → 注入该规则授权的 env 变量集（值来自 vault 解密，
@@ -112,6 +117,12 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 ## 7. 安全约束与测试要点
 
 - fail-closed：启动者未知 / 规则库损坏 / 守护进程无界面 → 一律拒绝。
+- **已知边界（待拍板，issue #65）**：三层门当前仅约束 `authz.evaluate`
+  （即 `lk inject`）通道；`item.list` / `item.get` 等 IPC 方法持有效
+  会话令牌即可读全库明文，不经规则匹配与审批。即本门对「自觉走 inject
+  的 agent」是流程约束，对**不合作的同用户进程**（解锁窗口内直接调
+  `item.*`）无效——事后归因依赖审计真实 starter（已落，#66）；按调用方
+  区分能力面 / 解锁+审批一体化（#67）等收紧方案待决策后落规格。
 - 规则变更（add/list/remove）写审计；规则匹配逻辑单测覆盖 glob、目录绑定。
 - 安全专项（[testing.md](testing.md) 第三层）：绕过尝试清单——
   伪造 cwd、符号链接目录、跨会话进程、直连 IPC 调 `authz.evaluate`、
@@ -125,5 +136,7 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
     不回退到任何未授权路径；
   - 版本不匹配（主.次不一致）必须拒绝服务（`bridge.version_incompatible`），
     绝不静默降级；
-  - bridge 进程伪造/复用会话令牌：令牌仍随每次解锁轮换、仅存于客户端进程
-    内存（D10 不变），不落盘。
+  - bridge 进程伪造/复用会话令牌：令牌仍随每次解锁轮换；CLI 跨进程传递经
+    数据目录 `session.token`（A1 取舍：unix 0600 / Windows 显式 DACL 仅当前
+    用户、锁定即删，生命周期 = 解锁窗口，见 [ipc.md](ipc.md) §3）——同用户
+    之外不可读，bridge 中继路径不新增任何持久化。

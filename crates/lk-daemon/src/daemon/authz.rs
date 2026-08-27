@@ -26,7 +26,11 @@ impl Daemon {
                 Some(json!({ "detail": e })),
             )));
         }
-        let channel = audit_channel(p.channel.as_deref());
+        let channel = p
+            .channel
+            .as_deref()
+            .map(audit_channel)
+            .unwrap_or(AuditChannel::Cli);
         // 启动者判定：守护进程侧从 IPC 对端 PID 回溯（客户端自报字段不信任）
         let starter = derive_starter(peer);
         // cwd 以对端真实 cwd（canonical）为准；客户端自报 cwd 仅作提示（忽略）。

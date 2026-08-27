@@ -184,7 +184,8 @@ enum RuleCommand {
 /// `lk inject` 参数（决策 #1 A：`--keys` 指名，值不可见）。
 #[derive(clap::Args)]
 struct InjectArgs {
-    /// 请求注入的 key 名（agent 已知名字，只是不知道值）
+    /// 请求注入的 key 名（agent 已知名字，只是不知道值；须为 secret 类型
+    /// 条目的名称——login/note/file 条目不支持注入，与不存在同样拒绝）
     #[arg(long, num_args = 1.., value_name = "NAME")]
     keys: Vec<String>,
     /// 注入 env 后执行的命令（`--` 之后）
@@ -1928,7 +1929,10 @@ fn cmd_inject(
     command: &[String],
 ) -> i32 {
     if keys.is_empty() {
-        eprintln!("lk inject: 需要 --keys <name...> 指名请求的 key（值不可见、名可指名）");
+        eprintln!(
+            "lk inject: 需要 --keys <name...> 指名请求的 key（值不可见、名可指名；\
+             仅支持 secret 类型条目，login 等其他类型条目不可注入）"
+        );
         return 2;
     }
     let command_str = command.join(" ");
@@ -1966,11 +1970,16 @@ fn cmd_inject(
 }
 
 /// 拒绝原因 → 用户文案（不泄露库内容；仅反馈请求无法满足）。
+/// missing_keys 的指引须保持「不存在」与「存在但类型不可注入」不可区分
+/// （防枚举，authz.rs 注释）；指引只描述 --keys 的通用约束。
 fn reason_text(reason: &str) -> &'static str {
     match reason {
         "unknown_starter" => "无法确定启动者（进程回溯失败）",
         "no_cwd" => "无法确定工作目录",
-        "missing_keys" => "请求的 key 无法满足（部分 key 不存在或不可注入）",
+        "missing_keys" => {
+            "请求的 key 无法满足（不存在或不可注入；--keys 仅可指名 secret \
+             类型条目，login/note/file 条目不支持注入，与不存在不另行区分）"
+        }
         "rule_corrupt" => "规则库损坏",
         "no_ui" => "无审批界面（未命中规则且桌面端未运行）",
         "rejected" => "用户拒绝",

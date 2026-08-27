@@ -138,9 +138,10 @@ impl AppState {
         }
     }
 
-    /// 桌面侧请求的对端身份：未知（pid=0）——授权路径 fail-closed
-    /// （`authz.evaluate` 走 CLI 对端回溯；桌面前端不调用该方法）。
+    /// 桌面侧请求的对端身份：无 IPC 对端（pid=0）——授权路径照旧 fail-closed
+    /// （`authz.evaluate` 走 CLI 对端回溯，桌面前端不调用该方法）；审计归因
+    /// 按对端来源记 `starter=desktop` / `channel=desktop`（#66）。
     pub fn desktop_peer() -> PeerInfo {
-        PeerInfo::unknown()
+        PeerInfo::desktop()
     }
 }

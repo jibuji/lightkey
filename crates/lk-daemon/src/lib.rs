@@ -36,7 +36,7 @@ pub use notifier::{frame_for_event, Notifier};
 pub use router::{route, strategy_of, ExecutionStrategy};
 pub use sync::sync_fail_response;
 pub use sync::{run_sync_round, run_sync_round_with};
-pub use transport::{PeerInfo, PushHub};
+pub use transport::{PeerInfo, PeerOrigin, PushHub};
 
 // —— daemon 核心的对外面（路径与拆分前一致）——
 pub use daemon::lifecycle::{global_shutdown, make_handler, run, serve_embedded, EmbeddedDaemon};

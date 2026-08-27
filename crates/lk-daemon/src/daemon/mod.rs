@@ -217,28 +217,35 @@ impl Daemon {
             return resp;
         }
 
+        // 调用方归因（#66）：Inline 方法派生一次，供写审计的处理器复用
+        // （非审计方法不消费；CLI 单发进程语义下多一次进程链回溯成本可
+        // 忽略，desktop 直调短路为常量）。
+        let caller = CallerId::of(peer);
+
         let resp = match method.as_str() {
             M_VAULT_STATUS => self.vault_status(id.clone()),
-            M_VAULT_INIT => self.vault_init(id.clone(), params),
-            M_VAULT_UNLOCK => self.vault_unlock(id.clone(), params),
-            M_VAULT_LOCK => self.vault_lock(id.clone()),
-            M_VAULT_RECOVER => self.vault_recover(id.clone(), params),
-            M_ITEM_LIST => self.require_session(id.clone(), token, |me| me.item_list(id.clone())),
-            M_ITEM_GET => {
-                self.require_session(id.clone(), token, |me| me.item_get(id.clone(), params))
+            M_VAULT_INIT => self.vault_init(id.clone(), params, &caller),
+            M_VAULT_UNLOCK => self.vault_unlock(id.clone(), params, &caller),
+            M_VAULT_LOCK => self.vault_lock(id.clone(), &caller),
+            M_VAULT_RECOVER => self.vault_recover(id.clone(), params, &caller),
+            M_ITEM_LIST => {
+                self.require_session(id.clone(), token, |me| me.item_list(id.clone(), &caller))
             }
-            M_ITEM_PUT => {
-                self.require_session(id.clone(), token, |me| me.item_put(id.clone(), params))
-            }
-            M_ITEM_DELETE => {
-                self.require_session(id.clone(), token, |me| me.item_delete(id.clone(), params))
-            }
-            M_ITEM_EXPORT => {
-                self.require_session(id.clone(), token, |me| me.item_export(id.clone(), params))
-            }
-            M_AUDIT_LIST => {
-                self.require_session(id.clone(), token, |me| me.audit_list(id.clone(), params))
-            }
+            M_ITEM_GET => self.require_session(id.clone(), token, |me| {
+                me.item_get(id.clone(), params, &caller)
+            }),
+            M_ITEM_PUT => self.require_session(id.clone(), token, |me| {
+                me.item_put(id.clone(), params, &caller)
+            }),
+            M_ITEM_DELETE => self.require_session(id.clone(), token, |me| {
+                me.item_delete(id.clone(), params, &caller)
+            }),
+            M_ITEM_EXPORT => self.require_session(id.clone(), token, |me| {
+                me.item_export(id.clone(), params, &caller)
+            }),
+            M_AUDIT_LIST => self.require_session(id.clone(), token, |me| {
+                me.audit_list(id.clone(), params, &caller)
+            }),
             M_AUDIT_VERIFY => {
                 self.require_session(id.clone(), token, |me| me.audit_verify(id.clone()))
             }
@@ -253,15 +260,15 @@ impl Daemon {
             M_APPROVAL_RESULT => self.require_session(id.clone(), token, |me| {
                 me.approval_result(id.clone(), params)
             }),
-            M_RULE_ADD => {
-                self.require_session(id.clone(), token, |me| me.rule_add(id.clone(), params))
-            }
-            M_RULE_LIST => {
-                self.require_session(id.clone(), token, |me| me.rule_list(id.clone(), params))
-            }
-            M_RULE_REMOVE => {
-                self.require_session(id.clone(), token, |me| me.rule_remove(id.clone(), params))
-            }
+            M_RULE_ADD => self.require_session(id.clone(), token, |me| {
+                me.rule_add(id.clone(), params, &caller)
+            }),
+            M_RULE_LIST => self.require_session(id.clone(), token, |me| {
+                me.rule_list(id.clone(), params, &caller)
+            }),
+            M_RULE_REMOVE => self.require_session(id.clone(), token, |me| {
+                me.rule_remove(id.clone(), params, &caller)
+            }),
             // authz.evaluate = ApprovalDeferred 策略（见 dispatch 开头的策略
             // 分派；此臂仅为表完整性兜底，正常不会到达）
             _ => RpcResponse::err(id.clone(), ERR_METHOD_NOT_FOUND, MSG_METHOD_NOT_FOUND, None),
@@ -326,12 +333,71 @@ fn derive_starter(peer: &PeerInfo) -> String {
     starter::resolve_starter(peer.pid, starter::platform_table().as_ref())
 }
 
-/// 审计来源标注（`authz.evaluate`/`rule.*` 的 `channel` 参数；缺省 cli）。
-/// `wsl-bridge` = WSL 内客户端经 interop stdio 桥（cross-subsystem.md §7.5）。
-fn audit_channel(channel: Option<&str>) -> AuditChannel {
+/// 单次请求的调用方归因（#66：审计 starter/channel 不再硬编码 "lk"/cli）。
+/// dispatch 层派生一次，各命令处理器写入审计事件复用：
+///
+/// - socket 客户端（CLI / bridge）：starter = 真实进程链回溯结果
+///   （bridge 对端回溯出 interop 链顶层，可区分本地 CLI 与桥接调用），
+///   回溯失败如实记 `unknown`；channel = cli；
+/// - 桌面内嵌直调（lk-app command 桥，无 IPC 对端）：starter/channel =
+///   `desktop`（授权路径不看这里——authz.evaluate 仍走 derive_starter，
+///   desktop 对端 pid=0 照样 fail-closed）。
+pub(crate) struct CallerId {
+    pub starter: String,
+    pub channel: AuditChannel,
+}
+
+impl CallerId {
+    /// 按对端来源派生调用方归因。
+    fn of(peer: &PeerInfo) -> CallerId {
+        match peer.origin {
+            crate::transport::PeerOrigin::Desktop => CallerId::desktop_self(),
+            crate::transport::PeerOrigin::Socket => CallerId {
+                starter: derive_starter(peer),
+                channel: AuditChannel::Cli,
+            },
+        }
+    }
+
+    /// 桌面内嵌直调（command 桥 / 锁屏等进程内路径）。
+    fn desktop_self() -> CallerId {
+        CallerId {
+            starter: "desktop".to_string(),
+            channel: AuditChannel::Desktop,
+        }
+    }
+
+    /// 守护进程自身触发（空闲超时等；channel 无独立 daemon 枚举，沿用 cli，
+    /// 靠 starter=daemon 区分——audit.md §2）。
+    fn daemon_self() -> CallerId {
+        CallerId {
+            starter: "daemon".to_string(),
+            channel: AuditChannel::Cli,
+        }
+    }
+
+    /// 以本归因构造常规审计事件（target 恒为 daemon；与 `EventInput::new`
+    /// 同字段集，仅 starter/channel 换真实值）。
+    fn event(&self, command: impl Into<String>, result: AuditResult) -> EventInput {
+        EventInput {
+            starter: self.starter.clone(),
+            target: "daemon".to_string(),
+            command: command.into(),
+            result,
+            channel: self.channel,
+            old_key_id: None,
+            new_key_id: None,
+        }
+    }
+}
+
+/// 审计来源标注（`authz.evaluate`/`rule.*` 的 `channel` 参数；缺省按对端
+/// 来源，见 [`CallerId`]）。`wsl-bridge` = WSL 内客户端经 interop stdio 桥
+/// （cross-subsystem.md §7.5）。
+fn audit_channel(channel: &str) -> AuditChannel {
     match channel {
-        Some("desktop") => AuditChannel::Desktop,
-        Some("wsl-bridge") => AuditChannel::WslBridge,
+        "desktop" => AuditChannel::Desktop,
+        "wsl-bridge" => AuditChannel::WslBridge,
         _ => AuditChannel::Cli,
     }
 }

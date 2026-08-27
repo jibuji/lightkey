@@ -17,7 +17,12 @@ impl Daemon {
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
 
-    pub(crate) fn vault_init(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn vault_init(
+        &mut self,
+        id: Value,
+        params: Value,
+        caller: &CallerId,
+    ) -> RpcResponse {
         let p: InitParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
@@ -27,7 +32,7 @@ impl Daemon {
         let result = if p.force {
             let shared = Arc::clone(&self.shared);
             let mut vault_guard = shared.vault.write().unwrap();
-            self.lock_internal_locked(&mut vault_guard, LockReason::Manual);
+            self.lock_internal_locked(&mut vault_guard, LockReason::Manual, caller);
             let r = vault::init_vault(&shared.dir, &p.master_password, true, &mut self.audit);
             drop(vault_guard);
             r
@@ -56,7 +61,12 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn vault_unlock(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn vault_unlock(
+        &mut self,
+        id: Value,
+        params: Value,
+        caller: &CallerId,
+    ) -> RpcResponse {
         // 限流（失败计数 + 退避）
         if let Some(retry) = self.unlock_guard.check() {
             return RpcResponse::err(
@@ -81,7 +91,7 @@ impl Daemon {
                 self.unlock_guard.on_success();
                 let _ = self.audit.append(
                     vault.keys(),
-                    &EventInput::new("lk", "vault.unlock", AuditResult::Allowed),
+                    &caller.event("vault.unlock", AuditResult::Allowed),
                 );
                 // C 层装配：vault-store 挂总线（写成功 → `item.changed`）
                 self.core.attach_vault(&mut vault);
@@ -101,32 +111,28 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn vault_lock(&mut self, id: Value) -> RpcResponse {
-        self.lock_internal();
+    pub(crate) fn vault_lock(&mut self, id: Value, caller: &CallerId) -> RpcResponse {
+        self.lock_internal_with(LockReason::Manual, caller);
         // 空对象而非 null：避免客户端把 result:null 解析为「无 result」
         RpcResponse::ok(id, json!({}))
     }
 
     /// 锁定：先签名审计事件（用当前 K_audit），再擦除密钥 + 失效令牌 + 删令牌文件。
-    /// 默认 reason = manual（`lock_internal_with` 可指定）。
-    pub(crate) fn lock_internal(&mut self) {
-        self.lock_internal_with(LockReason::Manual);
-    }
-
-    /// 锁定（`reason` 进 `session.locked` 事件负载）。
-    pub(crate) fn lock_internal_with(&mut self, reason: LockReason) {
+    /// `caller` = 触发本次锁定的调用方归因（RPC 对端 / desktop / daemon 自身）。
+    pub(crate) fn lock_internal_with(&mut self, reason: LockReason, caller: &CallerId) {
         let shared = Arc::clone(&self.shared);
         let mut vault = shared.vault.write().unwrap();
-        self.lock_internal_locked(&mut vault, reason);
+        self.lock_internal_locked(&mut vault, reason, caller);
     }
 
     /// 带原因的锁定（M2 desktop：锁屏自动锁定 `LockReason::Lockscreen`）。
     ///
     /// 桌面壳在进程内直接调用（不经 IPC，避免引入协议面）：锁屏检测线程
     /// → `lock_with_reason(Lockscreen)` → 事件总线广播 `session.locked`
-    /// （reason=lockscreen）→ 通知桥推送给订阅中的前端。
+    /// （reason=lockscreen）→ 通知桥推送给订阅中的前端。审计归因记
+    /// desktop（#66）。
     pub fn lock_with_reason(&mut self, reason: LockReason) {
-        self.lock_internal_with(reason);
+        self.lock_internal_with(reason, &CallerId::desktop_self());
     }
 
     /// 锁定（调用方已持 vault 写锁；供锁定/恢复/强制重置共用）。
@@ -134,19 +140,24 @@ impl Daemon {
         &mut self,
         vault: &mut Option<UnlockedVault>,
         reason: LockReason,
+        caller: &CallerId,
     ) {
         if let Some(v) = vault {
-            let _ = self.audit.append(
-                v.keys(),
-                &EventInput::new("lk", "vault.lock", AuditResult::Allowed),
-            );
+            let _ = self
+                .audit
+                .append(v.keys(), &caller.event("vault.lock", AuditResult::Allowed));
         }
         *vault = None;
         self.sessions.invalidate_with(reason);
         self.remove_session_token();
     }
 
-    pub(crate) fn vault_recover(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn vault_recover(
+        &mut self,
+        id: Value,
+        params: Value,
+        caller: &CallerId,
+    ) -> RpcResponse {
         // 限流（失败计数 + 指数退避，与 vault.unlock 对称；A4）
         if let Some(retry) = self.recover_guard.check() {
             return RpcResponse::err(
@@ -164,7 +175,7 @@ impl Daemon {
         let shared = Arc::clone(&self.shared);
         let mut vault_guard = shared.vault.write().unwrap();
         // 恢复会更换全部密钥：现有解锁态（旧钥）立即作废
-        self.lock_internal_locked(&mut vault_guard, LockReason::Manual);
+        self.lock_internal_locked(&mut vault_guard, LockReason::Manual, caller);
         let code = match RecoveryCode::parse(&p.recovery_code) {
             Ok(c) => c,
             Err(_) => {
@@ -198,7 +209,7 @@ impl Daemon {
         let elapsed = self.last_activity.elapsed();
         let timeout = Duration::from_secs(idle * 60);
         if self.vault_peek() && elapsed >= timeout {
-            self.lock_internal_with(LockReason::Timeout);
+            self.lock_internal_with(LockReason::Timeout, &CallerId::daemon_self());
         }
     }
 
@@ -209,9 +220,9 @@ impl Daemon {
     pub(crate) fn write_session_token(&self, token: &[u8; 32]) {
         let path = self.session_token_path();
         // 取舍说明（A1）：CLI 每次调用是独立进程，令牌须经进程间传递才能
-        // 跨命令复用解锁态；ipc.md §3「令牌不落盘」以桌面/浏览器进程常驻为
-        // 前提，CLI 落地方式与规格字面冲突（文档修订另走 docs 同步）。
-        // 风险面收窄到同用户：文件 0600 + 用户私有目录 + 锁定/退出即删除。
+        // 跨命令复用解锁态；ipc.md §3 如实记录本取舍（生命周期 = 解锁窗口，
+        // 锁定/退出即删除）。风险面收窄到同用户：unix 0600 + 用户私有目录；
+        // Windows 显式 DACL 仅当前用户（不依赖目录继承，#68）。
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -224,6 +235,12 @@ impl Daemon {
                 let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
             }
             let _ = std::io::Write::write_all(&mut f, hex::encode(token).as_bytes());
+            #[cfg(windows)]
+            {
+                // 文件已创建后收紧 DACL（尽力而为：失败时保留目录继承 ACL，
+                // 数据目录本身用户私有）
+                let _ = crate::transport::restrict_file_to_user(&path);
+            }
         }
     }
 

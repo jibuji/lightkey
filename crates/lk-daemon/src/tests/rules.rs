@@ -191,6 +191,7 @@ fn rule_add_and_authz_normalize_wsl_namespace() {
     let peer = PeerInfo {
         pid: std::process::id(),
         cwd: Some(r"\\wsl.localhost\DEBIAN\home\u\p\".to_string()),
+        origin: PeerOrigin::Socket,
     };
     let resp = handler(
         &rpc_line(

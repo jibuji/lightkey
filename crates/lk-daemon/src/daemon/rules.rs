@@ -4,9 +4,10 @@ use super::*;
 
 impl Daemon {
     /// `rule.add`：跨命名空间归一化 → 校验 → canonicalize → 入库（vault
-    /// 写锁）+ 审计（channel 区分 cli/desktop/wsl-bridge；testing.md 第三层
-    /// #19 超长/非法拒绝）。
-    pub(crate) fn rule_add(&mut self, id: Value, params: Value) -> RpcResponse {
+    /// 写锁）+ 审计（channel 区分 cli/desktop/wsl-bridge：客户端参数标注
+    /// 优先，缺省按对端来源；starter 为真实调用方归因，#66；
+    /// testing.md 第三层 #19 超长/非法拒绝）。
+    pub(crate) fn rule_add(&mut self, id: Value, params: Value, caller: &CallerId) -> RpcResponse {
         let p: RuleAddParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
@@ -23,7 +24,11 @@ impl Daemon {
                 Some(json!({ "detail": e })),
             );
         }
-        let channel = audit_channel(p.channel.as_deref());
+        let channel = p
+            .channel
+            .as_deref()
+            .map(audit_channel)
+            .unwrap_or(caller.channel);
         // wsl:// 规范形直接入库（非本机 fs 路径）；常规路径仍以 canonical
         // 形态入库（解析符号链接），并经与运行时 cwd 判定同一个归一化函数
         // 剥离 Windows verbatim 前缀（§7.4 两侧同函数，存储形态 == 判定形态）
@@ -58,7 +63,7 @@ impl Daemon {
                 let _ = self.audit.append(
                     me.keys(),
                     &EventInput {
-                        starter: "lk".into(),
+                        starter: caller.starter.clone(),
                         target: "daemon".into(),
                         command: format!("rule.add {}", p.name),
                         result: AuditResult::Allowed,
@@ -75,10 +80,14 @@ impl Daemon {
     }
 
     /// `rule.list`：解密态规则（规则库损坏 → fail-closed 报错）。
-    pub(crate) fn rule_list(&mut self, id: Value, params: Value) -> RpcResponse {
+    pub(crate) fn rule_list(&mut self, id: Value, params: Value, caller: &CallerId) -> RpcResponse {
         let channel = match serde_json::from_value::<RuleListParams>(params) {
-            Ok(p) => audit_channel(p.channel.as_deref()),
-            Err(_) => AuditChannel::Cli,
+            Ok(p) => p
+                .channel
+                .as_deref()
+                .map(audit_channel)
+                .unwrap_or(caller.channel),
+            Err(_) => caller.channel,
         };
         let shared = Arc::clone(&self.shared);
         let guard = shared.vault.read().unwrap();
@@ -88,7 +97,7 @@ impl Daemon {
                 let _ = self.audit.append(
                     me.keys(),
                     &EventInput {
-                        starter: "lk".into(),
+                        starter: caller.starter.clone(),
                         target: "daemon".into(),
                         command: "rule.list".into(),
                         result: AuditResult::Allowed,
@@ -104,13 +113,22 @@ impl Daemon {
         }
     }
 
-    /// `rule.remove`：软删除（墓碑；删除随同步传播）+ 审计。
-    pub(crate) fn rule_remove(&mut self, id: Value, params: Value) -> RpcResponse {
+    /// `rule.remove`：软删除（墓碑，删除随同步传播）+ 审计。
+    pub(crate) fn rule_remove(
+        &mut self,
+        id: Value,
+        params: Value,
+        caller: &CallerId,
+    ) -> RpcResponse {
         let p: RuleRemoveParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        let channel = audit_channel(p.channel.as_deref());
+        let channel = p
+            .channel
+            .as_deref()
+            .map(audit_channel)
+            .unwrap_or(caller.channel);
         let shared = Arc::clone(&self.shared);
         let mut guard = shared.vault.write().unwrap();
         let me = guard.as_mut().unwrap();
@@ -119,7 +137,7 @@ impl Daemon {
                 let _ = self.audit.append(
                     me.keys(),
                     &EventInput {
-                        starter: "lk".into(),
+                        starter: caller.starter.clone(),
                         target: "daemon".into(),
                         command: format!("rule.remove {}", p.id),
                         result: AuditResult::Allowed,
