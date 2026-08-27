@@ -119,6 +119,11 @@ pub fn check_anchor(
         return AnchorCheck::AnchorBehind(chain_ordinal - anchor.ordinal);
     }
     // ordinal 相等：锚定的最后一条事件必须与链尾一致
+    if anchor.ordinal == 0 {
+        // 空链锚点（ordinal==0 时 last_hmac 为空串是合法值，见
+        // `AuditAnchorValue` 文档）：链此刻也为空 → 一致。
+        return AnchorCheck::Ok;
+    }
     if anchor.last_hmac.is_empty() {
         // ordinal>0 但 last_hmac 缺失 = 损坏的锚点，视作未锚定 → 缺失
         return AnchorCheck::AnchorMissing;
@@ -136,9 +141,13 @@ pub const AUDIT_ANCHOR_SIDECAR: &str = "audit.anchor";
 /// 文件侧写锚点（0600，原子写）。作为平台 keychain 不可用时的**降级**锚点
 /// ——比没有强（可证明「链被整体重写/截尾到某条数」，且 blast radius 收窄），
 /// 但同用户可改写文件本身，属最弱档（文档标注）。
+///
+/// 并发：后台 flush 线程与命令线程都可能写侧写，用进程内 `write_lock` 串行化
+/// 写入（同一固定 tmp 路径并发 truncate 可能交叉写坏）。`read` 只读不受影响。
 #[derive(Debug, Clone)]
 pub struct FileAnchorSidecar {
     path: PathBuf,
+    write_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl FileAnchorSidecar {
@@ -146,6 +155,7 @@ impl FileAnchorSidecar {
     pub fn new(dir: &Path) -> FileAnchorSidecar {
         FileAnchorSidecar {
             path: dir.join(AUDIT_ANCHOR_SIDECAR),
+            write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -176,6 +186,12 @@ impl AuditAnchorStore for FileAnchorSidecar {
             Ok(b) => b,
             Err(e) => return Err(AuditAnchorError::Io(e.to_string())),
         };
+        // 串行化并发写入（后台 flush / 命令线程低频点），防同一 tmp 路径
+        // 双开 truncate 交叉写坏；写入内不重入，无死锁。
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = self.path.with_extension("tmp");
         match OpenOptions::new()
             .write(true)
@@ -427,6 +443,25 @@ mod tests {
         assert_eq!(
             check_anchor(2, &events[1].hmac, None),
             AnchorCheck::AnchorMissing
+        );
+    }
+
+    #[test]
+    fn empty_chain_with_empty_anchor_matches() {
+        // 无事件时建立的首个锚点（ordinal==0，last_hmac 空串合法）→ 空链一致
+        let a = AuditAnchorValue {
+            ordinal: 0,
+            last_hmac: String::new(),
+        };
+        assert_eq!(check_anchor(0, "", Some(&a)), AnchorCheck::Ok);
+        // 锚点建于 3 条、链被整条删光 → 仍判截断（不是「缺失」）
+        let a3 = anchor(&chain_with(3).1);
+        assert_eq!(
+            check_anchor(0, "", Some(&a3)),
+            AnchorCheck::Truncated {
+                chain_ordinal: 0,
+                anchor_ordinal: 3,
+            }
         );
     }
 

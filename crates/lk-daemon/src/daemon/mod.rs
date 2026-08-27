@@ -98,11 +98,13 @@ pub struct Daemon {
     audit: AuditLog,
     /// 审计锚点（issue #75）：平台 keychain + 侧写降级；文件外可信锚点。
     anchor: Arc<CompositeAuditAnchor>,
-    /// 锚点状态（供 `vault.status.auditAnchorOk`）：锚点可用且链未截断。
-    /// 降级到侧写视为 ancor 仍存在但 weakened——此处仍置 true 以表示「可受力
-    /// 校验」，真正的降级警示放 `anchor_degraded`。
+    /// 锚点状态（供 `vault.status.auditAnchorOk`）：平台级锚点可用**且**链未被
+    /// 截断 = true。降级到侧写（平台 keychain 不可用）、锚点缺失或检测到截断
+    /// = false——桌面 UI 据此提示「审计链可能被截断/防篡改能力减弱」
+    /// （`ipc::StatusResult.audit_anchor_ok` 同语义；降级单独由
+    /// `audit.verify.anchorDegraded` 细粒度暴露）。
     anchor_ok: std::sync::atomic::AtomicBool,
-    /// 组合锚点当前是否处理降级（平台 keychain 不可用）——`vault.status` 可选。
+    /// 组合锚点当前是否处于降级（平台 keychain 不可用）——`vault.status` 可选。
     anchor_degraded: std::sync::atomic::AtomicBool,
     unlock_guard: AuthGuard,
     recover_guard: AuthGuard,
@@ -180,15 +182,17 @@ impl Daemon {
         Ok(daemon)
     }
 
-    /// 启动自检：锚点 vs 链（截断检测），置 `anchor_ok`。锁定态也能跑
-    /// （只读链尾 ordinal/hmac + 组合锚点读取，不需要 K_audit）。
+    /// 启动自检：锚点 vs 链（截断检测）＋降级状态，置 `anchor_ok`/`anchor_degraded`。
+    /// 锁定态也能跑（只读链尾 ordinal/hmac + 组合锚点读取，不需要 K_audit）。
     pub(crate) fn anchor_selfcheck(&self) {
-        self.anchor_ok.store(
-            self.anchor_continues_clean(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let clean = self.anchor_continues_clean();
+        let degraded = self.anchor.degraded();
         self.anchor_degraded
-            .store(self.anchor.degraded(), std::sync::atomic::Ordering::Relaxed);
+            .store(degraded, std::sync::atomic::Ordering::Relaxed);
+        // 降级到侧写（平台不可用）也计为不 ok：`vault.status.auditAnchorOk`
+        // 的唯一告警通道（嵌入式 daemon 的 stderr 用户不可见）。
+        self.anchor_ok
+            .store(clean && !degraded, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 判断当前链相对锚点是否未被截断（锚点缺失也计为不 ok：
@@ -210,8 +214,10 @@ impl Daemon {
         )
     }
 
-    /// 同步写锚点（读链尾 → 写组合锚点）。返回 (是否命中平台, 是否截断自检通过)。
-    /// 锚点写入失败**不阻断**调用方（fail-open）：只降 degraded 状态、记日志。
+    /// 同步写锚点（读链尾 → 写组合锚点）。返回是否降级（`Ok(true)` = 平台不可用、
+    /// 已落到侧写文件）。**调用方不得持有 vault 写锁**（本方法含同步 I/O：
+    /// 读审计文件 + keyring 写入，G1 锁纪律）。锚点写入失败**不阻断**调用方
+    /// （fail-open）：只降 degraded 状态、记日志、向调用方返回错误。
     pub(crate) fn sync_anchor(
         &self,
         warn_degraded: bool,
@@ -231,9 +237,10 @@ impl Daemon {
         let degraded = self.anchor.store(&value)?;
         self.anchor_degraded
             .store(degraded, std::sync::atomic::Ordering::Relaxed);
-        // 自检：写入后链 = 锚点，理应一致
+        // 写入后链 = 锚点，理应一致；降级（平台不可用）时 anchor_ok = false，
+        // 由 status 暴露「防篡改能力减弱」告警（ipc.rs `audit_anchor_ok` 语义）。
         self.anchor_ok
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(!degraded, std::sync::atomic::Ordering::Relaxed);
         if degraded && warn_degraded {
             eprintln!(
                 "lk daemon: 警告：平台 keychain 不可用，审计锚点已降级到数据目录侧写文件（{}）；防篡改能力减弱（issue #75）",

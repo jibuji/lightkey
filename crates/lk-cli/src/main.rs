@@ -1342,16 +1342,21 @@ fn cmd_audit(
         match c.audit_verify() {
             Ok(r) => {
                 if r.truncated {
-                    // 截断检测（issue #75）：链比可信锚点短，或锚点缺失。
-                    let msg = if r.anchor_ordinal.is_some() {
-                        format!(
+                    // 截断检测（issue #75）：链比可信锚点短 / 锚定事件被换 /
+                    // 锚点缺失——任意一种都退出非零（docs/cli.md §5.0）。
+                    let msg = match r.anchor_ordinal {
+                        Some(ao) if ao > r.chain_ordinal => format!(
                             "截断检测（truncation detected）：审计链 {} 条事件，但可信锚点记录 {} 条——链尾可能被抹除",
-                            r.chain_ordinal,
-                            r.anchor_ordinal.unwrap_or(0)
-                        )
-                    } else {
-                        "截断检测（truncation detected）：无可用审计锚点，无法证明链未被截断"
-                            .to_string()
+                            r.chain_ordinal, ao
+                        ),
+                        Some(_) => format!(
+                            "截断检测（truncation detected）：审计链 {} 条事件与锚点记录的条数相同，但链尾 HMAC 与锚点不一致——锚定事件可能被替换",
+                            r.chain_ordinal
+                        ),
+                        None => {
+                            "截断检测（truncation detected）：无可用审计锚点，无法证明链未被截断"
+                                .to_string()
+                        }
                     };
                     if json_out {
                         let _ = writeln!(
@@ -1364,11 +1369,16 @@ fn cmd_audit(
                             })
                         );
                     } else {
-                        let _ = writeln!(out, "HMAC 链校验失败：{}", msg);
+                        // HMAC 链本身仍自洽（verified 条通过）；失败在锚点核对
+                        let _ = writeln!(out, "审计校验失败：{}", msg);
                     }
                     eprintln!("lk: {msg}");
                     return 1;
                 }
+                let behind = r
+                    .anchor_ordinal
+                    .filter(|ao| *ao < r.chain_ordinal)
+                    .map(|ao| r.chain_ordinal - ao);
                 if json_out {
                     let _ = writeln!(
                         out,
@@ -1379,19 +1389,23 @@ fn cmd_audit(
                             "anchorOk": r.anchor_ok,
                             "anchorDegraded": r.anchor_degraded,
                             "anchorOrdinal": r.anchor_ordinal,
+                            "anchorBehind": behind,
                         })
                     );
                 } else {
-                    let anchor_note = if r.anchor_degraded {
-                        "（注意：锚点已降级到数据目录侧写文件——防篡改能力减弱）".to_string()
-                    } else {
-                        String::new()
-                    };
-                    let _ = writeln!(
-                        out,
-                        "HMAC 链校验：{} 条事件验证通过，锚点一致{}",
-                        r.verified, anchor_note
-                    );
+                    // 锚点覆盖范围提示（cli.md §5.0）：锚点后追加的事件不是截断
+                    let mut note = String::new();
+                    if let Some(ao) = r.anchor_ordinal {
+                        note.push_str(&format!("（锚点覆盖至第 {ao} 条事件"));
+                        if let Some(n) = behind {
+                            note.push_str(&format!("，其后 {n} 条为锚点后追加——非截断"));
+                        }
+                        note.push('）');
+                    }
+                    if r.anchor_degraded {
+                        note.push_str("（注意：锚点已降级到数据目录侧写文件——防篡改能力减弱）");
+                    }
+                    let _ = writeln!(out, "HMAC 链校验：{} 条事件验证通过{}", r.verified, note);
                 }
             }
             Err(e) => return rpc_fail(&e),
