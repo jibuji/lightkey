@@ -12,8 +12,9 @@ impl Daemon {
     /// `approval.result`：审批回传（决策权始终在 Rust 侧）。调用方限制
     /// （仅桌面内嵌直调）与挑战值校验见 dispatch / [`PendingApprovals::resolve`]：
     /// 伪造 requestId、已超时或**挑战不符** → 忽略（`accepted=false`，
-    /// testing.md 第三层 #17/#78）。挑战不符等失败提交写审计（#78：谁在
-    /// 提交审批可归因；成功提交由第 3 层 finalize 路径审计，不重复记）。
+    /// testing.md 第三层 #17/#78）。失败提交写审计（#78：谁在提交审批可
+    /// 归因；socket 来源被 `channel.forbidden` 拒绝的审计在 dispatch 拒绝
+    /// 分支就地写入；成功提交由第 3 层 finalize 路径审计，不重复记）。
     pub(crate) fn approval_result(
         &mut self,
         id: Value,

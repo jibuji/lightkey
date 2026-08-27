@@ -98,6 +98,7 @@ export const MOCK_AUDIT: AuditEvent[] = [
   { eventId: "e4", ts: "2026-08-16T09:58:47Z", starter: "claude", target: "npm", command: "lk inject <55667788>", result: "timeout", channel: "approval" },
   { eventId: "e5", ts: "2026-08-16T09:41:12Z", starter: "lk", target: "daemon", command: "vault.unlock", result: "allowed", channel: "desktop" },
   { eventId: "e6", ts: "2026-08-16T09:12:03Z", starter: "zsh", target: "git", command: "lk inject <aabbccdd>", result: "denied", channel: "cli" },
+  { eventId: "e7", ts: "2026-08-16T08:55:40Z", starter: "zsh", target: "npm", command: "lk inject <1a2b3c4d>", result: "allowed", channel: "wsl-bridge" },
 ];
 
 export const MOCK_SETTINGS: VaultSettings = {

@@ -33,7 +33,7 @@ docs/              实施规格集（docs/README.md 为索引；含前端设计�
 ## 构建与测试
 
 ```bash
-# 核心 + daemon + CLI（任意平台，Linux 上 Tauri 壳需要 webkit2gtk，由 CI 在 Windows 检查）
+# 核心 + daemon + CLI（任意平台，Linux 上 Tauri 壳需要 webkit2gtk，由 Windows 侧检查）
 cargo test                      # 默认成员 = lk-core + lk-daemon + lk-cli
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
 
@@ -41,8 +41,9 @@ cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
 cd frontend && npm install && npm run build
 ```
 
-验收平台：Windows（优先，主开发测试平台）；macOS/Linux 桌面构建不占 CI
-矩阵。CI 见 `.github/workflows/ci.yml`。
+验收平台：Windows（优先，主开发测试平台）；macOS/Linux 桌面构建不占发布
+矩阵。CI 只在 release 时运行（2026-08-27 裁定），见
+`.github/workflows/release.yml`——质量门禁内嵌为构建前置；日常提交本地验证。
 
 ## 文档索引
 

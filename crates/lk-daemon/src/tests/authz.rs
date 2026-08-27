@@ -587,7 +587,8 @@ fn approval_result_rejects_forged_and_unauthenticated() {
 
 /// #78 方案 A（对抗性回归）：持有效令牌的 **socket** 进程即使拿到正确的
 /// requestId/challenge，提交审批也必须被专用错误码拒绝，且不得消耗/清掉
-/// 真实的待审批条目——随后真正的桌面回传照常生效。
+/// 真实的待审批条目——随后真正的桌面回传照常生效。被拒提交写审计
+/// （command=approval.result，对端归因）。
 #[test]
 fn approval_result_rejected_from_socket_origin_keeps_pending_entry() {
     let dir = tempfile::tempdir().unwrap();
@@ -625,6 +626,17 @@ fn approval_result_rejected_from_socket_origin_keeps_pending_entry() {
         v["error"]["code"], ERR_CHANNEL_FORBIDDEN,
         "socket 提交审批必须 channel.forbidden：{resp}"
     );
+
+    // 被拒提交写审计（#78：尝试自我批准的 socket 进程可归因——
+    // starter 为对端回溯结果，unknown 对端如实记 unknown）
+    let submissions: Vec<_> = audit_events(dir.path())
+        .into_iter()
+        .filter(|e| e.command == "approval.result")
+        .collect();
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].result, lk_core::audit::AuditResult::Denied);
+    assert_eq!(submissions[0].starter, "unknown");
+    assert_eq!(submissions[0].channel, lk_core::audit::AuditChannel::Cli);
 
     // 待审批条目未被消耗：真正的桌面回传照常放行
     let resp = state.lock().unwrap().handle(

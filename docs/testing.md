@@ -1,7 +1,7 @@
 # 测试策略与 CI（testing）
 
 - 状态：已拍板（D13/D2）
-- 关联：[milestones.md](milestones.md)（出口标准）· `.github/workflows/ci.yml`（骨架）
+- 关联：[milestones.md](milestones.md)（出口标准）· `.github/workflows/release.yml`（发布前置门禁，2026-08-27 裁定）
 
 ## 1. 测试三层（D13）
 
@@ -52,20 +52,28 @@
 - 该红线不受跨子系统桥（M2.75）新增测试影响：`e2e_cross_subsystem.sh`
   同样只在测试内生成密钥或从环境变量注入，仓库不出现任何真实密钥。
 
-## 3. CI（GitHub Actions，骨架已建）
+## 3. CI（GitHub Actions，release-only）
 
-`.github/workflows/ci.yml`（船长裁定收敛为 Windows 优先，替代原 D2 CI 部分）：
+**2026-08-27 船长裁定：CI 只在 release 时运行。** 原 `.github/workflows/ci.yml`
+（main push / 全部 pull_request 触发）已删除，全部质量检查收敛为
+`.github/workflows/release.yml` 的**构建前置门禁**——发布前必须绿：
 
-| Job | 平台 | 内容 |
-|-----|------|------|
-| desktop-windows | windows-latest | fmt / clippy(-D warnings) / test（`lk-core` + `lk-daemon` + `lk-cli`）/ `cargo check --workspace`（含 Tauri 壳与 Windows 资源生成） |
-| frontend | ubuntu-latest | `npm ci` + `npm test`（vitest D 层单测）+ `npm run build`（tsc + vite） |
+| Job | 平台 | 门禁内容（打包前） |
+|-----|------|--------------------|
+| check-version | ubuntu-latest | 发布 tag（去 v 前缀）== lk-cli package version（#34） |
+| build-windows | windows-latest | `cargo fmt --all -- --check` · clippy `-D warnings`（三 crate）· `cargo test`（三 crate）· 前端 `npm ci` + `npm test` + `npm run build` |
+| build-linux-cli | ubuntu-latest | clippy `-D warnings`（lk-cli）· `cargo test`（lk-cli） |
 
-- **Windows 是主开发测试平台**（船长本机 Windows WSL）；macOS/Linux 桌面构建
-  不再占 CI 矩阵（Linux 冒烟由本地承担）。
-- 工具链固定：`rust-toolchain.toml`（1.94）+ `dtolnay/rust-toolchain@stable` 对齐，
-  `Swatinem/rust-cache` 缓存。
-- 属性测试在 CI 跑固定种子（回归可复现）+ 每日/PR 随机种子抽查（可选后续）。
+- 触发面：tag `v*` push / `workflow_dispatch`（不带 release_tag 只留
+  Actions artifact；带则补发到既有 Release，不移动标签）。
+- **每日开发提交不在 GitHub 侧跑任何 workflow**——本地承担：Windows 全量
+  （fmt/clippy/test 三 crate + 前端）+ WSL/Linux 侧同口径（覆盖 unix 分支），
+  见 AGENTS.md「常用命令」。
+- Windows 仍是主开发测试平台（船长本机 Windows WSL）；macOS/Linux 桌面构建
+  不占发布矩阵（Linux 冒烟由本地承担）。
+- 工具链固定：`rust-toolchain.toml`（1.94）+ `dtolnay/rust-toolchain@stable`
+  对齐，`Swatinem/rust-cache` 缓存。
+- 属性测试在 CI 跑固定种子（回归可复现）+ 随机种子抽查（可选后续）。
 
 ## 4. 里程碑出口映射
 

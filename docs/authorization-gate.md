@@ -121,9 +121,9 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
     该帧）；回传必须原样带回，错值 → `accepted=false` 且待审批条目保留
     （伪回传不能打掉真审批）。纵使未来出现可伪造连接标签的进程内组件，
     无挑战值仍无法自我批准。
-  - 失败提交（伪造 id / 过期 / 挑战不符）写审计（command=`approval.result`，
-    starter/channel 取对端归因）；成功提交由第 3 层 finalize 路径审计
-    （channel=approval），不重复记。
+  - 失败提交（伪造 id / 过期 / 挑战不符 / socket 来源被 `channel.forbidden`
+    拒绝）写审计（command=`approval.result`，starter/channel 取对端归因）；
+    成功提交由第 3 层 finalize 路径审计（channel=approval），不重复记。
 - **本地通道**（V1）：桌面弹窗/系统通知，30s 超时默认拒绝。
 - **远程通道**（未来，P1 不做）：远程审批中继 = 未来服务端付费点；本阶段
   只留接口与类型，不实现。
