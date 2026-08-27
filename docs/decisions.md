@@ -223,5 +223,30 @@ needs-decision，不得自行变更。
     实现：crates/lk-cli/src/memguard.rs（`harden_process` / `zeroize_env` /
     测试）+ crates/lk-cli/src/main.rs（`main()` 启动加固、`cmd_inject` 注入后
     zeroize、--help 文案）+ 文档。
+18. **审计文件外锚点（截断可证明）（2026-08-27 · 来源：issue #75（SEC MEDIUM）
+    核实 + 实现，船长拍板）**：核实属实——审计链是逐事件 HMAC-SHA256 链，但
+    文件系统层面只是 0600 追加式文件，**无文件外可信锚点**：同用户攻击者可截尾
+    尾部抹掉近期事件、或删文件让守护进程重建空链，截断后的链仍能通过
+    `audit.verify`（验证器只走首尾 HMAC，「篡改可检测」≠「篡改可证明」）。裁定
+    设计取向为**「截断可证明」，而非「截断可预防」**（同用户总能写数据目录）：
+    - 锚点值 = 链尾 `{ordinal, last_hmac}`（最后一条事件 HMAC + 序号）；
+    - 写入点：解锁/锁定/恢复（密钥轮换）/守护进程干净关闭低频同步写 + 后台
+      60s 异步 flush（**热路径非阻塞**，不得持 vault 写锁——G1 纪律）；
+    - 平台存储：Windows Credential Manager / macOS Keychain / Linux
+      secret-service·keyutils（经 keyring crate；失败统一映射 Unavailable，
+      无 panic）；平台不可用 → **fail-open** 降级到数据目录 0600 原子写侧写
+      `audit.anchor` 并告警，**绝不阻断 vault 解锁**；降级 ≠ 可信，文档明示更弱；
+    - `lk audit --verify` 交叉核对锚点：截尾 / 锚点缺失 / 锚定事件被替换 →
+      报「truncation detected」语义错误且 CLI **退出非零**；链长于锚点的
+      「锚点后追加」不误报；
+    - `vault.status` 暴露可选 `auditAnchorOk`（`false` 覆盖「降级/截断/缺失」
+      三态，桌面 UI 告警通道；前端类型向后兼容可选字段）；
+    - 锚点值无需 K_audit（只读链尾）→ 锁定态也可写锚点；
+    - 同用户边界衔接补充拍板 #15：截断可证明 ≠ 可预防，不做防同用户删除的
+      虚假承诺。
+    实现：crates/lk-core/src/audit_anchor.rs + crates/lk-daemon/src/audit_anchor.rs
+    （KeyringAuditAnchor + Composite + FileAnchorSidecar）+ daemon（sync_anchor /
+    flusher / 启动自检 / vault.status.auditAnchorOk）+ lk-cli（audit --verify
+    截断检测）+ 前端（auditAnchorOk 可选字段）+ docs/audit.md §3.2。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
