@@ -80,13 +80,14 @@ lightkey/
 │   └── lk-app/                # Tauri 2 壳（窗口、tauri.conf.json、capabilities、图标占位）
 ├── frontend/                  # React + TS（Vite；dev 端口 1420 与 tauri devUrl 一致）
 ├── docs/                      # 本规格集（docs/README.md 为索引）
-└── .github/workflows/ci.yml   # CI 骨架（测试策略见 docs/testing.md）
+└── .github/workflows/release.yml  # 发布流水线（release-only 质量门禁，见 docs/testing.md §3）
 ```
 
 **default-members 说明**：workspace 默认成员为 `lk-core` + `lk-daemon` + `lk-cli`，因此在任何平台
 `cargo test`/`cargo check`/`cargo clippy` 默认只构建这三个 crate（Linux 上 Tauri 需
-webkit2gtk 系统库，不阻塞）；`lk-app` 由 CI 在 Windows 上以 `--workspace`
-显式检查（船长裁定收敛为 Windows 优先，见 [decisions.md](decisions.md) 补充拍板 #4）。
+webkit2gtk 系统库，不阻塞）；`lk-app` 在 Windows 上检查/构建（本地 `cargo check
+--workspace` 交叉目标，或 release 流水线的 `cargo tauri build`；船长裁定收敛为
+Windows 优先，见 [decisions.md](decisions.md) 补充拍板 #4）。
 
 ## 5. 关键横切设计（速览，细节见各规格）
 

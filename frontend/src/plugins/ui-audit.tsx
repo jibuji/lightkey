@@ -22,6 +22,7 @@ const CHANNEL_LABEL: Record<AuditChannel, string> = {
   cli: "CLI",
   desktop: "桌面",
   approval: "审批",
+  "wsl-bridge": "WSL 桥接",
 };
 
 const FILTERS: { value: "all" | AuditResult; label: string }[] = [

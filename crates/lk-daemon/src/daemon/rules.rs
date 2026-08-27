@@ -24,11 +24,7 @@ impl Daemon {
                 Some(json!({ "detail": e })),
             );
         }
-        let channel = p
-            .channel
-            .as_deref()
-            .map(audit_channel)
-            .unwrap_or(caller.channel);
+        let channel = client_channel(p.channel.as_deref(), caller.channel);
         // wsl:// 规范形直接入库（非本机 fs 路径）；常规路径仍以 canonical
         // 形态入库（解析符号链接），并经与运行时 cwd 判定同一个归一化函数
         // 剥离 Windows verbatim 前缀（§7.4 两侧同函数，存储形态 == 判定形态）
@@ -82,11 +78,7 @@ impl Daemon {
     /// `rule.list`：解密态规则（规则库损坏 → fail-closed 报错）。
     pub(crate) fn rule_list(&mut self, id: Value, params: Value, caller: &CallerId) -> RpcResponse {
         let channel = match serde_json::from_value::<RuleListParams>(params) {
-            Ok(p) => p
-                .channel
-                .as_deref()
-                .map(audit_channel)
-                .unwrap_or(caller.channel),
+            Ok(p) => client_channel(p.channel.as_deref(), caller.channel),
             Err(_) => caller.channel,
         };
         let shared = Arc::clone(&self.shared);
@@ -124,11 +116,7 @@ impl Daemon {
             Ok(p) => p,
             Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
         };
-        let channel = p
-            .channel
-            .as_deref()
-            .map(audit_channel)
-            .unwrap_or(caller.channel);
+        let channel = client_channel(p.channel.as_deref(), caller.channel);
         let shared = Arc::clone(&self.shared);
         let mut guard = shared.vault.write().unwrap();
         let me = guard.as_mut().unwrap();

@@ -238,8 +238,11 @@ impl Daemon {
             #[cfg(windows)]
             {
                 // 文件已创建后收紧 DACL（尽力而为：失败时保留目录继承 ACL，
-                // 数据目录本身用户私有）
-                let _ = crate::transport::restrict_file_to_user(&path);
+                // 数据目录本身用户私有）。失败不静默——stderr 留痕便于排查，
+                // 与 ipc.md §3 记录的回落路径一致（#68）。
+                if let Err(e) = crate::transport::restrict_file_to_user(&path) {
+                    eprintln!("lk daemon: session.token DACL 收紧失败（回落目录继承 ACL）：{e}");
+                }
             }
         }
     }

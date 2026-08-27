@@ -264,8 +264,17 @@ impl Daemon {
             M_SUBSCRIBE => self.require_session(id.clone(), token, |me| me.subscribe(id.clone())),
             M_APPROVAL_RESULT => {
                 // #72/#78 方案 A：审批回传仅接受桌面内嵌直调——socket 连接
-                // 一律拒绝（专用错误码），「持令牌进程自我批准」路径闭合
+                // 一律拒绝（专用错误码），「持令牌进程自我批准」路径闭合。
+                // 被拒提交写审计（#78：谁在尝试自我批准可归因——starter/channel
+                // 取对端归因；已锁定无法签名则跳过，与桌面路径失败提交同口径）
                 if peer.origin != PeerOrigin::Desktop {
+                    let vault = self.shared.vault.read().unwrap();
+                    if let Some(v) = vault.as_ref() {
+                        let _ = self.audit.append(
+                            v.keys(),
+                            &caller.event("approval.result", AuditResult::Denied),
+                        );
+                    }
                     RpcResponse::err(
                         id.clone(),
                         ERR_CHANNEL_FORBIDDEN,
@@ -372,7 +381,7 @@ impl CallerId {
             crate::transport::PeerOrigin::Desktop => CallerId::desktop_self(),
             crate::transport::PeerOrigin::Socket => CallerId {
                 starter: derive_starter(peer),
-                channel: AuditChannel::Cli,
+                channel: peer_channel(peer),
             },
         }
     }
@@ -418,6 +427,22 @@ fn audit_channel(channel: &str) -> AuditChannel {
         "wsl-bridge" => AuditChannel::WslBridge,
         _ => AuditChannel::Cli,
     }
+}
+
+/// 按对端来源的审计通道（#66）：socket 客户端 = cli，桌面内嵌直调 =
+/// desktop。只取通道枚举、不做进程链回溯（供缺省回退复用，与
+/// [`CallerId::of`] 同口径）。
+fn peer_channel(peer: &PeerInfo) -> AuditChannel {
+    match peer.origin {
+        PeerOrigin::Desktop => AuditChannel::Desktop,
+        PeerOrigin::Socket => AuditChannel::Cli,
+    }
+}
+
+/// 客户端自报 `channel` 标注（参数优先）→ 缺省按对端来源回退
+/// （`authz.evaluate` / `rule.*` 共用；audit.md §2）。
+fn client_channel(channel: Option<&str>, fallback: AuditChannel) -> AuditChannel {
+    channel.map(audit_channel).unwrap_or(fallback)
 }
 
 /// RpcResponse → 行（序列化失败兜底 `{}`）。
