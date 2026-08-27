@@ -54,9 +54,20 @@
 
 | 命令 | 语义 | 里程碑 |
 |------|------|--------|
-| `lk audit [--tail <N>] [--verify]` | 查看审计日志（只读；无密钥值；`--tail` 最近 N 条、`--verify` 校验 HMAC 链） | M0 |
+| `lk audit [--tail <N>] [--verify]` | 查看审计日志（只读；无密钥值；`--tail` 最近 N 条、`--verify` 校验 HMAC 链 + **交叉核对文件外锚点**，见下方 §5.0） | M0 |
 | `lk daemon` | 以守护进程方式常驻（解锁态、密钥仅内存；由客户端自动拉起，也可手动前台运行） | M0 |
 | `lk bridge` | （Windows）stdio 中继：stdin 逐行读 JSON-RPC 帧 → named pipe → stdout 回写，一进程一请求后退出；不做业务解析（除版本校验外原样透传）；错误码 `bridge.no_daemon` / `bridge.version_incompatible` / `bridge.io`，退出码非 0。随桌面包安装，供 WSL 侧 Linux `lk` 经 interop 调用 | M2.75 |
+
+## 5.0 `lk audit --verify` 截断检测（issue #75）
+
+- 除原有 HMAC 链校验外，`--verify` 还会**交叉核对文件外锚点**（平台安全存储 /
+  降级侧写，见 [audit.md](audit.md) §3.2）。
+- **截断检测**：链比可信锚点短（tail 被抹）、链与锚点 ordinal 相同但最后一条
+  事件的 HMAC 不一致（锚定事件被换/伪造）、或锚点缺失（平台与侧写都没有）——
+  上述任意情形都打印「截断检测（truncation detected）」并**退出非零**。
+- 锚点落后于链尾（锚点后追加的事件，不是截断）：正常通过，输出里提示锚点
+  覆盖范围；平台 keychain 不可用已降级到侧写时，会在输出里标注「防篡改能力
+  减弱」警告，但不影响退出码（链仍完整可证明）。
 
 ## 5.1 跨子系统桥环境变量（补充拍板 #14，M2.75）
 

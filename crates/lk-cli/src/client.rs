@@ -175,6 +175,17 @@ pub struct AuditPage {
     pub total: u64,
 }
 
+/// `audit.verify` 结果（含锚点交叉核对；`truncated` = 截断检测，调用方据此退出非零）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditVerifyOutcome {
+    pub verified: u64,
+    pub anchor_ok: bool,
+    pub anchor_degraded: bool,
+    pub truncated: bool,
+    pub chain_ordinal: u64,
+    pub anchor_ordinal: Option<u64>,
+}
+
 /// `authz.evaluate` 裁决结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthzDecision {
@@ -340,10 +351,17 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
         })
     }
 
-    /// `audit.verify` → 校验通过的事件数（缺失兜底 0，同重构前）。
-    pub fn audit_verify(&mut self) -> Result<u64, RpcError> {
+    /// `audit.verify` → 校验通过的事件数 + 锚点交叉核对结果（截断检测）。
+    pub fn audit_verify(&mut self) -> Result<AuditVerifyOutcome, RpcError> {
         let res = self.call(M_AUDIT_VERIFY, json!({}))?;
-        Ok(res["verified"].as_u64().unwrap_or(0))
+        Ok(AuditVerifyOutcome {
+            verified: res["verified"].as_u64().unwrap_or(0),
+            anchor_ok: res["anchorOk"].as_bool().unwrap_or(false),
+            anchor_degraded: res["anchorDegraded"].as_bool().unwrap_or(false),
+            truncated: res["truncated"].as_bool().unwrap_or(false),
+            chain_ordinal: res["chainOrdinal"].as_u64().unwrap_or(0),
+            anchor_ordinal: res["anchorOrdinal"].as_u64(),
+        })
     }
 
     // -----------------------------------------------------------------------

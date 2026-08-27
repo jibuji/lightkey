@@ -23,6 +23,7 @@
 //! - 启动者判定在守护进程侧从 IPC 对端 PID 回溯（[`lk_core::starter`]），
 //!   客户端自报字段一律不信任。
 
+pub mod audit_anchor;
 pub mod config;
 mod daemon;
 pub mod dirs;

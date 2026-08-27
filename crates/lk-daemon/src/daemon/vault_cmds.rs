@@ -8,11 +8,13 @@ impl Daemon {
         let unlocked = self.vault_peek();
         let initialized = vault::vault_exists(&self.shared.dir);
         let watermark = self.shared.sync.lock().unwrap().state.watermark.clone();
+        let (anchor_ok, _anchor_degraded) = self.anchor_status();
         let result = StatusResult {
             unlocked,
             initialized,
             version: env!("CARGO_PKG_VERSION").to_string(),
             sync_watermark: watermark,
+            audit_anchor_ok: anchor_ok,
         };
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
@@ -96,6 +98,15 @@ impl Daemon {
                 // C 层装配：vault-store 挂总线（写成功 → `item.changed`）
                 self.core.attach_vault(&mut vault);
                 *self.shared.vault.write().unwrap() = Some(vault);
+                // 审计锚点：解锁后链尾即「vault.unlock」事件，同步写入锚点
+                // （低频点；平台不可用 → fail-open 降级侧写并警告，不阻断解锁）
+                if let Err(e) = self.sync_anchor(true) {
+                    self.anchor_ok
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "lk daemon: 警告：审计锚点写入失败（{e}）——防篡改能力减弱（issue #75）"
+                    );
+                }
                 let token = self.sessions.issue();
                 self.write_session_token(&token);
                 let result = UnlockResult {
@@ -147,6 +158,13 @@ impl Daemon {
                 .audit
                 .append(v.keys(), &caller.event("vault.lock", AuditResult::Allowed));
         }
+        // 锁定：审计锚点（低频点同步写）。失败只记警告，不阻断锁定
+        // （fail-open，issue #75）。
+        if let Err(e) = self.sync_anchor(true) {
+            self.anchor_ok
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("lk daemon: 警告：审计锚点写入失败（{e}）——防篡改能力减弱（issue #75）");
+        }
         *vault = None;
         self.sessions.invalidate_with(reason);
         self.remove_session_token();
@@ -186,6 +204,15 @@ impl Daemon {
         match vault::recover_vault(&shared.dir, &code, &p.new_password, &mut self.audit) {
             Ok(new_code) => {
                 self.recover_guard.on_success();
+                // 密钥轮换点：链尾是「审计密钥轮换」事件，同步写入锚点
+                // （低频点；fail-open 降级侧写并警告，不阻断恢复）
+                if let Err(e) = self.sync_anchor(true) {
+                    self.anchor_ok
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "lk daemon: 警告：审计锚点写入失败（{e}）——防篡改能力减弱（issue #75）"
+                    );
+                }
                 let result = RecoverResult {
                     recovery_code: new_code.display(),
                 };
@@ -255,6 +282,8 @@ impl Daemon {
     pub fn shutdown(&mut self) {
         let saved = { self.shared.sync.lock().unwrap().clone() };
         saved.save(&self.shared.dir);
+        // 审计锚点：干净关闭前的最后同步（低频点；失败只告警）
+        let _ = self.sync_anchor(true);
         // 广播 `session.locked(daemon-exit)`（进程退出前的最后事件）
         self.sessions.invalidate_with(LockReason::DaemonExit);
         self.remove_session_token();

@@ -82,7 +82,11 @@ async function ensureSubscribed(): Promise<void> {
 export class TauriAdapter implements LightKeyIpc {
   readonly kind = "tauri" as const;
 
-  async status(): Promise<{ unlocked: boolean; initialized: boolean }> {
+  async status(): Promise<{
+    unlocked: boolean;
+    initialized: boolean;
+    auditAnchorOk?: boolean;
+  }> {
     return rpc("vault.status");
   }
 

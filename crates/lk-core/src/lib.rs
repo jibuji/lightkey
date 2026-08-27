@@ -46,6 +46,7 @@
 //! D 层真 Cordis 宿主见 `frontend/`。M2 授权门为占位模块。
 
 pub mod audit;
+pub mod audit_anchor;
 pub mod authz;
 pub mod bus;
 pub mod crypto;

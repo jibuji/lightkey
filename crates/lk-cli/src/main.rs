@@ -1332,11 +1332,58 @@ fn cmd_audit(
     }
     if verify {
         match c.audit_verify() {
-            Ok(verified) => {
+            Ok(r) => {
+                if r.truncated {
+                    // 截断检测（issue #75）：链比可信锚点短，或锚点缺失。
+                    let msg = if r.anchor_ordinal.is_some() {
+                        format!(
+                            "截断检测（truncation detected）：审计链 {} 条事件，但可信锚点记录 {} 条——链尾可能被抹除",
+                            r.chain_ordinal,
+                            r.anchor_ordinal.unwrap_or(0)
+                        )
+                    } else {
+                        "截断检测（truncation detected）：无可用审计锚点，无法证明链未被截断"
+                            .to_string()
+                    };
+                    if json_out {
+                        let _ = writeln!(
+                            out,
+                            "{}",
+                            json!({
+                                "verified": r.verified,
+                                "truncated": true,
+                                "message": msg,
+                            })
+                        );
+                    } else {
+                        let _ = writeln!(out, "HMAC 链校验失败：{}", msg);
+                    }
+                    eprintln!("lk: {msg}");
+                    return 1;
+                }
                 if json_out {
-                    let _ = writeln!(out, "{}", json!({ "verified": verified }));
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        json!({
+                            "verified": r.verified,
+                            "truncated": false,
+                            "anchorOk": r.anchor_ok,
+                            "anchorDegraded": r.anchor_degraded,
+                            "anchorOrdinal": r.anchor_ordinal,
+                        })
+                    );
                 } else {
-                    let _ = writeln!(out, "HMAC 链校验：{} 条事件验证通过", verified);
+                    let anchor_note = if r.anchor_degraded {
+                        "（注意：锚点已降级到数据目录侧写文件——防篡改能力减弱）".to_string()
+                    } else {
+                        String::new()
+                    };
+                    let _ = writeln!(
+                        out,
+                        "HMAC 链校验：{} 条事件验证通过，锚点一致{}",
+                        r.verified, anchor_note
+                    );
                 }
             }
             Err(e) => return rpc_fail(&e),
