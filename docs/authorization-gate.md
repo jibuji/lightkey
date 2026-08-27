@@ -102,12 +102,28 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 - 审批通道 = 接口（trait）`ApprovalChannel`（本地/远程可切换）；两阶段接口
   对应守护进程的 G1 三阶段编排（`authz.evaluate` 锁内登记 → 锁外等待 → 重取锁
   收尾）：
-  - `available()` — 是否有界面可能响应审批（桌面壳已订阅推送连接）；
-    `false` → fail-closed 立即拒绝（不登记、不阻塞）。
-  - `open(req, expires_at)` — 登记待审批 + 广播 `authz.request`（命令锁内、
-    非阻塞）。
+  - `available()` — 是否有界面可能响应审批（**桌面来源的推送订阅存在**；
+    #72/#78：socket 订阅者不计——任何持令牌进程都能建立 socket 订阅，
+    「有订阅」不等于「有人类可批准」）；`false` → fail-closed 立即拒绝
+    （不登记、不阻塞）。
+  - `open(req, expires_at)` — 登记待审批（含一次性 challenge）+ 广播
+    `authz.request`（命令锁内、非阻塞）。
   - `await_decision(request_id, expires_at)` — 命令锁外等待决策，返回
     `Allowed` / `Denied` / `Timeout`（到期默认拒绝）。
+- **信任绑定（#72/#78，补充拍板 #16）**：审批提交与通知投递按连接来源收紧，
+  双重防线：
+  - **方案 A · 连接标签**：订阅登记带来源标签（桌面内嵌直调 / socket 流连接）；
+    `approval.result` 仅接受**桌面内嵌直调**提交——socket/pipe 连接一律以
+    专用错误码 `channel.forbidden`（-32014）拒绝。据此「持令牌进程自行
+    订阅 + 自行回传批准」的路径闭合。
+  - **方案 B · 一次性 challenge**：`open` 时生成高熵随机挑战，仅随
+    `authz.request` notification 帧**投递给桌面订阅者**（socket 订阅者不收
+    该帧）；回传必须原样带回，错值 → `accepted=false` 且待审批条目保留
+    （伪回传不能打掉真审批）。纵使未来出现可伪造连接标签的进程内组件，
+    无挑战值仍无法自我批准。
+  - 失败提交（伪造 id / 过期 / 挑战不符）写审计（command=`approval.result`，
+    starter/channel 取对端归因）；成功提交由第 3 层 finalize 路径审计
+    （channel=approval），不重复记。
 - **本地通道**（V1）：桌面弹窗/系统通知，30s 超时默认拒绝。
 - **远程通道**（未来，P1 不做）：远程审批中继 = 未来服务端付费点；本阶段
   只留接口与类型，不实现。
@@ -117,12 +133,18 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 ## 7. 安全约束与测试要点
 
 - fail-closed：启动者未知 / 规则库损坏 / 守护进程无界面 → 一律拒绝。
-- **已知边界（待拍板，issue #65）**：三层门当前仅约束 `authz.evaluate`
+- **已知边界（#71/#74/#77 已拍板承认，补充拍板 #15；issue #65 的收紧项仍待拍板）**：
+  三层门当前仅约束 `authz.evaluate`
   （即 `lk inject`）通道；`item.list` / `item.get` 等 IPC 方法持有效
   会话令牌即可读全库明文，不经规则匹配与审批。即本门对「自觉走 inject
   的 agent」是流程约束，对**不合作的同用户进程**（解锁窗口内直接调
-  `item.*`）无效——事后归因依赖审计真实 starter（已落，#66）；按调用方
-  区分能力面 / 解锁+审批一体化（#67）等收紧方案待决策后落规格。
+  `item.*`）无效——事后归因依赖审计真实 starter（已落，#66）。会话令牌的
+  同用户复用属同一威胁模型边界（补充拍板 #15），文档声明而非代码防护；
+  按调用方区分能力面 / 解锁+审批一体化（#67）/ 常驻进程持令牌（#68 选项 2）
+  等收紧方案待决策后落规格。
+- 审批通道对抗性测试（#72/#78）：socket 来源提交（即使参数完整正确）→
+  `channel.forbidden` 且条目保留；挑战不符 → 忽略 + 条目保留 + 审计；
+  仅 socket 订阅者 → no_ui 立即拒绝；authz.request 帧绝不投 socket 订阅者。
 - 规则变更（add/list/remove）写审计；规则匹配逻辑单测覆盖 glob、目录绑定。
 - 安全专项（[testing.md](testing.md) 第三层）：绕过尝试清单——
   伪造 cwd、符号链接目录、跨会话进程、直连 IPC 调 `authz.evaluate`、

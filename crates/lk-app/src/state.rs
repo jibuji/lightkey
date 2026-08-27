@@ -63,8 +63,10 @@ impl AppState {
 
     /// 建立推送流（`subscribe` 命令：令牌已由守护进程校验通过）。
     /// 替换旧流：先停旧 writer 线程再登记新订阅（同进程只有一个订阅者）。
+    /// 来源标签 desktop=true（#72/#78 方案 A）：审批界面判定与
+    /// `authz.request` 挑战帧只认桌面来源订阅者。
     pub fn start_push_stream(&self, app: &tauri::AppHandle) -> Result<(), String> {
-        let (id, rx) = self.shared.push.subscribe();
+        let (id, rx) = self.shared.push.subscribe(true);
         let stop = Arc::new(AtomicBool::new(false));
         {
             let mut guard = self.push.lock().unwrap();

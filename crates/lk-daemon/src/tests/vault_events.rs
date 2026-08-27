@@ -208,8 +208,8 @@ fn subscribe_requires_valid_token() {
 fn push_channel_notifies_session_and_item_events() {
     let dir = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), None);
-    let (_sid, rx) = shared.push.subscribe();
-    // 写条目 → item.changed 帧
+    let (_sid, rx) = shared.push.subscribe(true); // 桌面壳模拟（#72/#78 起订阅带来源标签）
+                                                  // 写条目 → item.changed 帧
     state.lock().unwrap().handle(
         &rpc_line(
             M_ITEM_PUT,

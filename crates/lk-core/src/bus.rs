@@ -86,12 +86,15 @@ pub enum VaultEvent {
     /// `authz.request`（M2）：授权门进入第 3 层弹窗审批——「需要用户决策」
     /// 的通知（plugin-architecture.md §5.3）；决策权始终在 Rust 侧，
     /// 用户选择经 `approval.result` 回传。`keys` 仅 key 名，永不含值。
+    /// `challenge` 为一次性审批应答值（#78 方案 B）：随本事件仅投递给
+    /// 桌面订阅者，回传时必须原样带回（ipc.md §4 / authorization-gate.md §6）。
     AuthzRequest {
         request_id: uuid::Uuid,
         starter: String,
         project_dir: String,
         command: String,
         keys: Vec<String>,
+        challenge: String,
     },
 }
 
@@ -255,6 +258,7 @@ mod tests {
                 project_dir: "/p".into(),
                 command: "npm publish".into(),
                 keys: vec!["NPM_TOKEN".into()],
+                challenge: "chal".into(),
             }
             .name(),
             "authz.request"

@@ -106,6 +106,10 @@ pub const ERR_SYNC_STORAGE: i64 = -32010;
 pub const ERR_SYNC_ANOMALY: i64 = -32011;
 /// 同步：凭据缺失/钥匙串不可用。
 pub const ERR_SYNC_CREDENTIALS: i64 = -32012;
+/// 审批回传等信任敏感方法仅限桌面内嵌直调（#72/#78：审批通道信任绑定，
+/// authorization-gate.md §6 / 补充拍板 #16；socket 连接一律拒绝）。
+pub const ERR_CHANNEL_FORBIDDEN: i64 = -32014;
+pub const MSG_CHANNEL_FORBIDDEN: &str = "channel.forbidden";
 
 pub const MSG_VAULT_INVALID: &str = "vault.invalid";
 pub const MSG_SESSION_INVALID: &str = "session.invalid";
@@ -347,12 +351,18 @@ pub struct AuthzEvaluateResult {
 }
 
 /// `approval.result` 参数（审批回传；决策权始终在 Rust 侧，§5.3）。
+///
+/// #72/#78：本方法仅接受**桌面内嵌直调**（socket 连接 →
+/// `channel.forbidden`）；`challenge` 为 `authz.request` 广播帧携带的
+/// 一次性应答值，必须原样回带（错值 → `accepted=false`，条目保留）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalResultParams {
     pub request_id: Uuid,
     /// `allowed` | `denied`（timeout 由守护进程侧超时产生，客户端不可发）。
     pub decision: String,
+    /// 一次性审批挑战（#78 方案 B）。
+    pub challenge: String,
 }
 
 /// `approval.result` 结果：是否被守护进程接受（伪造/已超时的 requestId

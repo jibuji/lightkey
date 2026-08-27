@@ -31,7 +31,7 @@ use sha2::Digest;
 use crate::config::{Config, SyncRuntime};
 use crate::notifier::Notifier;
 use crate::router::{strategy_of, ExecutionStrategy};
-use crate::transport::{PeerInfo, PushHub};
+use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 
 use self::authz::AuthzBegin;
 use self::lifecycle::{install_shutdown_handlers, load_config};
@@ -130,12 +130,15 @@ impl Daemon {
         // （通知桥订阅总线：Rust 事件 → notification 帧 → 订阅连接，非阻塞）
         let approvals = Arc::new(PendingApprovals::new());
         let push = PushHub::new();
+        // #72/#78 方案 A：`has_ui` 只数**桌面来源**订阅者——socket 订阅者
+        // （任何持令牌进程可建立）不算「有界面」；审批挑战帧也只投给桌面
+        // 订阅者（notifier），双重收紧第 3 层的信任前提。
         let approval: Arc<dyn ApprovalChannel> = Arc::new(LocalApprovalChannel::new(
             Arc::clone(&approvals),
             Arc::clone(core.bus()),
             Box::new({
                 let push = Arc::clone(&push);
-                move || push.subscriber_count() > 0
+                move || push.desktop_subscriber_count() > 0
             }),
         ));
         core.subscribe(Arc::new(Notifier::new(Arc::clone(&push))));
@@ -255,11 +258,26 @@ impl Daemon {
                 self.require_session(id.clone(), token, |me| me.sync_trigger_inline(id.clone()))
             }
             M_SYNC_POLL => self.require_session(id.clone(), token, |me| me.sync_poll(id.clone())),
-            // M2：通知订阅（连接转入流模式由传输层处理；此处只做会话校验）
+            // M2：通知订阅（连接转入流模式由传输层处理；此处只做会话校验）。
+            // socket 订阅仍可收 item.changed 等事件，但 `has_ui` 不计、
+            // 也收不到 authz.request 挑战帧（#72/#78，见 PushHub/Notifier）
             M_SUBSCRIBE => self.require_session(id.clone(), token, |me| me.subscribe(id.clone())),
-            M_APPROVAL_RESULT => self.require_session(id.clone(), token, |me| {
-                me.approval_result(id.clone(), params)
-            }),
+            M_APPROVAL_RESULT => {
+                // #72/#78 方案 A：审批回传仅接受桌面内嵌直调——socket 连接
+                // 一律拒绝（专用错误码），「持令牌进程自我批准」路径闭合
+                if peer.origin != PeerOrigin::Desktop {
+                    RpcResponse::err(
+                        id.clone(),
+                        ERR_CHANNEL_FORBIDDEN,
+                        MSG_CHANNEL_FORBIDDEN,
+                        None,
+                    )
+                } else {
+                    self.require_session(id.clone(), token, |me| {
+                        me.approval_result(id.clone(), params, &caller)
+                    })
+                }
+            }
             M_RULE_ADD => self.require_session(id.clone(), token, |me| {
                 me.rule_add(id.clone(), params, &caller)
             }),

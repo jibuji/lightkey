@@ -266,6 +266,7 @@ export class MockAdapter implements LightKeyIpc {
   async approvalResult(
     requestId: string,
     _decision: "allowed" | "denied",
+    _challenge: string,
   ): Promise<{ accepted: boolean }> {
     this.requireUnlocked();
     const accepted = this.pendingApprovals.delete(requestId);
@@ -307,16 +308,22 @@ export class MockAdapter implements LightKeyIpc {
 
   /* ---------- QA 钩子（仅 mock；验证帧翻译 / 审批弹窗闭环） ---------- */
 
-  /** 模拟守护进程推送 authz.request 帧（审批弹窗演示/测试入口）。 */
+  /** 模拟守护进程推送 authz.request 帧（审批弹窗演示/测试入口）。
+   *  `challenge` 缺省给固定值（mock 不校验，仅透传给弹窗回传）。 */
   simulateAuthzRequest(params: {
     requestId: string;
     starter: string;
     projectDir: string;
     command: string;
     keys: string[];
+    challenge?: string;
   }): void {
     this.pendingApprovals.add(params.requestId);
-    this.onFrame?.({ jsonrpc: "2.0", method: "authz.request", params });
+    this.onFrame?.({
+      jsonrpc: "2.0",
+      method: "authz.request",
+      params: { challenge: "mock-challenge", ...params },
+    });
   }
 
   /** 模拟守护进程推送 item.changed 帧（ui-vault 刷新 / CAS 场景）。 */

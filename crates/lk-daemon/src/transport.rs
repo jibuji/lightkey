@@ -83,12 +83,23 @@ impl PeerInfo {
 
 /// 通知订阅注册表（跨线程：命令线程广播 → 每订阅连接一个 writer 线程排空）。
 ///
+/// 订阅者带**来源标签**（#72/#78 方案 A）：桌面内嵌直调订阅（lk-app
+/// `start_push_stream`）= desktop；socket/pipe 流模式连接 = socket。
+/// 审批界面判定与 `authz.request` 帧（含一次性 challenge）只认 desktop
+/// 标签——持令牌的 socket 进程既不算「有界面」也拿不到挑战，无法自我批准。
+///
 /// [`PushHub::broadcast`] 只做内存 channel 投递（**非阻塞**，符合总线契约）；
 /// socket 写入由订阅连接自己的 writer 线程承担。客户端慢/死 → 内存队列
 /// 增长（桌面持续读取；死连接写入失败即退订）。
 pub struct PushHub {
-    subs: Mutex<std::collections::HashMap<u64, mpsc::Sender<String>>>,
+    subs: Mutex<std::collections::HashMap<u64, SubEntry>>,
     next_id: AtomicU64,
+}
+
+struct SubEntry {
+    tx: mpsc::Sender<String>,
+    /// 桌面内嵌直调订阅 = true；socket 流模式连接 = false。
+    desktop: bool,
 }
 
 impl PushHub {
@@ -100,10 +111,15 @@ impl PushHub {
     }
 
     /// 登记订阅者，返回 (订阅者 id, 帧接收端)。writer 线程排空接收端。
-    pub fn subscribe(&self) -> (u64, mpsc::Receiver<String>) {
+    /// `desktop` = 来源标签：桌面内嵌直调传 true，socket 流模式连接传 false
+    /// （#72/#78 方案 A：审批界面判定与 `authz.request` 帧只认 desktop）。
+    pub fn subscribe(&self, desktop: bool) -> (u64, mpsc::Receiver<String>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
-        self.subs.lock().unwrap().insert(id, tx);
+        self.subs
+            .lock()
+            .unwrap()
+            .insert(id, SubEntry { tx, desktop });
         (id, rx)
     }
 
@@ -114,15 +130,48 @@ impl PushHub {
 
     /// 广播一帧给全部订阅者（非阻塞内存投递）。
     pub fn broadcast(&self, frame: &str) {
-        let subs: Vec<mpsc::Sender<String>> = self.subs.lock().unwrap().values().cloned().collect();
+        let subs: Vec<mpsc::Sender<String>> = self
+            .subs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.tx.clone())
+            .collect();
         for tx in subs {
             let _ = tx.send(frame.to_string());
         }
     }
 
-    /// 订阅连接数（0 = 桌面壳未运行 = 无审批界面 → 第 3 层 fail-closed）。
+    /// 广播一帧给**桌面来源**订阅者（#72/#78：`authz.request` 携带一次性
+    /// 审批挑战，不得离开受信桌面通道）。
+    pub fn broadcast_desktop(&self, frame: &str) {
+        let subs: Vec<mpsc::Sender<String>> = self
+            .subs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.desktop)
+            .map(|e| e.tx.clone())
+            .collect();
+        for tx in subs {
+            let _ = tx.send(frame.to_string());
+        }
+    }
+
+    /// 订阅连接数（含非桌面；通知可达面统计用）。
     pub fn subscriber_count(&self) -> usize {
         self.subs.lock().unwrap().len()
+    }
+
+    /// 桌面来源订阅数（0 = 无审批界面 → 第 3 层 fail-closed；#72/#78：
+    /// socket 订阅者不计入——订阅存在不等于「有人类可批准」）。
+    pub fn desktop_subscriber_count(&self) -> usize {
+        self.subs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.desktop)
+            .count()
     }
 }
 
@@ -286,7 +335,8 @@ mod imp {
     /// 订阅连接流模式：writer 线程排空通知帧写 socket；主线程读到对端关闭
     /// 即退出（writer 线程随后退订）。
     fn serve_push_stream(stream: UnixStream, hub: &Arc<PushHub>) {
-        let (id, rx) = hub.subscribe();
+        // socket 流模式订阅：非桌面来源（#72/#78——收不到 authz.request 帧）
+        let (id, rx) = hub.subscribe(false);
         let closed = Arc::new(AtomicBool::new(false));
         let writer_stream = match stream.try_clone() {
             Ok(c) => c,
@@ -736,7 +786,8 @@ mod imp {
     /// 惰性检测的代价可忽略）。流模式结束时在本函数内完成 Flush/Disconnect/
     /// Close 收尾（句柄已移入 writer 线程，调用方不再触碰）。
     fn serve_push_stream(mut stream: PipeStream, hub: &Arc<PushHub>) {
-        let (id, rx) = hub.subscribe();
+        // socket 流模式订阅：非桌面来源（#72/#78——收不到 authz.request 帧）
+        let (id, rx) = hub.subscribe(false);
         let hub = Arc::clone(hub);
         let writer = std::thread::spawn(move || {
             loop {

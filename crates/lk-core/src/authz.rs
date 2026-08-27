@@ -105,6 +105,11 @@ pub enum ApprovalDecision {
 }
 
 /// 审批请求负载（`authz.request` 事件与弹窗展示用；keys 仅 key 名）。
+///
+/// `challenge` 为**一次性应答值**（#78 方案 B）：随 `open` 登记 + 仅经
+/// 事件总线广播给桌面订阅者（不出现在任何 RPC 响应里），`approval.result`
+/// 必须原样回带才被接受——纵使未来出现可伪造连接标签的进程内组件，无
+/// 挑战值仍无法自我批准。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub request_id: Uuid,
@@ -112,6 +117,8 @@ pub struct ApprovalRequest {
     pub project_dir: String,
     pub command: String,
     pub keys: Vec<String>,
+    /// 一次性审批挑战（见结构体文档；守护进程侧生成的高熵随机值 hex）。
+    pub challenge: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +144,9 @@ pub trait RuleVault: Send + Sync {
 /// [`ApprovalChannel::open`]（登记 + 广播，命令锁内、非阻塞）→
 /// [`ApprovalChannel::await_decision`]（命令锁外等待，超时默认拒绝）。
 pub trait ApprovalChannel: Send + Sync {
-    /// 是否有界面可能响应审批（桌面壳已订阅推送连接）。`false` →
-    /// fail-closed 立即拒绝，不登记、不阻塞（authorization-gate.md §7）。
+    /// 是否有界面可能响应审批（桌面壳的进程内推送订阅；#72/#78 起 daemon
+    /// 装配只数**桌面来源**订阅者——socket 订阅不计，见 lk-daemon 装配）。
+    /// `false` → fail-closed 立即拒绝，不登记、不阻塞（authorization-gate.md §7）。
     fn available(&self) -> bool;
     /// 登记待审批 + 广播 `authz.request`（非阻塞；守护进程命令锁内调用）。
     fn open(&self, req: &ApprovalRequest, expires_at: Instant);
@@ -147,10 +155,14 @@ pub trait ApprovalChannel: Send + Sync {
 }
 
 /// 待审批条目（`expires_at` 到期即清理；决策槽供 `approval.result` 写入）。
-#[derive(Debug, Clone, Copy)]
+///
+/// #78 方案 A+B：`challenge` 仅随事件总线广播（桌面订阅者可见），回传时
+/// 必须逐一比对——连接标签之外的纵深防御。
+#[derive(Debug, Clone)]
 struct PendingApproval {
     decision: Option<ApprovalDecision>,
     expires_at: Instant,
+    challenge: String,
 }
 
 /// 待审批注册表（守护进程跨线程共享：命令线程登记/等待，审批回传线程写入）。
@@ -165,20 +177,26 @@ impl PendingApprovals {
         PendingApprovals::default()
     }
 
-    /// 登记待审批（幂等：重复登记刷新到期时刻与决策槽）。
-    pub fn register(&self, request_id: Uuid, expires_at: Instant) {
+    /// 登记待审批（幂等：重复登记刷新到期时刻与决策槽/挑战值）。
+    pub fn register(&self, request_id: Uuid, expires_at: Instant, challenge: String) {
         self.inner.lock().unwrap().insert(
             request_id,
             PendingApproval {
                 decision: None,
                 expires_at,
+                challenge,
             },
         );
     }
 
-    /// 回传决策（`approval.result`）：条目存在且未到期 → 写入并唤醒等待者；
-    /// 未知/已超时（伪造 requestId）→ 忽略（返回 false）。
-    pub fn resolve(&self, request_id: Uuid, decision: ApprovalDecision) -> bool {
+    /// 回传决策（`approval.result`）：条目存在且未到期**且挑战值匹配** →
+    /// 写入并唤醒等待者；未知/已超时/挑战不符 → 忽略并返回 false。
+    ///
+    /// - 伪造 requestId（未知/已超时）→ 移除已到期条目、返回 false；
+    /// - 挑战不符（#78：无广播帧则拿不到 challenge）→ **不移除**条目，
+    ///   防止伪回传把真用户的待审批请求打掉（拒绝 DoS），仅本次忽略；
+    /// - 比较用普通等值判定：注册表跨进程共享内存，无逐字节侧信道面。
+    pub fn resolve(&self, request_id: Uuid, decision: ApprovalDecision, challenge: &str) -> bool {
         let mut map = self.inner.lock().unwrap();
         let expired = map
             .get(&request_id)
@@ -186,6 +204,13 @@ impl PendingApprovals {
             .unwrap_or(true);
         if expired {
             map.remove(&request_id);
+            return false;
+        }
+        let matches = map
+            .get(&request_id)
+            .map(|p| p.challenge == challenge)
+            .unwrap_or(false);
+        if !matches {
             return false;
         }
         if let Some(p) = map.get_mut(&request_id) {
@@ -266,14 +291,17 @@ impl ApprovalChannel for LocalApprovalChannel {
     }
 
     fn open(&self, req: &ApprovalRequest, expires_at: Instant) {
-        self.approvals.register(req.request_id, expires_at);
-        // 广播 `authz.request`（通知 D 层弹窗；无密钥值）
+        self.approvals
+            .register(req.request_id, expires_at, req.challenge.clone());
+        // 广播 `authz.request`（通知 D 层弹窗；无密钥值；challenge 仅经本
+        // 事件通道下发——守护进程侧通知桥只投给桌面订阅者，#78 方案 A）
         self.bus.emit(&VaultEvent::AuthzRequest {
             request_id: req.request_id,
             starter: req.starter.clone(),
             project_dir: req.project_dir.clone(),
             command: req.command.clone(),
             keys: req.keys.clone(),
+            challenge: req.challenge.clone(),
         });
     }
 
@@ -692,12 +720,15 @@ mod tests {
         let reg = Arc::new(PendingApprovals::new());
         let id = Uuid::new_v4();
         // 回传决策 → 唤醒等待者
-        reg.register(id, Instant::now() + Duration::from_secs(10));
+        reg.register(id, Instant::now() + Duration::from_secs(10), "c1".into());
+        // 挑战不符 → 忽略且**不清除**条目（防伪回传 DoS 掉真审批）
+        assert!(!reg.resolve(id, ApprovalDecision::Allowed, "wrong"));
+        assert_eq!(reg.pending_count(), 1);
         let h = std::thread::spawn({
             let reg = Arc::clone(&reg);
             move || {
                 std::thread::sleep(Duration::from_millis(50));
-                assert!(reg.resolve(id, ApprovalDecision::Allowed));
+                assert!(reg.resolve(id, ApprovalDecision::Allowed, "c1"));
             }
         });
         let d = reg.await_decision(id);
@@ -706,13 +737,13 @@ mod tests {
         assert_eq!(reg.pending_count(), 0, "消费后清理");
 
         // 超时 → 默认拒绝 + 清理
-        reg.register(id, Instant::now() + Duration::from_millis(30));
+        reg.register(id, Instant::now() + Duration::from_millis(30), "c2".into());
         let d = reg.await_decision(id);
         assert_eq!(d, ApprovalDecision::Timeout);
         assert_eq!(reg.pending_count(), 0);
 
         // 伪造 requestId（未知/已清理）→ 忽略
-        assert!(!reg.resolve(Uuid::new_v4(), ApprovalDecision::Allowed));
+        assert!(!reg.resolve(Uuid::new_v4(), ApprovalDecision::Allowed, "c2"));
     }
 
     /// LocalApprovalChannel：登记 + 广播 `authz.request` + 等待/超时。
@@ -733,6 +764,7 @@ mod tests {
             project_dir: "/proj".into(),
             command: "npm publish".into(),
             keys: vec!["A".into()],
+            challenge: "chal-xyz".into(),
         };
         // open：登记 + 广播（非阻塞）
         ch.open(&req, Instant::now() + Duration::from_secs(10));
@@ -745,12 +777,15 @@ mod tests {
                 project_dir,
                 command,
                 keys,
+                challenge,
             } => {
                 assert_eq!(*request_id, req.request_id);
                 assert_eq!(starter, "/bin/zsh");
                 assert_eq!(project_dir, "/proj");
                 assert_eq!(command, "npm publish");
                 assert_eq!(keys, &vec!["A".to_string()]);
+                // challenge 仅经事件通道下发（#78 方案 B）
+                assert_eq!(challenge, "chal-xyz");
             }
             other => panic!("应广播 authz.request：{other:?}"),
         }
@@ -760,7 +795,7 @@ mod tests {
             let reg = Arc::clone(&reg);
             move || {
                 std::thread::sleep(Duration::from_millis(50));
-                assert!(reg.resolve(id, ApprovalDecision::Allowed));
+                assert!(reg.resolve(id, ApprovalDecision::Allowed, "chal-xyz"));
             }
         });
         let d = ch.await_decision(req.request_id, Instant::now() + Duration::from_secs(10));
@@ -850,6 +885,7 @@ mod tests {
                 project_dir: "p".into(),
                 command: "c".into(),
                 keys: vec![],
+                challenge: String::new(),
             },
             Instant::now() + Duration::from_secs(10),
         );
@@ -861,7 +897,7 @@ mod tests {
         let reg = Arc::new(PendingApprovals::new());
         let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
         for id in &ids {
-            reg.register(*id, Instant::now() + Duration::from_secs(10));
+            reg.register(*id, Instant::now() + Duration::from_secs(10), "c".into());
         }
         let (tx, rx) = mpsc::channel::<Uuid>();
         let mut handles = Vec::new();
@@ -877,7 +913,7 @@ mod tests {
         drop(tx);
         std::thread::sleep(Duration::from_millis(50));
         for &id in &ids {
-            assert!(reg.resolve(id, ApprovalDecision::Allowed));
+            assert!(reg.resolve(id, ApprovalDecision::Allowed, "c"));
         }
         let mut resolved: Vec<Uuid> = rx.iter().collect();
         resolved.sort();

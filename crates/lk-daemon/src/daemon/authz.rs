@@ -103,8 +103,11 @@ impl Daemon {
                         .unwrap_or(Value::Null),
                     )));
                 }
-                // 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）
+                // 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）。
+                // challenge：一次性审批应答值（#78 方案 B），仅经通知桥投给
+                // 桌面订阅者；回传必须原样带回（resolve 逐一比对）
                 let request_id = lk_core::crypto::random_uuid();
+                let challenge = hex::encode(lk_core::crypto::random_array::<16>());
                 let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
                 let areq = ApprovalRequest {
                     request_id,
@@ -112,6 +115,7 @@ impl Daemon {
                     project_dir: req.cwd.clone(),
                     command: req.command.clone(),
                     keys: req.keys.clone(),
+                    challenge,
                 };
                 self.gate.approval().open(&areq, expires_at);
                 self.pending_authz

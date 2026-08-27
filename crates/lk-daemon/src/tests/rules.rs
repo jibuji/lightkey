@@ -52,8 +52,8 @@ fn rule_crud_audits_and_broadcasts() {
     let proj = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), None);
     // 监听 item.changed 帧（推送通道）
-    let (_sid, rx) = shared.push.subscribe();
-    // add
+    let (_sid, rx) = shared.push.subscribe(true); // 桌面壳模拟（#72/#78 起订阅带来源标签）
+                                                  // add
     let add = state.lock().unwrap().handle(
         &rpc_line(
             M_RULE_ADD,

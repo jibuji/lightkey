@@ -32,11 +32,14 @@
 - 桌面壳 Windows 验收：`cargo check --workspace --target x86_64-pc-windows-gnu`
   （本地需 mingw 交叉工具链：conda env `lightkey-mingw`，PATH 前置其 bin；
   Linux 无 webkit2gtk 不编译 lk-app）。
-- CI 骨架：`.github/workflows/ci.yml`（Windows 全量 + ubuntu lk-cli clippy/test + frontend）；
-  发布流水线：`.github/workflows/release.yml`
+- CI 只在 release 时运行（2026-08-27 裁定，补充拍板：每次提交不触发）：
+  唯一 workflow 为 `.github/workflows/release.yml`（原 `ci.yml` 已删除），
+  触发面 = tag `v*` push / workflow_dispatch；全部质量检查（Windows：
+  fmt/clippy/test 三 crate + 前端 npm test；Linux：lk-cli clippy/test）
+  作为**构建前置门禁**内嵌在 build job 里
   （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI；独立 CLI
   Windows `lk.exe` + Linux `lk` 双产物；tag `v*` → GitHub Release 附件（两个 build
-  job 均需 `permissions: contents: write`）；main push / workflow_dispatch →
+  job 均需 `permissions: contents: write`）；不带 release_tag 的 dispatch →
   Actions artifact，dispatch 传 `release_tag` 输入可把产物补发到既有 Release
   （不移动标签）；发布路径（tag / 带 release_tag 的 dispatch）先过 check-version
   闸门：去 v 前缀的发布 tag 须等于根 Cargo.toml [workspace.package] version
