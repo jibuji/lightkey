@@ -372,6 +372,11 @@ pub struct AuthzEvaluateResult {
 /// #72/#78：本方法仅接受**桌面内嵌直调**（socket 连接 →
 /// `channel.forbidden`）；`challenge` 为 `authz.request` 广播帧携带的
 /// 一次性应答值，必须原样回带（错值 → `accepted=false`，条目保留）。
+///
+/// 锁定态一体化审批（#67）：`needs_unlock` 的待审条目要求允许决策时携带
+/// `masterPassword`——守护进程以之做**临时解锁**（仅本次注入可用，不签发
+/// 会话令牌）。错误主密码计 AuthGuard 失败（防暴破），并以错误响应退回
+/// 弹窗（条目保留，倒计时内可重试）；解锁成功才 `resolve`。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalResultParams {
@@ -380,6 +385,10 @@ pub struct ApprovalResultParams {
     pub decision: String,
     /// 一次性审批挑战（#78 方案 B）。
     pub challenge: String,
+    /// 锁定态一体化的主密码（可选：仅 `needs_unlock` 待审且 decision=
+    /// `allowed` 时使用并校验；其余情况忽略）。决不在审计/日志中出现。
+    #[serde(default)]
+    pub master_password: Option<String>,
 }
 
 /// `approval.result` 结果：是否被守护进程接受（伪造/已超时的 requestId

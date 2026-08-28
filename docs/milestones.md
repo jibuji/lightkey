@@ -152,6 +152,32 @@ Windows 主机上的 LightKey 桌面守护实例——查看条目、请求授�
 
 > 本里程碑为补充拍板 #14 新增（插入 M2.5 之后、M3 之前），已完成。
 
+## M2.8 —— 锁定态 inject 一体化（临时解锁 + 本次授权为一次交互）（已完成）
+
+**目标**：issue #67（锁定态 `lk inject` UX 断层）与 #65（inject 后顺手获得
+全量令牌）按补充拍板 #19 实现——库锁定且桌面审批界面在场时，把「临时解锁 +
+本次授权」折叠为 GUI 上的一次交互；headless 维持 fail-closed。
+
+范围：
+
+- 协议/Rust：`ApprovalResultParams.masterPassword`（可选）、
+  `ApprovalRequest.needs_unlock` 与 `authz.request` 帧 `needsUnlock`；
+  daemon 锁态 `authz.evaluate` 走一体化（`authz_begin` 锁态分支 +
+  `authz_finalize_unlock` 在临时 vault 上跑完整三层）；desktop 来源 `subscribe`
+  允许锁态订阅。
+- 前端：approval 插件 `needsUnlock` 弹窗（主密码输入栏 + 解锁并允许 + 错误
+  停留可重试）；`ensureSubscribed` 启动即订阅；mock 适配器支持锁态一体化。
+- 审计两条：`vault.unlock`（channel=desktop / via=inject-gui）+ `lk inject`
+  （channel=approval），用临时 vault 的 K_audit 签名。
+- 锁态一体化**不签发会话令牌 / 不写 session.token / 不置 shared.vault**——
+  临时解锁材料只服务本次注入，不产生 item.* 全量读能力（#65 配套）。
+
+**出口**：`cargo test`（lk-core/lk-daemon/lk-cli 三 crate）+ vitest 全绿；M0/M1
+/M2 E2E 回归通过；clippy/fmt 全绿；文档同步（decisions #19、authorization-gate
+§5.1/§6/§7、ipc §4.1、cli §4、milestones）。
+
+> 本里程碑为补充拍板 #19 新增（插入 M2.75 之后、M3 之前），已完成。
+
 ## M3 —— 浏览器填充（V1 之后）
 
 **目标**：浏览器扩展按 [browser-fill.md](browser-fill.md) 协议实现。

@@ -127,7 +127,9 @@ fn authz_evaluate_deferred(
     let begin = {
         let mut guard = state.lock().expect("daemon mutex poisoned");
         guard.auto_lock_if_idle();
-        if !guard.trigger_precheck(token.as_deref()) {
+        // #67：锁态 + 桌面审批界面在场 → 放行至 authz_begin 走一体化
+        // （headless 锁态仍 fail-closed session.invalid）
+        if !guard.authz_evaluate_precheck(token.as_deref()) {
             return rpc_string(session_invalid(id));
         }
         guard.authz_begin(id.clone(), req.params, peer)

@@ -68,6 +68,18 @@ async function flushApproval() {
   });
 }
 
+/** React 受控组件输入（原生 setter；同 onboarding.test 的 setInput）。 */
+function setInput(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(
+    window.HTMLInputElement.prototype,
+    "value",
+  )!.set!;
+  act(() => {
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 describe("ipc-bridge 通知翻译（Rust 事件 → IPC 通知 → 本层重新 emit）", () => {
   it("authz.request 帧 → Cordis 事件（负载字段对齐契约，无密钥值）", async () => {
     const { ctx, mock } = await mountHost();
@@ -90,6 +102,8 @@ describe("ipc-bridge 通知翻译（Rust 事件 → IPC 通知 → 本层重新 
         keys: ["NPM_TOKEN"],
         // mock 缺省注入的固定挑战（真实守护进程为一次性随机值，#78）
         challenge: "mock-challenge",
+        // 锁定态一体化标志（#67）：mock 缺省 false，帧原样透传
+        needsUnlock: false,
       },
     ]);
   });
@@ -337,7 +351,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it("锁定态收到 authz.request：不弹窗、不展示请求元数据（QA P1 门控）", async () => {
+  it("锁定态收到普通 authz.request：不弹窗、不展示请求元数据（QA P1 门控）", async () => {
     const { mock } = await mountHost(); // 不解锁
     act(() => {
       mock.simulateAuthzRequest({
@@ -346,10 +360,91 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-e",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+        needsUnlock: false,
       });
     });
     expect(document.body.querySelector(".approval-dialog")).toBeNull();
     expect(document.body.textContent).not.toContain("/work/proj-e");
+  });
+
+  it("锁定态 + needsUnlock（#67）：弹窗渲染主密码栏；解锁并允许携带 masterPassword", async () => {
+    const { ctx, mock } = await mountHost(); // 不解锁（锁态一体化流程）
+    const spy = vi.spyOn(ctx.ipc, "approvalResult");
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-unlock",
+        starter: "claude",
+        projectDir: "/work/proj-l",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+        needsUnlock: true,
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog");
+    expect(dialog).not.toBeNull();
+    const text = dialog!.textContent ?? "";
+    // 身份确认栏：主密码输入（labels：临时解锁）
+    expect(text).toContain("主密码");
+    expect(text).toContain("临时解锁");
+    expect(text).toContain("npm publish");
+    // 空密码不可提交（解锁并允许 disabled）
+    const allowBtn = Array.from(dialog!.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("解锁并允许"),
+    )!;
+    expect((allowBtn as HTMLButtonElement).disabled).toBe(true);
+    // 输入正确主密码 → 解锁并允许 → approvalResult(allowed, masterPassword)
+    const input = dialog!.querySelector('input[aria-label="主密码"]') as HTMLInputElement;
+    setInput(input, "demo-password");
+    await act(async () => {
+      allowBtn.click();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(spy).toHaveBeenCalledWith("req-unlock", "allowed", "mock-challenge", "demo-password");
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+    expect(ctx.toast.all.some((t) => t.text.includes("已允许本次"))).toBe(true);
+  });
+
+  it("锁定态一体化：主密码错误 → VaultInvalidError → 弹窗停留显示错误可重试（#67）", async () => {
+    const { mock } = await mountHost(); // 不解锁
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-unlock-bad",
+        starter: "claude",
+        projectDir: "/work/proj-m",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+        needsUnlock: true,
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const input = dialog.querySelector('input[aria-label="主密码"]') as HTMLInputElement;
+    const allowBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("解锁并允许"),
+    )!;
+    // 错误密码：mock 抛 VaultInvalidError → 弹窗停留 + 错误文案（条目保留可重试）
+    setInput(input, "wrong-password");
+    await act(async () => {
+      allowBtn.click();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(document.body.querySelector(".approval-dialog")).not.toBeNull();
+    expect(document.body.textContent).toContain("解锁失败（主密码错误或库未初始化）");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    // 重试正确密码 → 关闭
+    const input2 = document.body.querySelector('input[aria-label="主密码"]') as HTMLInputElement;
+    const allowBtn2 = Array.from(document.body.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("解锁并允许"),
+    )!;
+    setInput(input2, "demo-password");
+    await act(async () => {
+      allowBtn2.click();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
   });
 
   it("弹窗打开期间 session.locked → 清空队列并关闭弹窗（QA P2 自动锁残留）", async () => {

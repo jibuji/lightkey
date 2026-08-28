@@ -249,4 +249,34 @@ needs-decision，不得自行变更。
     flusher / 启动自检 / vault.status.auditAnchorOk）+ lk-cli（audit --verify
     截断检测）+ 前端（auditAnchorOk 可选字段）+ docs/audit.md §3.2。
 
+19. **锁定态 inject 一体化：临时解锁 + 本次授权为一次交互（2026-08-27 · 来源：
+    issue #67（UX 断层）与 #65（inject 后顺手获得全量令牌）再核实，船长拍板）**：
+    此前按补充拍板 #15 约定「#65-B 能力面 + #67 审批一体化 + #68-opt2 常驻令牌
+    打包立 spec、暂缓」，本次指令提前实现其不冲突部分：
+    - **#67 全量**：库处于锁定态时收到 `authz.evaluate`（即 `lk inject`），若桌面
+      审批界面在场（desktop 推送订阅存在），把「临时身份确认（解锁）+ 本次行为
+      授权」折叠成 GUI 上的一次交互——弹窗同时展示主密码输入栏（身份确认）与
+      启动者/项目目录/命令/key 名/倒计时（行为授权），用户一次性完成临时解锁 +
+      本次授权；**GUI 不在运行（纯 headless）维持 fail-closed `session.invalid`**
+      （CLI 仍提示先解锁，不阻塞、不静默回落）。
+    - **#65 配套（关键约束）**：一体化流程**不签发会话令牌 / 不写 session.token /
+      不置 shared.vault**——vault 保持锁定，仅做临时解锁内存态供本次注入 + 审计
+      签名，解锁材料只服务本次注入，**不产生 item.* 全量读能力**（#65 的主要
+      担忧由此闭环）。
+    - 协议/前端配套：`ApprovalResultParams.masterPassword`（可选，仅 needs_unlock
+      待审 + allowed 决策使用并校验）；`ApprovalRequest.needs_unlock` 与
+      `authz.request` 帧 `needsUnlock` 字段；desktop 来源 `subscribe` 允许**锁定态**
+      订阅（推送目标注册，桌面直调无需会话；帧无密钥值，socket 订阅照旧要求会话）。
+    - 审计两条：`vault.unlock`（channel=desktop，via=inject-gui）+ `lk inject`
+      （channel=approval），均用**临时 vault 的 K_audit** 签名；拒绝/超时且未解锁
+      （无临时 vault）→ 无 K_audit 不可签名，**不写审计**（与 v0 锁态拒绝同口径，
+      fail-closed 不留审计内容）。
+    - **#65 其余（item.* 能力面按调用方区分 / 常驻进程持令牌，#15 的方向 B）仍按
+      补充拍板 #15 推迟**：威胁模型不变（同用户进程互信在防护边界之外），仅在
+      威胁模型升级（多 Agent 互不信任成为产品前提）时打包立 spec。#65 文档边界
+      声明（authorization-gate.md §7）维持，不因本次一体化撤销。
+    实现：crates/lk-core/src/{ipc,authz,bus}.rs + crates/lk-daemon/src/{daemon/
+    {authz,mod,session}.rs, notifier.rs, router.rs} + 前端 {events,ipc/*,plugins/
+    approval.tsx} + E2E/单测。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

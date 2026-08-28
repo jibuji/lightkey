@@ -48,7 +48,7 @@
 | `lk rule add <projectDir> <command> --name <name> <keys...>` | 新增白名单规则（入库加密） | M2 |
 | `lk rule list` | 列出规则（最小字段） | M2 |
 | `lk rule remove <id>` | 删除规则 | M2 |
-| `lk inject --keys <name...> -- <command...>` | 给具名命令注入被批准 env（三层模型，见 [authorization-gate.md](authorization-gate.md) §5；`--keys` 必需，且只可指名 **secret 类型条目**的名称——login/note/file 条目不支持注入，与「不存在」同样拒绝、不另行区分，不泄露库内 key 名单）。**值生命周期**：值会经 lk CLI 进程内存传递一次（已做 zeroize 擦除 + 防 core dump/WER 加固，见 [decisions.md](decisions.md) 补充拍板 #17），仅排除 stdout/日志/审计；不防**同用户调试器**（同用户进程互信在防护边界外，补充拍板 #15） | M2 |
+| `lk inject --keys <name...> -- <command...>` | 给具名命令注入被批准 env（三层模型，见 [authorization-gate.md](authorization-gate.md) §5；`--keys` 必需，且只可指名 **secret 类型条目**的名称——login/note/file 条目不支持注入，与「不存在」同样拒绝、不另行区分，不泄露库内 key 名单）。**值生命周期**：值会经 lk CLI 进程内存传递一次（已做 zeroize 擦除 + 防 core dump/WER 加固，见 [decisions.md](decisions.md) 补充拍板 #17），仅排除 stdout/日志/审计；不防**同用户调试器**（同用户进程互信在防护边界外，补充拍板 #15）。**锁定态**（#67）：vault 锁定 + 桌面审批界面在场 → CLI 触发 GUI 弹「临时解锁 + 本次授权」一次性交互（CLI 侧等待决策；见 [authorization-gate.md](authorization-gate.md) §5.1）；GUI 不在运行（headless）→ fail-closed `session.invalid`（CLI 仍提示先解锁） | M2 |
 
 ## 5. 审计与守护进程
 
@@ -69,7 +69,19 @@
   覆盖范围；平台 keychain 不可用已降级到侧写时，会在输出里标注「防篡改能力
   减弱」警告，但不影响退出码（链仍完整可证明）。
 
-## 5.1 跨子系统桥环境变量（补充拍板 #14，M2.75）
+## 5.1 跨子系统桥环境变量与 CLI 环境判定（补充拍板 #14，M2.75）
+
+**CLI 双产物与环境判定矩阵**（规格 cross-subsystem.md §7.0）：`lk`（Linux）与
+`lk.exe`（Windows）各自按**运行环境**选连通目标，而非每次手工指定：
+
+- Linux `lk`：原生 Linux → 本地 UDS 守护实例（Linux 侧 GUI 宿主）；
+  **WSL2**（osrelease 含 microsoft/wsl）→ 经 `lk.exe bridge` 连 **Windows
+  主机 GUI**（`channel=wsl-bridge`）。
+- `lk.exe`：无论 Windows 原生还是被 WSL interop 调用，均为 Windows 进程、
+  走 named pipe → 恒连 Windows 主机 GUI；从 WSL 调用的差异仅 cwd 可能为
+  UNC（`\\wsl.localhost\…`），由守护进程侧 `path_ns` 归一化承接。
+
+环境变量：
 
 - `LIGHTKEY_BRIDGE`：
   - `off` — 强制本地 daemon（逃生口）；

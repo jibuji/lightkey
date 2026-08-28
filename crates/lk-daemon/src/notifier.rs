@@ -45,6 +45,7 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
             command,
             keys,
             challenge,
+            needs_unlock,
         } => (
             "authz.request",
             json!({
@@ -54,6 +55,7 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
                 "command": command,
                 "keys": keys,
                 "challenge": challenge,
+                "needsUnlock": needs_unlock,
             }),
         ),
     };
@@ -125,7 +127,8 @@ mod tests {
         assert_eq!(v["params"]["via"], "password");
 
         // authz.request：字段对齐 plugin-architecture.md §5.2；challenge 仅
-        // 随本帧走桌面通道（#78 方案 A/B）
+        // 随本帧走桌面通道（#78 方案 A/B）；needsUnlock 标注锁定态一体化
+        // 审批（#67，弹窗须收集主密码）
         let frame = frame_for_event(&VaultEvent::AuthzRequest {
             request_id: uuid::Uuid::nil(),
             starter: "/bin/zsh".into(),
@@ -133,6 +136,7 @@ mod tests {
             command: "npm publish".into(),
             keys: vec!["NPM_TOKEN".into()],
             challenge: "chal-1".into(),
+            needs_unlock: true,
         });
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["method"], "authz.request");
@@ -141,6 +145,7 @@ mod tests {
         assert_eq!(v["params"]["command"], "npm publish");
         assert_eq!(v["params"]["keys"][0], "NPM_TOKEN");
         assert_eq!(v["params"]["challenge"], "chal-1");
+        assert_eq!(v["params"]["needsUnlock"], true, "需解锁一体化帧须标注");
         assert!(desktop_only(&VaultEvent::AuthzRequest {
             request_id: uuid::Uuid::nil(),
             starter: String::new(),
@@ -148,6 +153,7 @@ mod tests {
             command: String::new(),
             keys: vec![],
             challenge: String::new(),
+            needs_unlock: false,
         }));
         assert!(!desktop_only(&VaultEvent::ItemChanged {
             item_id: uuid::Uuid::nil(),

@@ -25,6 +25,10 @@
 
 ### 2.1 跨子系统 stdio 桥（补充拍板 #14，M2.75）
 
+- **CLI 按运行环境选连通目标**（判定矩阵见
+  [cross-subsystem.md](cross-subsystem.md) §7.0）：Linux `lk` 在 WSL → 连
+  Windows 主机 GUI；原生 Linux → 本地 UDS；`lk.exe` 恒走 named pipe 连
+  Windows 主机 GUI（无论 Windows 原生还是被 WSL interop 调用）。
 - 场景：WSL2 内 Linux 原生 `lk` 连接同机 Windows 桌面守护实例。WSL/Windows
   边界上 UDS 与 named pipe 互不可达，故增加一条 stdio 中继通道：
   Linux `lk` 把行 JSON JSON-RPC 帧经 WSL interop 管道交给 `lk.exe bridge`
@@ -70,12 +74,12 @@
 | `item.put` / `item.delete` | 写 | 新 revision |
 | `item.export` | 导出 file 条目附件（整包下载） | 名称/MIME/大小 + base64 数据 |
 | `sync.trigger` / `sync.poll` | 同步控制 | 变更摘要（不返回内容） |
-| `authz.evaluate` | 授权门判定（M2）；`channel` 枚举 `cli` \| `desktop` \| `wsl-bridge`（跨子系统桥，补充拍板 #14，审计如实记录） | 允许/拒绝 + 最小 env 集 |
-| `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`）。**仅桌面内嵌直调可提交**——socket/pipe 连接 → `channel.forbidden`（-32014）；params 含 `challenge`（`authz.request` 帧下发的一次性应答值，错值 → `accepted=false` 且条目保留；#72/#78 / 补充拍板 #16） | accepted（是否接受） |
+| `authz.evaluate` | 授权门判定（M2）；`channel` 枚举 `cli` \| `desktop` \| `wsl-bridge`（跨子系统桥，补充拍板 #14，审计如实记录）。锁定态一体化（#67/补充拍板 #19）：库锁态 + 桌面审批界面在场 → 走临时解锁+本次授权一次交互（§4.1 锁定态）；headless 锁态 → fail-closed `session.invalid` | 允许/拒绝 + 最小 env 集 |
+| `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`）。**仅桌面内嵌直调可提交**——socket/pipe 连接 → `channel.forbidden`（-32014）；params 含 `challenge`（`authz.request` 帧下发的一次性应答值，错值 → `accepted=false` 且条目保留；#72/#78 / 补充拍板 #16）；锁定态一体化待审+allowed 时含可选 `masterPassword`（守护进程临时解锁，§4.1） | accepted（是否接受） |
 | `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6） | 规则 / 规则列表 / 无 |
 | `audit.list` | 审计查询 | 事件（无密钥值） |
 | `audit.verify` | 校验审计 HMAC 链 | 已验证事件数 |
-| `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A）。来源标签：桌面壳为进程内直调订阅，socket 流连接为普通订阅——后者**不计入审批界面判定、也收不到 `authz.request` 帧**（#72/#78：帧内 challenge 是审批应答凭据，只走桌面通道） | 无 |
+| `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A）。来源标签：桌面壳为进程内直调订阅，socket 流连接为普通订阅——后者**不计入审批界面判定、也收不到 `authz.request` 帧**（#72/#78：帧内 challenge 是审批应答凭据，只走桌面通道）。**锁定态订阅**（#67）：desktop 来源允许锁态订阅（推送目标注册，桌面直调无需会话令牌；socket 订阅照旧要求有效会话），使锁态 `authz.request` 帧到达 GUI；帧无密钥值，不泄露明文 | 无 |
 
 - **最小字段原则**：IPC 响应只包含调用方被授权的最小已解密字段——例如
   `authz.evaluate` 只返回「被批准命令的 env 变量」，绝不返回整库内容
@@ -83,6 +87,22 @@
 - **错误码**：`vault.init` 的弱密码（`vault.weak_password`）与已存在库
   （`vault.exists`）错误码不同，但 UI 层统一文案不区分（防探测语义同
   §3 的 `session.invalid`）；`vault.recover` 的新主密码同策略。
+
+### 4.1 锁定态一体化审批（#67，补充拍板 #19）
+
+- **锁定态解除 + 本次授权一次交互**：库锁定 + 桌面审批界面在场时，锁态
+  `authz.evaluate` 广播 `authz.request`（帧带 `needsUnlock=true`）→ 桌面弹窗
+  同时收集主密码（身份确认）与 Allow/Deny（行为授权）；headless →
+  fail-closed `session.invalid`。详见 [authorization-gate.md](authorization-gate.md) §5.1。
+- **`authz.request` 帧扩展**：`needsUnlock`（bool）标注锁定态一体化审批（弹窗
+  须收集主密码），缺省 false。
+- **`approval.result` 扩展**：可选 `masterPassword`——仅 `needs_unlock` 待审
+  条目 + `allowed` 决策时使用并校验；守护进程以其做**临时解锁**（AuthGuard
+  限流照常），错误主密码计失败计数并以错误响应退回弹窗（条目保留可重试）。
+- **临时解锁安全边界**：允许决策后守护进程以主密码临时解锁 vault 内存态，
+  仅供本次注入解析 env + 审计签名；**不签发会话令牌 / 不写 `session.token` /
+  不置 `shared.vault`**——vault 保持锁定，临时态随 finalize 结束销毁，不产生
+  `item.*` 全量读能力（#65 配套）。
 
 ## 5. 自动锁定（D10）
 

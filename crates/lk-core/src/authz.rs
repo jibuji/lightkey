@@ -119,6 +119,10 @@ pub struct ApprovalRequest {
     pub keys: Vec<String>,
     /// 一次性审批挑战（见结构体文档；守护进程侧生成的高熵随机值 hex）。
     pub challenge: String,
+    /// 锁定态一体化（#67）：弹窗须同时收集主密码（临时解锁 + 本次授权
+    /// 一次交互）；守护进程拿到 `approval.result` 的 `masterPassword` 后
+    /// 先临时解锁再跑授权门，且不签发会话令牌。false = 常规解锁态审批。
+    pub needs_unlock: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +306,7 @@ impl ApprovalChannel for LocalApprovalChannel {
             command: req.command.clone(),
             keys: req.keys.clone(),
             challenge: req.challenge.clone(),
+            needs_unlock: req.needs_unlock,
         });
     }
 
@@ -765,6 +770,7 @@ mod tests {
             command: "npm publish".into(),
             keys: vec!["A".into()],
             challenge: "chal-xyz".into(),
+            needs_unlock: false,
         };
         // open：登记 + 广播（非阻塞）
         ch.open(&req, Instant::now() + Duration::from_secs(10));
@@ -778,6 +784,7 @@ mod tests {
                 command,
                 keys,
                 challenge,
+                needs_unlock,
             } => {
                 assert_eq!(*request_id, req.request_id);
                 assert_eq!(starter, "/bin/zsh");
@@ -786,6 +793,8 @@ mod tests {
                 assert_eq!(keys, &vec!["A".to_string()]);
                 // challenge 仅经事件通道下发（#78 方案 B）
                 assert_eq!(challenge, "chal-xyz");
+                // #67：常规（解锁态）审批不带 needs_unlock
+                assert!(!needs_unlock);
             }
             other => panic!("应广播 authz.request：{other:?}"),
         }
@@ -886,6 +895,7 @@ mod tests {
                 command: "c".into(),
                 keys: vec![],
                 challenge: String::new(),
+                needs_unlock: false,
             },
             Instant::now() + Duration::from_secs(10),
         );

@@ -122,6 +122,12 @@ pub struct Daemon {
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
 struct PendingAuthz {
     request: AuthzRequest,
+    /// 锁定态一体化（#67）：审批需先临时解锁；`temp_vault` 由
+    /// `approval.result`（正确主密码 + allowed）填充，`authz_finalize`
+    /// 消费后丢弃。**不签发会话令牌 / 不写 session.token / 不置 shared
+    /// vault**——临时解锁材料只服务本次注入（关键约束，见 issue #67）。
+    needs_unlock: bool,
+    temp_vault: Option<UnlockedVault>,
 }
 
 /// 信号处理标志（unix：SIGINT/SIGTERM 优雅退出）。
@@ -322,7 +328,7 @@ impl Daemon {
         // 持锁前提下顺序执行与 route() 相同的 phase 方法（单线程直调下锁
         // 窗口不可观察，请求/响应与主缝一致）。
         if strategy_of(&method) == ExecutionStrategy::ApprovalDeferred {
-            if !self.trigger_precheck(token.as_deref()) {
+            if !self.authz_evaluate_precheck(token.as_deref()) {
                 return rpc_string(session_invalid(id));
             }
             let resp = match self.authz_begin(id.clone(), params, peer) {
@@ -375,10 +381,22 @@ impl Daemon {
                 self.require_session(id.clone(), token, |me| me.sync_trigger_inline(id.clone()))
             }
             M_SYNC_POLL => self.require_session(id.clone(), token, |me| me.sync_poll(id.clone())),
-            // M2：通知订阅（连接转入流模式由传输层处理；此处只做会话校验）。
-            // socket 订阅仍可收 item.changed 等事件，但 `has_ui` 不计、
-            // 也收不到 authz.request 挑战帧（#72/#78，见 PushHub/Notifier）
-            M_SUBSCRIBE => self.require_session(id.clone(), token, |me| me.subscribe(id.clone())),
+            // M2：通知订阅（连接转入流模式由传输层处理；此处做会话校验）。
+            // #67（锁定态一体化）：桌面内嵌直调允许在**锁定态**建立推送流
+            // ——锁定态 inject 需要 GUI 收到 `authz.request(needsUnlock)` 并
+            // 回传 masterPassword，且 `has_ui` 判定依赖桌面订阅者在场。
+            // 桌面直调无 IPC 对端，`require_session` 会因 vault 锁定而失败；
+            // 订阅本身只注册推送目标（会话事件/挑战帧仍按来源过滤），
+            // 锁态订阅不泄露明文——帧无密钥值（桌面终态订阅由前端在
+            // 启动/解锁时重建｜#67 前端 `subscribeNotifications` 兜底）。
+            // socket 订阅仍要求有效会话（照旧）。
+            M_SUBSCRIBE => {
+                if peer.origin == PeerOrigin::Desktop {
+                    self.subscribe(id.clone())
+                } else {
+                    self.require_session(id.clone(), token, |me| me.subscribe(id.clone()))
+                }
+            }
             M_APPROVAL_RESULT => {
                 // #72/#78 方案 A：审批回传仅接受桌面内嵌直调——socket 连接
                 // 一律拒绝（专用错误码），「持令牌进程自我批准」路径闭合。
@@ -398,6 +416,11 @@ impl Daemon {
                         MSG_CHANNEL_FORBIDDEN,
                         None,
                     )
+                } else if self.approval_needs_unlock(&params) {
+                    // #67 锁定态一体化：待审条目带 needs_unlock → 锁态
+                    // 无会话令牌，跳过 require_session（桌面来源 + 一次性
+                    // challenge 已双保险，见 daemon/session.rs approval_result）
+                    self.approval_result(id.clone(), params, &caller)
                 } else {
                     self.require_session(id.clone(), token, |me| {
                         me.approval_result(id.clone(), params, &caller)
@@ -422,6 +445,39 @@ impl Daemon {
     }
 
     // -- 会话 / 生命周期 ------------------------------------------------
+
+    /// `authz.evaluate` 专用预检（#67 锁定态一体化）：解锁态 = 令牌有效；
+    /// **锁态 = 有桌面审批界面**（可弹「临时解锁+本次授权」一体化弹窗）→
+    /// 放行至 `authz_begin`（其按 vault 是否存在分派锁态路径）；锁态无
+    /// GUI → fail-closed `session.invalid`（headless，与 issue #67 一致）。
+    /// `sync.trigger` 等其他方法仍走 [`trigger_precheck`](Self::trigger_precheck)
+    /// 的严格会话校验，不受影响。
+    pub(crate) fn authz_evaluate_precheck(&self, token: Option<&[u8]>) -> bool {
+        if self.vault_peek() {
+            self.sessions.validate(token.unwrap_or(&[]))
+        } else {
+            // 锁态：无会话可言——只要桌面审批界面在，就值得让锁态 inject
+            // 进入一体化流程（headless 直接 fail-closed）
+            self.gate.approval().available()
+        }
+    }
+
+    /// `approval.result` 是否命中锁定态一体化待审条目（#67）：params 里
+    /// 的 request_id 对应一个带 `needs_unlock` 的 pending → 是。锁态无
+    /// 会话令牌，桌面来源 + 一次性 challenge 已是双重绑定，故这类回传
+    /// 跳过 `require_session`（dispatch 用）。
+    fn approval_needs_unlock(&self, params: &Value) -> bool {
+        serde_json::from_value::<ApprovalResultParams>(params.clone())
+            .ok()
+            .and_then(|p| {
+                self.pending_authz
+                    .lock()
+                    .unwrap()
+                    .get(&p.request_id)
+                    .map(|e| e.needs_unlock)
+            })
+            .unwrap_or(false)
+    }
 
     /// 需要有效会话的方法统一走这里：令牌错误/过期/未解锁 → `session.invalid`。
     fn require_session(
