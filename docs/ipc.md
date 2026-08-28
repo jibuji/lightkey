@@ -25,6 +25,10 @@
 
 ### 2.1 跨子系统 stdio 桥（补充拍板 #14，M2.75）
 
+- **CLI 按运行环境选连通目标**（判定矩阵见
+  [cross-subsystem.md](cross-subsystem.md) §7.0）：Linux `lk` 在 WSL → 连
+  Windows 主机 GUI；原生 Linux → 本地 UDS；`lk.exe` 恒走 named pipe 连
+  Windows 主机 GUI（无论 Windows 原生还是被 WSL interop 调用）。
 - 场景：WSL2 内 Linux 原生 `lk` 连接同机 Windows 桌面守护实例。WSL/Windows
   边界上 UDS 与 named pipe 互不可达，故增加一条 stdio 中继通道：
   Linux `lk` 把行 JSON JSON-RPC 帧经 WSL interop 管道交给 `lk.exe bridge`

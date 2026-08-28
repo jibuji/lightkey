@@ -69,7 +69,19 @@
   覆盖范围；平台 keychain 不可用已降级到侧写时，会在输出里标注「防篡改能力
   减弱」警告，但不影响退出码（链仍完整可证明）。
 
-## 5.1 跨子系统桥环境变量（补充拍板 #14，M2.75）
+## 5.1 跨子系统桥环境变量与 CLI 环境判定（补充拍板 #14，M2.75）
+
+**CLI 双产物与环境判定矩阵**（规格 cross-subsystem.md §7.0）：`lk`（Linux）与
+`lk.exe`（Windows）各自按**运行环境**选连通目标，而非每次手工指定：
+
+- Linux `lk`：原生 Linux → 本地 UDS 守护实例（Linux 侧 GUI 宿主）；
+  **WSL2**（osrelease 含 microsoft/wsl）→ 经 `lk.exe bridge` 连 **Windows
+  主机 GUI**（`channel=wsl-bridge`）。
+- `lk.exe`：无论 Windows 原生还是被 WSL interop 调用，均为 Windows 进程、
+  走 named pipe → 恒连 Windows 主机 GUI；从 WSL 调用的差异仅 cwd 可能为
+  UNC（`\\wsl.localhost\…`），由守护进程侧 `path_ns` 归一化承接。
+
+环境变量：
 
 - `LIGHTKEY_BRIDGE`：
   - `off` — 强制本地 daemon（逃生口）；

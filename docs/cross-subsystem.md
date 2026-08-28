@@ -146,6 +146,37 @@ Windows 侧守护实例有两种承载形态（二选一就位）；named pipe �
 
 ## 7. 详细设计
 
+### 7.0 环境判定矩阵（CLI 按运行环境选通行目标）
+
+LightKey 客户端二进制分 Linux 产物（`lk`）与 Windows 产物（`lk.exe`）。二者的
+**传输后端选择（连哪个 GUI）由运行环境决定**，而非由用户在每次调用时手工指定
+（显式 `LIGHTKEY_BRIDGE` 仅作逃生口/强制口，见 §7.2）。判定矩阵：
+
+| 产物 | 运行环境 | 判定依据 | 连通目标 |
+|------|----------|----------|----------|
+| Linux `lk` | 原生 Linux（非 WSL） | `wsl` 探测（osrelease 无 microsoft/wsl） | 本地 UDS 守护实例（Linux 侧 GUI 的宿主；见下「无 Linux GUI 时的为现状」） |
+| Linux `lk` | **WSL2**（`/proc/sys/fs/binfmt_misc/WSLInterop` 存在 + osrelease 含 microsoft/wsl） | detect_wsl + probe → `lk.exe bridge` | **Windows 主机 GUI**（`channel=wsl-bridge`） |
+| `lk.exe` | Windows 原生主机 | 恒 `Local`（named pipe） | Windows 主机 GUI |
+| `lk.exe` | **从 WSL 内经 interop 调用** | 恒 `Local`（named pipe） | Windows 主机 GUI（同一主机；见下「为什么不需特判」） |
+
+**关键判据**：
+
+- **Linux `lk` 的 WSL 判定** = `wsl` 探测（osrelease 含 `microsoft`/`wsl`），
+  与 `WSLInterop` 可用性**解耦**（企业策略禁用 interop 时仍能给出「装了但
+  连不上」的明确报错，而非静默落入本地——§7.2 探测失败分型）。
+- **`lk.exe` 从 WSL 经 interop 调用**：`lk.exe` 是 Windows 进程，进程上下文在
+  Windows 主机，其传输（named pipe）与本地仓库解析天然落在 Windows 侧，
+  因此**无需特判「是否从 WSL 而来」**——无论由 Windows 终端直接执行还是由
+  WSL interop 发出，它连的都是同一 Windows 主机 GUI。唯一环境差异是
+  继承的 cwd 可能为 UNC（`\\wsl.localhost\…`），该差异由守护进程侧的
+  `path_ns::canonical_project_dir` 归一化（§7.4）承接，不在 CLI 层特判。
+- **无 Linux GUI 时的为现状**：当前产品交付的桌面 GUI 为 **Windows 专属**
+  （Tauri 壳，`lk-app.exe`）。Linux 原生环境下暂**没有**独立的 Linux GUI，
+  因此 Linux `lk` 在原生 Linux 下连的是本地 **UDS 守护实例**（由 `ensure_daemon()`
+  自动拉起）——这正是未来 Linux GUI 的宿主；若未来落地 Linux GUI，它将以与
+  Windows 桌面端相同的 `serve_embedded` 内嵌该守护实例，本判定矩阵无需改动
+  （仍是「Linux 原生 → 本地 UDS」）。
+
 ### 7.1 `lk.exe bridge` 子命令（Windows 侧中继）
 
 - 形态：`lk.exe bridge --dir <数据目录>`（默认目录解析复用 `dirs::data_dir`）。
