@@ -91,6 +91,8 @@ pub enum VaultEvent {
     /// `needs_unlock`（#67）：锁定态一体化审批——弹窗须同时提供主密码
     /// 输入（身份确认）与 Allow/Deny（行为授权）；守护进程以主密码做
     /// **临时解锁**（仅本次注入可用，不签发会话令牌）。
+    /// `kind` / `export_meta`（M2.9 值披露）：审批类型（弹窗按形态渲染）
+    /// 与 export 数据包规模元信息（仅 export 审批有值）。
     AuthzRequest {
         request_id: uuid::Uuid,
         starter: String,
@@ -99,6 +101,8 @@ pub enum VaultEvent {
         keys: Vec<String>,
         challenge: String,
         needs_unlock: bool,
+        kind: crate::authz::ApprovalKind,
+        export_meta: Option<crate::authz::ExportMeta>,
     },
 }
 
@@ -264,6 +268,8 @@ mod tests {
                 keys: vec!["NPM_TOKEN".into()],
                 challenge: "chal".into(),
                 needs_unlock: false,
+                kind: crate::authz::ApprovalKind::Inject,
+                export_meta: None,
             }
             .name(),
             "authz.request"

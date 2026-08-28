@@ -416,6 +416,16 @@ impl ItemDraft {
 // 授权规则（M2；authorization-gate.md §4）
 // ---------------------------------------------------------------------------
 
+/// 规则能力类型：注入（默认；值披露裁决前的既有语义，spec value-disclosure §4）。
+pub const RULE_CAPABILITY_INJECT: &str = "inject";
+/// 规则能力类型：读值（M2.9 值披露；授权 socket 通道按名读条目）。
+pub const RULE_CAPABILITY_READ: &str = "read";
+
+/// 读规则 `capability` 的 serde 缺省（既有规则密文无该字段 → inject，无迁移）。
+fn default_rule_capability() -> String {
+    RULE_CAPABILITY_INJECT.to_string()
+}
+
 /// 授权门白名单规则（`docs/authorization-gate.md` §4，字段含 `name`——决策 #6）。
 ///
 /// - 落盘：`{uuid}.rule.lk`，K_data 密封（[`SealType::Rule`](crate::crypto::SealType::Rule)）；
@@ -423,6 +433,10 @@ impl ItemDraft {
 /// - 规则体内无 `revision`（规格字段集），修订号只在索引（[`IndexEntry`]）内；
 /// - 唯一写入路径：`lk rule add`（CLI）+ 桌面规则管理页（M2 desktop）；
 ///   不开放手动改加密文件；规则变更写审计。
+///
+/// M2.9 值披露（value-disclosure.md §4）：`capability` 区分注入/读值，
+/// **能力不互授**——inject 规则不授权读，read 规则不授权注入；带 serde
+/// 缺省，既有规则密文反序列化不受影响。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
@@ -432,9 +446,14 @@ pub struct Rule {
     /// 规则名（决策 #6；与前端 AuthRule.name 对齐）。
     pub name: String,
     /// 具名命令，可 glob（如 `npm publish` 精确、`npm *` 通配；大小写敏感）。
+    /// capability=read 时为空串（读规则无命令绑定）。
     pub command: String,
-    /// 授权注入的 key 名（最小集合）。
+    /// 授权注入的 key 名（最小集合）；capability=read 时语义为**可读条目名**
+    /// （精确匹配，不做通配）。
     pub keys: Vec<String>,
+    /// 规则能力类型：inject（注入，默认）| read（读值）。
+    #[serde(default = "default_rule_capability")]
+    pub capability: String,
     /// 创建时间（ISO-8601 UTC；替换时保留）。
     pub created: String,
 }
@@ -447,6 +466,9 @@ pub struct RuleDraft {
     pub name: String,
     pub command: String,
     pub keys: Vec<String>,
+    /// 规则能力类型（inject | read；缺省 inject，见 [`Rule::capability`] 语义）。
+    #[serde(default = "default_rule_capability")]
+    pub capability: String,
 }
 
 impl Rule {
@@ -467,6 +489,7 @@ impl Rule {
             name: draft.name,
             command: draft.command,
             keys: draft.keys,
+            capability: draft.capability,
             created,
         }
     }
@@ -696,5 +719,40 @@ mod tests {
         );
         let back: AttachmentMeta = serde_json::from_value(v).unwrap();
         assert_eq!(back, meta);
+    }
+
+    // -- M2.9 值披露（补充拍板 #20）：Rule.capability ----------------------
+
+    /// 既有规则密文（无 capability 字段）反序列化 → inject，无迁移。
+    #[test]
+    fn rule_legacy_json_without_capability_parses_as_inject() {
+        let legacy = serde_json::json!({
+            "id": Uuid::nil(),
+            "projectDir": "/proj",
+            "name": "publish",
+            "command": "npm *",
+            "keys": ["NPM_TOKEN"],
+            "created": "2026-01-01T00:00:00.000000Z",
+        });
+        let rule: Rule = serde_json::from_value(legacy).unwrap();
+        assert_eq!(rule.capability, RULE_CAPABILITY_INJECT);
+    }
+
+    /// capability 读写往返：read 规则密封/解密封后保持 read。
+    #[test]
+    fn rule_capability_roundtrip_through_plaintext() {
+        let rule = Rule {
+            id: Uuid::new_v4(),
+            project_dir: "/proj".into(),
+            name: "read-config".into(),
+            command: String::new(),
+            keys: vec!["DATABASE_URL".into()],
+            capability: RULE_CAPABILITY_READ.into(),
+            created: rev(),
+        };
+        let bytes = rule.to_plaintext().unwrap();
+        let back = Rule::from_plaintext(&bytes).unwrap();
+        assert_eq!(back, rule);
+        assert_eq!(back.capability, RULE_CAPABILITY_READ);
     }
 }

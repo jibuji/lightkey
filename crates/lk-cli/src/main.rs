@@ -38,7 +38,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use client::{RpcClient, RpcError};
-use lk_core::ipc::{M_AUTHZ_EVALUATE, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE};
+use lk_core::ipc::{
+    M_AUTHZ_EVALUATE, M_ITEM_EXPORT, M_ITEM_GET, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE,
+};
 use lk_core::model::ItemDraft;
 use serde_json::{json, Value};
 
@@ -164,17 +166,31 @@ struct RuleArgs {
 #[derive(Subcommand)]
 enum RuleCommand {
     /// 新增白名单规则（入库加密；projectDir 规范化后入库）
+    ///
+    /// 注入规则：`lk rule add <projectDir> <command> --name <name> <keys...>`
+    /// 读值规则（M2.9）：`lk rule add <projectDir> --read --name <name> --keys <name...>`
+    /// （读规则无 command 绑定，keys 经 `--keys` 选项给出——位置 keys 会被
+    /// 可选的 `<command>` 占位吞掉，选项形态与 `lk inject --keys` 一致）
     Add {
         /// 项目目录（规范化绝对路径；须存在。以 / 开头且非现存本机路径时
         /// 按 WSL 默认发行版解析为 wsl://… 并回显确认）
         project_dir: String,
-        /// 具名命令（可 glob，如 "npm *"；含空格需引号）
-        command: String,
+        /// 具名命令（可 glob，如 "npm *"；含空格需引号）；--read 时省略
+        command: Option<String>,
         /// 规则名（如 publish）
         #[arg(long)]
         name: String,
-        /// 授权注入的 key 名（1~32 个；值不可见、名可指名）
+        /// 读值规则（M2.9 值披露）：授权该项目目录按 key 名读取条目值
+        /// （keys=条目名精确匹配）；不带命令绑定，与注入能力互不授权
+        #[arg(long)]
+        read: bool,
+        /// 授权注入的 key 名（1~32 个；值不可见、名可指名）；--read 时
+        /// 语义为可读条目名
         keys: Vec<String>,
+        /// 读值规则的 key 名列表（`--read` 时使用，与 `lk inject --keys`
+        /// 同形态；`--read` 时忽略位置 keys）
+        #[arg(long = "keys", num_args = 1.., value_name = "NAME", requires = "read")]
+        read_keys: Vec<String>,
     },
     /// 列出规则（最小字段）
     List,
@@ -400,6 +416,11 @@ fn rpc_fail_text(err: &RpcError) -> String {
         ),
         RpcError::VaultInvalid => "解锁失败：主密码错误或库未初始化".to_string(),
         RpcError::SessionInvalid => "库未解锁或会话已失效，请先运行 lk unlock".to_string(),
+        // M2.9 值披露（spec §7）：读/导出被授权门拒绝的统一文案
+        RpcError::AuthzDenied => {
+            "读取被授权门拒绝（无规则且未批准/超时）；可用 `lk rule add --read` 为该项目目录预授权"
+                .to_string()
+        }
         RpcError::ItemConflict => {
             "条目已被其他设备修改（CAS 冲突），请刷新后重试".to_string()
         }
@@ -517,7 +538,7 @@ fn rpc_via_bridge(
     // （客户端硬编码的 "cli" 在此路径被覆写；其余方法无 channel 字段，不动）。
     if matches!(
         method,
-        M_AUTHZ_EVALUATE | M_RULE_ADD | M_RULE_LIST | M_RULE_REMOVE
+        M_AUTHZ_EVALUATE | M_RULE_ADD | M_RULE_LIST | M_RULE_REMOVE | M_ITEM_GET | M_ITEM_EXPORT
     ) {
         params["channel"] = json!("wsl-bridge");
     }
@@ -1670,8 +1691,51 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
             project_dir,
             command,
             name,
+            read,
             keys,
-        } => cmd_rule_add(out, dir, project_dir, name, command, keys, json_out),
+            read_keys,
+        } => {
+            let capability = if *read { Some("read") } else { None };
+            // --read：keys 经 --keys 选项（位置 keys 被可选 <command> 占位，
+            // 无 command 可省略）；注入规则：keys 位置参数
+            if *read {
+                if !keys.is_empty() {
+                    eprintln!("lk rule add: --read 规则的 key 名请经 --keys <name...> 给出（位置参数留给 <command>）");
+                    return 2;
+                }
+                if read_keys.is_empty() {
+                    eprintln!("lk rule add: --read 需要 --keys <name...> 指名可读条目名");
+                    return 2;
+                }
+                cmd_rule_add(
+                    out,
+                    dir,
+                    project_dir,
+                    name,
+                    command.clone(),
+                    read_keys,
+                    capability,
+                    json_out,
+                )
+            } else {
+                if !read_keys.is_empty() {
+                    eprintln!(
+                        "lk rule add: --keys 仅配合 --read 使用（注入规则的 key 名用位置参数）"
+                    );
+                    return 2;
+                }
+                cmd_rule_add(
+                    out,
+                    dir,
+                    project_dir,
+                    name,
+                    command.clone(),
+                    keys,
+                    capability,
+                    json_out,
+                )
+            }
+        }
         RuleCommand::List => cmd_rule_list(out, dir, json_out),
         RuleCommand::Remove { id } => cmd_rule_remove(out, dir, id, json_out),
     }
@@ -1687,13 +1751,15 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
 /// - bridge 后端下解析出的 POSIX 绝对路径折算并回显确认：drvfs 目录
 ///   （/mnt/<盘>/…）→ Windows 绝对路径形态（与运行时 cwd 同命名空间）；
 ///   其余 → `wsl://<默认发行版>/…`。
+#[allow(clippy::too_many_arguments)]
 fn cmd_rule_add(
     out: &mut impl Write,
     dir: &std::path::Path,
     project_dir: &str,
     name: &str,
-    command: &str,
+    command: Option<String>,
     keys: &[String],
+    capability: Option<&str>,
     json_out: bool,
 ) -> i32 {
     use std::io::IsTerminal;
@@ -1701,6 +1767,25 @@ fn cmd_rule_add(
         eprintln!("lk rule add: 至少需要 1 个 key 名（值不可见、名可指名）");
         return 2;
     }
+    // --read（读值规则）：command 位置参数省略，以空串入库（spec §4/§7）；
+    // 注入规则：command 必填
+    let is_read = capability == Some("read");
+    let command_owned: String = if is_read {
+        if command.is_some() {
+            eprintln!("lk rule add: --read 规则不绑定命令，请省略 <command> 位置参数");
+            return 2;
+        }
+        String::new()
+    } else {
+        match command.as_deref() {
+            Some(c) => c.to_string(),
+            None => {
+                eprintln!("lk rule add: 需要 <command> 位置参数（注入规则绑定具名命令；读值规则用 --read）");
+                return 2;
+            }
+        }
+    };
+    let command: &str = command_owned.as_str();
     // 显式 `wsl://<distro>/...` 规范形直接采用（守护进程侧校验形态合法性）——
     // 本函数在默认发行版解析被拒时给出的重试指引就是该形态，必须可用。
     // bridge 后端下显式 Windows 绝对路径（X:\… / X:/…）同样直通：跳过本地
@@ -1759,7 +1844,7 @@ fn cmd_rule_add(
             },
         };
     }
-    match client_for(dir).rule_add(&canonical, name, command, keys) {
+    match client_for(dir).rule_add(&canonical, name, command, keys, capability) {
         Ok(rule) => {
             if json_out {
                 let _ = writeln!(
@@ -1955,16 +2040,17 @@ fn cmd_rule_list(out: &mut impl Write, dir: &std::path::Path, json_out: bool) ->
                 );
             } else {
                 if rules.is_empty() {
-                    let _ = writeln!(out, "（无规则。lk rule add <projectDir> <command> --name <name> <keys...> 添加）");
+                    let _ = writeln!(out, "（无规则。lk rule add <projectDir> <command> --name <name> <keys...> 添加；读值规则用 --read）");
                 }
                 for r in &rules {
                     let _ = writeln!(
                         out,
-                        "{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t[{}]\t{}",
                         r.id,
                         r.name,
                         r.project_dir,
                         r.command,
+                        r.capability,
                         r.keys.join(",")
                     );
                 }

@@ -22,12 +22,12 @@ use std::collections::BTreeMap;
 
 use lk_core::audit::AuditEvent;
 use lk_core::ipc::{
-    RpcResponse, ERR_ITEM_CONFLICT, ERR_ITEM_NOT_FOUND, ERR_LIMIT, ERR_PARSE, ERR_RATE_LIMITED,
-    ERR_SESSION_INVALID, ERR_SYNC_ANOMALY, ERR_SYNC_CREDENTIALS, ERR_SYNC_NOT_CONFIGURED,
-    ERR_SYNC_STORAGE, ERR_VAULT_EXISTS, ERR_VAULT_INVALID, ERR_WEAK_PASSWORD, M_AUDIT_LIST,
-    M_AUDIT_VERIFY, M_AUTHZ_EVALUATE, M_ITEM_DELETE, M_ITEM_EXPORT, M_ITEM_GET, M_ITEM_LIST,
-    M_ITEM_PUT, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE, M_SYNC_TRIGGER, M_VAULT_INIT, M_VAULT_LOCK,
-    M_VAULT_RECOVER, M_VAULT_STATUS, M_VAULT_UNLOCK,
+    RpcResponse, ERR_AUTHZ_DENIED, ERR_ITEM_CONFLICT, ERR_ITEM_NOT_FOUND, ERR_LIMIT, ERR_PARSE,
+    ERR_RATE_LIMITED, ERR_SESSION_INVALID, ERR_SYNC_ANOMALY, ERR_SYNC_CREDENTIALS,
+    ERR_SYNC_NOT_CONFIGURED, ERR_SYNC_STORAGE, ERR_VAULT_EXISTS, ERR_VAULT_INVALID,
+    ERR_WEAK_PASSWORD, M_AUDIT_LIST, M_AUDIT_VERIFY, M_AUTHZ_EVALUATE, M_ITEM_DELETE,
+    M_ITEM_EXPORT, M_ITEM_GET, M_ITEM_LIST, M_ITEM_PUT, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE,
+    M_SYNC_TRIGGER, M_VAULT_INIT, M_VAULT_LOCK, M_VAULT_RECOVER, M_VAULT_STATUS, M_VAULT_UNLOCK,
 };
 use lk_core::model::{Item, ItemDraft, ItemSummary, Rule};
 use lk_core::sync::SyncSummary;
@@ -51,6 +51,9 @@ pub enum RpcError {
     VaultInvalid,
     /// 库未解锁或会话已失效（统一，防探测）。
     SessionInvalid,
+    /// 值披露裁决拒绝（M2.9：读/导出未命中规则且未批准/超时/无 UI；
+    /// 统一不区分原因防探测，spec value-disclosure §5.4/§7）。
+    AuthzDenied,
     /// CAS 冲突（base revision 过期）。
     ItemConflict,
     ItemNotFound,
@@ -110,6 +113,7 @@ impl RpcError {
         match code {
             ERR_VAULT_INVALID => RpcError::VaultInvalid,
             ERR_SESSION_INVALID => RpcError::SessionInvalid,
+            ERR_AUTHZ_DENIED => RpcError::AuthzDenied,
             ERR_ITEM_CONFLICT => RpcError::ItemConflict,
             ERR_ITEM_NOT_FOUND => RpcError::ItemNotFound,
             ERR_LIMIT => RpcError::Limit { detail },
@@ -380,29 +384,36 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
 
     /// `rule.add` → 入库规则。daemon 返回的 rule 体无法解析时兜底合成
     /// （nil id + 请求参数回填），与重构前行为逐字一致。
+    /// `rule.add` → 入库规则。`capability`：`Some("read")` = 读值规则
+    /// （M2.9，`--read`）；`None` = 注入规则（不带 capability 字段，老
+    /// 守护进程兼容）。daemon 返回的 rule 体无法解析时兜底合成
+    /// （nil id + 请求参数回填），与重构前行为逐字一致。
     pub fn rule_add(
         &mut self,
         project_dir: &str,
         name: &str,
         command: &str,
         keys: &[String],
+        capability: Option<&str>,
     ) -> Result<Rule, RpcError> {
-        let res = self.call(
-            M_RULE_ADD,
-            json!({
-                "projectDir": project_dir,
-                "name": name,
-                "command": command,
-                "keys": keys,
-                "channel": "cli",
-            }),
-        )?;
+        let mut params = json!({
+            "projectDir": project_dir,
+            "name": name,
+            "command": command,
+            "keys": keys,
+            "channel": "cli",
+        });
+        if let Some(cap) = capability {
+            params["capability"] = json!(cap);
+        }
+        let res = self.call(M_RULE_ADD, params)?;
         let fallback = Rule {
             id: uuid::Uuid::nil(),
             project_dir: project_dir.to_string(),
             name: name.to_string(),
             command: command.to_string(),
             keys: keys.to_vec(),
+            capability: lk_core::model::RULE_CAPABILITY_INJECT.into(),
             created: String::new(),
         };
         Ok(serde_json::from_value(res["rule"].clone()).unwrap_or(fallback))
@@ -700,18 +711,50 @@ mod tests {
         });
         let mut c = ok_client(&rec, json!({ "rule": rule }));
         let got = c
-            .rule_add("/p", "publish", "npm publish", &["T".to_string()])
+            .rule_add("/p", "publish", "npm publish", &["T".to_string()], None)
             .unwrap();
         assert_eq!(got.id.to_string(), "00000000-0000-0000-0000-000000000002");
 
         let rec = Recorder::default();
         let mut c = ok_client(&rec, json!({}));
         let got = c
-            .rule_add("/p", "publish", "npm publish", &["T".to_string()])
+            .rule_add("/p", "publish", "npm publish", &["T".to_string()], None)
             .unwrap();
         assert_eq!(got.id, uuid::Uuid::nil());
         assert_eq!(got.project_dir, "/p");
         assert_eq!(got.keys, vec!["T".to_string()]);
+    }
+
+    /// rule.add 参数形状（M2.9 值披露）：read 规则带 capability=read 且
+    /// command 为空串；inject 规则省略 capability 字段（老守护进程兼容）。
+    #[test]
+    fn rule_add_capability_params_shape() {
+        let rec = Recorder::default();
+        let mut c = ok_client(&rec, json!({ "rule": {} }));
+        // 读规则：--read → capability=read，command 空串
+        c.rule_add(
+            "/p",
+            "read-config",
+            "",
+            &["APIKey".to_string()],
+            Some("read"),
+        )
+        .unwrap();
+        assert_eq!(rec.last().0, "rule.add");
+        assert_eq!(
+            rec.last().1,
+            json!({ "projectDir": "/p", "name": "read-config", "command": "",
+                    "keys": ["APIKey"], "capability": "read", "channel": "cli" })
+        );
+        // 注入规则：无 capability 字段（缺省 inject，向后兼容）
+        let rec = Recorder::default();
+        let mut c = ok_client(&rec, json!({ "rule": {} }));
+        c.rule_add("/p", "publish", "npm *", &["T".to_string()], None)
+            .unwrap();
+        assert!(
+            rec.last().1.get("capability").is_none(),
+            "inject 规则不携带 capability 字段"
+        );
     }
 
     // ------------------------- 错误分类 -------------------------
@@ -738,6 +781,11 @@ mod tests {
             RpcError::ItemNotFound
         ));
         assert!(matches!(cls(ERR_VAULT_EXISTS, None), RpcError::VaultExists));
+        // M2.9 值披露：authz.denied → 专用变体（CLI 拒绝文案路由用）
+        assert!(matches!(
+            cls(lk_core::ipc::ERR_AUTHZ_DENIED, None),
+            RpcError::AuthzDenied
+        ));
         assert!(matches!(
             cls(ERR_WEAK_PASSWORD, None),
             RpcError::WeakPassword

@@ -95,6 +95,8 @@ impl Daemon {
                 keys: req.keys.clone(),
                 challenge: challenge.clone(),
                 needs_unlock: true,
+                kind: lk_core::authz::ApprovalKind::Inject,
+                export_meta: None,
             };
             self.gate.approval().open(&areq, expires_at);
             self.pending_authz.lock().unwrap().insert(
@@ -173,6 +175,8 @@ impl Daemon {
                     keys: req.keys.clone(),
                     challenge: challenge.clone(),
                     needs_unlock: false,
+                    kind: lk_core::authz::ApprovalKind::Inject,
+                    export_meta: None,
                 };
                 self.gate.approval().open(&areq, expires_at);
                 self.pending_authz.lock().unwrap().insert(

@@ -255,9 +255,17 @@ export class MockAdapter implements LightKeyIpc {
   async ruleAdd(input: RuleInput): Promise<AuthRule> {
     this.requireUnlocked();
     // 对齐真实守护进程校验：目录须为绝对路径（浏览器无文件系统，「存在」
-    // 只能由真实侧判定；mock 至少拦截相对路径，保证前端 invalid 分支可达）
+    // 只能由真实侧判定；mock 至少拦截相对路径，保证前端 invalid 分支可达）。
+    // capability 感知（M2.9）：read 规则 command 恒为空串（不绑定命令）
     const isAbsolute = /^([a-zA-Z]:[\\/]|\/)/.test(input.projectDir);
-    if (!input.projectDir || !isAbsolute || !input.name || !input.command || !input.keys.length) {
+    const isRead = input.capability === "read";
+    if (
+      !input.projectDir ||
+      !isAbsolute ||
+      !input.name ||
+      !input.keys.length ||
+      (isRead ? !!input.command : !input.command)
+    ) {
       return delayReject(new Error("invalid params"));
     }
     const rule: AuthRule = {
@@ -342,7 +350,8 @@ export class MockAdapter implements LightKeyIpc {
   /** 模拟守护进程推送 authz.request 帧（审批弹窗演示/测试入口）。
    *  `challenge` 缺省给固定值（mock 不校验，仅透传给弹窗回传）。
    *  `needsUnlock`（#67）：锁定态一体化——弹窗须收集主密码；见
-   *  `unlockApprovals`。 */
+   *  `unlockApprovals`。`kind` / `exportMeta`（M2.9 值披露）：审批类型
+   *  与 export 数据包规模元信息。 */
   simulateAuthzRequest(params: {
     requestId: string;
     starter: string;
@@ -351,6 +360,8 @@ export class MockAdapter implements LightKeyIpc {
     keys: string[];
     challenge?: string;
     needsUnlock?: boolean;
+    kind?: "inject" | "read" | "export";
+    exportMeta?: { name: string; mime: string; size: number } | null;
   }): void {
     this.pendingApprovals.add(params.requestId);
     if (params.needsUnlock) {

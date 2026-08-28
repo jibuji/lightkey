@@ -73,10 +73,12 @@ export interface AuthRule {
   /** 规范化绝对路径（守护进程侧 canonicalize）。 */
   projectDir: string;
   name: string;
-  /** 具名命令（可 glob）。 */
+  /** 具名命令（可 glob）；read 规则（M2.9 值披露）为空串。 */
   command: string;
-  /** 授权注入的 key 名（最小集合）。 */
+  /** 授权注入的 key 名（最小集合）；read 规则语义为可读条目名。 */
   keys: string[];
+  /** 规则能力类型（M2.9 值披露）：inject | read；旧守护进程缺省。 */
+  capability?: string;
   /** 创建时间（ISO-8601 UTC）。 */
   created: string;
 }
@@ -87,6 +89,9 @@ export interface RuleInput {
   name: string;
   command: string;
   keys: string[];
+  /** 规则能力类型（M2.9 值披露）：inject（注入，缺省）| read（读值，
+   *  read 规则 command 恒为空串、keys=可读条目名）。 */
+  capability?: "inject" | "read";
 }
 
 export type AuditResult = "allowed" | "denied" | "timeout";

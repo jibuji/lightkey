@@ -5,8 +5,10 @@
 # 场景：init → unlock → item add secret（NPM_TOKEN）→ rule add/list →
 #       inject 规则命中（env 只含被授权 key、值只进子进程）→ inject 未命中
 #       （headless 无审批界面 → 立即拒绝，非零退出码）→ inject 伪造 cwd 参数
-#       → 拒绝 → audit 留痕（allowed/denied，无密钥值）→ rule remove → 删除
-#       生效 + 审计。
+#       → 拒绝 → audit 留痕（allowed/denied，无密钥值）→ 值披露（M2.9，
+#       docs/value-disclosure.md）：无规则 item get → authz.denied 拒绝、
+#       rule add --read 后静默放行、item export 恒弹窗（headless 拒绝）→
+#       rule remove → 删除生效 + 审计。
 #
 # 用法：bash scripts/e2e_m2.sh [lk-binary-path]
 set -u
@@ -37,8 +39,9 @@ echo "$MASTER_PW" | "$LK" unlock --stdin >/dev/null 2>&1
 check "unlock" 0 $?
 
 echo "== 2. secret 条目（key 名 → 值；值不可见、名可指名）=="
-"$LK" item add secret --name NPM_TOKEN --value "$SECRET_VALUE" --purpose 测试 >/dev/null
+SECRET_ID="$("$LK" item add secret --name NPM_TOKEN --value "$SECRET_VALUE" --purpose 测试 | awk '{print $2}')"
 check "add secret NPM_TOKEN" 0 $?
+[ -n "$SECRET_ID" ] && ok "拿到条目 id" || bad "item add 未回传 id"
 
 echo "== 3. rule add / list =="
 "$LK" rule add "$PROJ" "npm *" --name publish NPM_TOKEN >/dev/null
@@ -99,7 +102,44 @@ fi
 "$LK" audit --verify >/dev/null 2>&1
 check "审计 HMAC 链校验通过" 0 $?
 
-echo "== 8. rule remove =="
+echo "== 8. 值披露（M2.9）：headless 无规则 item get → authz.denied 拒绝 =="
+( cd "$PROJ" && "$LK" item get "$SECRET_ID" >/dev/null 2>"$WORK/get.err" )
+check "无规则 item get 拒绝（exit 1）" 1 $?
+if grep -q "授权门拒绝" "$WORK/get.err"; then
+  ok "拒绝文案提示 rule add --read 预授权"
+else
+  bad "拒绝文案不符：$(cat "$WORK/get.err")"
+fi
+
+echo "== 9. 值披露：rule add --read 后 item get 静默放行 =="
+"$LK" rule add "$PROJ" --read --name read-token --keys NPM_TOKEN >/dev/null
+check "rule add --read" 0 $?
+GET_OUT="$(cd "$PROJ" && "$LK" item get "$SECRET_ID" --json 2>/dev/null | jq -r .value)"
+if [ "$GET_OUT" = "$SECRET_VALUE" ]; then
+  ok "读规则命中 → 静默放行（不弹窗返回明文值）"
+else
+  bad "读规则未放行或值不符：$GET_OUT"
+fi
+"$LK" rule list | grep -q "\[read\]" && ok "rule list 展示 [read] 能力" || bad "rule list 缺 capability 列"
+
+echo "== 10. 值披露：item export 恒弹窗 → headless 拒绝（读规则不豁免）=="
+( cd "$PROJ" && "$LK" item export "$SECRET_ID" -o "$WORK/out.bin" >/dev/null 2>"$WORK/export.err" )
+check "export headless 拒绝（exit 1）" 1 $?
+if grep -q "授权门拒绝" "$WORK/export.err"; then
+  ok "export 被授权门拒绝（恒弹窗，规则不豁免）"
+else
+  bad "export 拒绝文案不符：$(cat "$WORK/export.err")"
+fi
+
+echo "== 11. 值披露审计：item.get allowed/denied 留痕 =="
+GET_ALLOWED=$("$LK" audit --json | jq '[.[] | select(.command == "item.get") | select(.result == "allowed")] | length')
+[ "${GET_ALLOWED:-0}" -ge 1 ] && ok "审计含 item.get allowed（规则命中）" || bad "审计缺 item.get allowed"
+GET_DENIED=$("$LK" audit --json | jq '[.[] | select(.command == "item.get") | select(.result == "denied")] | length')
+[ "${GET_DENIED:-0}" -ge 1 ] && ok "审计含 item.get denied（无规则拒绝）" || bad "审计缺 item.get denied"
+EXPORT_DENIED=$("$LK" audit --json | jq '[.[] | select(.command == "item.export") | select(.result == "denied")] | length')
+[ "${EXPORT_DENIED:-0}" -ge 1 ] && ok "审计含 item.export denied" || bad "审计缺 item.export denied"
+
+echo "== 12. rule remove =="
 RULE_ID="$("$LK" rule list | awk '/publish/{print $1}')"
 "$LK" rule remove "$RULE_ID" >/dev/null
 check "rule remove" 0 $?

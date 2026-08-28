@@ -35,6 +35,7 @@ use crate::router::{strategy_of, ExecutionStrategy};
 use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 
 use self::authz::AuthzBegin;
+use self::disclosure::PendingDisclosure;
 use self::lifecycle::{install_shutdown_handlers, load_config};
 
 /// 会话令牌文件名（0600；CLI 进程间传递，锁定即删除）。
@@ -117,6 +118,8 @@ pub struct Daemon {
     gate: AuthzGate,
     /// 进行中的授权判定（第 3 层等待期间持有；request_id → 请求原文）。
     pending_authz: Mutex<HashMap<uuid::Uuid, PendingAuthz>>,
+    /// 进行中的值披露审批（M2.9；request_id → 条目/方法/归因）。
+    pending_disclosure: Mutex<HashMap<uuid::Uuid, PendingDisclosure>>,
 }
 
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
@@ -182,6 +185,7 @@ impl Daemon {
             core,
             gate,
             pending_authz: Mutex::new(HashMap::new()),
+            pending_disclosure: Mutex::new(HashMap::new()),
         };
         // 启动自检：锚点 vs 链（截断检测，无需 K_audit），置 `anchor_ok`。
         daemon.anchor_selfcheck();
@@ -328,14 +332,32 @@ impl Daemon {
         // 持锁前提下顺序执行与 route() 相同的 phase 方法（单线程直调下锁
         // 窗口不可观察，请求/响应与主缝一致）。
         if strategy_of(&method) == ExecutionStrategy::ApprovalDeferred {
-            if !self.authz_evaluate_precheck(token.as_deref()) {
+            if method == M_AUTHZ_EVALUATE {
+                if !self.authz_evaluate_precheck(token.as_deref()) {
+                    return rpc_string(session_invalid(id));
+                }
+                let resp = match self.authz_begin(id.clone(), params, peer) {
+                    AuthzBegin::Final(resp) => resp,
+                    AuthzBegin::Pending { request_id, .. } => {
+                        let decision = self.shared.approvals.await_decision(request_id);
+                        let r = self.authz_finalize(id.clone(), request_id, decision);
+                        self.touch_activity();
+                        r
+                    }
+                };
+                return resp;
+            }
+            // M2.9 值披露（`item.get` / `item.export`）：锁态先失败
+            // （session.invalid，spec §3——读通道不做解锁一体化）；desktop
+            // 直调受信豁免在 begin 内直返。
+            if !self.disclosure_precheck(token.as_deref()) {
                 return rpc_string(session_invalid(id));
             }
-            let resp = match self.authz_begin(id.clone(), params, peer) {
-                AuthzBegin::Final(resp) => resp,
-                AuthzBegin::Pending { request_id, .. } => {
+            let resp = match self.disclosure_begin(id.clone(), &method, params, peer) {
+                disclosure::DisclosureBegin::Final(resp) => resp,
+                disclosure::DisclosureBegin::Pending { request_id } => {
                     let decision = self.shared.approvals.await_decision(request_id);
-                    let r = self.authz_finalize(id.clone(), request_id, decision);
+                    let r = self.disclosure_finalize(id, request_id, decision);
                     self.touch_activity();
                     r
                 }
@@ -357,17 +379,13 @@ impl Daemon {
             M_ITEM_LIST => {
                 self.require_session(id.clone(), token, |me| me.item_list(id.clone(), &caller))
             }
-            M_ITEM_GET => self.require_session(id.clone(), token, |me| {
-                me.item_get(id.clone(), params, &caller)
-            }),
+            // M_ITEM_GET / M_ITEM_EXPORT = ApprovalDeferred 策略（M2.9 值披露
+            // 裁决，见 dispatch 开头的策略分派与 daemon/disclosure.rs）
             M_ITEM_PUT => self.require_session(id.clone(), token, |me| {
                 me.item_put(id.clone(), params, &caller)
             }),
             M_ITEM_DELETE => self.require_session(id.clone(), token, |me| {
                 me.item_delete(id.clone(), params, &caller)
-            }),
-            M_ITEM_EXPORT => self.require_session(id.clone(), token, |me| {
-                me.item_export(id.clone(), params, &caller)
             }),
             M_AUDIT_LIST => self.require_session(id.clone(), token, |me| {
                 me.audit_list(id.clone(), params, &caller)
@@ -631,6 +649,7 @@ pub(crate) fn extract_token(params: &Value) -> Option<Vec<u8>> {
 }
 
 pub(crate) mod authz;
+pub(crate) mod disclosure;
 mod items;
 pub(crate) mod lifecycle;
 mod rules;

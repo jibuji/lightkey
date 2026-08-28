@@ -104,12 +104,36 @@ pub enum ApprovalDecision {
     Timeout,
 }
 
+/// 审批请求类型（M2.9 值披露；弹窗按 kind 选形态，value-disclosure.md §6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalKind {
+    /// 命令注入（既有 inject 语义）。
+    Inject,
+    /// 读条目值（`item.get`；读规则命中则不产生审批）。
+    Read,
+    /// 导出条目数据包（`item.export`；恒弹窗，规则不豁免）。
+    Export,
+}
+
+/// export 审批的数据包元信息（弹窗展示规模用；不含数据本身）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportMeta {
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
 /// 审批请求负载（`authz.request` 事件与弹窗展示用；keys 仅 key 名）。
 ///
 /// `challenge` 为**一次性应答值**（#78 方案 B）：随 `open` 登记 + 仅经
 /// 事件总线广播给桌面订阅者（不出现在任何 RPC 响应里），`approval.result`
 /// 必须原样回带才被接受——纵使未来出现可伪造连接标签的进程内组件，无
 /// 挑战值仍无法自我批准。
+///
+/// M2.9 值披露（value-disclosure.md §5.2/§6）：`kind` 区分注入/读/导出
+/// 审批形态；`command` 字段填 `"item.get"` / `"item.export"`（展示用），
+/// `keys` 为单元素 [条目名]；`export_meta` 仅 export 审批有值。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub request_id: Uuid,
@@ -123,6 +147,10 @@ pub struct ApprovalRequest {
     /// 一次交互）；守护进程拿到 `approval.result` 的 `masterPassword` 后
     /// 先临时解锁再跑授权门，且不签发会话令牌。false = 常规解锁态审批。
     pub needs_unlock: bool,
+    /// 审批类型（值披露读/导出弹窗按 kind 渲染；读/导出不带解锁一体化）。
+    pub kind: ApprovalKind,
+    /// export 审批的数据包规模元信息（kind=Export 时有值；读/注入为 None）。
+    pub export_meta: Option<ExportMeta>,
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +326,8 @@ impl ApprovalChannel for LocalApprovalChannel {
         self.approvals
             .register(req.request_id, expires_at, req.challenge.clone());
         // 广播 `authz.request`（通知 D 层弹窗；无密钥值；challenge 仅经本
-        // 事件通道下发——守护进程侧通知桥只投给桌面订阅者，#78 方案 A）
+        // 事件通道下发——守护进程侧通知桥只投给桌面订阅者，#78 方案 A；
+        // kind/export_meta 供弹窗按审批类型渲染，M2.9 值披露）
         self.bus.emit(&VaultEvent::AuthzRequest {
             request_id: req.request_id,
             starter: req.starter.clone(),
@@ -307,6 +336,8 @@ impl ApprovalChannel for LocalApprovalChannel {
             keys: req.keys.clone(),
             challenge: req.challenge.clone(),
             needs_unlock: req.needs_unlock,
+            kind: req.kind,
+            export_meta: req.export_meta.clone(),
         });
     }
 
@@ -395,10 +426,23 @@ impl AuthzGate {
     }
 }
 
-/// 规则是否匹配 `(cwd, command)`：projectDir 祖先匹配（canonical 形态，
+/// 规则是否匹配 `(cwd, command)`（注入路径）：**capability=inject**（能力
+/// 不互授，read 规则不授权注入）+ projectDir 祖先匹配（canonical 形态，
 /// 相等或为前缀 + `/`）+ command glob（`*`/`?`，大小写敏感）。
 pub fn rule_matches(rule: &Rule, canonical_cwd: &str, command: &str) -> bool {
-    project_dir_matches(&rule.project_dir, canonical_cwd) && glob_match(&rule.command, command)
+    rule.capability == crate::model::RULE_CAPABILITY_INJECT
+        && project_dir_matches(&rule.project_dir, canonical_cwd)
+        && glob_match(&rule.command, command)
+}
+
+/// 读规则是否匹配 `(cwd, 条目名)`（值披露读路径，value-disclosure.md §4）：
+/// **capability=read**（inject 规则不授权读）+ projectDir 祖先匹配（与
+/// inject 同一套归一化/祖先匹配，WSL 侧两侧同函数）+ keys **精确包含**
+/// 条目名（不做 key 通配，与 inject 的 keys 语义一致）。
+pub fn read_rule_matches(rule: &Rule, canonical_cwd: &str, item_name: &str) -> bool {
+    rule.capability == crate::model::RULE_CAPABILITY_READ
+        && project_dir_matches(&rule.project_dir, canonical_cwd)
+        && rule.keys.iter().any(|k| k == item_name)
 }
 
 /// projectDir 祖先匹配：`cwd` 等于 `project_dir`，或 `cwd` 是 `project_dir`
@@ -475,6 +519,7 @@ mod tests {
             name: "t".into(),
             command: command.into(),
             keys: keys.iter().map(|s| s.to_string()).collect(),
+            capability: crate::model::RULE_CAPABILITY_INJECT.into(),
             created: "2026-01-01T00:00:00.000000Z".into(),
         }
     }
@@ -771,6 +816,8 @@ mod tests {
             keys: vec!["A".into()],
             challenge: "chal-xyz".into(),
             needs_unlock: false,
+            kind: ApprovalKind::Inject,
+            export_meta: None,
         };
         // open：登记 + 广播（非阻塞）
         ch.open(&req, Instant::now() + Duration::from_secs(10));
@@ -785,6 +832,8 @@ mod tests {
                 keys,
                 challenge,
                 needs_unlock,
+                kind,
+                export_meta,
             } => {
                 assert_eq!(*request_id, req.request_id);
                 assert_eq!(starter, "/bin/zsh");
@@ -795,6 +844,9 @@ mod tests {
                 assert_eq!(challenge, "chal-xyz");
                 // #67：常规（解锁态）审批不带 needs_unlock
                 assert!(!needs_unlock);
+                // M2.9 值披露：inject 审批不带导出元信息
+                assert_eq!(*kind, ApprovalKind::Inject);
+                assert!(export_meta.is_none());
             }
             other => panic!("应广播 authz.request：{other:?}"),
         }
@@ -896,6 +948,8 @@ mod tests {
                 keys: vec![],
                 challenge: String::new(),
                 needs_unlock: false,
+                kind: ApprovalKind::Inject,
+                export_meta: None,
             },
             Instant::now() + Duration::from_secs(10),
         );
@@ -934,5 +988,103 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(reg.pending_count(), 0);
+    }
+
+    // -- M2.9 值披露（补充拍板 #20）：读规则匹配 + ApprovalKind ------------
+
+    /// 读规则（capability=read）的 helper：command 恒空串（spec §4）。
+    fn read_rule(project_dir: &str, keys: &[&str]) -> Rule {
+        let mut r = rule(project_dir, "", keys);
+        r.capability = crate::model::RULE_CAPABILITY_READ.into();
+        r
+    }
+
+    /// 读规则匹配矩阵：capability 过滤 + projectDir 祖先 + keys 精确名。
+    #[test]
+    fn read_rule_matching_matrix() {
+        let r = read_rule("/proj", &["A", "B"]);
+        // 条目名精确包含 + cwd 祖先
+        assert!(read_rule_matches(&r, "/proj", "A"));
+        assert!(read_rule_matches(&r, "/proj/sub", "B"));
+        assert!(!read_rule_matches(&r, "/proj", "C"), "keys 未包含 → 不命中");
+        assert!(!read_rule_matches(&r, "/other", "A"), "cwd 不匹配 → 不命中");
+        assert!(!read_rule_matches(&r, "/projc", "A"), "目录边界不匹配");
+        // 能力不互授：inject 规则不授权读
+        let inject = rule("/proj", "*", &["A"]);
+        assert!(!read_rule_matches(&inject, "/proj", "A"));
+        // read 规则不授权注入（inject 匹配路径按 capability 过滤）
+        assert!(!rule_matches(&r, "/proj", "x"), "read 规则不得命中注入");
+        // 带伪造 command 的 read 规则同样不得命中注入
+        let mut rogue = r.clone();
+        rogue.command = "npm *".into();
+        assert!(!rule_matches(&rogue, "/proj", "npm publish"));
+    }
+
+    /// 读规则跨命名空间：`wsl://` 规范形规则命中归一化后的 WSL cwd
+    /// （与 inject 同一套 project_dir_matches，两侧同函数）。
+    #[test]
+    fn read_rule_matches_wsl_normalized_cwd() {
+        let r = read_rule("wsl://Debian/home/u/p", &["A"]);
+        let cwd = crate::path_ns::canonical_project_dir(r"\\wsl.localhost\DEBIAN\home\u\p\sub");
+        assert!(read_rule_matches(&r, &cwd, "A"));
+        let cwd2 = crate::path_ns::canonical_project_dir(r"\\wsl$\Debian\home\u\p2");
+        assert!(!read_rule_matches(&r, &cwd2, "A"));
+    }
+
+    /// inject 规则（capability 缺省）照常命中注入路径（回归：legacy 规则
+    /// 反序列化为 inject 后三层语义不变）。
+    #[test]
+    fn inject_rule_still_matches_after_capability_default() {
+        let mut r = rule("/proj", "npm *", &["A"]);
+        r.capability = crate::model::RULE_CAPABILITY_INJECT.into();
+        assert!(rule_matches(&r, "/proj/sub", "npm publish"));
+    }
+
+    /// ApprovalKind 协议面序列化（serde camelCase 单词 → 小写）。
+    #[test]
+    fn approval_kind_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(ApprovalKind::Inject).unwrap(),
+            serde_json::json!("inject")
+        );
+        assert_eq!(
+            serde_json::to_value(ApprovalKind::Read).unwrap(),
+            serde_json::json!("read")
+        );
+        assert_eq!(
+            serde_json::to_value(ApprovalKind::Export).unwrap(),
+            serde_json::json!("export")
+        );
+        let back: ApprovalKind = serde_json::from_value(serde_json::json!("read")).unwrap();
+        assert_eq!(back, ApprovalKind::Read);
+    }
+
+    /// 审批请求携带 kind + export 数据包元信息（export 弹窗展示规模用）。
+    #[test]
+    fn approval_request_carries_kind_and_export_meta() {
+        let areq = ApprovalRequest {
+            request_id: Uuid::new_v4(),
+            starter: "/bin/zsh".into(),
+            project_dir: "/proj".into(),
+            command: "item.export".into(),
+            keys: vec!["合同.pdf".into()],
+            challenge: "chal".into(),
+            needs_unlock: false,
+            kind: ApprovalKind::Export,
+            export_meta: Some(ExportMeta {
+                name: "合同.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 1024,
+            }),
+        };
+        assert_eq!(areq.kind, ApprovalKind::Export);
+        assert_eq!(areq.export_meta.as_ref().unwrap().size, 1024);
+        // 常规注入审批不带 export 元信息
+        let inject_req = ApprovalRequest {
+            kind: ApprovalKind::Inject,
+            export_meta: None,
+            ..areq.clone()
+        };
+        assert!(inject_req.export_meta.is_none());
     }
 }

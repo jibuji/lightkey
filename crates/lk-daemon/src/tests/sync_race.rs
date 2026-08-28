@@ -149,9 +149,11 @@ fn sync_round_does_not_block_commands_and_apply_respects_races() {
     let summary = round.join().unwrap().unwrap();
     assert_eq!(summary.pulled, 0, "应用复核跳过旧快照导入");
     assert_eq!(summary.pushed, 1, "Y 已推送");
+    // M2.9 值披露：socket 读值经裁决（本测试与授权无关）→ desktop 直调
+    // 受信豁免读取，验证数据不被轮次覆盖
     let x = rpc_result(&daemon.handle(
         &rpc_line(M_ITEM_GET, Some(&token), json!({ "id": x_id })),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     ));
     assert_eq!(
         x["username"].as_str().unwrap(),

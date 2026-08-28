@@ -18,6 +18,11 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 3. 被批准的密钥值注入 **Linux 子进程**环境（`lk inject` 语义完整对齐）；
 4. 全程可审计、默认拒绝语义不变。
 
+以上目标的连通目标选择**由 CLI 按运行环境自动判定**（§7.0 判定矩阵）：Linux
+`lk` 同时服务两种运行环境——原生 Linux（非 WSL）连本地 UDS 守护实例（Linux
+侧 GUI 的宿主），WSL2 连 Windows 主机 GUI；Windows `lk.exe` 无论被谁调用均连
+Windows 主机 GUI。
+
 ### 非目标
 
 - 跨主机访问（D8 远程审批通道仍为 P1 不做）；
@@ -69,10 +74,10 @@ Windows 主机**上的 LightKey 桌面应用（内置守护实例）：
 ## 5. 总体架构
 
 > **回填说明（2026-08-24，经船长授权的事实回填）**：下方架构图与本节末
-> 「守护形态与审批通知」为真机实测后的**补充覆盖**——依据 Windows 宿主实测指南
-> [win-host-cross-subsystem-retest.md](agents/win-host-cross-subsystem-retest.md) §0 与
-> 实测报告
-> [win-host-cross-subsystem-retest-report-20260824.md](agents/win-host-cross-subsystem-retest-report-20260824.md)。
+> 「守护形态与审批通知」为 Windows 宿主真机实测（2026-08-24，issue #32 第 0 步
+> 复测）后的**补充覆盖**——当时的实测指南与报告为一次性文档，已于 2026-08-28
+> 收束删除，操作口径并入 [testing-cross-subsystem.md](testing-cross-subsystem.md)
+> （Windows 本地冒烟见其 §5.5，探针判别法见其 §7.2–§7.4）。
 > 仅补充「纯 CLI daemon」守护形态及其审批通知语义；本规格既有拍板结论、决策
 > 编号（decisions.md 补充拍板 #14）与其余章节均不变。
 
@@ -138,7 +143,7 @@ Windows 侧守护实例有两种承载形态（二选一就位）；named pipe �
 
 | 二进制 | 编译目标 | 角色 | 交付 |
 |---|---|---|---|
-| `lk` | `x86_64-unknown-linux-gnu` | agent/用户在 WSL 内调用的入口 CLI | 新增 Linux 产物（CI ubuntu job 或 release 补齐） |
+| `lk` | `x86_64-unknown-linux-gnu` | Linux 环境入口 CLI（原生 Linux 与 WSL 通用；运行时按 §7.0 判定环境选连通目标） | release 流水线独立 Linux 产物（双产物之一） |
 | `lk.exe` | `x86_64-pc-windows-msvc` | ① bridge 中继；② Windows 原生 CLI（现状不变） | release 流水线已有独立 CLI 产物；**需随桌面安装包落地**（当前装机目录缺失，见 §4#7 前科） |
 
 同一 workspace，无代码分叉；平台差异收敛在 `transport.rs`（已有）与新增
@@ -287,10 +292,14 @@ WSL 侧 CLI 经 drvfs 读取 Windows 数据目录 `session.token` 附带到 RPC
 （bridge 探测/连接路径），曾被报为「令牌跨子系统边界复用，SEC HIGH」。
 定案（2026-08-27）：**这是补充拍板 #14 的既定特性而非漏洞**——驱动场景就是
 「Windows 桌面解锁一次，WSL 侧直接使用」，drvfs 路径要求同一 Windows 用户
-身份（`/mnt/c/Users/<user>/…` 本就按用户隔离），与 A1 取舍、同用户进程互信
-边界一致（见 [ipc.md](ipc.md) §3）。令牌仍随每次解锁轮换、锁定即失效；
-`LIGHTKEY_BRIDGE=off` 与探测分型语义不变。若未来做多 Agent 会话隔离
-（#68 选项 2），bridge 通道将随之改为独立凭据分发，不单独改造。
+身份（`/mnt/c/Users/<user>/…` 本就按用户隔离），与 A1 取舍一致（见
+[ipc.md](ipc.md) §3）。令牌仍随每次解锁轮换、锁定即失效；
+`LIGHTKEY_BRIDGE=off` 与探测分型语义不变。补充拍板 #20 修订边界后此结论
+不变：**解锁态复用仍是特性**，但令牌 = 认证 ≠ 授权——WSL 侧 `item.get`
+等值读取同样走值披露裁决（读规则按 `wsl://` cwd 归一化匹配，见
+[authorization-gate.md](authorization-gate.md) §8，拍板待实现）；若未来做
+多 Agent 会话隔离（#68 选项 2，已降级观望），bridge 通道将随之改为独立
+凭据分发，不单独改造。
 
 ## 9. 实现清单
 

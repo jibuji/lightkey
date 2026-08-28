@@ -110,6 +110,13 @@ pub const ERR_SYNC_CREDENTIALS: i64 = -32012;
 /// authorization-gate.md §6 / 补充拍板 #16；socket 连接一律拒绝）。
 pub const ERR_CHANNEL_FORBIDDEN: i64 = -32014;
 pub const MSG_CHANNEL_FORBIDDEN: &str = "channel.forbidden";
+/// 值披露裁决拒绝（M2.9 值披露，value-disclosure.md §5.4）：读/导出未命中
+/// 规则且未批准/超时/无 UI/启动者未知——统一不区分原因，防探测。
+/// （spec 原定 -32015，但 -32014~-32016 已被 lk-cli bridge 错误码占用
+/// （ERR_BRIDGE_*，M2.75），撞码会使 bridge.version_incompatible 被误分类；
+/// 取顺次空闲码 -32017，语义不变。）
+pub const ERR_AUTHZ_DENIED: i64 = -32017;
+pub const MSG_AUTHZ_DENIED: &str = "authz.denied";
 
 pub const MSG_VAULT_INVALID: &str = "vault.invalid";
 pub const MSG_SESSION_INVALID: &str = "session.invalid";
@@ -229,9 +236,16 @@ pub struct ItemPutResult {
 }
 
 /// `item.get` 参数。
+///
+/// M2.9 值披露：请求/响应形状不变；`channel` 为**可选审计来源标注**
+/// （spec §8——`wsl-bridge` 客户端标注优先，缺省按对端来源，与
+/// `rule.*` 同口径），不参与裁决。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemGetParams {
     pub id: Uuid,
+    /// 审计来源标注（`cli` | `desktop` | `wsl-bridge`；缺省按对端来源）。
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 /// `item.delete` 参数（软删除 → 墓碑）。
@@ -241,9 +255,13 @@ pub struct ItemDeleteParams {
 }
 
 /// `item.export` 参数（file 类型整包下载，M0 单机；分块协议 M1）。
+/// `channel` 语义同 [`ItemGetParams::channel`]（spec §8）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemExportParams {
     pub id: Uuid,
+    /// 审计来源标注（`cli` | `desktop` | `wsl-bridge`；缺省按对端来源）。
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 /// `item.export` 结果。
@@ -400,6 +418,9 @@ pub struct ApprovalResultOutcome {
 }
 
 /// `rule.add` 参数（决策 #6：规则含 `name`；写入唯一合法路径之一）。
+///
+/// M2.9 值披露（value-disclosure.md §4）：`capability` 选规则能力类型——
+/// `inject`（注入，默认）或 `read`（读值；`command` 必须为空串）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleAddParams {
@@ -407,9 +428,12 @@ pub struct RuleAddParams {
     /// `wsl://<distro>/<rest>` 规范形（守护进程侧经 [`crate::path_ns`] 归一化）。
     pub project_dir: String,
     pub name: String,
-    /// 具名命令（可 glob）。
+    /// 具名命令（可 glob）；capability=read 时空串。
     pub command: String,
     pub keys: Vec<String>,
+    /// 规则能力类型（`inject` | `read`；缺省 inject）。
+    #[serde(default)]
+    pub capability: Option<String>,
     /// 审计来源标注（`cli` | `desktop` | `wsl-bridge`；缺省 = cli）。
     #[serde(default)]
     pub channel: Option<String>,
@@ -441,19 +465,28 @@ pub struct RuleRemoveParams {
 
 /// 规则字段校验（超长/非法 → `Err`，不入库；testing.md 第三层 #19）。
 ///
+/// - `capability`：`inject` | `read`（值披露裁决，value-disclosure.md §4；
+///   能力不互授——校验层面即强制 inject 规则带命令、read 规则不带命令）；
 /// - `projectDir`：绝对路径且可 canonicalize（存在）；**合法**的
 ///   `wsl://<distro>[/<rest>]` 跨命名空间规范形（[`crate::path_ns`]，守护进程
 ///   侧已归一化）例外——非本机文件系统路径，无法 canonicalize，仅接受该形态
 ///   本身（缺 distro 段等畸形形态一律拒绝）；
-/// - `command`：非空、≤ 1024、无控制字符；
+/// - `command`：inject 时非空、≤ 1024、无控制字符；read 时必须为空串；
 /// - `name`：非空、≤ 256、无控制字符；
-/// - `keys`：1..=32 个，均为合法环境变量名（`[A-Za-z_][A-Za-z0-9_]*`）。
+/// - `keys`：1..=32 个，均为合法环境变量名（`[A-Za-z_][A-Za-z0-9_]*`；
+///   read 规则语义为可读条目名，同一约束）。
 pub fn validate_rule_fields(
+    capability: &str,
     project_dir: &str,
     name: &str,
     command: &str,
     keys: &[String],
 ) -> std::result::Result<(), String> {
+    if capability != crate::model::RULE_CAPABILITY_INJECT
+        && capability != crate::model::RULE_CAPABILITY_READ
+    {
+        return Err("capability 必须是 inject 或 read".into());
+    }
     if !crate::path_ns::is_valid_wsl_canonical(project_dir) {
         if project_dir.is_empty() || !std::path::Path::new(project_dir).is_absolute() {
             return Err("projectDir 必须是绝对路径".into());
@@ -465,8 +498,17 @@ pub fn validate_rule_fields(
     if name.is_empty() || name.len() > 256 || has_control_chars(name) {
         return Err("name 必须是非空、≤256 字符且无控制字符的规则名".into());
     }
-    if command.is_empty() || command.len() > 1024 || has_control_chars(command) {
-        return Err("command 必须是非空、≤1024 字符且无控制字符的命令".into());
+    match capability {
+        crate::model::RULE_CAPABILITY_READ => {
+            if !command.is_empty() {
+                return Err("read 规则不绑定命令（command 必须为空）".into());
+            }
+        }
+        _ => {
+            if command.is_empty() || command.len() > 1024 || has_control_chars(command) {
+                return Err("command 必须是非空、≤1024 字符且无控制字符的命令".into());
+            }
+        }
     }
     if keys.is_empty() || keys.len() > 32 {
         return Err("keys 必须是 1~32 个 key 名".into());

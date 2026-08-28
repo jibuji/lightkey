@@ -46,6 +46,8 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
             keys,
             challenge,
             needs_unlock,
+            kind,
+            export_meta,
         } => (
             "authz.request",
             json!({
@@ -56,6 +58,12 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
                 "keys": keys,
                 "challenge": challenge,
                 "needsUnlock": needs_unlock,
+                // M2.9 值披露：审批类型（弹窗按形态渲染）+ export 数据包
+                // 规模元信息（仅 export 审批携带，帧不含数据本身）
+                "kind": serde_json::to_value(kind).unwrap_or(serde_json::json!("inject")),
+                "exportMeta": export_meta.as_ref().map(|m| json!({
+                    "name": m.name, "mime": m.mime, "size": m.size,
+                })),
             }),
         ),
     };
@@ -137,6 +145,8 @@ mod tests {
             keys: vec!["NPM_TOKEN".into()],
             challenge: "chal-1".into(),
             needs_unlock: true,
+            kind: lk_core::authz::ApprovalKind::Inject,
+            export_meta: None,
         });
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["method"], "authz.request");
@@ -146,6 +156,33 @@ mod tests {
         assert_eq!(v["params"]["keys"][0], "NPM_TOKEN");
         assert_eq!(v["params"]["challenge"], "chal-1");
         assert_eq!(v["params"]["needsUnlock"], true, "需解锁一体化帧须标注");
+        assert_eq!(v["params"]["kind"], "inject", "审批类型帧字段（M2.9）");
+        assert!(
+            v["params"].get("exportMeta").is_none_or(|m| m.is_null()),
+            "inject 帧不携带导出元信息"
+        );
+
+        // export 审批帧：kind=export + 数据包规模元信息（M2.9 值披露）
+        let frame = frame_for_event(&VaultEvent::AuthzRequest {
+            request_id: uuid::Uuid::nil(),
+            starter: "/bin/zsh".into(),
+            project_dir: "/proj".into(),
+            command: "item.export".into(),
+            keys: vec!["合同.pdf".into()],
+            challenge: "chal-e".into(),
+            needs_unlock: false,
+            kind: lk_core::authz::ApprovalKind::Export,
+            export_meta: Some(lk_core::authz::ExportMeta {
+                name: "合同.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 1024,
+            }),
+        });
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["params"]["kind"], "export");
+        assert_eq!(v["params"]["exportMeta"]["name"], "合同.pdf");
+        assert_eq!(v["params"]["exportMeta"]["mime"], "application/pdf");
+        assert_eq!(v["params"]["exportMeta"]["size"], 1024);
         assert!(desktop_only(&VaultEvent::AuthzRequest {
             request_id: uuid::Uuid::nil(),
             starter: String::new(),
@@ -154,6 +191,8 @@ mod tests {
             keys: vec![],
             challenge: String::new(),
             needs_unlock: false,
+            kind: lk_core::authz::ApprovalKind::Inject,
+            export_meta: None,
         }));
         assert!(!desktop_only(&VaultEvent::ItemChanged {
             item_id: uuid::Uuid::nil(),
