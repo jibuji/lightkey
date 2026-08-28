@@ -13,8 +13,12 @@
 #     - Windows job：cargo fmt --check、clippy -D warnings（三 crate）、
 #       cargo test（三 crate）、前端 npm test（D 层单测）
 #     - Linux job：clippy + test（lk-cli）
-#   每日开发提交不在 GitHub 侧跑任何 workflow（本地承担：Windows 全量 +
-#   WSL/Linux 侧 lk-core/lk-daemon/lk-cli，见 AGENTS.md「常用命令」）。
+#
+# 【2026-08-29 变更（船长裁定）：PR 恢复自动 CI，本地 no-mistakes 闸门移除】
+#   触发面新增 pull_request（opened / synchronize / reopened）：提交 PR 或
+#   PR 更新即自动运行同一套构建前置门禁。PR 运行属非发布路径：
+#   check-version 跳过、不发布 Release、不传 artifact（省存储配额）。
+#   并发组按 event+ref 隔离，PR 更新自动取消上一轮未完运行。
 #
 # 双 job（build-windows / build-linux-cli）并行；tag 触发时跳过 artifact 留存，
 # 避免同一份产物重复上传。
@@ -48,6 +52,13 @@ on:
         description: "发布到已存在的 Release（如 v0.1.3）；留空则只留 Actions artifact"
         required: false
         type: string
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# 同一 PR 连续推送只保留最新一轮（tag / dispatch 运行不受影响：组按 event+ref 隔离）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,7 +81,7 @@ jobs:
           elif [ -n "$DISPATCH_RELEASE_TAG" ]; then
             release_tag="$DISPATCH_RELEASE_TAG"
           else
-            echo "非发布路径（未带 release_tag 的 dispatch），跳过版本一致性校验。"
+            echo "非发布路径（PR / 未带 release_tag 的 dispatch），跳过版本一致性校验。"
             exit 0
           fi
 
@@ -196,8 +207,9 @@ jobs:
           Copy-Item 'target/release/lk.exe' (Join-Path 'artifacts' "lk-cli-$version-windows-x86_64.exe")
           Get-ChildItem 'artifacts' | Select-Object Name, Length
 
+      # 仅 dispatch 留 artifact（PR 运行不传，省私有仓库存储配额；tag 挂 Release）
       - name: Upload artifacts as workflow artifact
-        if: github.ref_type != 'tag'
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: LightKey-windows-installers
@@ -266,8 +278,9 @@ jobs:
           cp target/x86_64-unknown-linux-gnu/release/lk "artifacts/lk-cli-${version}-linux-x86_64"
           ls -l artifacts/
 
+      # 仅 dispatch 留 artifact（与 Windows job 同口径）
       - name: Upload artifacts as workflow artifact
-        if: github.ref_type != 'tag'
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: LightKey-linux-cli

@@ -32,9 +32,11 @@
 - 桌面壳 Windows 验收：`cargo check --workspace --target x86_64-pc-windows-gnu`
   （本地需 mingw 交叉工具链：conda env `lightkey-mingw`，PATH 前置其 bin；
   Linux 无 webkit2gtk 不编译 lk-app）。
-- CI 只在 release 时运行（2026-08-27 裁定，补充拍板：每次提交不触发）：
+- CI 触发面 = pull_request（opened/synchronize/reopened，2026-08-29 裁定：
+  提交 PR 或 PR 更新自动跑门禁；PR 运行不传 artifact、不发布）+ tag `v*`
+  push / workflow_dispatch（2026-08-27 裁定：非 PR 的提交不触发）。
   唯一 workflow 为 `.github/workflows/release.yml`（原 `ci.yml` 已删除），
-  触发面 = tag `v*` push / workflow_dispatch；全部质量检查（Windows：
+  全部质量检查（Windows：
   fmt/clippy/test 三 crate + 前端 npm test；Linux：lk-cli clippy/test）
   作为**构建前置门禁**内嵌在 build job 里
   （`crates/lk-app/tauri.conf.json` bundle.active=true，NSIS+MSI；独立 CLI
@@ -52,8 +54,9 @@
 
 ## 交付纪律
 
-- 本仓库为 no-mistakes 交付：改动经 `/no-mistakes` 管道验证后开 PR，
-  不直接推默认分支。
+- 功能分支开发，开 PR 由 GitHub CI 自动跑质量门禁（见「常用命令」CI 条目），
+  全绿后合并；不直接推默认分支。本地 no-mistakes 闸门已于 2026-08-29 移除
+  （补充拍板 #21），不再跑 `/no-mistakes`。
 - 测试 fixture 密钥不进仓库（testing.md）。
 - 前端设计评审用 agent_browser 对
   `docs/design/prototype/`（零构建原型）截图；评审流程见

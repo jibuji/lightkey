@@ -9,7 +9,8 @@ needs-decision，不得自行变更。
 - 路线：**从零自研**——把 Bitwarden 当作“技术规格书”照抄设计（抄设计不抄代码，
   不 fork、不用 Bitwarden/Vaultwarden 当底座）。
 - 许可：**客户端全开源（MIT）**；服务端（如未来有）不开源；付费暂缓。
-- 本仓库：`jibuji/lightkey`（private），no-mistakes 已 init。
+- 本仓库：`jibuji/lightkey`（private）；本地 no-mistakes 闸门已于 2026-08-29
+  移除（补充拍板 #21），质量门禁由 PR 触发的 GitHub CI 承担。
 
 ## 决议项 → 规格映射
 
@@ -315,5 +316,20 @@ needs-decision，不得自行变更。
       ipc.md §3 + data-model.md 读规则 schema），实现按 TDD 在
       `router.rs strategy_of` / dispatch seam 先立失败测试；**#65 保持 open
       至 spec 落地再关闭**。
+
+21. **PR 恢复自动 CI + 本地 no-mistakes 闸门移除（2026-08-29 · 船长拍板）**：
+    - **CI 触发面恢复 pull_request（opened / synchronize / reopened）**：提交 PR
+      或 PR 更新即自动运行 `.github/workflows/release.yml` 同一套构建前置门禁
+      （Windows：fmt/clippy/test 三 crate + 前端 npm test；Linux：lk-cli
+      clippy/test）。PR 运行属非发布路径：check-version 跳过、不发布 Release、
+      不传 artifact（省私有仓库存储配额）；并发组按 event+ref 隔离，PR 更新
+      自动取消上一轮未完运行。2026-08-27「CI 只在 release 时运行」裁定自此
+      修订为「release + PR 双触发，非 PR 的提交仍不触发」。
+    - **本地 no-mistakes 闸门移除**：`no-mistakes eject`（gate remote、裸仓库、
+      worktree、DB 记录一并清除）+ 残留清理（`refs/no-mistakes/sync/*` 与 Temp
+      基线 worktree）。交付纪律改为**功能分支 + PR + GitHub CI 门禁**，不再经
+      `/no-mistakes` 管道验证。
+    落盘：`.github/workflows/release.yml`、AGENTS.md（「常用命令」CI 条目 +
+    「交付纪律」）、本条。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
