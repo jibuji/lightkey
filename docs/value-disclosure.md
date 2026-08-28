@@ -226,7 +226,7 @@ vitest（mock 适配器）。
 
 ## 11. 交付切分
 
-建议 PR 序列（各自出口全绿，走 no-mistakes 管道）：
+建议 PR 序列（各自出口全绿，走 PR CI 门禁）：
 
 1. **PR A（lk-core）**：`Rule.capability` + 读规则匹配 + `ApprovalKind` +
    `ERR_AUTHZ_DENIED` + 单测（§10.1）；
