@@ -64,18 +64,7 @@ fn desktop_direct_get_and_export_exempt_with_audit() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _shared, token) = m2_daemon(dir.path(), Some(("APIKey", "sk-1")));
     let file_id = put_file_item(&state, &token, "report.bin", b"file-bytes");
-    let secret_id = {
-        let v = state.lock().unwrap().handle(
-            &rpc_line(M_ITEM_LIST, Some(&token), json!({})),
-            &PeerInfo::unknown(),
-        );
-        // list 只回最小索引；此处直接经 desktop get 拿 id——先经 file put 的
-        // id 路径验证，secret 条目 id 由 item.put 返回补齐
-        let _ = v;
-        String::new()
-    };
-    let _ = secret_id;
-    // 经 item.put 返回值拿 secret 条目 id（m2_daemon 内部 put 未回传，重新种）
+    // 经 item.put 返回值拿 secret 条目 id（m2_daemon 内部 seed 未回传）
     let secret_id = {
         let resp = state.lock().unwrap().handle(
             &rpc_line(
@@ -179,7 +168,7 @@ fn socket_get_with_matching_read_rule_allowed_silently() {
     assert_eq!(evs[0].target, "APIKey");
 }
 
-/// socket 无读规则 + 无桌面订阅 → `authz.denied`(-32015) + 审计 denied。
+/// socket 无读规则 + 无桌面订阅 → `authz.denied`(-32017) + 审计 denied。
 #[test]
 fn socket_get_without_rule_or_ui_denied_with_audit() {
     let dir = tempfile::tempdir().unwrap();
@@ -506,6 +495,73 @@ fn disclosure_socket_cannot_self_approve() {
     let resp = h.join().unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["error"]["code"], ERR_AUTHZ_DENIED);
+}
+
+/// 等待期间锁定（桌面手动/自动锁定）→ 审批 allowed 也无法披露：vault 与
+/// K_audit 已擦除 → 保守 `session.invalid`（不 panic；与 authz_finalize
+/// resolve_env 失败同口径，G1 回归类）。
+#[test]
+fn disclosure_allowed_but_locked_during_wait_returns_session_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("APIKey", "sk-1")));
+    let item_id = {
+        let resp = state.lock().unwrap().handle(
+            &rpc_line(
+                M_ITEM_PUT,
+                Some(&token),
+                json!({ "item": {
+                    "type": "secret", "name": "APIKey", "value": "sk-1",
+                    "purpose": "", "expiresAt": null } }),
+            ),
+            &PeerInfo::unknown(),
+        );
+        rpc_result(&resp)["item"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let line = rpc_line(M_ITEM_GET, Some(&token), json!({ "id": item_id }));
+    let peer = test_peer(Some(proj.path()));
+    let h = {
+        let handler = handler.clone();
+        std::thread::spawn(move || handler(&line, &peer))
+    };
+    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    let (request_id, challenge) = (
+        fv["params"]["requestId"].as_str().unwrap().to_string(),
+        fv["params"]["challenge"].as_str().unwrap().to_string(),
+    );
+    // 等待期锁定复现（锁屏线程时序）：① 命令锁内审批回传解析（accepted，
+    // 等待线程被唤醒但阻塞在命令锁上）；② 仍持命令锁时直接锁定 vault——
+    // `lock_with_reason`（锁屏线程等价路径）只取 vault 写锁、不经过命令锁，
+    // 正是生产中的竞态窗口：审批已放行但披露前 vault 被锁屏/手动锁定擦除
+    let mut guard = state.lock().unwrap();
+    let resp = guard.handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            Some(&token),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["result"]["accepted"],
+        true
+    );
+    guard.lock_with_reason(LockReason::Manual);
+    drop(guard);
+    // ③ 等待线程获得命令锁 → finalize Allowed + vault 已锁 → session.invalid
+    // （保守，不 panic、不披露）
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["error"]["code"], ERR_SESSION_INVALID,
+        "等待期锁定后批准 → session.invalid：{resp}"
+    );
 }
 
 /// 锁定态读值 → `session.invalid`（spec §3：require_session 先失败；

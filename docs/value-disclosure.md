@@ -155,10 +155,10 @@ pub struct Rule {
 - 前端 approval 插件按 kind 渲染：
   - `read`：展示启动者 / 项目目录 / 条目名 / 倒计时（不展示值）；
   - `export`：额外展示数据包规模（name/mime/size）；
-  - 均提供 **「允许并为此项目记住」** 按钮 = allow 决策 + 追加一条
-    `rule.add`（channel=desktop，capability=read，keys=[条目名]，
-    projectDir=弹窗展示的 cwd）。仅 `read` 提供记住按钮，`export` 不提供
-    （恒弹窗语义）。
+  - 均提供「允许本次」/「拒绝」按钮；**「允许并为此项目记住」仅 `read`
+    提供**，`export` 不提供（恒弹窗语义）。「允许并为此项目记住」
+    = allow 决策 + 追加一条 `rule.add`（channel=desktop，capability=read，
+    keys=[条目名]，projectDir=弹窗展示的 cwd）。
 - 桌面规则管理页与审计页：规则列表展示 capability；审计事件按 §8 落表。
 
 ## 7. CLI

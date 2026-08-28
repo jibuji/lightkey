@@ -4,7 +4,8 @@
 //! 判定矩阵（spec §3）：desktop 内嵌直调受信豁免直返；socket 通道
 //! `item.get` 读规则命中 → 静默放行，未命中 → 弹窗（无 UI fail-closed）；
 //! `item.export` 恒弹窗（任何规则不豁免）。拒绝统一 `authz.denied`
-//! （-32015，不区分原因防探测）。审计 spec §8：command=`item.get` /
+//! （-32017，不区分原因防探测；spec §5.4 实现注记——-32015 被
+//! `ERR_BRIDGE_*` 占用）。审计 spec §8：command=`item.get` /
 //! `item.export`，target=条目名，starter/channel=真实归因。
 
 use super::*;
@@ -202,6 +203,12 @@ impl Daemon {
         };
         match decision {
             ApprovalDecision::Allowed => {
+                // 等待期间锁定（手动/自动/锁屏/恢复）：vault 与 K_audit 已
+                // 擦除，无法披露也无法签名审计 → 保守 `session.invalid`
+                // （与 authz_finalize resolve_env 失败同口径；exec 不再 unwrap）
+                if !self.vault_peek() {
+                    return rpc_string(session_invalid(id));
+                }
                 let resp = match p.method.as_str() {
                     M_ITEM_GET => {
                         self.item_get_exec(id, p.item_id, &p.starter, AuditChannel::Approval)
