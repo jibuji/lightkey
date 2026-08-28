@@ -43,9 +43,69 @@ impl Daemon {
         let shared = Arc::clone(&self.shared);
         let vault = shared.vault.read().unwrap();
         let Some(v) = vault.as_ref() else {
-            return AuthzBegin::Final(
-                serde_json::to_string(&session_invalid(id)).unwrap_or_else(|_| "{}".into()),
+            // 锁定态（#67）：桌面审批界面在场 → 一体化解锁+审批；否则沿旧
+            // 行为 fail-closed `session.invalid`（headless，CLI 提示先解锁）。
+            // 锁态无法裁决规则项（规则在加密 vault 内）：只做不依赖 vault
+            // 的第 1 层 fail-closed（unknown starter / 无 cwd），其余裁决
+            // 全部推迟到弹窗批准 + 临时解锁之后的 finalize（届时使用临时
+            // vault 跑完整三层，见 authz_finalize）。unknown starter 不弹窗
+            // （fail-closed 不打扰用户、不留内容；锁态无 K_audit 无法审计，
+            // 与 v0 锁态 session.invalid 同口径）。
+            if req.starter == UNKNOWN_STARTER {
+                return AuthzBegin::Final(rpc_string(RpcResponse::ok(
+                    id,
+                    serde_json::to_value(AuthzEvaluateResult {
+                        allowed: false,
+                        reason: Some(DenyReason::UnknownStarter.as_str().to_string()),
+                        env: None,
+                    })
+                    .unwrap_or(Value::Null),
+                )));
+            }
+            if req.cwd.is_empty() {
+                return AuthzBegin::Final(rpc_string(RpcResponse::ok(
+                    id,
+                    serde_json::to_value(AuthzEvaluateResult {
+                        allowed: false,
+                        reason: Some(DenyReason::NoCwd.as_str().to_string()),
+                        env: None,
+                    })
+                    .unwrap_or(Value::Null),
+                )));
+            }
+            // 无审批界面（纯 headless 守护进程）→ fail-closed（issue #67：
+            // GUI 不在运行维持现状直接拒绝，不阻塞、不静默回落）
+            if !self.gate.approval().available() {
+                return AuthzBegin::Final(
+                    serde_json::to_string(&session_invalid(id)).unwrap_or_else(|_| "{}".into()),
+                );
+            }
+            // 登记待审批（needs_unlock=true）+ 广播 authz.request
+            // （needsUnlock=true，D 层弹窗须同时展示主密码输入与授权栏）。
+            // challenge 语义不变：一次性应答值，仅投递桌面订阅者（#78）。
+            drop(vault);
+            let request_id = lk_core::crypto::random_uuid();
+            let challenge = hex::encode(lk_core::crypto::random_array::<16>());
+            let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
+            let areq = ApprovalRequest {
+                request_id,
+                starter: req.starter.clone(),
+                project_dir: req.cwd.clone(),
+                command: req.command.clone(),
+                keys: req.keys.clone(),
+                challenge: challenge.clone(),
+                needs_unlock: true,
+            };
+            self.gate.approval().open(&areq, expires_at);
+            self.pending_authz.lock().unwrap().insert(
+                request_id,
+                PendingAuthz {
+                    request: req,
+                    needs_unlock: true,
+                    temp_vault: None,
+                },
             );
+            return AuthzBegin::Pending { request_id };
         };
         // 单次扫描 secret 索引（批量解析请求 key；避免逐 key 全表扫描）
         let secrets = v.secret_values().unwrap_or_default();
@@ -111,13 +171,18 @@ impl Daemon {
                     project_dir: req.cwd.clone(),
                     command: req.command.clone(),
                     keys: req.keys.clone(),
-                    challenge,
+                    challenge: challenge.clone(),
+                    needs_unlock: false,
                 };
                 self.gate.approval().open(&areq, expires_at);
-                self.pending_authz
-                    .lock()
-                    .unwrap()
-                    .insert(request_id, PendingAuthz { request: req });
+                self.pending_authz.lock().unwrap().insert(
+                    request_id,
+                    PendingAuthz {
+                        request: req,
+                        needs_unlock: false,
+                        temp_vault: None,
+                    },
+                );
                 AuthzBegin::Pending { request_id }
             }
         }
@@ -125,6 +190,13 @@ impl Daemon {
 
     /// 阶段③（重取命令锁）：收决策 → 解密 key 值 → 审计（channel=Approval）
     /// → 返回。等待期间锁定 → `session.invalid`（无法解密/审计）。
+    ///
+    /// **锁定态一体化（#67）**：`pending.needs_unlock` 时，`Allowed` 决策
+    /// 使用审批回传时已临时解锁的 vault（`temp_vault`，approval_result 存
+    /// 入）：在临时 vault 上跑完整三层（第 1/2 层锁态无法预载——规则在
+    /// 加密库内）+ 解析 env + 审计（用临时 vault 的 K_audit），随后临时
+    /// vault 随条目销毁——**不置 shared.vault / 不签发令牌 / 不写
+    /// session.token**（#67 关键约束：本次注入不产生 item.* 全量能力，#65）。
     pub(crate) fn authz_finalize(
         &mut self,
         id: Value,
@@ -144,6 +216,9 @@ impl Daemon {
                 .unwrap_or(Value::Null),
             ));
         };
+        if pending.needs_unlock {
+            return self.authz_finalize_unlock(id, pending, decision);
+        }
         let result = match decision {
             ApprovalDecision::Allowed => {
                 match self.resolve_env(&pending.request.keys) {
@@ -197,6 +272,124 @@ impl Daemon {
         ))
     }
 
+    /// 锁定态一体化 finalize（#67，见 [`Self::authz_finalize`]）。
+    fn authz_finalize_unlock(
+        &mut self,
+        id: Value,
+        pending: PendingAuthz,
+        decision: ApprovalDecision,
+    ) -> String {
+        let req = &pending.request;
+        match decision {
+            ApprovalDecision::Allowed => {
+                // 临时 vault 由 approval_result 以正确主密码解锁后存入；
+                // 缺失（异常路径）→ 保守拒绝
+                let Some(vault) = pending.temp_vault else {
+                    return rpc_string(RpcResponse::ok(
+                        id,
+                        serde_json::to_value(AuthzEvaluateResult {
+                            allowed: false,
+                            reason: Some(DenyReason::Rejected.as_str().to_string()),
+                            env: None,
+                        })
+                        .unwrap_or(Value::Null),
+                    ));
+                };
+                // 完整三层裁决（锁态 begin 无法预载规则/解析 key；解锁后
+                // 一次性在临时 vault 上跑：第 1/2 层短路、未命中则第 3 层
+                // 已由弹窗批准视同通过）
+                let secrets = vault.secret_values().unwrap_or_default();
+                let layer = self.gate.evaluate_layers(
+                    req,
+                    &VaultRuleView {
+                        vault: &vault,
+                        secrets,
+                    },
+                );
+                let result = match layer {
+                    LayerResult::Allowed { keys } => match self.resolve_env_from(&vault, &keys) {
+                        Ok(env) => {
+                            self.audit_authz_from(
+                                &vault,
+                                req,
+                                AuditChannel::Approval,
+                                AuditResult::Allowed,
+                            );
+                            AuthzEvaluateResult {
+                                allowed: true,
+                                reason: None,
+                                env: Some(env),
+                            }
+                        }
+                        Err(_) => {
+                            return serde_json::to_string(&session_invalid(id))
+                                .unwrap_or_else(|_| "{}".into())
+                        }
+                    },
+                    LayerResult::Denied { reason } => {
+                        self.audit_authz_from(
+                            &vault,
+                            req,
+                            AuditChannel::Approval,
+                            AuditResult::Denied,
+                        );
+                        AuthzEvaluateResult {
+                            allowed: false,
+                            reason: Some(reason.as_str().to_string()),
+                            env: None,
+                        }
+                    }
+                    // 未命中规则：第 3 层弹窗已批准（allowed 决策即批准）
+                    LayerResult::NeedsApproval => match self.resolve_env_from(&vault, &req.keys) {
+                        Ok(env) => {
+                            self.audit_authz_from(
+                                &vault,
+                                req,
+                                AuditChannel::Approval,
+                                AuditResult::Allowed,
+                            );
+                            AuthzEvaluateResult {
+                                allowed: true,
+                                reason: None,
+                                env: Some(env),
+                            }
+                        }
+                        Err(_) => {
+                            return serde_json::to_string(&session_invalid(id))
+                                .unwrap_or_else(|_| "{}".into())
+                        }
+                    },
+                };
+                // 临时 vault 随本函数结束 drop——临时解锁态销毁（未置
+                // shared.vault，vault 仍锁定；无会话令牌、无 token 文件）
+                rpc_string(RpcResponse::ok(
+                    id,
+                    serde_json::to_value(result).unwrap_or(Value::Null),
+                ))
+            }
+            // 拒绝/超时：未解锁（无临时 vault）→ 无 K_audit 可签名，审计
+            // 不可写（与 v0 锁态拒绝同口径——fail-closed 不留审计内容）
+            ApprovalDecision::Denied => rpc_string(RpcResponse::ok(
+                id,
+                serde_json::to_value(AuthzEvaluateResult {
+                    allowed: false,
+                    reason: Some(DenyReason::Rejected.as_str().to_string()),
+                    env: None,
+                })
+                .unwrap_or(Value::Null),
+            )),
+            ApprovalDecision::Timeout => rpc_string(RpcResponse::ok(
+                id,
+                serde_json::to_value(AuthzEvaluateResult {
+                    allowed: false,
+                    reason: Some(DenyReason::Timeout.as_str().to_string()),
+                    env: None,
+                })
+                .unwrap_or(Value::Null),
+            )),
+        }
+    }
+
     /// 解析注入 env（vault 读锁内；key 名 → 值；仅被授权 key；单次扫描）。
     pub(crate) fn resolve_env(
         &self,
@@ -204,6 +397,16 @@ impl Daemon {
     ) -> Result<std::collections::BTreeMap<String, String>> {
         let vault = self.shared.vault.read().unwrap();
         let v = vault.as_ref().ok_or(Error::SessionInvalid)?;
+        self.resolve_env_from(v, keys)
+    }
+
+    /// 从指定 vault（临时解锁态，#67）解析注入 env；语义同
+    /// [`Self::resolve_env`]——仅被授权 key、单次扫描。
+    pub(crate) fn resolve_env_from(
+        &self,
+        v: &UnlockedVault,
+        keys: &[String],
+    ) -> Result<std::collections::BTreeMap<String, String>> {
         let all = v.secret_values()?;
         let mut env = std::collections::BTreeMap::new();
         for k in keys {
@@ -215,9 +418,37 @@ impl Daemon {
     }
 
     /// 授权路径审计（starter 为进程链回溯结果；command 为命令摘要，脱敏：
-    /// `lk inject <sha256:8>`，audit.md §2）。
+    /// `lk inject <sha256:8>`，audit.md §2）。签名用共享 vault 的 K_audit。
     pub(crate) fn audit_authz(
         &self,
+        req: &AuthzRequest,
+        channel: AuditChannel,
+        result: AuditResult,
+    ) {
+        let vault = self.shared.vault.read().unwrap();
+        let Some(v) = vault.as_ref() else {
+            return; // 已锁定 → 无法签名（K_audit 已擦除）
+        };
+        self.audit_authz_with_keys(&v.keys().clone(), req, channel, result);
+    }
+
+    /// 授权路径审计的变体：用**指定 vault**（锁定态一体化的临时 vault，#67）
+    /// 的 K_audit 签名——锁态 `shared.vault` 为空，但临时解锁后 K_audit
+    /// 在内存可用（不落盘、不签发令牌，仅本次注入）。字段语义同
+    /// [`Self::audit_authz`]。
+    pub(crate) fn audit_authz_from(
+        &self,
+        vault: &UnlockedVault,
+        req: &AuthzRequest,
+        channel: AuditChannel,
+        result: AuditResult,
+    ) {
+        self.audit_authz_with_keys(&vault.keys().clone(), req, channel, result);
+    }
+
+    fn audit_authz_with_keys(
+        &self,
+        keys: &lk_core::crypto::Keys,
         req: &AuthzRequest,
         channel: AuditChannel,
         result: AuditResult,
@@ -230,14 +461,8 @@ impl Daemon {
             .next()
             .unwrap_or("lk")
             .to_string();
-        let vault = self.shared.vault.read().unwrap();
-        let Some(v) = vault.as_ref() else {
-            return; // 已锁定 → 无法签名（K_audit 已擦除）
-        };
-        let keys = v.keys().clone();
-        drop(vault);
         let _ = self.audit.append(
-            &keys,
+            keys,
             &EventInput {
                 starter: req.starter.clone(),
                 target,

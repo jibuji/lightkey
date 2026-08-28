@@ -88,6 +88,9 @@ pub enum VaultEvent {
     /// 用户选择经 `approval.result` 回传。`keys` 仅 key 名，永不含值。
     /// `challenge` 为一次性审批应答值（#78 方案 B）：随本事件仅投递给
     /// 桌面订阅者，回传时必须原样带回（ipc.md §4 / authorization-gate.md §6）。
+    /// `needs_unlock`（#67）：锁定态一体化审批——弹窗须同时提供主密码
+    /// 输入（身份确认）与 Allow/Deny（行为授权）；守护进程以主密码做
+    /// **临时解锁**（仅本次注入可用，不签发会话令牌）。
     AuthzRequest {
         request_id: uuid::Uuid,
         starter: String,
@@ -95,6 +98,7 @@ pub enum VaultEvent {
         command: String,
         keys: Vec<String>,
         challenge: String,
+        needs_unlock: bool,
     },
 }
 
@@ -259,6 +263,7 @@ mod tests {
                 command: "npm publish".into(),
                 keys: vec!["NPM_TOKEN".into()],
                 challenge: "chal".into(),
+                needs_unlock: false,
             }
             .name(),
             "authz.request"

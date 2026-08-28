@@ -107,6 +107,12 @@
   `lk-core::path_ns` 跨命名空间归一化（`wsl://<distro>/…` 规范形，两侧同函数）
   + 审计 `channel=wsl-bridge`；release 双产物（Linux `lk` + 桌面包捆绑
   `lk.exe`）；E2E `scripts/e2e_cross_subsystem.sh`（无 WSL 干净跳过）
+- [x] M2.8 锁定态 inject 一体化（补充拍板 #19）：锁定态 `lk inject` 在桌面审批
+  界面在场时折叠「临时解锁 + 本次授权」为一次交互（弹窗含主密码栏 + Allow/Deny）；
+  headless 维持 fail-closed `session.invalid`；一体化**不签发会话令牌 / 不写
+  session.token / 不置 shared.vault**（临时解锁材料只服务本次注入，不产生
+  item.* 全量读能力，#65 配套）；协议加 `approval.result.masterPassword` + 
+  `authz.request.needsUnlock`。见 `docs/authorization-gate.md` §5.1
 - [ ] M3 浏览器填充
 
 ## Agent skills

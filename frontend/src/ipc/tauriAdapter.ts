@@ -69,11 +69,16 @@ function unwrap<T>(res: { result?: T; error?: { code?: string; message?: string 
   return res.result as T;
 }
 
-/** 建立推送流（需有效会话令牌；失败静默——下次解锁重试）。 */
+/** 建立推送流（#67：桌面直调允许在**锁定态**订阅——锁态下守护进程需把
+ *  `authz.request(needsUnlock)` 帧投递给 GUI 以弹解锁+审批一体化窗口；
+ *  仅桌面来源被允许无会话订阅，socket 订阅仍需 token。失败静默——下次
+ *  解锁重试（通知为增强通道；会话事件经 ipc-bridge 本地兜底）。
+ *  订阅连接跨锁定有效（tauriAdapter.lock 保留推送流），首次订阅在启动
+ *  即建立（subscribeNotifications 于插件装配时调用），不再等到解锁。
+ */
 async function ensureSubscribed(): Promise<void> {
-  if (!sessionToken) return;
   try {
-    await invoke("subscribe", { token: sessionToken });
+    await invoke("subscribe", { token: sessionToken ?? "" });
   } catch {
     // 订阅失败不阻断主流程（通知为增强通道；会话事件经 ipc-bridge 本地兜底）
   }
@@ -227,12 +232,14 @@ export class TauriAdapter implements LightKeyIpc {
     requestId: string,
     decision: "allowed" | "denied",
     challenge: string,
+    masterPassword?: string,
   ): Promise<{ accepted: boolean }> {
     try {
       return rpc<{ accepted: boolean }>("approval.result", {
         requestId,
         decision,
         challenge,
+        ...(masterPassword !== undefined ? { masterPassword } : {}),
       });
     } catch (e) {
       throw mapError(e);

@@ -917,3 +917,279 @@ fn authz_deferred_invalid_token_session_gated_on_both_seams() {
     assert_eq!(ok["result"]["allowed"], true);
     assert_eq!(ok["result"]["env"]["NPM_TOKEN"], "sekrit");
 }
+
+// -------------------------------------------------------------------------
+// #67 锁定态一体化（临时解锁 + 本次授权一次交互）
+// -------------------------------------------------------------------------
+
+/// 锁定态夹具：初始化 + 建条目后**锁定**（无会话令牌、vault=None），
+/// 模拟「库存在但未解锁、GUI 已运行」场景。返回（命令锁, 共享态）。
+fn locked_daemon_with_secret(
+    dir: &std::path::Path,
+    secret: Option<(&str, &str)>,
+) -> (Arc<Mutex<Daemon>>, Arc<SharedDaemon>) {
+    {
+        let mut audit = AuditLog::open(dir).unwrap();
+        init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
+    }
+    let mut daemon = Daemon::start(dir).unwrap();
+    daemon
+        .shared()
+        .config
+        .write()
+        .unwrap()
+        .approval_timeout_secs = 1;
+    // 解锁建条目，再锁定（回到锁态）
+    let unlock = rpc_result(&daemon.handle(
+        &rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::unknown(),
+    ));
+    let token = unlock["token"].as_str().unwrap().to_string();
+    if let Some((name, value)) = secret {
+        daemon.handle(
+            &rpc_line(
+                M_ITEM_PUT,
+                Some(&token),
+                json!({ "item": {
+                    "type": "secret", "name": name, "value": value,
+                    "purpose": "", "expiresAt": null
+                } }),
+            ),
+            &PeerInfo::unknown(),
+        );
+    }
+    daemon.handle(
+        &rpc_line(M_VAULT_LOCK, None, json!({})),
+        &PeerInfo::unknown(),
+    );
+    let shared = daemon.shared();
+    let state = Arc::new(Mutex::new(daemon));
+    (state, shared)
+}
+
+/// 锁定态 + 桌面订阅：authz.evaluate → 广播 authz.request(needsUnlock=true)
+/// → approval.result(desktop, masterPassword) → 临时解锁放行 env；
+/// **不签发会话令牌**（vault 仍锁定、session.token 未写、item.* 不可用）——
+/// 即 #67 关键约束 + #65 注入通道不再产生全量能力。
+#[test]
+fn authz_locked_inject_unified_unlock_approval_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon_with_secret(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    // 锁态自检：vault 未解锁、令牌文件不存在（锁定时已删）
+    assert!(!shared.vault.read().unwrap().is_some());
+    assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
+
+    let handler = make_handler(&state, &shared);
+    // 桌面壳订阅（进程内登记 = desktop 来源）→ has_ui=true
+    let (_sid, rx) = shared.push.subscribe(true);
+    assert_eq!(shared.push.subscriber_count(), 1);
+    // 记录流程前审计水位（夹具 unlock/lock 各写一条；只断言本次流程新增）
+    let audit_before = audit_events(dir.path()).len();
+
+    // 线程内发起 evaluate（锁态、无 token —— 一体化流程应放行到审批等待）
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        None,
+        json!({ "command": "npm publish", "keys": ["NPM_TOKEN"] }),
+    );
+    let h = std::thread::spawn({
+        let handler = handler.clone();
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    // 广播帧：needsUnlock=true + challenge
+    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(fv["method"], "authz.request");
+    assert_eq!(fv["params"]["needsUnlock"], true, "锁态一体化帧须标注");
+    assert_eq!(fv["params"]["command"], "npm publish");
+    assert_eq!(fv["params"]["keys"][0], "NPM_TOKEN");
+    assert!(!frame.contains("sekrit"));
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    // 审批回传：desktop 直调 + allowed + masterPassword + challenge（
+    // 锁态无会话令牌——跳过 require_session 由 needs_unlock 待审保证）
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    // evaluate 返回放行 + env
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["allowed"], true, "锁态一体化应放行：{resp}");
+    assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit");
+    // 关键约束（#67 #2 / #65）：临时解锁不产生 item.* 全量能力
+    assert!(
+        shared.vault.read().unwrap().is_none(),
+        "临时解锁不得改写共享 vault（须保持锁定）"
+    );
+    assert!(
+        !dir.path().join(crate::SESSION_TOKEN_FILE).exists(),
+        "临时解锁不得写 session.token"
+    );
+    // 审计两条：#67 一体化 —— vault.unlock(desktop) + inject allowed(Approval)
+    let events = audit_events(dir.path());
+    let flow_events = &events[audit_before..];
+    let unlock_evs: Vec<_> = flow_events
+        .iter()
+        .filter(|e| e.command == "vault.unlock")
+        .collect();
+    assert_eq!(unlock_evs.len(), 1, "解锁事件须留痕（via=inject-gui）");
+    assert_eq!(unlock_evs[0].channel, lk_core::audit::AuditChannel::Desktop);
+    let authz_evs: Vec<_> = flow_events
+        .iter()
+        .filter(|e| e.command.starts_with("lk inject"))
+        .collect();
+    assert_eq!(authz_evs.len(), 1);
+    assert_eq!(authz_evs[0].result, lk_core::audit::AuditResult::Allowed);
+    assert_eq!(authz_evs[0].channel, lk_core::audit::AuditChannel::Approval);
+}
+
+/// 锁定态一体化：错误主密码 → approval.result 错误响应（accepted != true，
+/// 条目保留不回传）→ CLI 侧最终超时默认拒绝；AuthGuard 记失败。
+/// 弹窗在此错误上停留（UI 侧），倒计时内可重试——守护进程侧只保证不
+/// 解锁、不 resolve。
+#[test]
+fn authz_locked_inject_wrong_password_keeps_pending_and_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon_with_secret(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    let (_sid, rx) = shared.push.subscribe(true);
+    // 流程前审计水位（夹具 unlock 写过 vault.unlock，只断言本次流程新增）
+    let audit_before = audit_events(dir.path()).len();
+    let handler = make_handler(&state, &shared);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        None,
+        json!({ "command": "npm publish", "keys": ["NPM_TOKEN"] }),
+    );
+    // 线程内发起 evaluate（dispatch 直调在同线程会阻塞在 1s 审批等待上，
+    // 挡住后续 approval.result 的命令锁——须用主缝 handler 线程）
+    let h = std::thread::spawn({
+        let handler = handler.clone();
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    // 广播帧
+    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(fv["method"], "authz.request");
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    // 错误主密码：错误响应（vault.invalid 统一文案），条目未消费
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "WRONG-PW" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["error"]["code"], ERR_VAULT_INVALID,
+        "主密码错误须报错：{resp}"
+    );
+    assert_eq!(
+        shared.approvals.pending_count(),
+        1,
+        "错误密码不得 resolve（条目保留，弹窗可重试）"
+    );
+    // CLI 侧（等待线程）因审批窗口 1s 超时 → 默认拒绝
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["allowed"], false, "超时默认拒绝：{resp}");
+    assert_eq!(v["result"]["reason"], "timeout");
+    // vault 仍锁定、无令牌
+    assert!(shared.vault.read().unwrap().is_none());
+    assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
+    // 审计：未解锁 → 本次流程无 vault.unlock；无 inject 事件（超时拒绝
+    // 在锁态无 K_audit，与 v0 锁态拒绝同口径不审计）
+    let flow_events = &audit_events(dir.path())[audit_before..];
+    assert!(
+        !flow_events.iter().any(|e| e.command == "vault.unlock"),
+        "错误密码不得产生解锁事件"
+    );
+    assert!(!flow_events
+        .iter()
+        .any(|e| e.command.starts_with("lk inject")));
+}
+
+/// 锁定态一体化：用户拒绝 → 回传 denied（无需主密码）→ CLI 侧拒绝；
+/// vault 不解锁。
+#[test]
+fn authz_locked_inject_denied_without_unlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon_with_secret(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        None,
+        json!({ "command": "npm publish", "keys": ["NPM_TOKEN"] }),
+    );
+    let h = std::thread::spawn({
+        let handler = make_handler(&state, &shared);
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    // denied：无需主密码
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "denied", "challenge": challenge }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["allowed"], false);
+    assert_eq!(v["result"]["reason"], "rejected");
+    assert!(shared.vault.read().unwrap().is_none(), "拒绝不触发解锁");
+}
+
+/// 锁定态 + 无桌面订阅（纯 headless）：维持 v0 fail-closed——session.invalid，
+/// 不阻塞、不静默回落（issue #67「GUI 不在运行维持现状」）。
+#[test]
+fn authz_locked_inject_headless_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon_with_secret(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    assert_eq!(shared.push.subscriber_count(), 0, "无桌面订阅");
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        None,
+        json!({ "command": "npm publish", "keys": ["NPM_TOKEN"] }),
+    );
+    let resp = state.lock().unwrap().handle(&line, &peer);
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["error"]["code"], ERR_SESSION_INVALID,
+        "headless 锁态必须 fail-closed session.invalid：{resp}"
+    );
+    assert!(shared.vault.read().unwrap().is_none());
+}

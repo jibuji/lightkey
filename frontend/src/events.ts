@@ -69,6 +69,10 @@ export interface AuthzRequestPayload {
   /** 一次性审批挑战（#78）：回传 `approval.result` 时必须原样带回；
    *  该值仅经桌面通知通道下发（socket 订阅者不可见）。 */
   challenge: string;
+  /** 锁定态一体化（#67）：弹窗须同时收集主密码（临时解锁 + 本次授权
+   *  一次交互），允许决策回传 `masterPassword`；守护进程临时解锁后
+   *  不签发会话令牌——本次注入不产生 item.* 全量能力（#65）。 */
+  needsUnlock: boolean;
 }
 
 /** `vault.search` 负载（topbar 搜索框 → ui-vault；300ms 防抖）。 */

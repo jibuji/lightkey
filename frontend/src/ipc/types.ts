@@ -113,11 +113,15 @@ export interface LightKeyIpc {
    * approval.result：审批回传（allowed | denied；超时由守护进程侧产生）。
    * `challenge` 为 `authz.request` 帧携带的一次性应答值（#78），必须原样
    * 回带；仅桌面壳直调可提交（socket 来源 → channel.forbidden）。
+   * `masterPassword`（#67 锁定态一体化）：`needsUnlock` 待审且 decision=
+   * allowed 时必需——守护进程临时解锁本次注入（不签发会话令牌）；错误则
+   * 抛 VaultInvalidError（弹窗停留可重试）。
    */
   approvalResult(
     requestId: string,
     decision: "allowed" | "denied",
     challenge: string,
+    masterPassword?: string,
   ): Promise<{ accepted: boolean }>;
 
   /** config.get / config.set（ui-settings；config.json 非敏感运行时配置） */

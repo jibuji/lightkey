@@ -92,6 +92,11 @@ export class MockAdapter implements LightKeyIpc {
   private onFrame: ((frame: NotificationFrame) => void) | null = null;
   /** 待审批 requestId 集合（approvalResult 据此裁决 accepted）。 */
   private pendingApprovals = new Set<string>();
+  /** 锁定态一体化待审（#67）：这些 requestId 的 allowed 决策须先解锁
+   *  （masterPassword === MOCK_MASTER_PASSWORD），错误抛 VaultInvalidError
+   *  且条目保留（弹窗停留可重试）；锁态也允许提交（模拟守护进程跳过
+   *  require_session）。 */
+  private unlockApprovals = new Set<string>();
   /** 模拟 config（守护进程 config.json 的内存等价物）。 */
   private config: ConfigView = {
     autoLockMinutes: 5,
@@ -105,6 +110,7 @@ export class MockAdapter implements LightKeyIpc {
     this.rules = restore ? structuredClone(MOCK_RULES) : [];
     this.audit = restore ? [...MOCK_AUDIT] : [];
     this.pendingApprovals.clear();
+    this.unlockApprovals.clear();
   }
 
   private requireUnlocked() {
@@ -273,9 +279,26 @@ export class MockAdapter implements LightKeyIpc {
 
   async approvalResult(
     requestId: string,
-    _decision: "allowed" | "denied",
+    decision: "allowed" | "denied",
     _challenge: string,
+    masterPassword?: string,
   ): Promise<{ accepted: boolean }> {
+    // 锁定态一体化（#67）：unlock 待审允许在锁态提交（守护进程对 desktop
+    // 来源跳过 require_session）；allowed 须先解锁（主密码校验），错误
+    // 抛 VaultInvalidError 且条目保留（弹窗停留于倒计时内可重试）。
+    if (this.unlockApprovals.has(requestId)) {
+      if (decision === "allowed") {
+        if (masterPassword !== this.masterPassword) {
+          throw new VaultInvalidError();
+        }
+        this.unlockApprovals.delete(requestId);
+        const accepted = this.pendingApprovals.delete(requestId);
+        return delay({ accepted });
+      }
+      this.unlockApprovals.delete(requestId);
+      const accepted = this.pendingApprovals.delete(requestId);
+      return delay({ accepted });
+    }
     this.requireUnlocked();
     const accepted = this.pendingApprovals.delete(requestId);
     return delay({ accepted });
@@ -317,7 +340,9 @@ export class MockAdapter implements LightKeyIpc {
   /* ---------- QA 钩子（仅 mock；验证帧翻译 / 审批弹窗闭环） ---------- */
 
   /** 模拟守护进程推送 authz.request 帧（审批弹窗演示/测试入口）。
-   *  `challenge` 缺省给固定值（mock 不校验，仅透传给弹窗回传）。 */
+   *  `challenge` 缺省给固定值（mock 不校验，仅透传给弹窗回传）。
+   *  `needsUnlock`（#67）：锁定态一体化——弹窗须收集主密码；见
+   *  `unlockApprovals`。 */
   simulateAuthzRequest(params: {
     requestId: string;
     starter: string;
@@ -325,12 +350,20 @@ export class MockAdapter implements LightKeyIpc {
     command: string;
     keys: string[];
     challenge?: string;
+    needsUnlock?: boolean;
   }): void {
     this.pendingApprovals.add(params.requestId);
+    if (params.needsUnlock) {
+      this.unlockApprovals.add(params.requestId);
+    }
     this.onFrame?.({
       jsonrpc: "2.0",
       method: "authz.request",
-      params: { challenge: "mock-challenge", ...params },
+      params: {
+        challenge: "mock-challenge",
+        needsUnlock: params.needsUnlock ?? false,
+        ...params,
+      },
     });
   }
 

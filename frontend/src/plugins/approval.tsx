@@ -7,6 +7,14 @@
  * · 「允许本次」「拒绝」；Esc = 拒绝；超时自动关闭（守护进程侧超时审计
  * `timeout`，弹窗本地倒计时到期即关闭，不重复回传）。
  *
+ * **锁定态一体化（#67）**：帧携带 `needsUnlock=true` 时（守护进程锁态收到
+ * `authz.evaluate` 且桌面在场），弹窗额外渲染**主密码输入栏**（身份确认）：
+ * 「解锁并允许」= 一次性完成 临时解锁 + 本次授权；解锁失败（VaultInvalidError
+ * / 限流）→ 弹窗停留显示错误，倒计时继续（守护进程侧条目保留可重试，AuthGuard
+ * 不绕过）。允许后**不创建会话**——本次注入不产生 item.* 全量能力（#65）。
+ * 锁态（`session.unlocked=false`）下只有 needsUnlock 帧会弹窗；普通
+ * authz.request 仍被门控丢弃（QA P1 语义不变）。
+ *
  * 决策权始终在 Rust 侧（plugin-architecture.md §5.3）：本插件只把用户
  * 选择经 `approval.result` 回传，不持有裁决权；伪造/已超时 requestId →
  * 守护进程忽略（accepted=false）。
@@ -20,6 +28,7 @@ import type { Context, Plugin } from "@cordisjs/core";
 import type { AuthzRequestPayload } from "../events";
 import { CountdownRing } from "../components/atoms";
 import { Icon } from "../components/Icons";
+import { VaultInvalidError } from "../ipc";
 import { formatProjectDir } from "../utils/projectDir";
 
 /** 审批超时默认值（秒；与守护进程 `approval_timeout_secs` 默认值对齐）。
@@ -47,9 +56,13 @@ interface ApprovalItem {
   remain: number;
   /** 倒计时总秒数（config `approvalTimeoutSecs`，入队时读取）。 */
   total: number;
+  /** 解锁失败错误文案（#67；弹窗停留显示，可重试）。 */
+  error?: string;
 }
 
-/** 弹窗本体（手写 React：倒计时环形为原子组件，不拆内部结构）。 */
+/** 弹窗本体（手写 React：倒计时环形为原子组件，不拆内部结构）。
+ *  `needsUnlock`（#67）：展示主密码输入栏；「解锁并允许」携带
+ *  masterPassword 回传。 */
 export function ApprovalDialog({
   item,
   onResolve,
@@ -59,13 +72,32 @@ export function ApprovalDialog({
     requestId: string,
     decision: "allowed" | "denied",
     challenge: string,
-  ) => void;
+    masterPassword?: string,
+  ) => Promise<void>;
 }) {
   const req = item.request;
-  const deny = useCallback(
-    () => onResolve(req.requestId, "denied", req.challenge),
-    [onResolve, req.requestId, req.challenge],
-  );
+  const needsUnlock = req.needsUnlock;
+  const [password, setPassword] = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const deny = useCallback(() => {
+    void onResolve(req.requestId, "denied", req.challenge);
+  }, [onResolve, req.requestId, req.challenge]);
+
+  const allow = useCallback(async () => {
+    if (submitting) return;
+    // 解锁弹窗必须提供主密码（守护进程侧校验，错误不 resolve）
+    if (needsUnlock && !password) return;
+    setSubmitting(true);
+    // 解锁结果由插件的 onResolve 决定弹窗去留（失败停留显示 item.error）
+    if (needsUnlock) {
+      await onResolve(req.requestId, "allowed", req.challenge, password);
+    } else {
+      await onResolve(req.requestId, "allowed", req.challenge);
+    }
+    setSubmitting(false);
+  }, [submitting, needsUnlock, password, onResolve, req.requestId, req.challenge]);
 
   // Esc = 拒绝（spec §6.5；弹窗存在期间生效）
   useEffect(() => {
@@ -80,7 +112,11 @@ export function ApprovalDialog({
     <div className="modal-overlay" role="dialog" aria-modal="true" aria-label="授权请求审批">
       <div className="modal approval-dialog">
         <h3 className="modal-title">授权请求 · {req.starter}</h3>
-        <p className="modal-desc">Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）</p>
+        <p className="modal-desc">
+          {needsUnlock
+            ? "解锁态未就绪：输入主密码完成临时解锁并授权本次注入（不创建会话）"
+            : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
+        </p>
         <div className="approval-source">
           <span className="approval-avatar">
             <Icon name="terminal" size={18} />
@@ -100,6 +136,39 @@ export function ApprovalDialog({
             </span>
           ))}
         </div>
+        {needsUnlock ? (
+          <label className="field approval-unlock-field">
+            <span className="field-label">主密码（临时解锁 · 仅本次注入）</span>
+            <span className="input-wrap">
+              <input
+                type={showPw ? "text" : "password"}
+                placeholder="输入主密码"
+                value={password}
+                autoFocus
+                aria-label="主密码"
+                autoComplete="off"
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  if (item.error !== undefined) item.error = undefined;
+                }}
+              />
+              <button
+                type="button"
+                className="icon-btn input-affix"
+                aria-label={showPw ? "隐藏密码" : "显示密码"}
+                tabIndex={-1}
+                onClick={() => setShowPw((v) => !v)}
+              >
+                <Icon name="eye" size={16} />
+              </button>
+            </span>
+          </label>
+        ) : null}
+        {item.error ? (
+          <p className="field-error approval-error" role="alert">
+            {item.error}
+          </p>
+        ) : null}
         <div className="approval-timer">
           <CountdownRing total={item.total} remain={item.remain} />
           <span>
@@ -108,11 +177,15 @@ export function ApprovalDialog({
           </span>
         </div>
         <div className="modal-actions">
-          <button className="btn btn-ghost" onClick={deny}>
+          <button className="btn btn-ghost" onClick={deny} disabled={submitting}>
             拒绝
           </button>
-          <button className="btn btn-primary" onClick={() => onResolve(req.requestId, "allowed", req.challenge)}>
-            允许本次
+          <button
+            className="btn btn-primary"
+            onClick={() => void allow()}
+            disabled={submitting || (needsUnlock && !password)}
+          >
+            {needsUnlock ? "解锁并允许" : "允许本次"}
           </button>
         </div>
       </div>
@@ -132,7 +205,8 @@ function ApprovalHost({
     requestId: string,
     decision: "allowed" | "denied",
     challenge: string,
-  ) => void;
+    masterPassword?: string,
+  ) => Promise<void>;
   onExpire: () => void;
 }) {
   // 回调经 ref 持有：插件每次 render() 会新建闭包，但倒计时只随 current 重启
@@ -184,25 +258,38 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     root.render(
       <ApprovalHost
         current={queue[0] ?? null}
-        onResolve={(requestId, decision, challenge) => {
-          void ctx.ipc
-            .approvalResult(requestId, decision, challenge)
-            .then(({ accepted }) => {
-              // accepted=false = 守护进程已超时/伪造 id/挑战不符；弹窗照常关闭
-              if (decision === "allowed") {
-                ctx.toast.show(accepted ? "已允许本次（env 仅注入被批准 key）" : "请求已超时，未生效");
-              } else {
-                ctx.toast.show("已拒绝（已写审计）");
-              }
-            })
-            .catch(() => {
-              // 会话失效等回传失败：弹窗仍须关闭，不能卡死（QA P1）
+        onResolve={async (requestId, decision, challenge, masterPassword) => {
+          try {
+            const { accepted } =
+              masterPassword === undefined
+                ? await ctx.ipc.approvalResult(requestId, decision, challenge)
+                : await ctx.ipc.approvalResult(
+                    requestId,
+                    decision,
+                    challenge,
+                    masterPassword,
+                  );
+            // accepted=false = 守护进程已超时/伪造 id/挑战不符；弹窗照常关闭
+            if (decision === "allowed") {
+              ctx.toast.show(accepted ? "已允许本次（env 仅注入被批准 key）" : "请求已超时，未生效");
+            } else {
+              ctx.toast.show("已拒绝（已写审计）");
+            }
+            queue.shift();
+            render();
+          } catch (e) {
+            // 解锁失败（#67 锁定态一体化）：弹窗停留显示错误，倒计时继续
+            // ——守护进程侧条目保留（未 resolve），可重试；AuthGuard 限流
+            // 不绕过。其它错误（会话失效等）→ 弹窗仍须关闭，不能卡死（QA P1）
+            if (e instanceof VaultInvalidError && queue[0]?.request.needsUnlock) {
+              queue[0].error = "解锁失败（主密码错误或库未初始化）";
+              render();
+            } else {
               ctx.toast.show("审批回传失败（会话可能已锁定），弹窗已关闭");
-            })
-            .finally(() => {
               queue.shift();
               render();
-            });
+            }
+          }
         }}
         onExpire={() => {
           // 超时：守护进程侧超时审计 timeout；弹窗关闭、不回传
@@ -214,8 +301,8 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
   };
 
   // 订阅 authz.request：入队 + 弹窗（倒计时由宿主驱动，时长取自 config）。
-  // 锁态门控（QA P1）：锁定时不渲染弹窗、不展示任何请求元数据——守护进程侧
-  // 超时默认拒绝照常生效；解锁态才接受弹窗。
+  // 门控：普通帧仍要求解锁态；锁定态只接受 needsUnlock 一体化帧（#67，
+  // 锁态不渲染无关请求元数据——QA P1 语义不变）。
   let unlocked = ctx.session.unlocked;
   const offUnlocked = ctx.on("session.unlocked", () => {
     unlocked = true;
@@ -228,12 +315,12 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     render();
   });
   ctx.on("authz.request", (payload: AuthzRequestPayload) => {
-    if (!unlocked) return;
+    if (!unlocked && !payload.needsUnlock) return;
     // 入队前读 config（#50）：倒计时 total/remain 取自 approvalTimeoutSecs，
     // 与守护进程决策窗口同源；读取期间锁定则不入队。
     void (async () => {
       const total = await readApprovalTimeoutSecs(ctx);
-      if (!unlocked) return;
+      if (!unlocked && !payload.needsUnlock) return;
       queue.push({ request: payload, remain: total, total });
       mount();
       render();
