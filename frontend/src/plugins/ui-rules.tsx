@@ -76,7 +76,18 @@ export function RulesPage({ ctx }: { ctx: Context }) {
             <div className="rule-card" key={r.id}>
               <div className="rule-head">
                 <div>
-                  <div className="rule-cmd">{r.command}</div>
+                  <div className="rule-cmd">
+                    {/* M2.9 值披露：read 规则无命令绑定，按 capability 区分展示 */}
+                    {r.capability === "read" ? "读值规则（按条目名授权读取）" : r.command}
+                    {r.capability === "read" ? (
+                      <span
+                        className="key-tag"
+                        style={{ marginLeft: 8, verticalAlign: "middle" }}
+                      >
+                        read
+                      </span>
+                    ) : null}
+                  </div>
                   <div className="rule-dir">
                     <Icon name="folder" size={14} /> {formatProjectDir(r.projectDir)}
                     <span style={{ color: "var(--fg-2)" }}>· {r.name}</span>

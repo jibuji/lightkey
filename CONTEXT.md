@@ -1,3 +1,5 @@
+用平实自然的简体中文说清楚，不要堆砌抽象类名词。
+
 # LightKey
 
 轻钥（LightKey）：个人密钥/私密信息管理工具（lk-core / lk-daemon / lk-cli / 桌面壳），

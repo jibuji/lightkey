@@ -617,3 +617,109 @@ describe("tauri 模式：会话事件去重（本地广播 + 推送帧不双发�
     expect(states).toEqual(["unlocked", "unlocked"]);
   });
 });
+
+describe("M2.9 值披露弹窗（kind=read/export；docs/value-disclosure.md §6）", () => {
+  it("read 帧：展示条目名/启动者/目录、无命令框、有「允许并为此项目记住」", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-read",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.get",
+        keys: ["API_KEY"],
+        kind: "read",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    // 条目名 Tag（不展示值）
+    expect(dialog.textContent).toContain("API_KEY");
+    // read 弹窗不渲染命令框（读值无命令绑定）
+    expect(dialog.querySelector(".approval-cmd-box")).toBeNull();
+    // 记住按钮在（read 专属）
+    const rememberBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许并为此项目记住"),
+    );
+    expect(rememberBtn).toBeDefined();
+
+    // 点击记住 = allow 决策 + 追加 rule.add（capability=read，keys=[条目名]）
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    act(() => {
+      rememberBtn!.click();
+    });
+    await act(async () => {
+      // approvalResult 与 ruleAdd 各有 300ms 模拟延迟
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(resultSpy).toHaveBeenCalledWith("req-read", "allowed", "mock-challenge");
+    expect(ruleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectDir: "/work/proj-a",
+        command: "",
+        capability: "read",
+        keys: ["API_KEY"],
+      }),
+    );
+    // 弹窗关闭
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+
+  it("export 帧：展示数据包规模、无记住按钮（恒弹窗语义）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-export",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.export",
+        keys: ["合同.pdf"],
+        kind: "export",
+        exportMeta: { name: "合同.pdf", mime: "application/pdf", size: 1024 },
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    expect(dialog.textContent).toContain("合同.pdf");
+    // 数据包规模（formatSize(1024) = "1.0 KB"）
+    expect(dialog.textContent).toContain("1.0 KB");
+    expect(dialog.textContent).toContain("application/pdf");
+    // export 不提供记住按钮（规则不豁免导出）
+    const rememberBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许并为此项目记住"),
+    );
+    expect(rememberBtn).toBeUndefined();
+    // 允许/拒绝照常
+    expect(
+      Array.from(dialog.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("允许本次"),
+      ),
+    ).toBe(true);
+  });
+
+  it("inject 帧：无 exportMeta、无记住按钮（既有形态回归）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-inject",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+        kind: "inject",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    expect(dialog.querySelector(".approval-cmd-box")).not.toBeNull();
+    expect(
+      Array.from(dialog.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("允许并为此项目记住"),
+      ),
+    ).toBe(false);
+  });
+});

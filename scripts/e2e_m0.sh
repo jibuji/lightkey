@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # LightKey M0 单机闭环 E2E（docs/testing.md §1 第二层；CI 之外本地/手动运行）
 #
-# 场景：init → unlock → item add（四类各一）→ list/get → edit（CAS）→
-#       delete（墓碑）→ export（附件往返）→ lock → unlock → audit 可见 →
-#       恢复流程（恢复码 + 新主密码）→ 旧密码失效 / 数据完好
+# 场景：init → unlock → 预授权读规则（M2.9 值披露：headless 读值须经
+#       rule add --read 预授权；条目名须为 env 安全名以过规则校验）→
+#       item add（四类各一）→ list/get → edit（CAS）→ delete（墓碑）→
+#       export headless 拒绝（恒弹窗，无 GUI；附件往返由 lk-core 单测覆盖）→
+#       lock → unlock → audit 可见 → 恢复流程（恢复码 + 新主密码）→
+#       旧密码失效 / 数据完好
 #
 # 用法：bash scripts/e2e_m0.sh [lk-binary-path]
 set -u
@@ -39,24 +42,28 @@ check "错误密码解锁被拒（exit 1）" 1 $?
 echo "$MASTER_PW" | "$LK" unlock --stdin >/dev/null
 check "正确密码解锁成功" 0 $?
 
+echo "== 2.5 预授权读规则（M2.9 值披露：headless item get 须预授权）=="
+"$LK" rule add "$PWD" --read --name e2e0 --keys GitHub Diary API_KEY attachment >/dev/null
+check "rule add --read（绑定脚本 cwd）" 0 $?
+
 echo "== 3. item add（四类各一）=="
 ID_LOGIN="$("$LK" item add login --name GitHub --username octocat --password s3cr3t --uris https://github.com,https://gist.github.com | awk '{print $2}')"
 check "add login" 0 $?
-ID_NOTE="$("$LK" item add note --name 日记 --content '# 标题
+ID_NOTE="$("$LK" item add note --name Diary --content '# 标题
 
 正文内容' | awk '{print $2}')"
 check "add note" 0 $?
-ID_SECRET="$("$LK" item add secret --name 'API Key' --value sk-123456 --purpose 生产 --expires-at 2026-12-31 | awk '{print $2}')"
+ID_SECRET="$("$LK" item add secret --name API_KEY --value sk-123456 --purpose 生产 --expires-at 2026-12-31 | awk '{print $2}')"
 check "add secret" 0 $?
 head -c 2621440 /dev/urandom > "$WORK/orig.bin"   # 2.5 MiB（3 分块）
-ID_FILE="$("$LK" item add file --file "$WORK/orig.bin" --note 加密附件 | awk '{print $2}')"
+ID_FILE="$("$LK" item add file --name attachment --file "$WORK/orig.bin" --note 加密附件 | awk '{print $2}')"
 check "add file" 0 $?
 
 echo "== 4. list / get =="
 LIST="$("$LK" item list)"
 echo "$LIST" | grep -q "GitHub" && ok "list 含 login" || bad "list 缺 login"
-echo "$LIST" | grep -q "日记" && ok "list 含 note" || bad "list 缺 note"
-echo "$LIST" | grep -q "API Key" && ok "list 含 secret" || bad "list 缺 secret"
+echo "$LIST" | grep -q "Diary" && ok "list 含 note" || bad "list 缺 note"
+echo "$LIST" | grep -q "API_KEY" && ok "list 含 secret" || bad "list 缺 secret"
 echo "$LIST" | grep -q "orig.bin" && ok "list 含 file" || bad "list 缺 file"
 GET="$("$LK" item get "$ID_LOGIN")"
 echo "$GET" | grep -q "octocat" && ok "get 返回 username" || bad "get 缺 username"
@@ -77,12 +84,13 @@ echo "== 6. delete（墓碑）=="
 check "软删除成功" 0 $?
 "$LK" item get "$ID_NOTE" --json | jq -e .deleted >/dev/null && ok "条目进入 deleted 态" || bad "deleted 标记缺失"
 ls "$WORK" | grep -q "$ID_NOTE.tomb.lk" && ok "墓碑文件已写" || bad "墓碑文件缺失"
-"$LK" item list | grep "日记" | grep -q "\[deleted\]" && ok "list 显示 deleted" || bad "list 未标 deleted"
+"$LK" item list | grep "Diary" | grep -q "\[deleted\]" && ok "list 显示 deleted" || bad "list 未标 deleted"
 
-echo "== 7. export（附件往返）=="
-"$LK" item export "$ID_FILE" -o "$WORK/out.bin" >/dev/null
-check "export 成功" 0 $?
-cmp -s "$WORK/orig.bin" "$WORK/out.bin" && ok "附件往返一致（2.5 MiB）" || bad "附件不一致"
+echo "== 7. export（M2.9 值披露：headless 恒弹窗 → 拒绝）=="
+"$LK" item export "$ID_FILE" -o "$WORK/out.bin" >/dev/null 2>"$WORK/export.err"
+check "export 无 GUI 拒绝（exit 1）" 1 $?
+grep -q "授权门拒绝" "$WORK/export.err" && ok "拒绝文案提示 rule add --read 预授权" || bad "拒绝文案不符：$(cat "$WORK/export.err")"
+# 附件分块往返一致性由 lk-core vault 单测覆盖（M2.9 起 headless export 恒拒绝）
 
 echo "== 8. lock / status =="
 "$LK" lock >/dev/null && check "lock 成功" 0 $?
@@ -110,8 +118,7 @@ check "旧主密码失效（exit 1）" 1 $?
 echo "$NEW_PW" | "$LK" unlock --stdin >/dev/null
 check "新主密码解锁成功" 0 $?
 "$LK" item get "$ID_LOGIN" --json | jq -r .username | grep -q newuser2 && ok "重加密后数据完好" || bad "数据丢失"
-"$LK" item export "$ID_FILE" -o "$WORK/out2.bin" >/dev/null
-cmp -s "$WORK/orig.bin" "$WORK/out2.bin" && ok "附件重加密后仍可解密" || bad "附件损坏"
+"$LK" item get "$ID_FILE" --json | jq -r .note | grep -q 加密附件 && ok "附件元数据重加密后完好" || bad "附件元数据损坏"
 "$LK" audit | grep -q "audit-key-rotation" && ok "审计含密钥轮换事件（旧钥签名）" || bad "审计缺轮换事件"
 
 echo "== 11. 会话令牌生命周期 =="

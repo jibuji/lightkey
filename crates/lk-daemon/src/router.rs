@@ -44,10 +44,14 @@ pub enum ExecutionStrategy {
 }
 
 /// 方法 → 策略映射（唯一分发依据；新增方法在此登记，缺省 Inline）。
+///
+/// M2.9 值披露（value-disclosure.md §5.1）：`item.get` / `item.export`
+/// 升为 [`ExecutionStrategy::ApprovalDeferred`]——值离开守护进程必须是
+/// 授权事件（读规则命中静默放行，否则弹窗/拒绝）。
 pub fn strategy_of(method: &str) -> ExecutionStrategy {
     match method {
         M_SYNC_TRIGGER => ExecutionStrategy::OutsideLock,
-        M_AUTHZ_EVALUATE => ExecutionStrategy::ApprovalDeferred,
+        M_AUTHZ_EVALUATE | M_ITEM_GET | M_ITEM_EXPORT => ExecutionStrategy::ApprovalDeferred,
         _ => ExecutionStrategy::Inline,
     }
 }
@@ -67,9 +71,7 @@ pub fn route(
         .map(|req| strategy_of(&req.method));
     match strategy {
         Some(ExecutionStrategy::OutsideLock) => sync_trigger_outside_lock(state, shared, line),
-        Some(ExecutionStrategy::ApprovalDeferred) => {
-            authz_evaluate_deferred(state, shared, line, peer)
-        }
+        Some(ExecutionStrategy::ApprovalDeferred) => approval_deferred(state, shared, line, peer),
         _ => {
             let mut guard = state.lock().expect("daemon mutex poisoned");
             guard.handle(line, peer)
@@ -110,17 +112,39 @@ fn sync_trigger_outside_lock(
     serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into())
 }
 
-/// ApprovalDeferred 编排（`authz.evaluate`）：①命令锁内 begin（会话预检 +
-/// 启动者判定 + 第 1/2 层短路；需要审批则登记待审批并广播 `authz.request`）
-/// → ②命令锁外等待决策（≤超时默认拒绝；等待期间其他命令照常服务，G1）
-/// → ③重取命令锁收尾（解密 key 值 + 审计 channel=Approval）。
-fn authz_evaluate_deferred(
+/// ApprovalDeferred 编排（`authz.evaluate` / `item.get` / `item.export`，
+/// M2.9 值披露）：①命令锁内 begin（会话预检 + 通道判定 + 第 1/2 层短路；
+/// 需要审批则登记待审批并广播 `authz.request`）→ ②命令锁外等待决策（≤
+/// 超时默认拒绝；等待期间其他命令照常服务，G1）→ ③重取命令锁收尾。
+///
+/// 按 method 分派到各自的 begin/finalize 对：`authz.evaluate` 走注入裁决
+/// （`authz_begin` / `authz_finalize`），`item.get` / `item.export` 走值披露
+/// 裁决（`disclosure_begin` / `disclosure_finalize`，daemon/disclosure.rs）。
+fn approval_deferred(
     state: &Arc<Mutex<Daemon>>,
     shared: &Arc<SharedDaemon>,
     line: &str,
     peer: &PeerInfo,
 ) -> String {
     let req: RpcRequest = serde_json::from_str(line).expect("route 已按策略分派");
+    if req.method == M_AUTHZ_EVALUATE {
+        authz_evaluate_deferred(state, shared, &req, peer)
+    } else {
+        disclosure_deferred(state, shared, &req, peer)
+    }
+}
+
+/// 注入裁决编排（`authz.evaluate`；三阶段见 `authz_evaluate_deferred` 原语义）：
+/// ①命令锁内 begin（会话预检 + 启动者判定 + 第 1/2 层短路；需要审批则登记
+/// 待审批并广播 `authz.request`）→ ②命令锁外等待决策（≤超时默认拒绝；等待
+/// 期间其他命令照常服务，G1）→ ③重取命令锁收尾（解密 key 值 + 审计
+/// channel=Approval）。
+fn authz_evaluate_deferred(
+    state: &Arc<Mutex<Daemon>>,
+    shared: &Arc<SharedDaemon>,
+    req: &RpcRequest,
+    peer: &PeerInfo,
+) -> String {
     let id = req.id.clone();
     let token = extract_token(&req.params);
     // ① 命令锁内
@@ -132,7 +156,7 @@ fn authz_evaluate_deferred(
         if !guard.authz_evaluate_precheck(token.as_deref()) {
             return rpc_string(session_invalid(id));
         }
-        guard.authz_begin(id.clone(), req.params, peer)
+        guard.authz_begin(id.clone(), req.params.clone(), peer)
     };
     match begin {
         crate::AuthzBegin::Final(resp) => Some(resp),
@@ -143,6 +167,46 @@ fn authz_evaluate_deferred(
             let resp = {
                 let mut guard = state.lock().expect("daemon mutex poisoned");
                 let r = guard.authz_finalize(id, request_id, decision);
+                guard.touch_activity();
+                r
+            };
+            Some(resp)
+        }
+    }
+    .unwrap_or_else(|| "{}".into())
+}
+
+/// 值披露编排（`item.get` / `item.export`，M2.9）：同一三阶段骨架——
+/// ①命令锁内 `disclosure_begin`（会话预检 + 条目解析 + 通道判定：desktop
+/// 直调受信豁免直返；socket 走读规则匹配 → 命中静默放行，未命中弹窗/拒绝）
+/// → ②命令锁外等待决策 → ③重取命令锁收尾（披露值/数据包 + 审计）。
+fn disclosure_deferred(
+    state: &Arc<Mutex<Daemon>>,
+    shared: &Arc<SharedDaemon>,
+    req: &RpcRequest,
+    peer: &PeerInfo,
+) -> String {
+    let id = req.id.clone();
+    let token = extract_token(&req.params);
+    // ① 命令锁内：锁态先失败（session.invalid，spec §3——读通道不做 #67
+    // 式一体化，§12）
+    let begin = {
+        let mut guard = state.lock().expect("daemon mutex poisoned");
+        guard.auto_lock_if_idle();
+        if !guard.disclosure_precheck(token.as_deref()) {
+            return rpc_string(session_invalid(id));
+        }
+        guard.disclosure_begin(id.clone(), &req.method, req.params.clone(), peer)
+    };
+    match begin {
+        crate::DisclosureBegin::Final(resp) => Some(resp),
+        crate::DisclosureBegin::Pending { request_id } => {
+            // ② 锁外等待（≤超时默认拒绝；G1）
+            let decision = shared.approvals.await_decision(request_id);
+            // ③ 重取命令锁收尾
+            let resp = {
+                let mut guard = state.lock().expect("daemon mutex poisoned");
+                let r = guard.disclosure_finalize(id, request_id, decision);
                 guard.touch_activity();
                 r
             };

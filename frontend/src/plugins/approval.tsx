@@ -50,6 +50,13 @@ async function readApprovalTimeoutSecs(ctx: Context): Promise<number> {
   }
 }
 
+/** 字节规模人性化展示（export 弹窗的数据包规模；M2.9 值披露）。 */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 interface ApprovalItem {
   request: AuthzRequestPayload;
   /** 剩余秒数（倒计时环形）。 */
@@ -62,7 +69,11 @@ interface ApprovalItem {
 
 /** 弹窗本体（手写 React：倒计时环形为原子组件，不拆内部结构）。
  *  `needsUnlock`（#67）：展示主密码输入栏；「解锁并允许」携带
- *  masterPassword 回传。 */
+ *  masterPassword 回传。
+ *  M2.9 值披露：按 `kind` 选形态——`read`（条目名 Tag、无命令框、
+ *  「允许并为此项目记住」= allow + rule.add）；`export`（额外展示数据包
+ *  规模，无记住按钮——导出恒弹窗，规则不豁免）；`inject` 为既有形态
+ *  （缺省：旧帧无 kind 字段时按 inject 渲染）。 */
 export function ApprovalDialog({
   item,
   onResolve,
@@ -73,10 +84,14 @@ export function ApprovalDialog({
     decision: "allowed" | "denied",
     challenge: string,
     masterPassword?: string,
+    remember?: boolean,
   ) => Promise<void>;
 }) {
   const req = item.request;
   const needsUnlock = req.needsUnlock;
+  const kind = req.kind ?? "inject";
+  const isRead = kind === "read";
+  const isExport = kind === "export";
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -85,19 +100,22 @@ export function ApprovalDialog({
     void onResolve(req.requestId, "denied", req.challenge);
   }, [onResolve, req.requestId, req.challenge]);
 
-  const allow = useCallback(async () => {
-    if (submitting) return;
-    // 解锁弹窗必须提供主密码（守护进程侧校验，错误不 resolve）
-    if (needsUnlock && !password) return;
-    setSubmitting(true);
-    // 解锁结果由插件的 onResolve 决定弹窗去留（失败停留显示 item.error）
-    if (needsUnlock) {
-      await onResolve(req.requestId, "allowed", req.challenge, password);
-    } else {
-      await onResolve(req.requestId, "allowed", req.challenge);
-    }
-    setSubmitting(false);
-  }, [submitting, needsUnlock, password, onResolve, req.requestId, req.challenge]);
+  const allow = useCallback(
+    async (remember = false) => {
+      if (submitting) return;
+      // 解锁弹窗必须提供主密码（守护进程侧校验，错误不 resolve）
+      if (needsUnlock && !password) return;
+      setSubmitting(true);
+      // 解锁结果由插件的 onResolve 决定弹窗去留（失败停留显示 item.error）
+      if (needsUnlock) {
+        await onResolve(req.requestId, "allowed", req.challenge, password);
+      } else {
+        await onResolve(req.requestId, "allowed", req.challenge, undefined, remember);
+      }
+      setSubmitting(false);
+    },
+    [submitting, needsUnlock, password, onResolve, req.requestId, req.challenge],
+  );
 
   // Esc = 拒绝（spec §6.5；弹窗存在期间生效）
   useEffect(() => {
@@ -115,7 +133,11 @@ export function ApprovalDialog({
         <p className="modal-desc">
           {needsUnlock
             ? "解锁态未就绪：输入主密码完成临时解锁并授权本次注入（不创建会话）"
-            : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
+            : isRead
+              ? "Agent 请求读取该项目目录下条目的值（值不会显示，批准后仅返回给发起程序）"
+              : isExport
+                ? "Agent 请求导出条目数据包（附件明文将离开守护进程，请确认）"
+                : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
         </p>
         <div className="approval-source">
           <span className="approval-avatar">
@@ -128,7 +150,13 @@ export function ApprovalDialog({
             </div>
           </div>
         </div>
-        <div className="approval-cmd-box">$ {req.command}</div>
+        {isExport && req.exportMeta ? (
+          // export：数据包规模（name/mime/size；不含数据本身）
+          <div className="approval-cmd-box">
+            {req.exportMeta.name} · {req.exportMeta.mime} · {formatSize(req.exportMeta.size)}
+          </div>
+        ) : null}
+        {!isRead && !isExport ? <div className="approval-cmd-box">$ {req.command}</div> : null}
         <div className="approval-keys">
           {req.keys.map((k) => (
             <span className="key-tag" key={k}>
@@ -180,6 +208,17 @@ export function ApprovalDialog({
           <button className="btn btn-ghost" onClick={deny} disabled={submitting}>
             拒绝
           </button>
+          {/* read 专属「记住」：allow 决策 + 追加一条 read 规则（默认不持久化，
+              用户显式选择；export 恒弹窗语义 → 不提供记住） */}
+          {isRead ? (
+            <button
+              className="btn"
+              onClick={() => void allow(true)}
+              disabled={submitting}
+            >
+              允许并为此项目记住
+            </button>
+          ) : null}
           <button
             className="btn btn-primary"
             onClick={() => void allow()}
@@ -206,6 +245,7 @@ function ApprovalHost({
     decision: "allowed" | "denied",
     challenge: string,
     masterPassword?: string,
+    remember?: boolean,
   ) => Promise<void>;
   onExpire: () => void;
 }) {
@@ -258,7 +298,7 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     root.render(
       <ApprovalHost
         current={queue[0] ?? null}
-        onResolve={async (requestId, decision, challenge, masterPassword) => {
+        onResolve={async (requestId, decision, challenge, masterPassword, remember) => {
           try {
             const { accepted } =
               masterPassword === undefined
@@ -269,9 +309,26 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
                     challenge,
                     masterPassword,
                   );
-            // accepted=false = 守护进程已超时/伪造 id/挑战不符；弹窗照常关闭
             if (decision === "allowed") {
               ctx.toast.show(accepted ? "已允许本次（env 仅注入被批准 key）" : "请求已超时，未生效");
+              // read 审批的「允许并为此项目记住」：allow 后追加一条 read 规则
+              // （M2.9 值披露 §6：channel=desktop、capability=read、keys=[条目名]、
+              // projectDir=弹窗展示的 cwd）。仅 accepted 时写（超时/伪造回传
+              // 不预授权）；失败不阻塞弹窗关闭，仅提示。
+              if (remember && accepted && queue[0]?.request.kind === "read") {
+                const r = queue[0].request;
+                try {
+                  await ctx.ipc.ruleAdd({
+                    projectDir: r.projectDir,
+                    name: `read-${r.keys[0] ?? "item"}`,
+                    command: "",
+                    keys: r.keys,
+                    capability: "read",
+                  });
+                } catch {
+                  ctx.toast.show("记住规则写入失败（可稍后在规则页手动添加）");
+                }
+              }
             } else {
               ctx.toast.show("已拒绝（已写审计）");
             }

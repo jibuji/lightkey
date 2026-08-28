@@ -178,6 +178,36 @@ Windows 主机上的 LightKey 桌面守护实例——查看条目、请求授�
 
 > 本里程碑为补充拍板 #19 新增（插入 M2.75 之后、M3 之前），已完成。
 
+## M2.9 —— 值披露裁决：item.get / item.export 能力面（已完成）
+
+**目标**：issue #65 主体，按补充拍板 #20 落地——安全边界修订为
+**产品接口面即边界**（令牌 = 认证 ≠ 授权），`item.get` / `item.export`
+从「持令牌即返回明文」升为裁决方法。**实现规格见
+[value-disclosure.md](value-disclosure.md)**（判定矩阵、读规则 schema、
+RPC/执行计划、CLI/前端、审计、测试计划、PR 切分）。
+
+范围（细节以 [value-disclosure.md](value-disclosure.md) 为准）：
+
+- lk-core：`Rule.capability` + 读规则匹配 + `ApprovalKind` + `authz.denied`
+  错误码（spec §4/§5.4）；
+- lk-daemon：`strategy_of` 升级两方法 + begin/finalize 裁决编排 + 审计
+  （spec §5/§8）；
+- lk-cli + E2E：`rule add --read`、拒绝文案、e2e_m2.sh 场景（spec §7/§10.3）；
+- 前端：弹窗按 kind 渲染 + 「允许并记住」存读规则（spec §6）。
+
+**出口**：`cargo test` + vitest 全绿；M0/M1/M2 E2E 回归 + spec §10 新增
+断言通过；clippy/fmt 全绿；文档同步（spec 状态翻转、authorization-gate
+§8、milestones）；**#65 关闭**。
+
+**落地记录**：单 PR 交付（lk-core/lk-daemon/lk-cli/前端/e2e 一次合入）。
+实现与 spec 的两处偏差见 spec 注记：`authz.denied` 错误码取 **-32017**
+（spec 原定 -32015 已被 `ERR_BRIDGE_*` 占用，§5.4）；read 规则 CLI 形态为
+`--read --keys <name...>`（clap 位置参数贪婪性，§7）。e2e_m0/m1 同步适配：
+headless 读值经 `rule add --read` 预授权（条目名改 env 安全名）、headless
+export 转为恒拒绝断言（附件往返由 lk-core/daemon 测试覆盖）。
+
+> 本里程碑为补充拍板 #20 新增（插入 M2.8 之后、M3 之前）。
+
 ## M3 —— 浏览器填充（V1 之后）
 
 **目标**：浏览器扩展按 [browser-fill.md](browser-fill.md) 协议实现。

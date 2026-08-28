@@ -52,12 +52,16 @@
   仅当前用户——尽力而为，收紧失败回落目录继承 ACL 并在 stderr 留痕，
   数据目录本身用户私有），**锁定/超时/守护进程退出即删除**，生命周期 =
   解锁窗口。
-  风险面收窄到**同用户本地进程**——该边界已拍板承认：同用户进程互信是
-  个人单机工具的威胁模型基线（对标 ssh-agent / `gh auth` / aws credentials
-  等同类凭据的存放模型），「跨命令复用解锁态」与 bridge 跨子系统复用桌面
-  解锁态均为既定特性（#71/#74/#77 据此定案，补充拍板 #15）。
-  「令牌仅存于客户端进程内存、不落盘」的
-  形态以桌面/浏览器等常驻客户端为前提，属后续解锁通道一体化的设计项。
+  风险面收窄到**同用户本地进程**——安全边界（补充拍板 #20 修订）：
+  **产品接口面即边界**。令牌文件使同用户进程可复用解锁态（「跨命令复用
+  解锁态」与 bridge 跨子系统复用桌面解锁态均为既定特性，#71/#74/#77 据此
+  定案，补充拍板 #15），但**令牌 = 认证 ≠ 授权**：持令牌只保证能发起请求，
+  **值的披露是授权事件**（读规则命中或弹窗批准，见
+  [authorization-gate.md](authorization-gate.md) §8，拍板待实现）；绕过
+  产品接口的同用户原生攻击（调试器/内存注入/键盘钩子等）在边界外，如实
+  声明。「令牌仅存于客户端进程内存、不落盘」的形态（#68 选项 2）降级为
+  观望：dispatch 层值裁决落地后，被盗令牌的残值只剩元数据与规则范围内的
+  值，仅在元数据泄露被认为不可接受时再议。
 - 锁定/超时/守护进程退出 → 令牌立即失效。
 
 ## 4. 方法与最小字段原则（D10）
@@ -70,13 +74,13 @@
 | `vault.lock` | 立即锁定 | 无 |
 | `vault.recover` | 恢复：恢复码 + 新主密码（重置主密码，数据保留） | 新恢复码（仅展示一次） |
 | `item.list` | 索引（解密态最小字段） | id/name/type/revision/deleted |
-| `item.get` | 单条 | 完整解密条目 |
+| `item.get` | 单条（M2.9 值裁决：桌面直调豁免；socket 走**读规则 → 弹窗 → 拒绝**三层，未命中且无批准 → `authz.denied`（-32017）） | 完整解密条目 |
 | `item.put` / `item.delete` | 写 | 新 revision |
-| `item.export` | 导出 file 条目附件（整包下载） | 名称/MIME/大小 + base64 数据 |
+| `item.export` | 导出 file 条目附件（整包下载；M2.9：**恒弹窗**，任何规则不豁免；headless 无 GUI → `authz.denied`） | 名称/MIME/大小 + base64 数据 |
 | `sync.trigger` / `sync.poll` | 同步控制 | 变更摘要（不返回内容） |
 | `authz.evaluate` | 授权门判定（M2）；`channel` 枚举 `cli` \| `desktop` \| `wsl-bridge`（跨子系统桥，补充拍板 #14，审计如实记录）。锁定态一体化（#67/补充拍板 #19）：库锁态 + 桌面审批界面在场 → 走临时解锁+本次授权一次交互（§4.1 锁定态）；headless 锁态 → fail-closed `session.invalid` | 允许/拒绝 + 最小 env 集 |
 | `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`）。**仅桌面内嵌直调可提交**——socket/pipe 连接 → `channel.forbidden`（-32014）；params 含 `challenge`（`authz.request` 帧下发的一次性应答值，错值 → `accepted=false` 且条目保留；#72/#78 / 补充拍板 #16）；锁定态一体化待审+allowed 时含可选 `masterPassword`（守护进程临时解锁，§4.1） | accepted（是否接受） |
-| `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6） | 规则 / 规则列表 / 无 |
+| `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6；M2.9 起规则含 `capability`：`inject`（注入，缺省）\|`read`（读值，command 恒空串、keys=可读条目名），能力不互授） | 规则 / 规则列表 / 无 |
 | `audit.list` | 审计查询 | 事件（无密钥值） |
 | `audit.verify` | 校验审计 HMAC 链 | 已验证事件数 |
 | `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A）。来源标签：桌面壳为进程内直调订阅，socket 流连接为普通订阅——后者**不计入审批界面判定、也收不到 `authz.request` 帧**（#72/#78：帧内 challenge 是审批应答凭据，只走桌面通道）。**锁定态订阅**（#67）：desktop 来源允许锁态订阅（推送目标注册，桌面直调无需会话令牌；socket 订阅照旧要求有效会话），使锁态 `authz.request` 帧到达 GUI；帧无密钥值，不泄露明文 | 无 |
@@ -95,7 +99,9 @@
   同时收集主密码（身份确认）与 Allow/Deny（行为授权）；headless →
   fail-closed `session.invalid`。详见 [authorization-gate.md](authorization-gate.md) §5.1。
 - **`authz.request` 帧扩展**：`needsUnlock`（bool）标注锁定态一体化审批（弹窗
-  须收集主密码），缺省 false。
+  须收集主密码），缺省 false。M2.9 值披露：`kind`（`inject`\|`read`\|`export`）
+  标注审批类型（弹窗按形态渲染），缺省 `inject`；`kind=export` 时带
+  `exportMeta`（`name`/`mime`/`size`，数据包规模，不含数据本身）。
 - **`approval.result` 扩展**：可选 `masterPassword`——仅 `needs_unlock` 待审
   条目 + `allowed` 决策时使用并校验；守护进程以其做**临时解锁**（AuthGuard
   限流照常），错误主密码计失败计数并以错误响应退回弹窗（条目保留可重试）。

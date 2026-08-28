@@ -6,10 +6,10 @@
   「装什么、怎么装、怎么测、怎么判」。
 - 全程在 **WSL2 内操作**为主（标注「Windows 侧」的步骤在 PowerShell/CMD 执行）；
   所有命令可直接复制执行。
-- 真机复测实战经验见
-  [agents/win-host-cross-subsystem-retest.md](agents/win-host-cross-subsystem-retest.md)；
-  最新实测结论（判定矩阵行 1：设计链路成立，2026-08-24）见
-  [agents/win-host-cross-subsystem-retest-report-20260824.md](agents/win-host-cross-subsystem-retest-report-20260824.md)。
+- 2026-08-24 真机复测（issue #32 第 0 步）的实测指南与报告为一次性文档，已于
+  2026-08-28 收束删除：有用操作口径并入本文（Windows 本地冒烟 §5.5、探针判别法
+  §7.2–§7.4），链路结论（判定矩阵行 1：设计链路成立）已回填
+  [cross-subsystem.md](cross-subsystem.md) §5。
 
 ## 0. 前置事实表（先读再动手）
 
@@ -170,6 +170,26 @@ export LIGHTKEY_BRIDGE=/mnt/<盘>/<repo>/target/release/lk.exe   # 路径 B；�
 
 报错对照 §9 排障表。通了进入 §6。
 
+### 5.5 Windows 本地冒烟（可选基线自检，不涉 WSL）
+
+进入跨子系统测试前，可先在 Windows 本地（PowerShell）确认基线健康——
+inject 能读到 IPC 对端真实 cwd、传输不间歇误杀（历史故障点 #33/#31）：
+
+```powershell
+mkdir C:\lk-smoke; cd C:\lk-smoke
+.\lk.exe unlock    # 交互输入主密码；脚本化可 echo pw | .\lk.exe unlock --stdin
+.\lk.exe rule add C:\lk-smoke "cmd *" --name smoke LK_SMOKE_FAKE
+.\lk.exe item add secret --name LK_SMOKE_FAKE --value fake-not-a-real-key --purpose smoke
+.\lk.exe inject --keys LK_SMOKE_FAKE -- cmd /c echo %LK_SMOKE_FAKE%
+# 期望：stdout 为 fake-not-a-real-key，退出码 0
+```
+
+- 反向对照（建议）：`cd C:\` 后重跑 inject，期望被拒且拒绝原因**不是**
+  `no_cwd`（=「cwd 读得到但不匹配」的基线证据）；
+- 传输压测（#31 回归）：`$ok = 0; foreach ($i in 1..20) { .\lk.exe status *> $null; if ($LASTEXITCODE -eq 0) { $ok++ } }; "OK: $ok/20"`，
+  期望 ≥ 19/20；逐次失败 stderr 留档（传输类报错 = 竞态未根治的证据）；
+- 清理：`rule remove` + `item delete` + `lock`，`rule list` 无 smoke 残留。
+
 ## 6. E2E 主测试（[../scripts/e2e_cross_subsystem.sh](../scripts/e2e_cross_subsystem.sh)）
 
 用法（仓库根目录执行）：
@@ -295,8 +315,8 @@ cd /tmp && "$LK" inject --keys LK_PROBE_FAKE -- sh -c true
   与命名空间，逐项比对 `rule list` 入库 project_dir 与理论规范形）。
 
 2026-08-24 真机结论：探针 B 得 `no_ui` ≠ `no_cwd`，PEB cwd 可读，判定矩阵
-行 1（设计链路成立），详见
-[agents/win-host-cross-subsystem-retest-report-20260824.md](agents/win-host-cross-subsystem-retest-report-20260824.md)。
+行 1（设计链路成立）；结论已回填 [cross-subsystem.md](cross-subsystem.md) §5
+（当时的一次性实测报告已收束删除）。
 
 ### 7.4 GUI 弹窗存在性探测（Agent 可执行；30s 倒计时内）
 

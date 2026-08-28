@@ -279,4 +279,41 @@ needs-decision，不得自行变更。
     {authz,mod,session}.rs, notifier.rs, router.rs} + 前端 {events,ipc/*,plugins/
     approval.tsx} + E2E/单测。
 
+20. **安全边界修订：产品接口面即边界，#65-B 立项（2026-08-28 · 来源：issue #65
+    复议，船长拍板）**：修订补充拍板 #15 的后半句——「同用户进程互信为防护
+    边界之外」不再覆盖**经产品接口到达的请求**（IPC socket / named pipe /
+    桌面内嵌直调 / CLI / 未来 Native Messaging）。#15 前半句维持：同用户
+    **原生攻击者**（调试器、内存注入、键盘钩子等**绕过产品接口**的路径）仍在
+    边界外，如实声明（#17/#18 处置不变）。修订依据：被提示注入操纵的 agent
+    仍是走合法 API 的同用户进程，接口层能力收敛对它真实有效——这正是 D8 的
+    立项目标；ssh-agent 类比对 LightKey 不成立，因为 LightKey 自己承诺了
+    「agent 只能看到被授权的 key 名」，承诺与边界必须一致。裁定：
+    - **令牌 = 认证，不 = 授权**：会话令牌只证明「存在已解锁会话」；**值的
+      披露必须是一个授权事件**——用户预写的规则命中，或用户当场的弹窗批准。
+      桌面内嵌直调通道（人在 GUI 前）默认受信（复用 #78 连接标签）。
+    - **item.get / item.export 升为裁决方法**（复用 #81 的 ApprovalDeferred
+      编排，`router.rs strategy_of` 登记扩展）：读走三层——读规则（新增规则
+      能力类型：projectDir + keys，无 command 绑定）→ 桌面弹窗（30s 超时
+      拒绝）→ fail-closed 拒绝；**export 恒弹窗，任何规则不豁免**（整条目
+      数据包含附件原始数据、单次披露量最大）。git hook / cron /
+      VSCode task / WSL bridge 等
+      合法程序化读由读规则覆盖（WSL 侧复用 starter 链回溯 + `wsl://` cwd
+      归一化，无新机制）。
+    - **元数据维持令牌门**：`item.list`（名称）与 `rule.list`（规则内 key 名）
+      照旧持令牌即可读——值是边界，名称如实降级。D8「未授权 key 名不可见」
+      的承诺修订为「**在 inject 通道内严格成立；持令牌进程可见条目/规则
+      元数据**」（authorization-gate.md §2 同步修订）。
+    - **不依赖「交互式 / 程序化可区分」的启发式**（脚本与手敲的进程链同形、
+      TTY 可被继承可被伪造）：人在场的证明交给弹窗本身。弹窗提供「允许并为
+      此项目记住（存为读规则）」一键（GUI 写规则本就是 D8 合法路径），把
+      重复交互降为一次。
+    - **#68 选项 2（常驻进程持令牌）降级为观望**：dispatch 层能力门已把被盗
+      令牌的残值压到「元数据 + 规则范围内」；#68-opt2 关闭的是令牌获取路径，
+      但要重构 A1（文件令牌跨命令复用），代价高、边际收益小。仅在元数据
+      泄露被用户认为不可接受时再议，不与本项捆绑。
+    - **交付纪律**：上述落成一个完整 spec（authorization-gate.md §2/§7/§8 +
+      ipc.md §3 + data-model.md 读规则 schema），实现按 TDD 在
+      `router.rs strategy_of` / dispatch seam 先立失败测试；**#65 保持 open
+      至 spec 落地再关闭**。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

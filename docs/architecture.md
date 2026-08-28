@@ -13,10 +13,12 @@ V1 MVP 交付三样东西：
 3. **桌面应用**（Tauri 2 壳 `lk-app` + React 前端）：复用 `lk-core`。
 
 **产物矩阵补充（跨子系统桥，补充拍板 #14，M2.75）**：同一 workspace 无代码
-分叉，新增 Linux 产物 `lk`（`x86_64-unknown-linux-gnu`，CI ubuntu job 或
-release 补齐），供 WSL 内 agent/用户调用；Windows 侧 `lk.exe` 兼任 bridge
-stdio 中继（随桌面安装包落地到安装目录）。详见
-[cross-subsystem.md](cross-subsystem.md) §6。
+分叉，新增 Linux 产物 `lk`（`x86_64-unknown-linux-gnu`，release 双产物之一）——
+供 Linux 环境（原生 Linux 与 WSL2）调用，**按运行环境自动选连通目标**：原生
+Linux → 本地 UDS 守护实例（Linux 侧 GUI 的宿主），WSL2 → 经 `lk.exe bridge`
+连 Windows 主机 GUI。Windows 侧 `lk.exe` 兼任 bridge stdio 中继（随桌面安装
+包落地到安装目录），且无论被谁调用（Windows 终端或 WSL interop）都连 Windows
+主机 GUI。判定矩阵详见 [cross-subsystem.md](cross-subsystem.md) §7.0。
 
 浏览器扩展是 **M3 里程碑**（V1 之后），本阶段只落协议规格（[browser-fill.md](browser-fill.md)）。
 

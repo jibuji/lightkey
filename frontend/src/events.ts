@@ -73,6 +73,10 @@ export interface AuthzRequestPayload {
    *  一次交互），允许决策回传 `masterPassword`；守护进程临时解锁后
    *  不签发会话令牌——本次注入不产生 item.* 全量能力（#65）。 */
   needsUnlock: boolean;
+  /** 审批类型（M2.9 值披露）：弹窗按 kind 选形态；缺省视为 inject。 */
+  kind?: "inject" | "read" | "export";
+  /** export 审批的数据包规模元信息（仅 kind=export；不含数据本身）。 */
+  exportMeta?: { name: string; mime: string; size: number } | null;
 }
 
 /** `vault.search` 负载（topbar 搜索框 → ui-vault；300ms 防抖）。 */

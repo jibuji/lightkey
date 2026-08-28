@@ -16,7 +16,14 @@ impl Daemon {
         // 跨命名空间归一化——UNC / verbatim 包裹的 WSL 路径折算为
         // `wsl://<distro>/<rest>` 规范形；常规路径维持原语义。
         let project_dir_input = lk_core::path_ns::canonical_project_dir(&p.project_dir);
-        if let Err(e) = validate_rule_fields(&project_dir_input, &p.name, &p.command, &p.keys) {
+        // 规则能力类型（M2.9 值披露 §4）：缺省 inject；read 规则不绑定命令
+        let capability = p
+            .capability
+            .as_deref()
+            .unwrap_or(lk_core::model::RULE_CAPABILITY_INJECT);
+        if let Err(e) =
+            validate_rule_fields(capability, &project_dir_input, &p.name, &p.command, &p.keys)
+        {
             return RpcResponse::err(
                 id,
                 ERR_INVALID_PARAMS,
@@ -50,6 +57,7 @@ impl Daemon {
             name: p.name.clone(),
             command: p.command.clone(),
             keys: p.keys.clone(),
+            capability: capability.to_string(),
         };
         let shared = Arc::clone(&self.shared);
         let mut guard = shared.vault.write().unwrap();

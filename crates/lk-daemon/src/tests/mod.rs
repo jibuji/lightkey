@@ -126,6 +126,7 @@ fn inject_audit_events(dir: &std::path::Path) -> Vec<lk_core::audit::AuditEvent>
 mod audit_anchor;
 mod audit_attribution;
 mod authz;
+mod disclosure;
 mod rules;
 mod session_token;
 mod sync_race;

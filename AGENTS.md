@@ -113,6 +113,13 @@
   session.token / 不置 shared.vault**（临时解锁材料只服务本次注入，不产生
   item.* 全量读能力，#65 配套）；协议加 `approval.result.masterPassword` + 
   `authz.request.needsUnlock`。见 `docs/authorization-gate.md` §5.1
+- [x] M2.9 值披露裁决（补充拍板 #20，issue #65 主体）：安全边界修订为
+  **产品接口面即边界**（令牌 = 认证 ≠ 授权）；`item.get` 走三层
+  （读规则 → 弹窗 → 拒绝）、`item.export` 恒弹窗；桌面内嵌直调受信豁免；
+  读规则能力类型（`Rule.capability`，projectDir + keys，无 command）；
+  拒绝 = `authz.denied`（**-32017**，spec 原定 -32015 被 bridge 码占用）。
+  实现规格 `docs/value-disclosure.md`（唯一出处；实现注记：read 规则 CLI
+  形态 `--read --keys <name...>`）；#65 已关闭
 - [ ] M3 浏览器填充
 
 ## Agent skills

@@ -9,9 +9,15 @@
 #   3. 双客户端离线双改同条目 → 上线 → last-write-wins 收敛（后改者胜，
 #      含并发同步的真实 CAS 竞争窗口；CAS 冲突机制由 lk-core 单测确定性覆盖）
 #   4. 一端删除 → 墓碑传播 → 对端收敛
-#   5. 附件分块断点续传（删远端分块 → 补传 → 对端导出一致）
+#   5. 附件分块断点续传（删远端分块 → 补传 → 远端分块齐全 + 对端元数据一致；
+#      M2.9 值披露起 headless `item export` 恒弹窗拒绝，附件重组一致性由
+#      lk-core vault 单测与 daemon 集成测试覆盖）
 #   6. 后台轮询收敛（interval 15s）
 #   7. 存储端只见密文（零知识断言：文件名形态 + LKC1 magic + 无明文）
+#
+# 预授权：M2.9 值披露（docs/value-disclosure.md）后 headless `item get`
+# 须经读规则预授权——A 解锁后 `rule add --read` 绑定脚本 cwd（keys=条目名，
+# 须为 env 安全名）；B 经库复制继承同一规则。
 #
 # 用法：bash scripts/e2e_m1.sh [lk-binary-path]
 set -u
@@ -74,11 +80,15 @@ jq '.autoLockMinutes = 60' "$A/config.json" > "$WORK/config.tmp" && mv "$WORK/co
 a unlock --stdin <<<"$MASTER_PW" >/dev/null
 check "A unlock" 0 $?
 
-echo "== 2. A 添加条目与附件并同步 =="
+# M2.9 值披露预授权：read 规则绑定脚本 cwd（B 经库复制继承）
+a rule add "$PWD" --read --name e2e1 --keys GitHub APIKey attachment attachment2 >/dev/null
+check "A rule add --read（headless 读值预授权）" 0 $?
+
+echo "== 2. A 添加条目与附件并同步 ="
 ID_X=$(a item add login --name GitHub --username octocat --password s3cr3t | awk '{print $2}')
 ID_Z=$(a item add secret --name APIKey --value sk-123 | awk '{print $2}')
 head -c 2621440 /dev/urandom > "$WORK/orig.bin"   # 2.5 MiB（3 分块）
-ID_F=$(a item add file --file "$WORK/orig.bin" --note 加密附件 | awk '{print $2}')
+ID_F=$(a item add file --name attachment --file "$WORK/orig.bin" --note 加密附件 | awk '{print $2}')
 a sync >/dev/null
 check "lk sync 成功" 0 $?
 [ -f "$REMOTE/index.lk" ] && ok "远端 index.lk 已创建" || bad "远端 index.lk 缺失"
@@ -93,8 +103,10 @@ b unlock --stdin <<<"$MASTER_PW" >/dev/null
 check "B unlock" 0 $?
 b sync >/dev/null
 check "B 首次同步" 0 $?
-b item export "$ID_F" -o "$WORK/out0.bin" >/dev/null
-cmp -s "$WORK/orig.bin" "$WORK/out0.bin" && ok "B 附件导出一致（初始同步）" || bad "B 附件导出不一致"
+# M2.9 值披露：headless export 恒弹窗 → 拒绝（分块经远端断言 + lk-core 单测重组覆盖）
+b item export "$ID_F" -o "$WORK/out0.bin" >/dev/null 2>&1
+check "B headless export 被授权门拒绝（exit 1）" 1 $?
+b item get "$ID_F" --json | jq -r .size | grep -q 2621440 && ok "B 附件元数据一致（初始同步）" || bad "B 附件元数据不符"
 
 # 3a. 顺序双改（stale 索引窗口：B 在读到旧索引后推送，A 已抢先上传新版本）
 a item edit "$ID_X" --username alice >/dev/null
@@ -130,23 +142,24 @@ echo "== 5. 附件分块断点续传 =="
 # 5a. 真实中断语义：A 新建文件条目后，仅元数据 + 0 号分块到达远端
 #     （模拟上传中断的半成品状态）→ 下一次同步续传剩余分块
 head -c 2621440 /dev/urandom > "$WORK/orig2.bin"
-ID_F2=$(a item add file --file "$WORK/orig2.bin" --note 续传附件 | awk '{print $2}')
+ID_F2=$(a item add file --name attachment2 --file "$WORK/orig2.bin" --note 续传附件 | awk '{print $2}')
 AID_F2=$(a item get "$ID_F2" --json | jq -r .attachmentId)
 cp "$A/$AID_F2.attach.lk" "$REMOTE/" && cp "$A/$AID_F2.0.chunk.lk" "$REMOTE/"
 a sync >/dev/null
 [ -f "$REMOTE/$AID_F2.1.chunk.lk" ] && [ -f "$REMOTE/$AID_F2.2.chunk.lk" ] \
   && ok "中断续传：剩余分块已补传" || bad "中断续传失败"
 b sync >/dev/null
-b item export "$ID_F2" -o "$WORK/out2.bin" >/dev/null
-cmp -s "$WORK/orig2.bin" "$WORK/out2.bin" && ok "对端导出续传附件一致" || bad "对端导出续传附件不一致"
+B_SIZE=$(b item get "$ID_F2" --json | jq -r .size)
+[ "$B_SIZE" = 2621440 ] && ok "对端续传附件元数据一致" || bad "对端续传附件元数据不符：$B_SIZE"
+B_SIZE1=$(b item get "$ID_F" --json | jq -r .size)
+[ "$B_SIZE1" = 2621440 ] && ok "对端补传附件元数据一致" || bad "对端补传附件元数据不符：$B_SIZE1"
 # 5b. 事后丢失：早期已同步附件的分块被删 → 编辑条目（bump revision）→ 补传
 rm "$REMOTE/$AID_F.1.chunk.lk"
 a item edit "$ID_F" --note 触发补传 >/dev/null
 a sync >/dev/null
 [ -f "$REMOTE/$AID_F.1.chunk.lk" ] && ok "丢失分块已补传" || bad "丢失分块未补传"
 b sync >/dev/null
-b item export "$ID_F" -o "$WORK/out1.bin" >/dev/null
-cmp -s "$WORK/orig.bin" "$WORK/out1.bin" && ok "对端导出附件一致（补传后）" || bad "对端导出不一致"
+# 对端补传后一致性：分块齐全（上面已断言远端补传）+ 元数据一致
 
 echo "== 6. 后台轮询收敛（interval 15s）=="
 b item edit "$ID_X" --username polled >/dev/null
