@@ -74,6 +74,30 @@
 - 工具链固定：`rust-toolchain.toml`（1.94）+ `dtolnay/rust-toolchain@stable`
   对齐，`Swatinem/rust-cache` 缓存。
 - 属性测试在 CI 跑固定种子（回归可复现）+ 随机种子抽查（可选后续）。
+- **Cargo 命令一律带 `--locked`**（clippy / test / build）：manifest 与
+  `Cargo.lock` 漂移即失败。不带时 cargo 会在 CI 里静默重写锁文件，「改了
+  `Cargo.toml` 忘提交锁文件」便永远绿灯（v0.1.13 实际发生过：#94 升了
+  `[workspace.package] version`，锁文件仍停在 0.1.12，一路过闸）。
+  `cargo tauri build` 例外——tauri CLI 不保证透传该 flag，且其上游步骤已
+  拦过漂移。
+
+## 3.1 回归锁必须先验红
+
+声称「锁住某个 bug」的测试，合并前必须证明它**真的会红**：把 bug 放回去
+（临时改坏生产行为），确认目标测试失败，再还原。PR 正文里写明这个验证的
+结果。
+
+理由：一个恒真的断言长得和有效的断言一模一样，评审看不出来，CI 永远是绿
+的。本仓库实际踩过——PR #91 的 `sender_disconnect_ends_drain` 用
+`subscribe(false)` 却断言 `desktop_subscriber_count() == 0`（该方法按
+`desktop` 过滤，恒为 0），「发送端断开 → 退出**并退订**」的退订半边从未
+被验证；直到补验红才发现，并因此拆出 `emit_false_ends_drain_and_unsubscribes`
+（唯一能用计数直接观察退订的终止路径）。
+
+同理适用于放宽时间上界的改动：上界被放宽时，要确认它**仍然小于**它本该
+排除的那条路径的耗时，否则判据失去判别力（#92 把夹具审批窗口回生产默认
+30s 后，`authz_denies_without_ui_fast` 的 `FRAME_WAIT` 上界与窗口同阶，
+误入审批要跑满 30s 才红——已用独立的 `NO_WAIT_BOUND` 拆开）。
 
 ## 4. 里程碑出口映射
 

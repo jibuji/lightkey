@@ -129,11 +129,16 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # `--locked`：manifest 与 Cargo.lock 漂移即失败。不带它时 cargo 会在
+      # CI 里静默重写锁文件，于是「改了 Cargo.toml 忘提交锁文件」永远绿灯
+      # （v0.1.13 实际发生过：#94 升了 [workspace.package] version，锁文件
+      # 还停在 0.1.12，一路过闸）。锁文件是发布可复现性的一部分，漂移必须在
+      # 门禁上响，不能在 CI 里被悄悄抹平。
       - name: Clippy (core + daemon + cli)
-        run: cargo clippy -p lk-core -p lk-daemon -p lk-cli --all-targets -- -D warnings
+        run: cargo clippy --locked -p lk-core -p lk-daemon -p lk-cli --all-targets -- -D warnings
 
       - name: Test (core + daemon + cli)
-        run: cargo test -p lk-core -p lk-daemon -p lk-cli
+        run: cargo test --locked -p lk-core -p lk-daemon -p lk-cli
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -174,8 +179,11 @@ jobs:
 
       # 先建独立 CLI：tauri.conf.json 的 bundle.resources 把该 exe 捆进安装包
       - name: Build standalone CLI (lk.exe)
-        run: cargo build --release -p lk-cli
+        run: cargo build --locked --release -p lk-cli
 
+      # `cargo tauri build` 不加 --locked：tauri CLI 不保证透传，且其上游
+      # 步骤已用 --locked 把过漂移；发布产物构建保持原样，避免引入 CLI
+      # 版本相关的构建差异。
       - name: Build installers (NSIS + MSI, 捆绑 lk.exe 到安装目录)
         run: cargo tauri build
         working-directory: crates/lk-app
@@ -253,14 +261,15 @@ jobs:
 
       # ---- 质量门禁（2026-08-27 起 CI 只在 release 运行，检查前置；
       # Linux 是 WSL2 CLI 的发布目标，MSVC 视角覆盖不到，检查随构建做）----
+      # 同 Windows job：`--locked` 让 manifest/lock 漂移在门禁上失败。
       - name: Clippy (cli)
-        run: cargo clippy -p lk-cli --all-targets -- -D warnings
+        run: cargo clippy --locked -p lk-cli --all-targets -- -D warnings
 
       - name: Test (cli)
-        run: cargo test -p lk-cli
+        run: cargo test --locked -p lk-cli
 
       - name: Build Linux CLI (x86_64-unknown-linux-gnu)
-        run: cargo build --release -p lk-cli --target x86_64-unknown-linux-gnu
+        run: cargo build --locked --release -p lk-cli --target x86_64-unknown-linux-gnu
 
       - name: Collect artifact with versioned name
         shell: bash
