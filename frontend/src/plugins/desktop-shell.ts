@@ -13,7 +13,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { Context, Plugin } from "@cordisjs/core";
-import type { ShellService } from "../services/types";
+import type { ApprovalAlertPayload, ShellService } from "../services/types";
 
 export const desktopShell: Plugin.Function<Context> = Object.assign((ctx: Context) => {
   const shell: ShellService = {
@@ -27,6 +27,18 @@ export const desktopShell: Plugin.Function<Context> = Object.assign((ctx: Contex
         await invoke("app_quit");
       } catch {
         ctx.toast.show("退出仅桌面（Tauri）环境生效");
+      }
+    },
+    async alertApproval(payload: ApprovalAlertPayload) {
+      try {
+        // 载荷即通知正文的全部输入（保守口径由类型面锁死：只有
+        // starter / projectDir，命令与条目名无处可传）
+        // 展开为对象字面量：interface 无隐式索引签名，直接传会过不了
+        // `invoke` 的 `InvokeArgs`（`npm run build` 的 tsc 会红）
+        await invoke("approval_alert", { ...payload });
+      } catch {
+        // 提醒是旁路：非桌面环境（mock/浏览器）或通知被拒时静默降级，
+        // 不弹 Toast 干扰——审批弹窗本身仍在，闭环不受影响。
       }
     },
   };

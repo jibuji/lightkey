@@ -14,6 +14,7 @@ import { Context } from "@cordisjs/core";
 import { createRoot, type Root } from "react-dom/client";
 import { act } from "react";
 import { approval } from "../plugins/approval";
+import { desktopShell } from "../plugins/desktop-shell";
 import { ipcBridge } from "../plugins/ipc-bridge";
 import { preferenceStore } from "../plugins/preference-store";
 import { toast } from "../plugins/toast";
@@ -42,7 +43,9 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/** 装配 ipc-bridge（mock 适配器注入）+ toast + approval。 */
+/** 装配 ipc-bridge（mock 适配器注入）+ toast + desktop-shell + approval。
+ *  desktop-shell 必装（#95 起 approval 注入 ctx.shell 发强提醒）——与真实
+ *  装配（`cordis.yml`）一致：shell 缺失时 cordis 会推迟 approval 启动。 */
 async function mountHost(): Promise<{ ctx: Context; mock: MockAdapter }> {
   const ctx = new Context();
   const mock = new MockAdapter();
@@ -50,6 +53,7 @@ async function mountHost(): Promise<{ ctx: Context; mock: MockAdapter }> {
   await ctx.plugin(preferenceStore, {});
   await ctx.plugin(theme, { defaultTheme: "dark" });
   await ctx.plugin(toast, {});
+  await ctx.plugin(desktopShell, {});
   await ctx.plugin(approval, {});
   return { ctx, mock };
 }

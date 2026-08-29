@@ -16,6 +16,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 # 原生目录选择器（ui-rules 新建规则的「项目目录选择器」，spec §6.4）
 tauri-plugin-dialog = "2"
+# 操作系统通知（#95 审批强提醒；走 Rust command 桥，JS 面不依赖其 npm 包）
+tauri-plugin-notification = "2"
 lk-core = { path = "../lk-core" }
 lk-daemon = { path = "../lk-daemon" }
 serde.workspace = true
