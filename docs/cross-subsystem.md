@@ -132,8 +132,9 @@ Windows 侧守护实例有两种承载形态（二选一就位）；named pipe �
 - 服务端分支：第③层无订阅者 → 不阻塞立即拒绝、审计记 denied
   （`crates/lk-daemon/src/daemon/authz.rs`；测试锚定
   `authz_denies_without_ui_fast`：`crates/lk-daemon/src/tests/authz.rs`）；
-- CLI 拒绝文案：「无审批界面（未命中规则且桌面端未运行）」
-  （`crates/lk-cli/src/main.rs` L1969）。
+- CLI 拒绝文案：「无审批界面（桌面端未运行，或通知订阅未建立）」
+  （`crates/lk-cli/src/main.rs` `reason_text` 的 `no_ui` 分支；#89 起文案
+  纠偏：订阅死亡也会导致 `no_ui`，不一定是桌面端未运行）。
 
 推论：**弹窗只有桌面应用在运行时才存在**；纯 CLI daemon 形态下取密钥的唯一
 途径是第②层规则白名单命中。因此无人值守回归首选形态 B（E2E `--auto-approve`

@@ -10,12 +10,12 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::Emitter;
 
-use lk_daemon::transport::{Handler, PeerInfo};
+use lk_daemon::transport::{drain_subscription, Handler, PeerInfo};
 use lk_daemon::{Daemon, SharedDaemon};
 
 /// 推送流：订阅连接在**进程内**的等价物（不占 socket）。
@@ -82,19 +82,23 @@ impl AppState {
             let stop2 = Arc::clone(&stop);
             let thread = std::thread::Builder::new()
                 .name("lk-notify".into())
-                .spawn(move || loop {
-                    if stop2.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match rx.recv_timeout(Duration::from_millis(250)) {
-                        Ok(frame) => {
+                .spawn(move || {
+                    // writer 循环收敛到共享 `drain_subscription`（#89/#90）：
+                    // 帧处理不得终止流（旧实现在 match 之后无条件退订，
+                    // 首帧即自我注销 → available() 恒 false，审批/披露
+                    // 全部降级 fail-closed）；终止只来自 stop / 断开。
+                    drain_subscription(
+                        id,
+                        rx,
+                        &hub,
+                        Some(&stop2),
+                        Duration::from_millis(250),
+                        |frame| {
                             // JSON-RPC notification 帧 → 前端（ipc-bridge 翻译）
-                            let _ = app.emit("lk-notify", frame);
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                    hub.unsubscribe(id);
+                            let _ = app.emit(crate::NOTIFY_EVENT, frame);
+                            true
+                        },
+                    );
                 })
                 .map_err(|e| e.to_string())?;
             *guard = Some(PushStream {

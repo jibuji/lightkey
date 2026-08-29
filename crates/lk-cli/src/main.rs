@@ -2143,7 +2143,7 @@ fn reason_text(reason: &str) -> &'static str {
              类型条目，login/note/file 条目不支持注入，与不存在不另行区分）"
         }
         "rule_corrupt" => "规则库损坏",
-        "no_ui" => "无审批界面（未命中规则且桌面端未运行）",
+        "no_ui" => "无审批界面（桌面端未运行，或通知订阅未建立）",
         "rejected" => "用户拒绝",
         "timeout" => "审批超时（默认拒绝）",
         _ => "未获授权",
