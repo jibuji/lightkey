@@ -175,6 +175,42 @@ impl PushHub {
     }
 }
 
+/// 排空一个订阅的通知帧直到流终止（lk-app 桌面推送流的 writer 循环，
+/// #89/#90 抽到 PushHub 旁可测）。
+///
+/// 不变量：**帧处理不得终止流**——终止只来自 `stop` 置位、`emit` 返回
+/// false（如 socket 写失败）、或发送端断开（`Disconnected`）；每处理完
+/// 一帧继续循环。返回后订阅已从 hub 移除（幂等；外部先行退订亦安全）。
+pub fn drain_subscription(
+    id: u64,
+    rx: mpsc::Receiver<String>,
+    hub: &PushHub,
+    stop: Option<&AtomicBool>,
+    poll: Duration,
+    mut emit: impl FnMut(String) -> bool,
+) {
+    loop {
+        if let Some(flag) = stop {
+            if flag.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        match rx.recv_timeout(poll) {
+            Ok(frame) => {
+                if !emit(frame) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // 退订只属于流终止（stop / emit false / 断开）——放在 match 之后会让
+    // 每个收到的帧都触发自我注销（#89/#90：桌面订阅首帧即死，此后
+    // available() 恒 false，审批/披露全部 fail-closed）。
+    hub.unsubscribe(id);
+}
+
 pub fn daemon_json_path(dir: &Path) -> PathBuf {
     dir.join("daemon.json")
 }
@@ -1621,5 +1657,76 @@ mod tests {
         let echo: serde_json::Value =
             serde_json::from_str(v["echo"].as_str().expect("回显原始帧")).expect("回显为合法 JSON");
         assert_eq!(echo["id"], 1, "慢读客户端必须拿到完整回显响应");
+    }
+
+    // -------------------------------------------------------------------------
+    // 订阅排空循环（drain_subscription）：#89/#90 回归锁。期望值来自
+    // issue #90 症状规格：桌面订阅在首帧处理后必须存活——「广播可达、
+    // desktop 订阅数不变」，任何一帧处理导致退订即本组测试失败。
+    // -------------------------------------------------------------------------
+
+    /// 多帧投递：帧逐帧送达、订阅持续存活、后续广播仍可达；stop 置位后
+    /// 循环退出并退订。（旧 bug：首帧处理后即 `unsubscribe` 自我注销 →
+    /// 只收到第一帧，`desktop_subscriber_count` 归零，审批界面判定降级。）
+    #[test]
+    fn frames_do_not_terminate_subscription() {
+        let hub = PushHub::new();
+        let (id, rx) = hub.subscribe(true);
+        let (tx, rx_frames) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = Arc::clone(&hub);
+        let stop2 = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            drain_subscription(
+                id,
+                rx,
+                &h,
+                Some(&stop2),
+                Duration::from_millis(50),
+                |frame| tx.send(frame).is_ok(),
+            );
+        });
+        for expected in ["f1", "f2", "f3"] {
+            hub.broadcast(expected);
+            assert_eq!(
+                rx_frames
+                    .recv_timeout(Duration::from_secs(2))
+                    .ok()
+                    .as_deref(),
+                Some(expected),
+                "帧必须逐帧送达且处理不得终止流"
+            );
+        }
+        assert_eq!(
+            hub.desktop_subscriber_count(),
+            1,
+            "帧处理后订阅必须存活（#90：首帧自我注销即失败）"
+        );
+        hub.broadcast("f4");
+        assert_eq!(
+            rx_frames
+                .recv_timeout(Duration::from_secs(2))
+                .ok()
+                .as_deref(),
+            Some("f4"),
+            "首帧后的广播必须仍可达"
+        );
+        stop.store(true, Ordering::Relaxed);
+        worker.join().expect("stop 置位后循环退出");
+        assert_eq!(hub.desktop_subscriber_count(), 0, "流终止后退订");
+    }
+
+    /// 发送端断开（外部退订 / hub 清理）→ 循环退出并退订（幂等）。
+    #[test]
+    fn sender_disconnect_ends_drain() {
+        let hub = PushHub::new();
+        let (id, rx) = hub.subscribe(false);
+        let h = Arc::clone(&hub);
+        let worker = std::thread::spawn(move || {
+            drain_subscription(id, rx, &h, None, Duration::from_millis(50), |_| true);
+        });
+        hub.unsubscribe(id);
+        worker.join().expect("断开后循环必须退出");
+        assert_eq!(hub.desktop_subscriber_count(), 0);
     }
 }
