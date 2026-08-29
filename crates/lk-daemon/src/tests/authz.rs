@@ -139,12 +139,13 @@ fn authz_denies_without_ui_fast() {
         ),
         &test_peer(Some(proj.path())),
     );
-    // 阈值语义：粗上界，只防「误入审批等待」（m2_daemon 审批窗口=1s，
-    // 默认窗口=30s，误等任一都会超此界）；不是延迟 SLA。更紧的常数在
-    // 并行测试负载下不可靠：Windows 启动者进程链回溯（Toolhelp+PEB）
-    // 单机实测 ~440ms、满载 >1s，与本测试意图无关（功能面由下方
-    // reason=no_ui 断言锁定：走审批等待的结果是 timeout 而非 no_ui）。
-    assert!(t0.elapsed() < Duration::from_secs(5), "无界面必须立即拒绝");
+    // 阈值语义：粗上界，只防「误入审批等待」（m2_daemon 审批窗口=生产默认
+    // 30s，误等任一都会超此界）；不是延迟 SLA。更紧的常数在并行测试负载下
+    // 不可靠：Windows 启动者进程链回溯（Toolhelp+PEB）单机实测 ~440ms、
+    // 满载 >1s，3× 过载下 begin 段整体 >5s（#92），故上界与 FRAME_WAIT 同阶。
+    // 功能面由下方 reason=no_ui 断言锁定：走审批等待的结果是 timeout 而非
+    // no_ui，时间上界只是兜底哨兵。
+    assert!(t0.elapsed() < FRAME_WAIT, "无界面必须立即拒绝");
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["allowed"], false);
     assert_eq!(v["result"]["reason"], "no_ui");
@@ -175,7 +176,7 @@ fn authz_approval_roundtrip_via_push_and_result() {
         move || handler(&line, &peer)
     });
     // 推送通道收到 authz.request 帧（含 requestId + challenge；无密钥值）
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     assert!(fv.get("id").is_none());
@@ -230,7 +231,7 @@ fn authz_approval_roundtrip_via_push_and_result() {
 #[cfg(unix)]
 #[test]
 fn authz_response_returns_on_initiating_connection_over_real_transport() {
-    let _lock = TRANSPORT_TEST_LOCK.lock().unwrap();
+    let _lock = transport_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     let handler = make_handler(&state, &shared);
@@ -247,6 +248,7 @@ fn authz_response_returns_on_initiating_connection_over_real_transport() {
     });
 
     let ep = transport::read_endpoint(dir.path()).expect("bind 后应写入 daemon.json");
+    wait_transport_ready(&ep);
 
     // 发起连接：authz.evaluate（阻塞至审批回传；channel=wsl-bridge 覆盖）
     let eval_line = rpc_line(
@@ -260,7 +262,7 @@ fn authz_response_returns_on_initiating_connection_over_real_transport() {
     });
 
     // 订阅通道收到 authz.request 帧 → 取 requestId/challenge（桌面壳视角）
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
@@ -301,12 +303,11 @@ fn authz_response_returns_on_initiating_connection_over_real_transport() {
 #[cfg(windows)]
 #[test]
 fn authz_response_returns_on_initiating_connection_over_named_pipe() {
-    let _lock = TRANSPORT_TEST_LOCK.lock().unwrap();
+    let _lock = transport_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-    // 审批窗口放宽到 10s：本测试锁定「投递」段而非超时边界，避免 CI 慢机
-    // 上 1s 默认窗口把健康路径误判为 timeout（UDS 版用默认 1s 是历史现状）
-    shared.config.write().unwrap().approval_timeout_secs = 10;
+    // 审批窗口=夹具生产默认 30s：本测试锁定「投递」段而非超时边界，
+    // 宽窗口避免负载/慢机把健康路径误判为 timeout（#92）
     let handler = make_handler(&state, &shared);
 
     // 桌面壳订阅（进程内）：available()=true → 第 3 层走审批而非 no_ui
@@ -322,6 +323,9 @@ fn authz_response_returns_on_initiating_connection_over_named_pipe() {
     });
 
     let ep = transport::read_endpoint(dir.path()).expect("bind 后应写入 daemon.json");
+    // serve 线程创建首个监听实例前 connect 报 FILE_NOT_FOUND（瞬态重试
+    // 总窗口 ~200ms 满载下不够，#92）→ 先等就绪再发起真实请求
+    wait_transport_ready(&ep);
 
     // 发起连接：authz.evaluate（阻塞至审批回传；channel=wsl-bridge 覆盖）
     let eval_line = rpc_line(
@@ -335,7 +339,7 @@ fn authz_response_returns_on_initiating_connection_over_named_pipe() {
     });
 
     // 订阅通道收到 authz.request 帧 → 取 requestId/challenge（桌面壳视角）
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
@@ -380,7 +384,7 @@ fn authz_response_returns_on_initiating_connection_over_named_pipe() {
 #[cfg(windows)]
 #[test]
 fn push_stream_delivers_frames_over_real_named_pipe() {
-    let _lock = TRANSPORT_TEST_LOCK.lock().unwrap();
+    let _lock = transport_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     let handler = make_handler(&state, &shared);
@@ -392,6 +396,9 @@ fn push_stream_delivers_frames_over_real_named_pipe() {
         let _ = transport::serve(&serve_dir, handler, hub, global_shutdown());
     });
     let ep = transport::read_endpoint(dir.path()).unwrap();
+    // serve 线程创建首个监听实例前 connect 报 FILE_NOT_FOUND（瞬态重试
+    // 总窗口 ~200ms 满载下不够，#92）→ 先等就绪再建订阅连接
+    wait_transport_ready(&ep);
 
     // 订阅连接：subscribe → ok 响应 → 转流模式等通知帧
     let mut sub = transport::connect(&ep).unwrap();
@@ -435,6 +442,9 @@ fn authz_approval_timeout_denies_and_audits() {
     let dir = tempfile::tempdir().unwrap();
     let proj = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    // 纯超时边界测试：显式收窄窗口到 1s（夹具已回到生产默认 30s，#92）——
+    // 本测试不回传，超时拒绝与「回传落地」无关，短窗口只是让用例跑得快
+    shared.config.write().unwrap().approval_timeout_secs = 1;
     let handler = make_handler(&state, &shared);
     let (_sid, rx) = shared.push.subscribe(true);
     let peer = test_peer(Some(proj.path()));
@@ -448,7 +458,7 @@ fn authz_approval_timeout_denies_and_audits() {
         let peer = peer.clone();
         move || handler(&line, &peer)
     });
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
     let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
@@ -502,11 +512,14 @@ fn authz_wait_does_not_block_other_commands() {
         let peer = peer.clone();
         move || handler(&line, &peer)
     });
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
     let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
-    // 等待期间：其他命令必须及时返回（命令锁未被 30s 等待占用）
+    // 等待期间：其他命令必须及时返回（命令锁未被 30s 等待占用）。
+    // 上界取 5s：健康路径是毫秒级命令，若回归成「等待持命令锁」则阻塞
+    // 整个审批窗口（30s）必然超界；更紧的常数在并行满载下被调度延迟
+    // 挤爆（#92 同类）。
     let t0 = Instant::now();
     let resp = state.lock().unwrap().handle(
         &rpc_line(M_ITEM_LIST, Some(&token), json!({})),
@@ -514,7 +527,7 @@ fn authz_wait_does_not_block_other_commands() {
     );
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_millis(500),
+        elapsed < Duration::from_secs(5),
         "审批等待期间命令被阻塞 {elapsed:?}"
     );
     assert!(rpc_result(&resp)["items"].as_array().is_some());
@@ -607,7 +620,7 @@ fn approval_result_rejected_from_socket_origin_keeps_pending_entry() {
         let peer = peer.clone();
         move || handler(&line, &peer)
     });
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
     let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
@@ -674,7 +687,7 @@ fn approval_result_with_wrong_challenge_is_ignored_but_request_survives() {
         let peer = peer.clone();
         move || handler(&line, &peer)
     });
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
     let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
@@ -756,7 +769,7 @@ fn socket_subscribers_are_not_ui_and_receive_no_authz_frames() {
         move || handler(&line, &peer)
     });
     // 桌面通道收到帧（含挑战）
-    let frame = desk_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = desk_rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     assert!(fv["params"]["challenge"].as_str().is_some());
@@ -933,12 +946,7 @@ fn locked_daemon_with_secret(
         init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
     }
     let mut daemon = Daemon::start(dir).unwrap();
-    daemon
-        .shared()
-        .config
-        .write()
-        .unwrap()
-        .approval_timeout_secs = 1;
+    // 审批窗口维持生产默认 30s（同 m2_daemon，#92）
     // 解锁建条目，再锁定（回到锁态）
     let unlock = rpc_result(&daemon.handle(
         &rpc_line(
@@ -1004,7 +1012,7 @@ fn authz_locked_inject_unified_unlock_approval_roundtrip() {
         move || handler(&line, &peer)
     });
     // 广播帧：needsUnlock=true + challenge
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     assert_eq!(fv["params"]["needsUnlock"], true, "锁态一体化帧须标注");
@@ -1077,7 +1085,7 @@ fn authz_locked_inject_wrong_password_keeps_pending_and_times_out() {
         None,
         json!({ "command": "npm publish", "keys": ["NPM_TOKEN"] }),
     );
-    // 线程内发起 evaluate（dispatch 直调在同线程会阻塞在 1s 审批等待上，
+    // 线程内发起 evaluate（dispatch 直调在同线程会阻塞在审批等待上，
     // 挡住后续 approval.result 的命令锁——须用主缝 handler 线程）
     let h = std::thread::spawn({
         let handler = handler.clone();
@@ -1085,7 +1093,7 @@ fn authz_locked_inject_wrong_password_keeps_pending_and_times_out() {
         move || handler(&line, &peer)
     });
     // 广播帧
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
@@ -1110,7 +1118,11 @@ fn authz_locked_inject_wrong_password_keeps_pending_and_times_out() {
         1,
         "错误密码不得 resolve（条目保留，弹窗可重试）"
     );
-    // CLI 侧（等待线程）因审批窗口 1s 超时 → 默认拒绝
+    // CLI 侧（等待线程）超时默认拒绝：审批窗口为夹具生产默认 30s，
+    // 「回传落地」与「到期拒绝」两段都不与真实时钟赛跑——测试钩子把
+    // 待审条目即时到期，到期判定/清理/默认拒绝仍走 await_decision
+    // 既有语义（#92）
+    shared.approvals.expire_all_for_tests();
     let resp = h.join().unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["allowed"], false, "超时默认拒绝：{resp}");
@@ -1149,7 +1161,7 @@ fn authz_locked_inject_denied_without_unlock() {
         let peer = peer.clone();
         move || handler(&line, &peer)
     });
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
     let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();

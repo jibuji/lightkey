@@ -291,6 +291,20 @@ impl PendingApprovals {
     pub fn pending_count(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
+
+    /// 把所有待审批条目的到期时刻提前到当前时刻并唤醒等待者（测试专用）：
+    /// 需要同时断言「回传落地」与「超时拒绝」的测试（如 #67 错误主密码
+    /// 保留条目后 CLI 侧超时）不再依赖真实秒级等待——到期判定、清理与
+    /// 默认拒绝走既有 `await_decision` 语义，仅时钟被测试掌控。
+    #[doc(hidden)]
+    pub fn expire_all_for_tests(&self) {
+        let mut map = self.inner.lock().unwrap();
+        let now = Instant::now();
+        for p in map.values_mut() {
+            p.expires_at = now;
+        }
+        self.condvar.notify_all();
+    }
 }
 
 /// 本地审批通道：登记 → 广播 `authz.request` → 在注册表上等待

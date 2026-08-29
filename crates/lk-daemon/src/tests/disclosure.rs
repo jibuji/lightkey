@@ -236,7 +236,7 @@ fn socket_get_without_rule_approval_allow_deny_timeout() {
         let peer = peer.clone();
         std::thread::spawn(move || handler(&line, &peer))
     };
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "authz.request");
     assert_eq!(
@@ -276,7 +276,7 @@ fn socket_get_without_rule_approval_allow_deny_timeout() {
         let peer = peer.clone();
         std::thread::spawn(move || handler(&line, &peer))
     };
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let (request_id, challenge) = (
         fv["params"]["requestId"].as_str().unwrap().to_string(),
@@ -304,14 +304,16 @@ fn socket_get_without_rule_approval_allow_deny_timeout() {
     assert_eq!(evs.len(), 2);
     assert_eq!(evs[1].result, lk_core::audit::AuditResult::Denied);
 
-    // -- timeout（approval_timeout_secs=1；不回传等超时默认拒绝）
+    // -- timeout（显式收窄审批窗口到 1s——夹具为生产默认 30s，#92；
+    //    不回传等超时默认拒绝；本测试前两相位需要回传落地，须宽窗口）
+    shared.config.write().unwrap().approval_timeout_secs = 1;
     let line = rpc_line(M_ITEM_GET, Some(&token), json!({ "id": item_id }));
     let h = {
         let handler = handler.clone();
         let peer = peer.clone();
         std::thread::spawn(move || handler(&line, &peer))
     };
-    let _frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let _frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let resp = h.join().unwrap();
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["error"]["code"], ERR_AUTHZ_DENIED, "超时默认拒绝：{resp}");
@@ -375,7 +377,7 @@ fn socket_export_allowed_via_approval_returns_bundle() {
         let handler = handler.clone();
         std::thread::spawn(move || handler(&line, &peer))
     };
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["params"]["kind"], "export", "导出审批帧 kind=export");
     assert_eq!(
@@ -450,6 +452,9 @@ fn disclosure_socket_cannot_self_approve() {
     let dir = tempfile::tempdir().unwrap();
     let proj = tempfile::tempdir().unwrap();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("APIKey", "sk-1")));
+    // 纯超时收尾测试（socket 伪回传被拒后等待者按超时默认拒绝）：显式
+    // 收窄窗口到 1s（夹具为生产默认 30s，#92），短窗口只是让用例跑得快
+    shared.config.write().unwrap().approval_timeout_secs = 1;
     let item_id = {
         let resp = state.lock().unwrap().handle(
             &rpc_line(
@@ -474,7 +479,7 @@ fn disclosure_socket_cannot_self_approve() {
         let handler = handler.clone();
         std::thread::spawn(move || handler(&line, &peer))
     };
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let (request_id, challenge) = (
         fv["params"]["requestId"].as_str().unwrap().to_string(),
@@ -529,7 +534,7 @@ fn disclosure_allowed_but_locked_during_wait_returns_session_invalid() {
         let handler = handler.clone();
         std::thread::spawn(move || handler(&line, &peer))
     };
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     let (request_id, challenge) = (
         fv["params"]["requestId"].as_str().unwrap().to_string(),
