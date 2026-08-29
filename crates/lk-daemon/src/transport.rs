@@ -175,7 +175,8 @@ impl PushHub {
     }
 }
 
-/// 排空一个订阅的通知帧直到流终止（lk-app 桌面推送流的 writer 循环，
+/// 排空一个订阅的通知帧直到流终止（三处 writer 循环共享：lk-app 桌面
+/// 推送流、socket 订阅连接流模式、Windows named pipe 订阅流模式；
 /// #89/#90 抽到 PushHub 旁可测）。
 ///
 /// 不变量：**帧处理不得终止流**——终止只来自 `stop` 置位、`emit` 返回
@@ -385,21 +386,15 @@ mod imp {
         let c = Arc::clone(&closed);
         let writer = std::thread::spawn(move || {
             let mut ws = writer_stream;
-            loop {
-                if c.load(Ordering::Relaxed) {
-                    break;
-                }
-                match rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(frame) => {
-                        if write_line(&mut ws, &frame).is_err() {
-                            break;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            hub.unsubscribe(id);
+            // 帧循环共享 `drain_subscription`：写失败（emit false）即流终止
+            drain_subscription(
+                id,
+                rx,
+                &hub,
+                Some(&c),
+                Duration::from_millis(500),
+                |frame| write_line(&mut ws, &frame).is_ok(),
+            );
         });
         // 主线程：读（忽略内容——订阅连接不再承载请求）直到对端关闭
         let mut reader = stream;
@@ -821,29 +816,23 @@ mod imp {
     /// （下一次广播时 WriteFile 报错 → 退订；外部订阅者仅测试/未来扩展使用，
     /// 惰性检测的代价可忽略）。流模式结束时在本函数内完成 Flush/Disconnect/
     /// Close 收尾（句柄已移入 writer 线程，调用方不再触碰）。
-    fn serve_push_stream(mut stream: PipeStream, hub: &Arc<PushHub>) {
+    fn serve_push_stream(stream: PipeStream, hub: &Arc<PushHub>) {
         // socket 流模式订阅：非桌面来源（#72/#78——收不到 authz.request 帧）
         let (id, rx) = hub.subscribe(false);
         let hub = Arc::clone(hub);
         let writer = std::thread::spawn(move || {
-            loop {
-                match rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(frame) => {
-                        if write_line(&mut stream, &frame).is_err() {
-                            break;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
+            let mut s = stream;
+            // 帧循环共享 `drain_subscription`：断连靠写失败惰性检测
+            // （emit false -> 流终止），随后在本线程完成收尾
+            drain_subscription(id, rx, &hub, None, Duration::from_millis(500), |frame| {
+                write_line(&mut s, &frame).is_ok()
+            });
             // 流模式收尾（与常规请求连接同一套原语：确保送达再断连）
             unsafe {
-                let _ = FlushFileBuffers(stream.handle.0);
-                DisconnectNamedPipe(stream.handle.0);
-                CloseHandle(stream.handle.0);
+                let _ = FlushFileBuffers(s.handle.0);
+                DisconnectNamedPipe(s.handle.0);
+                CloseHandle(s.handle.0);
             }
-            hub.unsubscribe(id);
         });
         let _ = writer.join();
     }
