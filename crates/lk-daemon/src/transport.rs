@@ -1705,17 +1705,43 @@ mod tests {
         assert_eq!(hub.desktop_subscriber_count(), 0, "流终止后退订");
     }
 
-    /// 发送端断开（外部退订 / hub 清理）→ 循环退出并退订（幂等）。
+    /// 发送端断开（外部退订 / hub 清理）→ 循环退出。
+    ///
+    /// 订阅以 `desktop=true` 登记，计数才可判别。断开动作本身就是退订，
+    /// 故末尾的「不在册」断言恒真、只能锁定**循环退出**；**drain 自己退订**
+    /// 由 [`emit_false_ends_drain_and_unsubscribes`] 锁定——那是唯一能用
+    /// 计数直接观察退订的终止路径。
     #[test]
     fn sender_disconnect_ends_drain() {
         let hub = PushHub::new();
-        let (id, rx) = hub.subscribe(false);
+        let (id, rx) = hub.subscribe(true);
+        assert_eq!(hub.desktop_subscriber_count(), 1, "前置：订阅在册");
         let h = Arc::clone(&hub);
         let worker = std::thread::spawn(move || {
             drain_subscription(id, rx, &h, None, Duration::from_millis(50), |_| true);
         });
         hub.unsubscribe(id);
         worker.join().expect("断开后循环必须退出");
-        assert_eq!(hub.desktop_subscriber_count(), 0);
+        assert_eq!(hub.desktop_subscriber_count(), 0, "断开后订阅不在册");
+    }
+
+    /// 写失败（`emit` 返回 false，如 socket 写失败）→ 循环退出，且**由
+    /// drain 自己**退订。两条 socket 流模式 writer 走的就是这条终止路径
+    /// （unix / Windows 的 `serve_push_stream`）。
+    #[test]
+    fn emit_false_ends_drain_and_unsubscribes() {
+        let hub = PushHub::new();
+        let (id, rx) = hub.subscribe(true);
+        let h = Arc::clone(&hub);
+        let worker = std::thread::spawn(move || {
+            drain_subscription(id, rx, &h, None, Duration::from_millis(50), |_| false);
+        });
+        hub.broadcast("f1");
+        worker.join().expect("写失败后循环必须退出");
+        assert_eq!(
+            hub.desktop_subscriber_count(),
+            0,
+            "流终止的退订必须由 drain 完成"
+        );
     }
 }

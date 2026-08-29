@@ -41,6 +41,18 @@ pub fn transport_test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// 200ms/300ms 级的**负向**等待（断言无帧）不在此列，须保持短。
 pub const FRAME_WAIT: Duration = Duration::from_secs(30);
 
+/// 「不该发生等待」路径的上界——与 `FRAME_WAIT` 语义相反，勿混用：
+/// `FRAME_WAIT` 等帧**到达**（越宽越稳），本常数断言某条路径**没有等**
+/// （越窄越有判别力），用于「无审批界面必须立即拒绝」「审批等待期间其他
+/// 命令不被阻塞」这类判据。
+///
+/// 取值被两侧夹住，两侧各留 2–3× 余量：
+/// - **必须远小于**夹具审批窗口（生产默认 30s，#92 起不再调小）——否则
+///   误入审批等待要跑满整个窗口才返回，本界便失去快速失败能力；
+/// - **必须远大于** `authz.evaluate` begin 段在负载下的最坏耗时（线程调度
+///   + Windows 启动者进程链回溯，3× 过载实测 >5s，#92）。
+pub const NO_WAIT_BOUND: Duration = Duration::from_secs(15);
+
 /// 等待真实传输层可连接（Windows named pipe：serve 线程创建首个监听实例
 /// 之前客户端 connect 报 ERROR_FILE_NOT_FOUND，`connect_with_retry` 的
 /// 瞬态重试总窗口 ~200ms 在并行满载下会被 serve 线程启动延迟挤爆，#92）。
