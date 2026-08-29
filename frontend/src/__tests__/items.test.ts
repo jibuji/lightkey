@@ -4,7 +4,8 @@
  *
  * - §6.2 可搜字段白名单：白名单字段命中、密钥明文值与笔记全文不命中；
  * - 类型过滤 chips；
- * - 加载编排：成功 / 失败置 null（调用方据此清空列表）/ 刷新后选中保持；
+ * - 加载编排：成功 / 失败返回判别式结果（issue #85：失败可区分于空库，
+ *   不再用 null 表达）/ 刷新后选中保持；
  * - CAS 冲突处置：覆盖 = 同 id+draft 重发 update 且不带 expectedRevision；
  * - 表单↔草稿映射：itemToDraft 剥离 id/revision 的往返一致性。
  */
@@ -143,24 +144,39 @@ describe("filterItems（类型 chips + 查询词）", () => {
 
 /* ---------- (b) 加载编排 ---------- */
 
-describe("loadItems（list → 逐个 get 全量）", () => {
+describe("loadItems（list → 逐个 get 全量；失败为可区分判别式结果）", () => {
   it("成功：对每个 summary 调 get 并返回全量条目", async () => {
     const ipc = stubIpc(items);
-    const full = await loadItems(ipc);
+    const res = await loadItems(ipc);
     expect(ipc.list).toHaveBeenCalledTimes(1);
     expect(ipc.get).toHaveBeenCalledTimes(4);
-    expect(full).not.toBeNull();
-    expect(full!.map((it) => it.id)).toEqual(items.map((it) => it.id));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.items.map((it) => it.id)).toEqual(items.map((it) => it.id));
   });
 
-  it("list 失败 → 返回 null（不抛出）", async () => {
+  it("list 失败 → { ok:false, error }（不抛出；失败可区分于空库）", async () => {
     const ipc = stubIpc([], { failList: true });
-    await expect(loadItems(ipc)).resolves.toBeNull();
+    const res = await loadItems(ipc);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect((res.error as Error).message).toBe("session.invalid");
   });
 
-  it("任一 get 失败 → 整轮失败返回 null（与原 Promise.all 语义一致）", async () => {
+  it("任一 get 失败 → 整轮失败 { ok:false }（与原 Promise.all 语义一致）", async () => {
     const ipc = stubIpc(items, { failGet: true });
-    await expect(loadItems(ipc)).resolves.toBeNull();
+    await expect(loadItems(ipc)).resolves.toMatchObject({ ok: false });
+  });
+
+  it("list 返回非数组（v0.1.11 错配形状）→ 失败且错因保留，不吞成空库", async () => {
+    // 适配器漏解包时 list() 透传 ItemListResult 包装对象：旧实现吞成
+    // null → 「还没有条目」表象；判别式结果必须让形状错配可区分。
+    const ipc = stubIpc([]);
+    ipc.list.mockResolvedValue({ items: [] } as unknown as Awaited<ReturnType<typeof ipc.list>>);
+    const res = await loadItems(ipc);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect((res.error as Error).message).toContain("map is not a function");
   });
 });
 
