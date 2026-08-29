@@ -139,13 +139,12 @@ fn authz_denies_without_ui_fast() {
         ),
         &test_peer(Some(proj.path())),
     );
-    // 阈值语义：粗上界，只防「误入审批等待」（m2_daemon 审批窗口=生产默认
-    // 30s，误等任一都会超此界）；不是延迟 SLA。更紧的常数在并行测试负载下
-    // 不可靠：Windows 启动者进程链回溯（Toolhelp+PEB）单机实测 ~440ms、
-    // 满载 >1s，3× 过载下 begin 段整体 >5s（#92），故上界与 FRAME_WAIT 同阶。
-    // 功能面由下方 reason=no_ui 断言锁定：走审批等待的结果是 timeout 而非
-    // no_ui，时间上界只是兜底哨兵。
-    assert!(t0.elapsed() < FRAME_WAIT, "无界面必须立即拒绝");
+    // 阈值语义：粗上界，只防「误入审批等待」；不是延迟 SLA。
+    // 常数取 `NO_WAIT_BOUND`（15s）而非 `FRAME_WAIT`（30s）——夹具审批窗口
+    // 自 #92 起就是生产默认 30s，上界若与窗口同阶，误等时要跑满 30s 才红、
+    // 判据失去判别力。功能面由下方 reason=no_ui 断言锁定：走审批等待的
+    // 结果是 timeout 而非 no_ui，时间上界只是让它早点红。
+    assert!(t0.elapsed() < NO_WAIT_BOUND, "无界面必须立即拒绝");
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["allowed"], false);
     assert_eq!(v["result"]["reason"], "no_ui");
@@ -517,9 +516,9 @@ fn authz_wait_does_not_block_other_commands() {
     let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
     let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
     // 等待期间：其他命令必须及时返回（命令锁未被 30s 等待占用）。
-    // 上界取 5s：健康路径是毫秒级命令，若回归成「等待持命令锁」则阻塞
-    // 整个审批窗口（30s）必然超界；更紧的常数在并行满载下被调度延迟
-    // 挤爆（#92 同类）。
+    // 上界与 `authz_denies_without_ui_fast` 同族，共用 `NO_WAIT_BOUND`：
+    // 健康路径是毫秒级命令，若回归成「等待持命令锁」则阻塞整个审批窗口
+    // （30s）必然超界；上界也不能太紧——并行满载下调度延迟会误报（#92）。
     let t0 = Instant::now();
     let resp = state.lock().unwrap().handle(
         &rpc_line(M_ITEM_LIST, Some(&token), json!({})),
@@ -527,7 +526,7 @@ fn authz_wait_does_not_block_other_commands() {
     );
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_secs(5),
+        elapsed < NO_WAIT_BOUND,
         "审批等待期间命令被阻塞 {elapsed:?}"
     );
     assert!(rpc_result(&resp)["items"].as_array().is_some());
