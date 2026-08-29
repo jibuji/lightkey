@@ -2384,7 +2384,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lk-app"
-version = "0.1.10"
+version = "0.1.12"
 dependencies = [
  "core-foundation",
  "lk-core",
@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "lk-cli"
-version = "0.1.10"
+version = "0.1.12"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "lk-core"
-version = "0.1.10"
+version = "0.1.12"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "lk-daemon"
-version = "0.1.10"
+version = "0.1.12"
 dependencies = [
  "base64 0.22.1",
  "hex",
