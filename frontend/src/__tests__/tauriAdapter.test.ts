@@ -108,9 +108,10 @@ describe("tauri 适配器 × 守护进程响应形状", () => {
   });
 
   it("loadItems 编排（list → 逐个 get）能加载出条目", async () => {
-    const full = await loadItems(ipc);
-    expect(full).not.toBeNull();
-    expect(full?.[0]?.name).toBe("GitHub");
+    const res = await loadItems(ipc);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.items[0]?.name).toBe("GitHub");
     // 编排第二段必须真的发出 item.get
     expect(invoke.mock.calls.some((c) => (c[1] as { method: string }).method === "item.get")).toBe(
       true,
@@ -142,5 +143,23 @@ describe("tauri 适配器 × 守护进程响应形状", () => {
       keys: ["NPM_TOKEN"],
     });
     expect(added.id).toBe(RULE.id);
+  });
+});
+
+/** issue #85 契约防线：列表类响应非数组即抛——形状错配在开发/测试期变红。 */
+describe("tauri 适配器形状断言（列表类响应非数组即报错）", () => {
+  it("item.list 响应缺数组字段 → 抛契约错误（不静默返回 undefined）", async () => {
+    invoke.mockImplementation(async () => ({ jsonrpc: "2.0", id: 0, result: {} }));
+    await expect(ipc.list()).rejects.toThrow(/item\.list/);
+  });
+
+  it("audit.list 响应缺数组字段 → 抛契约错误", async () => {
+    invoke.mockImplementation(async () => ({ jsonrpc: "2.0", id: 0, result: {} }));
+    await expect(ipc.auditList()).rejects.toThrow(/audit\.list/);
+  });
+
+  it("rule.list 响应缺数组字段 → 抛契约错误", async () => {
+    invoke.mockImplementation(async () => ({ jsonrpc: "2.0", id: 0, result: {} }));
+    await expect(ipc.ruleList()).rejects.toThrow(/rule\.list/);
   });
 });

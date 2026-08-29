@@ -19,6 +19,7 @@
 
 import type { Context } from "@cordisjs/core";
 import type { ReactNode } from "react";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import type { SlotEntry } from "./slots";
 
 export interface SkeletonProps {
@@ -28,6 +29,18 @@ export interface SkeletonProps {
   content: SlotEntry[];
   /** 当前页面（nav 选中；content 槽位组件按 page 元数据匹配）。 */
   currentPage: string;
+}
+
+/**
+ * 槽位组件 = 一个错误边界（issue #85）：任一页面/槽位组件渲染抛错只降级
+ * 该组件自身，其余页面仍可用——v0.1.11 中规则页崩溃拖垮整棵树。
+ */
+function bounded(entry: SlotEntry): ReactNode {
+  return (
+    <ErrorBoundary key={entry.name} label={entry.name}>
+      <entry.component key={entry.name} />
+    </ErrorBoundary>
+  );
 }
 
 export function Skeleton({ ctx, topbar, sidebar, content, currentPage }: SkeletonProps) {
@@ -48,7 +61,7 @@ export function Skeleton({ ctx, topbar, sidebar, content, currentPage }: Skeleto
     }
     const lockedPage = initialized ? "unlock" : "onboarding";
     const locked = content.find((e) => e.meta?.page === lockedPage);
-    if (locked) return <locked.component key={locked.name} />;
+    if (locked) return bounded(locked);
     return (
       <div className="app">
         <div className="content">
@@ -69,18 +82,16 @@ export function Skeleton({ ctx, topbar, sidebar, content, currentPage }: Skeleto
           <span className="brand-mark" />
         </div>
         <nav className="sidebar-nav">
-          {sidebar.map((entry) => (
-            <entry.component key={entry.name} />
-          ))}
+          {sidebar.map(bounded)}
         </nav>
       </aside>
       <div className="main">
         <header className="topbar" aria-label="顶栏">
-          <div className="topbar-left">{topbar.map((entry) => <entry.component key={entry.name} />)}</div>
+          <div className="topbar-left">{topbar.map(bounded)}</div>
           <div className="topbar-right" />
         </header>
         <div className="content">
-          {lockedView ?? (active ? <active.component key={active.name} /> : null)}
+          {lockedView ?? (active ? bounded(active) : null)}
         </div>
       </div>
     </div>

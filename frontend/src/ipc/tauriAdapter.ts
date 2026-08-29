@@ -69,6 +69,18 @@ function unwrap<T>(res: { result?: T; error?: { code?: string; message?: string 
   return res.result as T;
 }
 
+/**
+ * 列表类响应的契约防线（issue #85）：非数组即抛——形状错配（如守护进程
+ * 协议变更、适配器漏解包）必须在开发/测试期变红，而不是把 `undefined`
+ * 静默透传给上层，最终被吞成「空列表」表象。
+ */
+function assertArray<T>(value: unknown, method: string, field: string): T[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`contract violation: ${method} result.${field} is not an array`);
+  }
+  return value;
+}
+
 /** 建立推送流（#67：桌面直调允许在**锁定态**订阅——锁态下守护进程需把
  *  `authz.request(needsUnlock)` 帧投递给 GUI 以弹解锁+审批一体化窗口；
  *  仅桌面来源被允许无会话订阅，socket 订阅仍需 token。失败静默——下次
@@ -136,9 +148,10 @@ export class TauriAdapter implements LightKeyIpc {
 
   async list(): Promise<ItemSummary[]> {
     try {
-      // 守护进程返回 `ItemListResult{items}`（ipc.rs）；解包为数组本体
-      const res = await rpc<{ items: ItemSummary[] }>("item.list");
-      return res.items;
+      // 守护进程返回 `ItemListResult{items}`（ipc.rs）；解包为数组本体 +
+      // 契约断言（非数组即抛，issue #85）
+      const res = await rpc<{ items?: unknown }>("item.list");
+      return assertArray<ItemSummary>(res.items, "item.list", "items");
     } catch (e) {
       throw mapError(e);
     }
@@ -207,9 +220,10 @@ export class TauriAdapter implements LightKeyIpc {
 
   async auditList(): Promise<AuditEvent[]> {
     try {
-      // 守护进程返回 `AuditListResult{events,total}`（ipc.rs）；解包为事件数组
-      const res = await rpc<{ events: AuditEvent[]; total: number }>("audit.list");
-      return res.events;
+      // 守护进程返回 `AuditListResult{events,total}`（ipc.rs）；解包为事件
+      // 数组 + 契约断言（非数组即抛，issue #85）
+      const res = await rpc<{ events?: unknown; total?: number }>("audit.list");
+      return assertArray<AuditEvent>(res.events, "audit.list", "events");
     } catch (e) {
       throw mapError(e);
     }
@@ -217,9 +231,10 @@ export class TauriAdapter implements LightKeyIpc {
 
   async ruleList(): Promise<AuthRule[]> {
     try {
-      // 守护进程返回 `RuleListResult{rules}`（ipc.rs）；解包为规则数组
-      const res = await rpc<{ rules: AuthRule[] }>("rule.list", { channel: "desktop" });
-      return res.rules;
+      // 守护进程返回 `RuleListResult{rules}`（ipc.rs）；解包为规则数组 +
+      // 契约断言（非数组即抛，issue #85）
+      const res = await rpc<{ rules?: unknown }>("rule.list", { channel: "desktop" });
+      return assertArray<AuthRule>(res.rules, "rule.list", "rules");
     } catch (e) {
       throw mapError(e);
     }

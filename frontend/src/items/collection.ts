@@ -4,8 +4,9 @@
  * 纯 TS module：零 React import、零 Cordis 注册，VaultPage 直接 import；
  * 每块行为均可不经 DOM 直接单测（`__tests__/items.test.ts`）。
  *
- * - 加载编排：`loadItems`（list → 逐个 get 取全量；任一步失败返回 null，
- *   由调用方置空数组）+ `resolveSelection`（刷新后选中保持：原选中仍在
+ * - 加载编排：`loadItems`（list → 逐个 get 取全量；失败返回判别式结果
+ *   `{ ok:false, error }`——issue #85，失败可区分于空库，由调用方呈现
+ *   错误态 + 重试）+ `resolveSelection`（刷新后选中保持：原选中仍在
  *   结果中则保持，否则选第一个；空结果为 null）；
  * - 过滤/搜索：`filterItems` + spec §6.2 可搜字段白名单 `searchableText`
  *   （名称 / 用户名 / 域名(login uris) / 用途(secret purpose) / 文件备注与
@@ -31,19 +32,31 @@ export type ItemFilterValue = "all" | ItemType;
 export type ItemsIpc = Pick<LightKeyIpc, "list" | "get" | "update">;
 
 /**
+ * 加载结果判别式（issue #85）：失败是**可区分**的状态，不再用 null 表达。
+ *
+ * 背景（v0.1.11 事故放大器）：旧实现把失败吞成 null → 调用方置空数组 →
+ * 「加载失败」与「库里没有条目」在 UI 上完全同形。改为判别式后调用方
+ * （VaultPage）必须分别处置：错误态 + 重试，而非空态。
+ */
+export type ItemsLoadResult =
+  | { ok: true; items: Item[] }
+  | { ok: false; error: unknown };
+
+/**
  * 加载编排：`ipc.list()` 后逐个 `ipc.get(id)` 取全量条目。
  *
- * 任一步失败返回 null（不抛出）；调用方据此置空数组——与原 VaultPage
- * 行为一致：失败只清空列表，不动当前选中。
+ * 不抛出：任何一步失败（含 list 返回非数组的契约错配——旧实现的
+ * `summaries.map is not a function` 正是从此处吞掉的）都折迭为
+ * `{ ok: false, error }`，错因原样保留给调用方呈现。
  */
 export async function loadItems(
   ipc: Pick<ItemsIpc, "list" | "get">,
-): Promise<Item[] | null> {
+): Promise<ItemsLoadResult> {
   try {
     const summaries = await ipc.list();
-    return await Promise.all(summaries.map((s) => ipc.get(s.id)));
-  } catch {
-    return null;
+    return { ok: true, items: await Promise.all(summaries.map((s) => ipc.get(s.id))) };
+  } catch (error) {
+    return { ok: false, error };
   }
 }
 
