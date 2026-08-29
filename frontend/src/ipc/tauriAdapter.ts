@@ -136,7 +136,9 @@ export class TauriAdapter implements LightKeyIpc {
 
   async list(): Promise<ItemSummary[]> {
     try {
-      return rpc<ItemSummary[]>("item.list");
+      // 守护进程返回 `ItemListResult{items}`（ipc.rs）；解包为数组本体
+      const res = await rpc<{ items: ItemSummary[] }>("item.list");
+      return res.items;
     } catch (e) {
       throw mapError(e);
     }
@@ -153,7 +155,9 @@ export class TauriAdapter implements LightKeyIpc {
   /** 新建：item.put（ipc.md §4；无 id → 守护进程生成） */
   async create(draft: ItemDraft): Promise<Item> {
     try {
-      return rpc<Item>("item.put", { item: draft });
+      // 守护进程返回 `ItemPutResult{item}`（ipc.rs）；解包为条目本体
+      const res = await rpc<{ item: Item }>("item.put", { item: draft });
+      return res.item;
     } catch (e) {
       throw mapError(e);
     }
@@ -162,7 +166,12 @@ export class TauriAdapter implements LightKeyIpc {
   /** 整条替换（CAS）：item.put，expectedRevision 必填 */
   async update(id: string, draft: ItemDraft, opts?: UpdateOptions): Promise<Item> {
     try {
-      return rpc<Item>("item.put", { id, item: draft, expectedRevision: opts?.expectedRevision });
+      const res = await rpc<{ item: Item }>("item.put", {
+        id,
+        item: draft,
+        expectedRevision: opts?.expectedRevision,
+      });
+      return res.item;
     } catch (e) {
       throw mapError(e);
     }
@@ -198,7 +207,9 @@ export class TauriAdapter implements LightKeyIpc {
 
   async auditList(): Promise<AuditEvent[]> {
     try {
-      return rpc<AuditEvent[]>("audit.list");
+      // 守护进程返回 `AuditListResult{events,total}`（ipc.rs）；解包为事件数组
+      const res = await rpc<{ events: AuditEvent[]; total: number }>("audit.list");
+      return res.events;
     } catch (e) {
       throw mapError(e);
     }
@@ -206,7 +217,9 @@ export class TauriAdapter implements LightKeyIpc {
 
   async ruleList(): Promise<AuthRule[]> {
     try {
-      return rpc<AuthRule[]>("rule.list", { channel: "desktop" });
+      // 守护进程返回 `RuleListResult{rules}`（ipc.rs）；解包为规则数组
+      const res = await rpc<{ rules: AuthRule[] }>("rule.list", { channel: "desktop" });
+      return res.rules;
     } catch (e) {
       throw mapError(e);
     }
@@ -214,7 +227,9 @@ export class TauriAdapter implements LightKeyIpc {
 
   async ruleAdd(input: RuleInput): Promise<AuthRule> {
     try {
-      return rpc<AuthRule>("rule.add", { ...input, channel: "desktop" });
+      // 守护进程返回 `RuleAddResult{rule}`（ipc.rs）；解包为规则本体
+      const res = await rpc<{ rule: AuthRule }>("rule.add", { ...input, channel: "desktop" });
+      return res.rule;
     } catch (e) {
       throw mapError(e);
     }
