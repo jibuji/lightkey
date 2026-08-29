@@ -221,7 +221,7 @@ fn push_channel_notifies_session_and_item_events() {
         ),
         &PeerInfo::unknown(),
     );
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "item.changed");
     assert_eq!(fv["params"]["type"], "login");
@@ -230,7 +230,7 @@ fn push_channel_notifies_session_and_item_events() {
         &rpc_line(M_VAULT_LOCK, Some(&token), json!({})),
         &PeerInfo::unknown(),
     );
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "session.locked");
     assert_eq!(fv["params"]["reason"], "manual");
@@ -243,7 +243,7 @@ fn push_channel_notifies_session_and_item_events() {
         ),
         &PeerInfo::unknown(),
     );
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "session.unlocked");
     assert_eq!(fv["params"]["via"], "password");

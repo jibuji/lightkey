@@ -26,6 +26,37 @@ use std::time::Instant;
 /// shutdown 标志会打断对方的 serve 循环，且负载下时间断言易误报）。
 static TRANSPORT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// 取传输层测试锁（毒化容忍）：一个传输层测试失败不应级联成同锁兄弟
+/// 测试的 PoisonError 假失败（#92）；锁只提供互斥、不保护共享不变量
+/// （各测试自置 global_shutdown 起点），恢复使用是安全的。
+pub fn transport_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TRANSPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 审批/事件帧等待上界。负载下 `authz.evaluate` 的 begin 段（线程调度 +
+/// Windows 启动者进程链回溯，单机实测满载 >1s、3× 过载下 >5s，见 #92）
+/// 把帧的到达时刻推得很晚；上界放宽对健康路径零成本（收到帧即返回）。
+/// 200ms/300ms 级的**负向**等待（断言无帧）不在此列，须保持短。
+pub const FRAME_WAIT: Duration = Duration::from_secs(30);
+
+/// 等待真实传输层可连接（Windows named pipe：serve 线程创建首个监听实例
+/// 之前客户端 connect 报 ERROR_FILE_NOT_FOUND，`connect_with_retry` 的
+/// 瞬态重试总窗口 ~200ms 在并行满载下会被 serve 线程启动延迟挤爆，#92）。
+/// 与生产 `ensure_daemon` 的就绪轮询同型；unix 侧 listener 在 bind 时已
+/// 就绪，此等待立即返回。探测成功的连接随手丢弃（服务端按 EOF 收尾）。
+fn wait_transport_ready(ep: &transport::Endpoint) {
+    let deadline = Instant::now() + FRAME_WAIT;
+    loop {
+        if transport::connect(ep).is_ok() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "传输层 30s 内未就绪");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// 构造 JSON-RPC 请求行。
 fn rpc_line(method: &str, token: Option<&str>, params: Value) -> String {
     let mut p = params;
@@ -61,13 +92,10 @@ fn m2_daemon(
         init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
     }
     let mut daemon = Daemon::start(dir).unwrap();
-    // 审批超时调小（测试不等真实 30s）
-    daemon
-        .shared()
-        .config
-        .write()
-        .unwrap()
-        .approval_timeout_secs = 1;
+    // 审批窗口维持生产默认 30s（#92）：需要审批回传落地的测试不再与
+    // 真实时钟赛跑（并行满载下测试线程从收到帧到提交回传可被调度延迟
+    // 挤出 1s 窗口）；只测超时边界的测试在本测试内显式调小（秒级等待
+    // 由 await_decision 真实时钟驱动，行为面不变）。
     let unlock = rpc_result(&daemon.handle(
         &rpc_line(
             M_VAULT_UNLOCK,

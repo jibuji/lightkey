@@ -77,7 +77,7 @@ fn rule_crud_audits_and_broadcasts() {
     );
     assert_eq!(rule["projectDir"], canonical_proj);
     // 广播 item.changed(kind=rule, deleted=false)（决策 #6）
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["method"], "item.changed");
     assert_eq!(fv["params"]["type"], "rule");
@@ -95,7 +95,7 @@ fn rule_crud_audits_and_broadcasts() {
         &rpc_line(M_RULE_REMOVE, Some(&token), json!({ "id": id })),
         &PeerInfo::unknown(),
     );
-    let frame = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(fv["params"]["type"], "rule");
     assert_eq!(fv["params"]["deleted"], true);

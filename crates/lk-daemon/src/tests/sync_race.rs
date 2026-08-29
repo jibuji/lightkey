@@ -101,15 +101,18 @@ fn sync_round_does_not_block_commands_and_apply_respects_races() {
         &PeerInfo::unknown(),
     );
     let (tx, rx) = mpsc::channel();
+    // 慢后端间隔 800ms 与断言上界 700ms 成对：回归态（命令在网络 I/O 中
+    // 被阻塞）至少等满一个慢 op ≥800ms 必然超界；健康路径在重载下的
+    // 调度延迟实测 ~360ms（#92 双套件碰撞观测），上界留出 >2× 余量
     let slow = Box::new(SlowBackend {
         inner: LocalStorage::new(remote_dir.path().to_path_buf()),
-        delay: Duration::from_millis(400),
+        delay: Duration::from_millis(800),
         signals: tx,
     });
     let round_shared = Arc::clone(&shared);
     let round = std::thread::spawn(move || run_sync_round_with(&round_shared, slow));
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    rx.recv_timeout(FRAME_WAIT).unwrap();
     let t0 = Instant::now();
     let list = daemon.handle(
         &rpc_line(M_ITEM_LIST, Some(&token), json!({})),
@@ -117,12 +120,12 @@ fn sync_round_does_not_block_commands_and_apply_respects_races() {
     );
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_millis(300),
+        elapsed < Duration::from_millis(700),
         "item.list 在同步网络 I/O 中被阻塞 {elapsed:?}"
     );
     assert_eq!(rpc_result(&list)["items"].as_array().unwrap().len(), 2);
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    rx.recv_timeout(FRAME_WAIT).unwrap();
     let put = daemon.handle(
         &rpc_line(
             M_ITEM_PUT,
@@ -144,7 +147,7 @@ fn sync_round_does_not_block_commands_and_apply_respects_races() {
         "命令更新在同步网络 I/O 中被阻塞或被拒绝：{put}"
     );
 
-    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    rx.recv_timeout(FRAME_WAIT).unwrap();
 
     let summary = round.join().unwrap().unwrap();
     assert_eq!(summary.pulled, 0, "应用复核跳过旧快照导入");
