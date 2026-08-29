@@ -96,12 +96,35 @@ export interface NavService {
   subscribe(listener: () => void): () => void;
 }
 
+/** 审批提醒载荷（#95）：系统通知正文的**唯一**输入面。 */
+export interface ApprovalAlertPayload {
+  /** 发起者（进程链回溯出的启动者名）。 */
+  starter: string;
+  /** 请求所在项目目录。 */
+  projectDir: string;
+}
+
 /** desktop-shell 服务：窗口/托盘联动（决策 #4 A；tauri 环境生效，mock no-op）。 */
 export interface ShellService {
   /** 关闭主窗口 = 隐藏到托盘、保持解锁（Rust 侧已拦截 close 事件；备用命令）。 */
   closeToTray(): Promise<void>;
   /** 退出应用（托盘退出 = 守护退出 = 锁定）。 */
   quit(): Promise<void>;
+  /**
+   * 审批强提醒（#95）：系统通知 + 窗口注意力提示（任务栏/图标闪烁）。
+   *
+   * **不聚焦窗口**——抢焦点既扰民，Windows 也可能拦截。窗口若已隐藏到
+   * 托盘则无任务栏按钮，闪烁这一步没有可见效果，由系统通知承担提醒职责；
+   * 用户经托盘「显示主窗口」回到审批弹窗。
+   *
+   * 通知正文按保守口径只含 `starter` 与 `projectDir`：通知会落进系统通知
+   * 中心与锁屏预览，等同离开守护进程保护，命令行与条目名绝不入列
+   * （与 M2.9 值披露边界一致）。
+   *
+   * 失败静默降级（非桌面环境 / 用户拒绝通知权限）：提醒是旁路，不能阻塞
+   * 审批闭环。
+   */
+  alertApproval(payload: ApprovalAlertPayload): Promise<void>;
 }
 
 declare module "@cordisjs/core" {

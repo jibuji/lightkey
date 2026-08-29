@@ -16,7 +16,10 @@
 //! - **配置读写**（`config_get`/`config_set`）：设置页（ui-settings）
 //!   走 config.json（非敏感运行时配置，与 `lk config` 同文件）；
 //! - **目录选择器**（`pick_dir`）：ui-rules 新建规则的「项目目录选择器」
-//!   （spec §6.4；tauri-plugin-dialog 原生对话框）。
+//!   （spec §6.4；tauri-plugin-dialog 原生对话框）；
+//! - **审批强提醒**（`approval_alert`，#95）：审批请求入队时发系统通知 +
+//!   窗口注意力提示，让用户即使没在看窗口也能感知（通知正文按保守口径，
+//!   只含启动者与项目目录）。
 
 mod lockwatch;
 mod state;
@@ -59,6 +62,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             rpc,
@@ -67,6 +71,7 @@ pub fn run() {
             config_get,
             config_set,
             pick_dir,
+            approval_alert,
             app_quit,
         ])
         .setup(|app| {
@@ -274,6 +279,54 @@ async fn pick_dir(app: tauri::AppHandle) -> Result<Option<String>, String> {
 #[tauri::command]
 fn app_quit(app: tauri::AppHandle) {
     app.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// 审批强提醒（#95）
+// ---------------------------------------------------------------------------
+
+/// 审批请求到达时的强提醒：系统通知 + 窗口注意力提示。
+///
+/// 背景：审批弹窗是纯 webview DOM 层，窗口最小化 / 隐藏到托盘（决策 #4 A）
+/// / 被遮挡时用户零感知，30s 倒计时静默走完即默认拒绝——用户连发生过一次
+/// 授权尝试都不知道。本命令给出不依赖窗口可见性的提醒。
+///
+/// **不聚焦窗口**：抢焦点既扰民，Windows 也可能拦截。窗口若已隐藏到托盘
+/// （无任务栏按钮）则注意力闪烁无可见效果，由系统通知承担提醒职责；用户
+/// 经托盘「显示主窗口」回到审批弹窗（[`setup_tray`]）。
+///
+/// **已知限制**：点击通知无法回调。`tauri-plugin-notification` 的桌面端
+/// 构建不发射任何事件（其 `register_action_types` 只存在于移动端实现），
+/// 因此「点击通知 → 聚焦窗口」这条交互在本平台无实现路径。
+///
+/// **尽力而为**：通知权限被拒 / 平台不支持时静默降级，注意力提示仍照常发出；
+/// 提醒是旁路，失败不得阻塞审批闭环。
+///
+/// **保守口径**：正文只含 `starter` 与 `project_dir`——通知会落进系统通知
+/// 中心与锁屏预览，等同离开守护进程保护，命令行与条目名绝不入列
+/// （与 M2.9 值披露边界一致）。
+#[tauri::command]
+fn approval_alert(app: tauri::AppHandle, starter: String, project_dir: String) {
+    use tauri::Manager;
+    use tauri_plugin_notification::NotificationExt;
+
+    // 不做事先的权限申请：插件桌面端（v2.3.3 `desktop.rs`，Windows/macOS/
+    // Linux 同一实现）的 `permission_state()` 恒返回 `Granted`、
+    // `request_permission()` 为空操作，加了只是死代码。macOS 的授权由系统
+    // 在首次投递时处理。
+    let _ = app
+        .notification()
+        .builder()
+        .title("LightKey · 待审批的授权请求")
+        .body(format!("{starter} 请求授权（{project_dir}）"))
+        .show();
+
+    // 窗口注意力提示：任务栏 / 图标闪烁，不抢焦点。
+    // 窗口若已隐藏到托盘（无任务栏按钮）则此步无可见效果，由上面的系统
+    // 通知承担提醒职责。
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
+    }
 }
 
 // ---------------------------------------------------------------------------

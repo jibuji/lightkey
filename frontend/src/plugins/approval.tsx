@@ -379,6 +379,20 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
       const total = await readApprovalTimeoutSecs(ctx);
       if (!unlocked && !payload.needsUnlock) return;
       queue.push({ request: payload, remain: total, total });
+      // 强提醒（#95）：弹窗只存在于窗口内部，窗口最小化/隐藏到托盘/被遮挡
+      // 时用户零感知，必须由操作系统级提醒兜底。仅在队列从空变非空时发
+      // （聚合：已在等待的请求不重复刷屏）。
+      // 载荷按保守口径只带 starter / projectDir（通知进系统通知中心与锁屏
+      // 预览，等同离开守护进程保护）。
+      if (queue.length === 1) {
+        // 发射后不管：提醒是旁路，其失败不得冒泡成未处理拒绝污染宿主
+        void ctx.shell
+          .alertApproval({
+            starter: payload.starter,
+            projectDir: payload.projectDir,
+          })
+          .catch(() => {});
+      }
       mount();
       render();
     })();
@@ -395,5 +409,5 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     queue.length = 0;
   };
 }, {
-  inject: ["ipc", "toast", "session"],
+  inject: ["ipc", "toast", "session", "shell"],
 });
