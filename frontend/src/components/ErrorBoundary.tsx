@@ -7,6 +7,7 @@
  */
 
 import { Component, type ReactNode } from "react";
+import { ErrorState } from "./ErrorState";
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -34,19 +35,11 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     const { error } = this.state;
     if (error === null) return this.props.children;
     return (
-      <div className="empty" role="alert">
-        <div style={{ color: "var(--fg-2)", fontSize: 32 }}>⚠️</div>
-        <div>{this.props.label ?? "此区域"}渲染出错，其他区域不受影响</div>
-        <div style={{ color: "var(--fg-2)", fontSize: 12 }} className="mono">
-          {error instanceof Error ? error.message : String(error)}
-        </div>
-        <button
-          className="btn btn-primary btn-sm"
-          onClick={() => this.setState({ error: null })}
-        >
-          重试
-        </button>
-      </div>
+      <ErrorState
+        error={error}
+        title={`${this.props.label ?? "此区域"}渲染出错，其他区域不受影响`}
+        onRetry={() => this.setState({ error: null })}
+      />
     );
   }
 }

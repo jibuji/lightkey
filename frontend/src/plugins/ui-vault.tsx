@@ -19,6 +19,7 @@ import type { ComponentType } from "react";
 import type { Context, Plugin } from "@cordisjs/core";
 import { mdRender, mdSnippet } from "../markdown/highlight";
 import type { CustomField, Item, ItemDraft, ItemType } from "../types";
+import { ErrorState } from "../components/ErrorState";
 import { Icon, type IconName } from "../components/Icons";
 import { Modal } from "../components/Modal";
 import { MdEditor } from "../components/MdEditor";
@@ -66,6 +67,12 @@ const TYPE_META: Record<ItemType, { icon: IconName; label: string; sub: (it: Ite
   },
 };
 
+/** 条目集合加载生命周期（issue #85）：失败是可区分状态，不与「空库」同形。 */
+type ItemsLoadState =
+  | { phase: "loading" }
+  | { phase: "ready"; items: Item[] }
+  | { phase: "error"; error: unknown };
+
 /** 条目页本体（content 槽位，page=vault）。 */
 export function VaultPage({ ctx }: { ctx: Context }) {
   const toast = ctx.toast;
@@ -74,9 +81,10 @@ export function VaultPage({ ctx }: { ctx: Context }) {
   const [search, setSearch] = useState("");
   const q = useDebounced(search.trim().toLowerCase(), 300);
 
-  const [items, setItems] = useState<Item[] | null>(null);
-  // 加载失败是可区分状态（issue #85）：错误态 + 重试，绝不降级成空列表
-  const [loadError, setLoadError] = useState<unknown>(null);
+  // 加载生命周期单一联合状态（issue #85）：重试入口复用 reload 通道
+  const [load, setLoad] = useState<ItemsLoadState>({ phase: "loading" });
+  // 就绪后的条目集合快照；加载中与失败态为 null，列表区按 load.phase 分流
+  const items = load.phase === "ready" ? load.items : null;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [revealed, setRevealed] = useState(false);
   const [reloadTick, setReloadTick] = useState(0);
@@ -92,18 +100,17 @@ export function VaultPage({ ctx }: { ctx: Context }) {
 
   useEffect(() => {
     let alive = true;
-    setItems(null);
-    setLoadError(null);
+    setLoad({ phase: "loading" });
     // 加载编排（list → 逐个 get）与失败语义在条目域模块；此处只接线 state：
-    // 失败 → 错误态（重试入口走 reload），绝不置空数组冒充空库（issue #85）
+    // 失败 → 错误态（重试走 reload），绝不置空数组冒充空库（issue #85）
     loadItems(ctx.ipc).then((res) => {
       if (!alive) return;
-      if (!res.ok) {
-        setLoadError(res.error);
-        return;
+      if (res.ok) {
+        setLoad({ phase: "ready", items: res.items });
+        setSelectedId((prev) => resolveSelection(res.items, prev));
+      } else {
+        setLoad({ phase: "error", error: res.error });
       }
-      setItems(res.items);
-      setSelectedId((prev) => resolveSelection(res.items, prev));
     });
     return () => {
       alive = false;
@@ -234,17 +241,12 @@ export function VaultPage({ ctx }: { ctx: Context }) {
           ))}
         </div>
         <div className="item-list">
-          {loadError ? (
-            <div className="empty" role="alert">
-              <div style={{ color: "var(--fg-2)", fontSize: 32 }}>⚠️</div>
-              <div>条目加载失败——读取加密库时出错</div>
-              <div style={{ color: "var(--fg-2)", fontSize: 12 }} className="mono">
-                {loadError instanceof Error ? loadError.message : String(loadError)}
-              </div>
-              <button className="btn btn-primary btn-sm" onClick={reload}>
-                重试
-              </button>
-            </div>
+          {load.phase === "error" ? (
+            <ErrorState
+              error={load.error}
+              title="条目加载失败——读取加密库时出错"
+              onRetry={reload}
+            />
           ) : filtered === null ? (
             <div className="empty">加载中…</div>
           ) : filtered.length === 0 ? (
