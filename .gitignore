@@ -36,3 +36,4 @@ desktop.ini
 
 # 船员 checkpoint / scratch（本地工作产物，勿提交）
 .scratch/
+.workbuddy/
