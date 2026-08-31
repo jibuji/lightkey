@@ -160,6 +160,63 @@ fn test_peer(cwd: Option<&std::path::Path>) -> PeerInfo {
     }
 }
 
+/// 锁定态夹具：初始化 + 建条目（可选）后**锁定**（无会话令牌、vault=None），
+/// 模拟「库存在但未解锁、GUI 已运行」场景。可选预插一条 read 规则（列表式
+/// 断言「锁态必弹窗」用——补充拍板 #23：读规则在加密库内无法预载，即使命中
+/// 也弹一体化窗；规则预插走 desktop 直调豁免）。返回（命令锁, 共享态）。
+fn locked_daemon(
+    dir: &std::path::Path,
+    secret: Option<(&str, &str)>,
+    read_rule: Option<(&std::path::Path, &str)>,
+) -> (Arc<Mutex<Daemon>>, Arc<SharedDaemon>) {
+    {
+        let mut audit = AuditLog::open(dir).unwrap();
+        init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
+    }
+    let mut daemon = Daemon::start(dir).unwrap();
+    let unlock = rpc_result(&daemon.handle(
+        &rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::unknown(),
+    ));
+    let token = unlock["token"].as_str().unwrap().to_string();
+    if let Some((name, value)) = secret {
+        daemon.handle(
+            &rpc_line(
+                M_ITEM_PUT,
+                Some(&token),
+                json!({ "item": {
+                    "type": "secret", "name": name, "value": value,
+                    "purpose": "", "expiresAt": null
+                } }),
+            ),
+            &PeerInfo::unknown(),
+        );
+    }
+    if let Some((proj, name)) = read_rule {
+        daemon.handle(
+            &rpc_line(
+                M_RULE_ADD,
+                Some(&token),
+                json!({ "projectDir": proj, "name": "read-seed",
+                        "command": "", "capability": "read", "keys": [name],
+                        "channel": "cli" }),
+            ),
+            &PeerInfo::desktop(),
+        );
+    }
+    daemon.handle(
+        &rpc_line(M_VAULT_LOCK, None, json!({})),
+        &PeerInfo::unknown(),
+    );
+    let shared = daemon.shared();
+    let state = Arc::new(Mutex::new(daemon));
+    (state, shared)
+}
+
 /// 审计事件（守护进程审计文件读取）。
 fn audit_events(dir: &std::path::Path) -> Vec<lk_core::audit::AuditEvent> {
     AuditLog::open(dir).unwrap().read().unwrap()
