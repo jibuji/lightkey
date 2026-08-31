@@ -210,15 +210,18 @@ export 转为恒拒绝断言（附件往返由 lk-core/daemon 测试覆盖）。
 
 > 本里程碑为补充拍板 #20 新增（插入 M2.8 之后、M3 之前）。
 
-## M2.95 —— 规则管理审批门（rule.add / rule.remove 走桌面审批）（已完成）
+## M2.95 —— 规则管理审批门 + 读通道一体化解锁（rule/读审批）（已完成）
 
-**目标**：issue #104，按补充拍板 #22 落地——socket/pipe 通道的 `rule.add` /
-`rule.remove` 从「仅验会话令牌」升为**桌面审批门**（对称原则：授权的建立与
-撤销都是授权事件），headless fail-closed，GUI desktop 直调豁免；配套 E2E
-自动批准通道与全路径审计。实现规格见 [authorization-gate.md](authorization-gate.md)
-§9（规则门判定矩阵、三阶段执行计划、TOCTOU 重校验、审计路径、E2E 适配）。
+**目标**：issue #104 与 #105，按补充拍板 #22/#23 落地——socket/pipe 通道的
+`rule.add` / `rule.remove` 从「仅验会话令牌」升为**桌面审批门**（对称原则：
+授权的建立与撤销都是授权事件），headless fail-closed，GUI desktop 直调
+豁免；配套 E2E 自动批准通道与全路径审计。**读通道一体化解锁**：锁定态 +
+桌面 UI 在场时 `item.get` / `item.export` 弹「主密码 + 解锁并允许」一体化
+窗（临时 vault 单次披露即毁、无痕）。实现规格见
+[authorization-gate.md](authorization-gate.md) §9（规则门）/ §5.2（读通道
+一体化）与 [value-disclosure.md](value-disclosure.md) §3/§5。
 
-范围：
+范围（规则门，issue #104）：
 
 - lk-core：`ApprovalKind::Rule`（serde `"rule"`，加性变更不升协议版本）+ 单一
   kind + command 字段承载操作（`rule.add <name>` / `rule.remove <name>`）；
@@ -239,13 +242,25 @@ export 转为恒拒绝断言（附件往返由 lk-core/daemon 测试覆盖）。
   自动批准放行）；`e2e_m2.sh` 新增「无 env 时 headless rule add 被拒」
   断言 + auto-approve 审计断言。
 
-**出口**：`cargo test` + vitest 全绿；M0/M1/M2/M2.75/M2.8/M2.9 E2E 回归 +
-规则门集成测试（tests/rule_gate.rs：desktop 豁免 / no_ui / 未知启动者 / 批准
-/ deny / 超时 / remove 门 / 锁态 session.invalid / 等待期锁定 / TOCTOU 竞争 /
-auto 通道）通过；clippy/fmt 全绿；文档同步（decisions #22、authorization-gate
-§9、milestones、audit.md）；**#104 关闭**。
+范围（读通道一体化，issue #105）：
 
-> 本里程碑为补充拍板 #22 新增（插入 M2.9 之后、M3 之前）。
+- lk-daemon：披露预检分流（未初始化/headless fail-closed；initialized &&
+  锁态 && 有 UI → 登记 `Pending{needs_unlock:true}`）；finalize 复用 #67
+  `approval_result_unlock` 临时 vault 编排，在临时 vault 上执行披露
+  （get/export exec 支持传入 vault 引用）+ 审计（channel=approval）。
+- 前端：读/导出 + needsUnlock 组合渲染（主密码栏复用、「解锁并允许」）；
+  **「记住」按钮渲染条件 = `isRead && !needsUnlock`**（锁态 read 弹窗无
+  记住按钮，D 层单测钉住）。
+- 集成测试：锁态 get/export 全流程、密码错重试、**临时 vault 无痕断言**、
+  等待期锁定/解锁竞争、锁态 read 规则命中仍必弹窗、未初始化库 fail-closed。
+
+**出口**：`cargo test` + vitest 全绿；M0/M1/M2/M2.75/M2.8/M2.9 E2E 回归 +
+规则门集成测试（tests/rule_gate.rs）+ 读通道一体化集成测试
+（tests/disclosure.rs 锁态用例组）通过；clippy/fmt 全绿；文档同步
+（decisions #22/#23、authorization-gate §5.2/§9、value-disclosure §3/§5、
+milestones、AGENTS.md、CONTEXT.md）；**#104/#105 关闭**。
+
+> 本里程碑为补充拍板 #22/#23 新增（插入 M2.9 之后、M3 之前）。
 
 ## M3 —— 浏览器填充（V1 之后）
 

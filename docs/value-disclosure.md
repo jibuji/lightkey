@@ -2,6 +2,10 @@
 
 - 状态：**已实现**（补充拍板 #20；issue #65 主体；M2.9 落地——实现与
   spec 的两处偏差见 §5.4 错误码注记与 §7 CLI 形态注记）
+  **补充拍板 #23（issue #105，M2.95）已扩展锁态行为**：锁定态 + 桌面 UI
+  在场时 `item.get` / `item.export` 走「主密码 + 解锁并允许」一体化弹窗
+  （§3 判定矩阵锁态行 / §5.2）；无 UI / 未初始化库维持本 spec 原始
+  fail-closed 语义。
 - 关联：[authorization-gate.md](authorization-gate.md) §8（摘要与边界）·
   [ipc.md](ipc.md) §3（令牌 = 认证 ≠ 授权）· [decisions.md](decisions.md)
   补充拍板 #20 · [milestones.md](milestones.md) M2.9
@@ -40,10 +44,11 @@ agent 走这条路即可绕过整个授权门——而「约束这类 agent」�
 
 - 元数据（`item.list` 名称、`rule.list` 规则内 key 名）维持令牌门，不做
   strict 隐藏旋钮；
-- 锁态 `item.get` 不做 #67 式「解锁 + 授权」一体化，维持 `session.invalid`；
 - #68 选项 2（常驻进程持令牌）观望，不与本项捆绑；
 - 同用户原生攻击（调试器 / 内存注入 / 键盘钩子等绕过产品接口的路径）
   仍在边界外，如实声明（#15 前半、#17、#18 不变）。
+- （补充拍板 #23 之后的修订）锁态读到 integrate 一体化解锁已实现（见 §3
+  锁态行），不再是本项非目标；**锁态规则管理一体化**仍是非目标（见 §12）。
 
 ## 3. 判定矩阵
 
@@ -56,12 +61,19 @@ agent 走这条路即可绕过整个授权门——而「约束这类 agent」�
 | cli / wsl-bridge | `item.export` | **永不豁免** | 是 | 弹窗 → allow / deny·timeout |
 | cli / wsl-bridge | `item.export` | — | 否 | 拒绝 `authz.denied` |
 | 任意 socket | `item.list` / `rule.list` | — | — | 维持现状（令牌门，不裁决） |
+| 任意 socket（**锁定态**，已初始化） | get / export | —（锁态不能预载规则） | 是 | **一体化弹窗（needsUnlock=true）**：主密码 + allow 放行 / deny·timeout 拒绝；临时 vault 单次披露即毁（**补充拍板 #23**，锁态必弹窗） |
+| 任意 socket（**锁定态**，已初始化） | get / export | —（锁态不能预载规则） | 否 | fail-closed `session.invalid`（无 UI 维持现状，不弹窗） |
+| 任意 socket（**锁定态**，未初始化库） | get / export | — | 是/否 | fail-closed `session.invalid`（空库无从解锁，不弹窗） |
 
 - 启动者未知 / cwd 不可得（socket 通道）→ 第 1 层 fail-closed 拒绝，
-  不弹窗、不留内容（与 inject 同口径）。
-- vault 锁定时 `require_session` 先失败 → `session.invalid`（现状不变）。
+  不弹窗、不留内容（与 inject 同口径）。锁定态下同样 fail-closed 拒绝
+  （无 K_audit 可签名，拒绝不留审计内容）。
+- **锁态（补充拍板 #23）**：vault 锁定时，已初始化库 + 桌面 UI 在场 →
+  一体化解锁弹窗（`needsUnlock=true`，read 规则命中**也必弹**——规则在加密
+  库内无法预载，与 #67 inject 同款妥协；文档明示「锁态下一切披露都要一次
+  交互」）；无 UI / 未初始化库 → `session.invalid`（fail-closed，不弹窗）。
 - `item.export` 是整条目数据包（含附件原始数据）外带，单次披露量最大，
-  所以**恒弹窗**：读规则、inject 规则、任何白名单都不豁免。
+  所以**恒弹窗**：读规则、inject 规则、任何白名单都不豁免（锁态同）。
 
 ## 4. 读规则（schema 扩展）
 
@@ -120,13 +132,31 @@ pub struct Rule {
 7. `ApprovalRequest` 填充：starter / project_dir（cwd）/ keys=[条目名] /
    kind（见 §6）/ challenge / `needs_unlock = false`。
 
+**锁定态分流（补充拍板 #23，issue #105）**：begin 前 `disclosure_precheck`
+把「vault 锁定 + 已初始化 + 桌面 UI 在场」放行至一体化路径——锁态无法
+解析条目名 / 规则 / exportMeta（vault 加密），步骤 2/4/5 全部跳过，直接
+登记 `Pending{needs_unlock:true}` 并广播 `authz.request(needsUnlock=true)`
+（keys 为空；条目名推迟到 finalize 在临时 vault 上解析）；未初始化库 /
+无 UI 维持 fail-closed `session.invalid`。锁态下即使 read 规则命中**也必
+弹窗**（规则在加密库内无法预载，与 #67 inject 同款妥协）。
+
 ### 5.3 finalize（命令锁外）
 
 - `await_decision`（30s 超时默认拒绝，复用 `PendingApprovals`）；
 - allow → 返回值 / 数据包 + 审计 allowed；
-- deny / timeout / 无 UI → `authz.denied` + 审计；
+- deny / timeout / 无 UI → `authz.denied` + 审计（锁态一体化条目 deny /
+  timeout：无 K_audit 可签名 → 不写审计，与 #67 注入拒绝同口径）；
 - 审批回传仍走 `approval.result`（仅 desktop 直调可提交 + challenge
   原样回带，#78 语义零改动，socket 伪造提交照旧 `channel.forbidden`）。
+- **锁定态一体化（#23）finalize**：allowed 决策须带 `masterPassword`——
+  `approval_result_unlock` 先做临时解锁（#67 同款编排，AuthGuard 限流照常，
+  审计 `vault.unlock`）并把临时 vault 存入待审条目；finalize 在**临时
+  vault** 上执行披露（get/export exec 支持传入 vault 引用）+ 审计
+  （channel=approval，用临时 vault 的 K_audit 签名）。关键约束：
+  临时 vault 即用即毁——不签发会话令牌 / 不写 `session.token` / 不置共享
+  vault，vault 保持锁定（#65 边界）。等待期间整库被解开（用户绕开弹窗直接
+  解锁）→ finalize 走**常态路径**（共享 vault）；等待期间被锁定 →
+  `session.invalid`（与 inject 同口径）。
 
 ### 5.4 错误码
 
@@ -143,8 +173,10 @@ pub struct Rule {
 
 - 请求/响应参数结构（`ItemGetParams` / `ItemExportParams` 等）零变更；
 - `item.list` / `rule.*` / `vault.*` / 同步方法策略不变；
-- 锁态行为不变：锁定 → `session.invalid`（本项不做读通道的解锁一体化，
-  理由见 §12）。
+- 解锁态行为零变化（规则命中静默放行 / 未命中弹窗 / 无 UI 拒绝）；
+- 锁定态 headless（无桌面 UI）与未初始化库维持 fail-closed
+  `session.invalid`（补充拍板 #23：只有「已初始化 + 锁态 + 有 UI」走
+  一体化弹窗；§12 原「锁态读一体化默认不做」已被 #23 取代）。
 
 ## 6. 审批帧与前端
 
@@ -159,6 +191,10 @@ pub struct Rule {
     提供**，`export` 不提供（恒弹窗语义）。「允许并为此项目记住」
     = allow 决策 + 追加一条 `rule.add`（channel=desktop，capability=read，
     keys=[条目名]，projectDir=弹窗展示的 cwd）。
+  - **锁态（needsUnlock=true，补充拍板 #23）**：主密码栏复用、「解锁并
+    允许」按钮；记住按钮渲染条件 = **`isRead && !needsUnlock`**——锁态 read
+    弹窗无「允许并为此项目记住」（临时 vault 无法持久化规则，UI 不承诺做
+    不到的事）；D 层单测钉住。
 - 桌面规则管理页与审计页：规则列表展示 capability；审计事件按 §8 落表。
 
 ## 7. CLI
@@ -215,14 +251,21 @@ vitest（mock 适配器）。
    - export：即使读规则命中也弹窗；无 UI → 拒绝；
    - starter 未知 → fail-closed 拒绝且不弹窗；
    - socket 提交 `approval.result` → `channel.forbidden`（#78 回归）；
-   - 锁定态 → `session.invalid`（回归）。
+   - 锁定态 headless → `session.invalid`（回归）；
+   - **锁态一体化（补充拍板 #23，tests/disclosure.rs）**：锁态 get/export
+     全流程（needsUnlock=true 帧 → allowed+masterPassword → 临时 vault 披露
+     + 审计）；**临时 vault 无痕断言**（session.token 不存在、vault.status
+     仍 locked）；密码错重试（`vault.invalid` + 条目保留）；锁态 read 规则
+     命中仍必弹窗；等待期整库解锁 → finalize 常态路径；拒绝不写审计；
+     未初始化库 + UI 在场仍 fail-closed。
 3. E2E（`scripts/e2e_m2.sh` 扩展，headless）：无规则 `lk item get` →
    `authz.denied` 非零退出 + 审计；`lk rule add --read` 后再读 → 静默放行；
    `lk item export` → headless 无 UI 拒绝；审计含 `item.get` 事件。
    （弹窗 allow/deny 路径由集成测试的假桌面订阅与前端 vitest 覆盖，
-   e2e_m2.sh 无 GUI。）
+   e2e_m2.sh 无 GUI；锁态一体化弹窗由集成测试 + 前端 vitest 覆盖。）
 4. 前端（vitest）：read/export 弹窗渲染、记住按钮触发 `rule.add`、export
-   无记住按钮。
+   无记住按钮、**锁态 read/export 弹窗无记住按钮 + 主密码栏 + 「解锁并
+   允许」携带 masterPassword（补充拍板 #23）**。
 
 ## 11. 交付切分
 
@@ -239,11 +282,15 @@ vitest（mock 适配器）。
 
 ## 12. 开放问题（默认值已定，改动需重新拍板）
 
-- **锁态读一体化（#67 同款）**：默认不做。理由：读值场景人在 GUI 前本就
-  可看全库，CLI 锁态读取引导先解锁即可；把「临时解锁」面扩大到读通道会
-  增加 #65 关切的能力面，收益小。
+- ~~锁态读一体化（#67 同款）：默认不做~~ → **已实现（补充拍板 #23，issue #105）**：
+  锁定态 + 桌面 UI 在场走「主密码 + 解锁并允许」一体化弹窗（§3 锁态行 /
+  §5.2-5.3），临时 vault 单次披露即毁、无痕（延续 #65 边界）；headless /
+  未初始化库维持 fail-closed。**已知限制**：锁态下 agent 循环重试可致弹窗
+  轰炸（每个 pending 30s 超时默认拒）；同 (starter, 条目) 合并去重 + 并发
+  上限/限流为后续可选加固，不阻塞本规格。
 - **key 名通配**：默认不做（read 规则 keys 精确名），与 inject 语义一致；
   需要时按 glob 扩展另行拍板。
-- **记住按钮默认态**：默认不勾选，用户显式选择授权持久化。
+- **记住按钮默认态**：默认不勾选，用户显式选择授权持久化。锁态弹窗无
+  记住按钮（`isRead && !needsUnlock`，临时 vault 无法持久化规则）。
 - **strict 元数据隐藏**（`item.list`/`rule.list` 名称也不给 socket 通道）：
   留作未来旋钮，本项不做。

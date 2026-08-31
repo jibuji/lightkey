@@ -395,4 +395,46 @@ needs-decision，不得自行变更。
     plugins/{approval,ui-audit}.tsx}` + `scripts/e2e_{m0,m1,m2,cross_subsystem}.sh`；
     规格：authorization-gate.md §9。
 
+23. **读通道一体化解锁：锁态 `item.get` / `item.export` 弹「主密码 + 解锁
+    并允许」窗（2026-08-31 · 来源：issue #105（#102 epic PR3 / 补充拍板 #23），
+    船长拍板）**：锁定态 + 桌面 UI 在场时，值披露的断点体验（#102 问题 3）
+    收口——与 #67 注入一体化同款机制，**协议零新增**（`needsUnlock` /
+    `masterPassword` / `kind` 三要素已就位）。裁定：
+    - **范围**：`item.get` 与 `item.export` **两者都做**（机制相同——单条目
+      单次披露、临时 vault 即用即毁；只做 get 会留 export 断点不一致）。
+    - **锁态必弹窗**：即使该条目已有 read 规则命中也必弹——规则在加密库内
+      无法预载（与 #67 inject 同款妥协），文档明示「锁态下一切披露都要一次
+      交互」。未初始化库（initialized=false）：不弹解锁窗，维持 fail-closed；
+      无 UI：维持 `session.invalid`；解锁态行为零变化。
+    - **临时 vault 生命周期**（延续 #65 边界）：不签发会话令牌、不写
+      `session.token`、不置共享 vault，单次披露执行即毁；密码错误 →
+      `vault.invalid` 统一文案防探测、弹窗内可重试（AuthGuard 限流照常）；
+      等待期间整库被解锁 → finalize 走**常态路径**（共享 vault）；等待期间
+      被锁定 → `session.invalid`（与 inject 同口径）。
+    - **daemon 侧**：披露预检分流（未初始化 / headless 维持 fail-closed；
+      initialized && 锁态 && 有 UI → 登记 `Pending{needs_unlock:true}`）；
+      finalize 复用 #67 的 `approval_result_unlock` 临时 vault 编排，在临时
+      vault 上执行披露（get/export exec 支持传入 vault 引用）+ 审计
+      （channel=approval，用临时 vault 的 K_audit 签名）。
+    - **前端「记住」按钮渲染条件改为 `isRead && !needsUnlock`**：现状只按
+      isRead，锁态 read 弹窗会渲染「允许并为此项目记住」但 remember 被静默
+      丢弃（needsUnlock 分支不传 remember）——误导性 UI；这是**真实代码变更**
+      而非「保持现状」，以 D 层单测钉住「锁态 read 弹窗无记住按钮」。
+    - **已知限制（留档，不阻塞本规格）**：锁态下 agent 循环重试可致弹窗轰炸
+      ——每个 pending 走 30s 超时默认拒绝，恶意/失控 agent 可高频刷弹窗。
+      后续可选加固：同 (starter, 条目) 合并去重 + 每 starter 并发上限/限流
+      （notes 于 [authorization-gate.md](../docs/authorization-gate.md)
+      §5.2 与 [value-disclosure.md](../docs/value-disclosure.md) §12）。
+    - 被否选项：
+      | 选项 | 否因 |
+      |------|------|
+      | 只做 `item.get` 一体化 | export 断点不一致；两者机制相同，不做就是半成品 |
+      | 锁态 read 规则直接放行（不弹窗） | 规则在加密库内无法预载；放行将打开「锁态可自动披露」的安全洞，与三层授权门语义冲突 |
+      | 记住按钮在 needsUnlock 时「降级为仅本次」 | 语义含糊；直接不渲染更诚实（`isRead && !needsUnlock`），避免 UI 承诺做不到的持久授权 |
+      | 锁态弹窗合并去重/限流随本规格交付 | 属可用性加固，收益确定性弱、协议/架构面新增；记为已知限制后续可选 |
+    实现：`crates/lk-daemon/src/{router.rs,daemon/{disclosure,items,session,mod}.rs}`
+    + 前端 `{plugins/approval.tsx,__tests__/m2.test.tsx}` +
+    `crates/lk-daemon/src/tests/disclosure.rs`；规格：
+    value-disclosure.md（判定矩阵锁态行）、authorization-gate.md §5.2。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
