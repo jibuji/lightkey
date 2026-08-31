@@ -36,6 +36,7 @@
 | [browser-fill.md](browser-fill.md) | 浏览器填充通道协议（Native Messaging） | M3 |
 | [testing.md](testing.md) | 三层测试策略与 CI | 全部 |
 | [cli.md](cli.md) | `lk` CLI 命令参考 | 全部 |
+| [agent-cli.md](agent-cli.md) | Agent 集成：CLI 机器可读输出契约（--json 错误对象 / 过滤 / inject reason / 错误→建议动作；issue #103） | 全部 |
 | [agents/](agents/) | Agent 技能文档（领域术语 / issue 追踪 / triage 标签） | 全部 |
 | [design/spec.md](design/spec.md) | 前端设计规范（tokens/组件/流程） | M2（界面） |
 | [design/prototype](design/prototype/) | 高保真单页原型（可交互、可截图评审；含 M2.5 初始化向导） | M2/M2.5（界面） |

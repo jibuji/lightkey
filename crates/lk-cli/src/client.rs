@@ -22,12 +22,13 @@ use std::collections::BTreeMap;
 
 use lk_core::audit::AuditEvent;
 use lk_core::ipc::{
-    RpcResponse, CHANNEL_CLI, ERR_AUTHZ_DENIED, ERR_ITEM_CONFLICT, ERR_ITEM_NOT_FOUND, ERR_LIMIT,
-    ERR_PARSE, ERR_RATE_LIMITED, ERR_SESSION_INVALID, ERR_SYNC_ANOMALY, ERR_SYNC_CREDENTIALS,
-    ERR_SYNC_NOT_CONFIGURED, ERR_SYNC_STORAGE, ERR_VAULT_EXISTS, ERR_VAULT_INVALID,
-    ERR_WEAK_PASSWORD, M_AUDIT_LIST, M_AUDIT_VERIFY, M_AUTHZ_EVALUATE, M_ITEM_DELETE,
-    M_ITEM_EXPORT, M_ITEM_GET, M_ITEM_LIST, M_ITEM_PUT, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE,
-    M_SYNC_TRIGGER, M_VAULT_INIT, M_VAULT_LOCK, M_VAULT_RECOVER, M_VAULT_STATUS, M_VAULT_UNLOCK,
+    RpcResponse, CHANNEL_CLI, ERR_AUTHZ_DENIED, ERR_CHANNEL_FORBIDDEN, ERR_ITEM_CONFLICT,
+    ERR_ITEM_NOT_FOUND, ERR_LIMIT, ERR_PARSE, ERR_RATE_LIMITED, ERR_SESSION_INVALID,
+    ERR_SYNC_ANOMALY, ERR_SYNC_CREDENTIALS, ERR_SYNC_NOT_CONFIGURED, ERR_SYNC_STORAGE,
+    ERR_VAULT_EXISTS, ERR_VAULT_INVALID, ERR_WEAK_PASSWORD, MSG_CHANNEL_FORBIDDEN, M_AUDIT_LIST,
+    M_AUDIT_VERIFY, M_AUTHZ_EVALUATE, M_ITEM_DELETE, M_ITEM_EXPORT, M_ITEM_GET, M_ITEM_LIST,
+    M_ITEM_PUT, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE, M_SYNC_TRIGGER, M_VAULT_INIT, M_VAULT_LOCK,
+    M_VAULT_RECOVER, M_VAULT_STATUS, M_VAULT_UNLOCK,
 };
 use lk_core::model::{Item, ItemDraft, ItemSummary, Rule};
 use lk_core::sync::SyncSummary;
@@ -86,9 +87,14 @@ pub enum RpcError {
     BridgeIo {
         detail: String,
     },
-    /// 未归类的服务端业务错误（保留原始 message/detail，呈现层兜底文案；
-    /// 未知错误码不参与任何输出，故不保留数值本身）。
+    /// socket/pipe 通道提交了只允许桌面内嵌直调的方法（如 `approval.result`）
+    /// 被拒（-32014，与 bridge 的 `bridge.no_daemon` 撞码，按错误帧 message
+    /// 消歧，issue #103）。
+    ChannelForbidden,
+    /// 未归类的服务端业务错误（保留原始 message/detail 与数字码——`--json`
+    /// 失败对象里 error 名归 `other`、code 兜底保留原始值，issue #103）。
     Other {
+        code: i64,
         message: String,
         detail: String,
     },
@@ -104,6 +110,9 @@ pub enum RpcError {
 
 impl RpcError {
     /// 服务端 JSON-RPC error 对象 → 具语义变体（未知码归入 [`RpcError::Other`]）。
+    ///
+    /// -32014 撞码消歧（issue #103）：daemon 的 `channel.forbidden` 与 bridge
+    /// 的 `bridge.no_daemon` 同码不同源，按错误帧 message 分型。
     pub fn classify(code: i64, message: String, data: Option<&Value>) -> RpcError {
         let detail = data
             .and_then(|d| d.get("detail"))
@@ -129,10 +138,49 @@ impl RpcError {
             ERR_SYNC_STORAGE => RpcError::SyncStorage { detail },
             ERR_SYNC_ANOMALY => RpcError::SyncAnomaly { detail },
             ERR_SYNC_CREDENTIALS => RpcError::SyncCredentials { detail },
+            // -32014 双义（issue #103）：daemon 帧 message=channel.forbidden；
+            // 其余（bridge 帧 message=bridge.no_daemon）维持 bridge 语义。
+            ERR_BRIDGE_NO_DAEMON if message == MSG_CHANNEL_FORBIDDEN => RpcError::ChannelForbidden,
             ERR_BRIDGE_NO_DAEMON => RpcError::BridgeNoDaemon { detail },
             ERR_BRIDGE_VERSION_INCOMPATIBLE => RpcError::BridgeVersionIncompatible { detail },
             ERR_BRIDGE_IO => RpcError::BridgeIo { detail },
-            _ => RpcError::Other { message, detail },
+            _ => RpcError::Other {
+                code,
+                message,
+                detail,
+            },
+        }
+    }
+
+    /// `--json` 失败对象的机器可读契约（docs/agent-cli.md）：返回
+    /// （error 名, code）。error 名在 CLI 内唯一——同码不同源已由
+    /// [`RpcError::classify`] 消歧为不同变体；`code` 只作兜底键，CLI 本地
+    /// 失败（transport / bad_response）无服务端错误码，固定 0。
+    pub fn machine(&self) -> (&'static str, i64) {
+        match self {
+            RpcError::VaultInvalid => ("vault.invalid", ERR_VAULT_INVALID),
+            RpcError::SessionInvalid => ("session.invalid", ERR_SESSION_INVALID),
+            RpcError::AuthzDenied => ("authz.denied", ERR_AUTHZ_DENIED),
+            RpcError::ItemConflict => ("item.conflict", ERR_ITEM_CONFLICT),
+            RpcError::ItemNotFound => ("item.not_found", ERR_ITEM_NOT_FOUND),
+            RpcError::Limit { .. } => ("item.limit", ERR_LIMIT),
+            RpcError::RateLimited { .. } => ("rate.limited", ERR_RATE_LIMITED),
+            RpcError::VaultExists => ("vault.exists", ERR_VAULT_EXISTS),
+            RpcError::WeakPassword => ("vault.weak_password", ERR_WEAK_PASSWORD),
+            RpcError::SyncNotConfigured { .. } => ("sync.not_configured", ERR_SYNC_NOT_CONFIGURED),
+            RpcError::SyncStorage { .. } => ("sync.storage", ERR_SYNC_STORAGE),
+            RpcError::SyncAnomaly { .. } => ("sync.data_anomaly", ERR_SYNC_ANOMALY),
+            RpcError::SyncCredentials { .. } => ("sync.credentials", ERR_SYNC_CREDENTIALS),
+            RpcError::ChannelForbidden => ("channel.forbidden", ERR_CHANNEL_FORBIDDEN),
+            RpcError::BridgeNoDaemon { .. } => ("bridge.no_daemon", ERR_BRIDGE_NO_DAEMON),
+            RpcError::BridgeVersionIncompatible { .. } => (
+                "bridge.version_incompatible",
+                ERR_BRIDGE_VERSION_INCOMPATIBLE,
+            ),
+            RpcError::BridgeIo { .. } => ("bridge.io", ERR_BRIDGE_IO),
+            RpcError::Other { code, .. } => ("other", *code),
+            RpcError::Transport { .. } => ("transport", 0),
+            RpcError::BadResponse { .. } => ("bad_response", 0),
         }
     }
 }
@@ -836,15 +884,138 @@ mod tests {
             } => assert_eq!(retry_after_seconds, 0),
             other => panic!("{other:?}"),
         }
-        // 标准段与应用段未知码都归 Other 并保留原文
+        // 标准段与应用段未知码都归 Other 并保留原文（code 原值兜底保留）
         for code in [ERR_METHOD_NOT_FOUND, ERR_INVALID_PARAMS] {
             match cls(code, Some(json!({"detail": "d"}))) {
-                RpcError::Other { message, detail } => {
+                RpcError::Other {
+                    code: c,
+                    message,
+                    detail,
+                } => {
+                    assert_eq!(c, code);
                     assert_eq!(message, "m");
                     assert_eq!(detail, "d");
                 }
                 other => panic!("{other:?}"),
             }
+        }
+    }
+
+    // ------------------------- 机器可读错误名（issue #103 契约） -------------------------
+
+    /// 每个变体的机器可读名在 CLI 内唯一（error 名是 skill 的主匹配键）；
+    /// code 只作兜底——-32014 双义正是靠 name 消歧的实证。
+    #[test]
+    fn machine_names_unique_with_codes() {
+        let cases: Vec<(RpcError, &str, i64)> = vec![
+            (RpcError::VaultInvalid, "vault.invalid", -32001),
+            (RpcError::SessionInvalid, "session.invalid", -32002),
+            (RpcError::AuthzDenied, "authz.denied", -32017),
+            (RpcError::ItemConflict, "item.conflict", -32003),
+            (RpcError::ItemNotFound, "item.not_found", -32004),
+            (RpcError::Limit { detail: "d".into() }, "item.limit", -32005),
+            (
+                RpcError::RateLimited {
+                    retry_after_seconds: 3,
+                },
+                "rate.limited",
+                -32006,
+            ),
+            (RpcError::VaultExists, "vault.exists", -32007),
+            (RpcError::WeakPassword, "vault.weak_password", -32013),
+            (
+                RpcError::SyncNotConfigured {
+                    detail: String::new(),
+                },
+                "sync.not_configured",
+                -32009,
+            ),
+            (
+                RpcError::SyncStorage {
+                    detail: "5xx".into(),
+                },
+                "sync.storage",
+                -32010,
+            ),
+            (
+                RpcError::SyncAnomaly { detail: "x".into() },
+                "sync.data_anomaly",
+                -32011,
+            ),
+            (
+                RpcError::SyncCredentials { detail: "x".into() },
+                "sync.credentials",
+                -32012,
+            ),
+            (RpcError::ChannelForbidden, "channel.forbidden", -32014),
+            (
+                RpcError::BridgeNoDaemon {
+                    detail: String::new(),
+                },
+                "bridge.no_daemon",
+                -32014,
+            ),
+            (
+                RpcError::BridgeVersionIncompatible {
+                    detail: String::new(),
+                },
+                "bridge.version_incompatible",
+                -32015,
+            ),
+            (
+                RpcError::BridgeIo {
+                    detail: "io".into(),
+                },
+                "bridge.io",
+                -32016,
+            ),
+            // CLI 本地失败（无服务端错误码）→ code 0
+            (
+                RpcError::Transport {
+                    message: "无法连接守护进程".into(),
+                },
+                "transport",
+                0,
+            ),
+            (
+                RpcError::BadResponse {
+                    message: "空响应".into(),
+                },
+                "bad_response",
+                0,
+            ),
+        ];
+        let mut names: Vec<&str> = cases.iter().map(|(_, n, _)| *n).collect();
+        names.sort_unstable();
+        let dupes = names.windows(2).filter(|w| w[0] == w[1]).count();
+        assert_eq!(dupes, 0, "机器可读名必须 CLI 内唯一");
+        for (err, name, code) in cases {
+            assert_eq!(err.machine(), (name, code), "{err:?}");
+        }
+    }
+
+    /// -32014 双义消歧（issue #103）：同一数字码按错误来源分型——daemon
+    /// 错误帧 message=channel.forbidden（socket 提交 approval.result 被拒），
+    /// bridge 错误帧 message=bridge.no_daemon（中继找不到守护实例）。
+    #[test]
+    fn code_32014_disambiguates_by_message() {
+        let daemon = RpcError::classify(-32014, "channel.forbidden".into(), None);
+        assert!(matches!(daemon, RpcError::ChannelForbidden));
+        assert_eq!(daemon.machine(), ("channel.forbidden", -32014));
+
+        let bridge = RpcError::classify(-32014, "bridge.no_daemon".into(), None);
+        assert!(matches!(bridge, RpcError::BridgeNoDaemon { .. }));
+        assert_eq!(bridge.machine(), ("bridge.no_daemon", -32014));
+    }
+
+    /// 未知服务端码（标准段/应用段）→ error 名归 other，code 保留原始数字
+    /// （code 只作兜底键，不能丢）。
+    #[test]
+    fn unknown_codes_map_to_other_with_raw_code() {
+        use lk_core::ipc::{ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND};
+        for code in [ERR_METHOD_NOT_FOUND, ERR_INVALID_PARAMS, -32099] {
+            let e = RpcError::classify(code, "whatever".into(), None);
+            assert_eq!(e.machine(), ("other", code));
         }
     }
 
