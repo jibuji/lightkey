@@ -240,12 +240,47 @@ struct EditArgs {
     fields: EditFields,
 }
 
+/// `lk item list --type` 过滤值（issue #103：CLI 侧过滤，协议不变）。
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
+enum ItemKindFilter {
+    Login,
+    Note,
+    Secret,
+    File,
+}
+
+impl ItemKindFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            ItemKindFilter::Login => "login",
+            ItemKindFilter::Note => "note",
+            ItemKindFilter::Secret => "secret",
+            ItemKindFilter::File => "file",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ItemCommand {
-    /// 列出条目（最小字段）
-    List,
-    /// 取单条（完整解密字段）
-    Get { id: String },
+    /// 列出条目（最小字段；--type/--name 为 CLI 侧过滤，协议不变）
+    List {
+        /// 按类型过滤：login / note / secret / file
+        #[arg(long = "type", value_enum)]
+        item_type: Option<ItemKindFilter>,
+        /// 按条目名子串过滤（与 `item get --name` 的精确匹配不同）
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// 取单条（完整解密字段；值披露裁决，value-disclosure.md §3）
+    Get {
+        /// 条目 id（与 --name 二选一）
+        #[arg(required_unless_present = "name")]
+        id: Option<String>,
+        /// 按条目名精确匹配取条目（issue #103；经 item.list 解析 id，重名
+        /// exit 2 报歧义；裁决路径与 id 版完全一致）
+        #[arg(long, conflicts_with = "id")]
+        name: Option<String>,
+    },
     /// 新建条目（四类：login / note / secret / file）
     Add {
         #[command(subcommand)]
@@ -376,8 +411,8 @@ fn run(cli: &Cli) -> i32 {
     let out = &mut std::io::stdout();
     match &cli.command {
         Command::Init { force, stdin } => cmd_init(out, &dir, *force, *stdin, cli.json),
-        Command::Unlock { stdin } => cmd_unlock(out, &dir, *stdin),
-        Command::Lock => cmd_lock(out, &dir),
+        Command::Unlock { stdin } => cmd_unlock(out, &dir, *stdin, cli.json),
+        Command::Lock => cmd_lock(out, &dir, cli.json),
         Command::Status => cmd_status(out, &dir, cli.json),
         Command::Recover(args) => {
             cmd_recover(out, &dir, args.code.as_deref(), args.stdin, cli.json)
@@ -388,7 +423,7 @@ fn run(cli: &Cli) -> i32 {
         Command::Sync => cmd_sync(out, &dir, cli.json),
         Command::Config(args) => cmd_config(out, &dir, &args.command, cli.json),
         Command::Rule(args) => cmd_rule(out, &dir, &args.command, cli.json),
-        Command::Inject(args) => cmd_inject(out, &dir, &args.keys, &args.command),
+        Command::Inject(args) => cmd_inject(out, &dir, &args.keys, &args.command, cli.json),
         Command::Bridge => bridge::cmd_bridge(out, &dir),
     }
 }
@@ -412,6 +447,11 @@ fn rpc_fail_text(err: &RpcError) -> String {
             "bridge 中继失败{}",
             if detail.is_empty() { String::new() } else { format!("：{detail}") }
         ),
+        // 防御分支：CLI 不调用 approval.result，此处仅保证 -32014 消歧后
+        // （issue #103）daemon 侧 channel.forbidden 不再被误报为 bridge 语义
+        RpcError::ChannelForbidden => {
+            "通道被拒（channel.forbidden）：该操作只接受桌面应用内嵌直调".to_string()
+        }
         RpcError::VaultInvalid => "解锁失败：主密码错误或库未初始化".to_string(),
         RpcError::SessionInvalid => "库未解锁或会话已失效，请先运行 lk unlock".to_string(),
         // M2.9 值披露（spec §7）：读/导出被授权门拒绝的统一文案
@@ -445,7 +485,9 @@ fn rpc_fail_text(err: &RpcError) -> String {
         }
         RpcError::SyncCredentials { detail } => format!("同步凭据不可用：{detail}"),
         // 未知业务码：保留服务端 message + detail（同重构前兜底文案）
-        RpcError::Other { message, detail, .. } => format!(
+        RpcError::Other {
+            message, detail, ..
+        } => format!(
             "{message}{}",
             if detail.is_empty() {
                 String::new()
@@ -458,8 +500,43 @@ fn rpc_fail_text(err: &RpcError) -> String {
     }
 }
 
-/// 业务失败统一出口：打印文案 + 退出码 1。
-fn rpc_fail(err: &RpcError) -> i32 {
+/// `--json` 失败时的机器可读错误对象（docs/agent-cli.md 契约；issue #103）。
+/// 字段顺序 = 序列化顺序（ok, error, code, message），与契约文档钉死一致。
+#[derive(serde::Serialize)]
+struct JsonErrorObject<'a> {
+    ok: bool,
+    error: &'a str,
+    code: i64,
+    message: String,
+}
+
+/// 向 stdout 写一行结构化错误对象（`--json` 失败路径统一出口）。
+fn write_json_error(out: &mut impl Write, error: &str, code: i64, message: &str) {
+    let obj = JsonErrorObject {
+        ok: false,
+        error,
+        code,
+        message: message.to_string(),
+    };
+    let _ = writeln!(out, "{}", serde_json::to_string(&obj).unwrap_or_default());
+}
+
+/// `lk inject --json` 拒绝对象（issue #103）：只含 allowed/reason 两字段，
+/// 不携带 env——值不落 stdout。
+#[derive(serde::Serialize)]
+struct InjectDeniedJson<'a> {
+    allowed: bool,
+    reason: &'a str,
+}
+
+/// 业务失败统一出口：`--json` 时 stdout 输出机器可读错误对象（错误名取
+/// CLI 侧错误分类、CLI 内唯一，同码不同源已消歧；未知码归 `other`），
+/// 人类文案照旧 stderr；退出码 1。
+fn rpc_fail(out: &mut impl Write, err: &RpcError, json_out: bool) -> i32 {
+    if json_out {
+        let (name, code) = err.machine();
+        write_json_error(out, name, code, &rpc_fail_text(err));
+    }
     eprintln!("lk: {}", rpc_fail_text(err));
     1
 }
@@ -682,11 +759,11 @@ fn cmd_init(
             }
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
-fn cmd_unlock(out: &mut impl Write, dir: &std::path::Path, stdin: bool) -> i32 {
+fn cmd_unlock(out: &mut impl Write, dir: &std::path::Path, stdin: bool, json_out: bool) -> i32 {
     let pw = match read_secret("主密码", stdin) {
         Ok(p) => p,
         Err(c) => return c,
@@ -696,17 +773,17 @@ fn cmd_unlock(out: &mut impl Write, dir: &std::path::Path, stdin: bool) -> i32 {
             let _ = writeln!(out, "已解锁");
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
-fn cmd_lock(out: &mut impl Write, dir: &std::path::Path) -> i32 {
+fn cmd_lock(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
     match client_for(dir).vault_lock() {
         Ok(_) => {
             let _ = writeln!(out, "已锁定（内存密钥已擦除）");
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -721,15 +798,25 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
         bridge_backend::Decision::Bridge(target) => match &target.data_dir {
             Some(dd) => (true, dd.clone()),
             None => {
-                eprintln!(
-                    "lk: bridge 模式下无法定位 Windows 侧数据目录（未指定 LIGHTKEY_BRIDGE_HOME 且探测无果），无法读取 Windows 侧同步配置"
+                // 本地探测失败也走统一错误对象（issue #103：error=transport，
+                // code=0），stderr 文案不变
+                return rpc_fail(
+                    out,
+                    &RpcError::Transport {
+                        message: "bridge 模式下无法定位 Windows 侧数据目录（未指定 LIGHTKEY_BRIDGE_HOME 且探测无果），无法读取 Windows 侧同步配置".to_string(),
+                    },
+                    json_out,
                 );
-                return 1;
             }
         },
         bridge_backend::Decision::Fatal(msg) => {
-            eprintln!("lk: {msg}");
-            return 1;
+            return rpc_fail(
+                out,
+                &RpcError::Transport {
+                    message: msg.clone(),
+                },
+                json_out,
+            );
         }
     };
     match client_for(dir).vault_status() {
@@ -774,7 +861,7 @@ fn cmd_status(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i3
             }
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -840,7 +927,7 @@ fn cmd_recover(
             }
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -850,10 +937,90 @@ fn cmd_recover(
 
 fn cmd_item(out: &mut impl Write, dir: &std::path::Path, cmd: &ItemCommand, json_out: bool) -> i32 {
     let mut c = client_for(dir);
+    item_command(out, &mut c, cmd, json_out)
+}
+
+/// `--name` → id 解析结果（issue #103）。
+enum NameResolution {
+    /// 唯一命中（存活条目）。
+    Id(String),
+    /// 失败，携带退出码（未命中/RPC 失败 = 1，歧义 = 2）。
+    Fail(i32),
+}
+
+/// `lk item get --name <名>`：经 item.list 按名精确解析 id（墓碑不参与；
+/// 与 `item list --name` 的子串过滤语义不同）。解析出 id 后与位置 id 版走
+/// 完全相同的 `item.get` 值披露裁决路径（value-disclosure.md §3）。
+fn resolve_name_to_id<'a>(
+    out: &mut impl Write,
+    c: &mut RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + 'a>,
+    name: &str,
+    json_out: bool,
+) -> NameResolution {
+    let items = match c.item_list() {
+        Ok(v) => v,
+        Err(e) => return NameResolution::Fail(rpc_fail(out, &e, json_out)),
+    };
+    let matched: Vec<&lk_core::model::ItemSummary> = items
+        .iter()
+        .filter(|it| !it.deleted && it.name == name)
+        .collect();
+    match matched.as_slice() {
+        [one] => NameResolution::Id(one.id.to_string()),
+        [] => NameResolution::Fail(rpc_fail(out, &RpcError::ItemNotFound, json_out)),
+        many => {
+            // 重名歧义（issue #103）：exit 2 + 结构化错误，让 agent 向用户
+            // 澄清而不是拿到随机一个。
+            let ids = many
+                .iter()
+                .map(|m| m.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let msg = format!(
+                "条目名「{name}」歧义：{} 条同名存活条目（{ids}），请改用 id 取值或先重命名",
+                many.len()
+            );
+            if json_out {
+                write_json_error(out, "item.name_ambiguous", 0, &msg);
+            }
+            eprintln!("lk: item get: {msg}");
+            NameResolution::Fail(2)
+        }
+    }
+}
+
+/// CLI 侧列表过滤（issue #103：协议不变，过滤在 CLI 内完成）：
+/// `--type` 按类型精确、`--name` 按条目名子串，两者可组合。
+fn filter_items(
+    items: &[lk_core::model::ItemSummary],
+    kind: Option<ItemKindFilter>,
+    name_sub: Option<&str>,
+) -> Vec<lk_core::model::ItemSummary> {
+    items
+        .iter()
+        .filter(|it| {
+            kind.is_none_or(|k| it.kind.as_str() == k.as_str())
+                && name_sub.is_none_or(|n| it.name.contains(n))
+        })
+        .cloned()
+        .collect()
+}
+
+fn item_command<'a>(
+    out: &mut impl Write,
+    c: &mut RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + 'a>,
+    cmd: &ItemCommand,
+    json_out: bool,
+) -> i32 {
     match cmd {
-        ItemCommand::List => match c.item_list() {
+        ItemCommand::List {
+            item_type,
+            name: name_sub,
+        } => match c.item_list() {
             Ok(items) => {
+                let items = filter_items(&items, *item_type, name_sub.as_deref());
                 if json_out {
+                    // 裸数组形状由 docs/agent-cli.md 钉死
                     let _ = writeln!(
                         out,
                         "{}",
@@ -878,28 +1045,40 @@ fn cmd_item(out: &mut impl Write, dir: &std::path::Path, cmd: &ItemCommand, json
                 }
                 0
             }
-            Err(e) => rpc_fail(&e),
+            Err(e) => rpc_fail(out, &e, json_out),
         },
-        ItemCommand::Get { id } => match c.item_get(id) {
-            Ok(item) => print_item(out, &item, json_out),
-            Err(e) => rpc_fail(&e),
-        },
-        ItemCommand::Add { kind } => cmd_item_add(out, &mut c, kind),
+        ItemCommand::Get { id, name } => {
+            // --name 先解析为 id，再与位置 id 版走同一 item.get（裁决一致）
+            let id = match (id, name) {
+                (Some(id), _) => id.clone(),
+                (None, Some(n)) => match resolve_name_to_id(out, c, n, json_out) {
+                    NameResolution::Id(id) => id,
+                    NameResolution::Fail(code) => return code,
+                },
+                (None, None) => unreachable!("clap 已强制 id 与 --name 二选一"),
+            };
+            match c.item_get(&id) {
+                Ok(item) => print_item(out, &item, json_out),
+                Err(e) => rpc_fail(out, &e, json_out),
+            }
+        }
+        ItemCommand::Add { kind } => cmd_item_add(out, c, kind, json_out),
         ItemCommand::Edit(args) => cmd_item_edit(
             out,
-            &mut c,
-            &args.id,
+            c,
+            args.id.as_str(),
             &args.fields,
             args.expected_revision.as_deref(),
+            json_out,
         ),
         ItemCommand::Delete { id } => match c.item_delete(id) {
             Ok(_) => {
                 let _ = writeln!(out, "已删除（软删除，30 天后硬删）");
                 0
             }
-            Err(e) => rpc_fail(&e),
+            Err(e) => rpc_fail(out, &e, json_out),
         },
-        ItemCommand::Copy { id, field } => cmd_item_copy(out, &mut c, id, field),
+        ItemCommand::Copy { id, field } => cmd_item_copy(out, c, id, field, json_out),
         ItemCommand::Export { id, output } => match c.item_export(id) {
             Ok(data) => match std::fs::write(output, &data) {
                 Ok(_) => {
@@ -911,7 +1090,7 @@ fn cmd_item(out: &mut impl Write, dir: &std::path::Path, cmd: &ItemCommand, json
                     1
                 }
             },
-            Err(e) => rpc_fail(&e),
+            Err(e) => rpc_fail(out, &e, json_out),
         },
     }
 }
@@ -997,6 +1176,7 @@ fn cmd_item_add<'a>(
     out: &mut impl Write,
     c: &mut RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + 'a>,
     kind: &AddKind,
+    json_out: bool,
 ) -> i32 {
     let draft = match kind {
         AddKind::Login {
@@ -1125,7 +1305,7 @@ fn cmd_item_add<'a>(
             }
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -1153,6 +1333,7 @@ fn cmd_item_edit<'a>(
     id: &str,
     fields: &EditFields,
     expected_revision: Option<&str>,
+    json_out: bool,
 ) -> i32 {
     use lk_core::model::Item;
     let any = fields.name.is_some()
@@ -1179,7 +1360,7 @@ fn cmd_item_edit<'a>(
     // CAS：缺省先取当前条目（base revision），再整条替换
     let current = match c.item_get(id) {
         Ok(v) => v,
-        Err(e) => return rpc_fail(&e),
+        Err(e) => return rpc_fail(out, &e, json_out),
     };
     let mut draft = match &current {
         Item::Login {
@@ -1278,7 +1459,7 @@ fn cmd_item_edit<'a>(
             let _ = writeln!(out, "已更新: {} (revision {})", item.id(), item.revision());
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -1287,11 +1468,12 @@ fn cmd_item_copy<'a>(
     c: &mut RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + 'a>,
     id: &str,
     field: &str,
+    json_out: bool,
 ) -> i32 {
     use lk_core::model::Item;
     let item = match c.item_get(id) {
         Ok(v) => v,
-        Err(e) => return rpc_fail(&e),
+        Err(e) => return rpc_fail(out, &e, json_out),
     };
     let ty = item.kind().as_str();
     let value: Option<&str> = match (&item, field) {
@@ -1335,7 +1517,7 @@ fn cmd_audit(
     let mut c = client_for(dir);
     let page = match c.audit_list(tail) {
         Ok(v) => v,
-        Err(e) => return rpc_fail(&e),
+        Err(e) => return rpc_fail(out, &e, json_out),
     };
     let events = &page.events;
     let total = page.total;
@@ -1426,7 +1608,7 @@ fn cmd_audit(
                     let _ = writeln!(out, "HMAC 链校验：{} 条事件验证通过{}", r.verified, note);
                 }
             }
-            Err(e) => return rpc_fail(&e),
+            Err(e) => return rpc_fail(out, &e, json_out),
         }
     }
     0
@@ -1458,7 +1640,7 @@ fn cmd_sync(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 
             }
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -1494,8 +1676,8 @@ fn cmd_config(
     let cfg_dir = match config_dir_for(&decision, dir) {
         Ok(d) => d,
         Err(msg) => {
-            eprintln!("lk: {msg}");
-            return 1;
+            // 本地探测失败走统一错误对象（issue #103），stderr 文案不变
+            return rpc_fail(out, &RpcError::Transport { message: msg }, json_out);
         }
     };
     match cmd {
@@ -1854,7 +2036,7 @@ fn cmd_rule_add(
             }
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -2054,7 +2236,7 @@ fn cmd_rule_list(out: &mut impl Write, dir: &std::path::Path, json_out: bool) ->
             }
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -2066,7 +2248,7 @@ fn cmd_rule_remove(out: &mut impl Write, dir: &std::path::Path, id: &str, json_o
             let _ = json_out;
             0
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -2082,6 +2264,25 @@ fn cmd_inject(
     dir: &std::path::Path,
     keys: &[String],
     command: &[String],
+    json_out: bool,
+) -> i32 {
+    let mut c = client_for(dir);
+    inject_command(out, &mut c, keys, command, json_out)
+}
+
+/// [`cmd_inject`] 的可测核心（fake transport 注入缝）。
+///
+/// `--json`（issue #103，docs/agent-cli.md）：
+/// - 裁决拒绝 → stdout 输出 `{"allowed":false,"reason":"<枚举>"}`（7 枚举与
+///   daemon 侧 DenyReason 一致）；允许 + 空 env 按 `missing_keys` 机读语义拒绝；
+/// - 允许路径 stdout **零输出**（值不落可被日志/上下文捕获的通道）；
+/// - RPC 级失败（如锁态 headless `session.invalid`）走统一错误对象。
+fn inject_command<'a>(
+    out: &mut impl Write,
+    c: &mut RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + 'a>,
+    keys: &[String],
+    command: &[String],
+    json_out: bool,
 ) -> i32 {
     if keys.is_empty() {
         eprintln!(
@@ -2093,15 +2294,30 @@ fn cmd_inject(
     let command_str = command.join(" ");
     // 不传 starter/cwd：守护进程以 IPC 对端真实 PID 回溯 + 真实 cwd 判定
     // （客户端自报字段一律不信任，伪造 cwd 必须失败）。
-    match client_for(dir).authz_evaluate(&command_str, keys) {
+    match c.authz_evaluate(&command_str, keys) {
         Ok(decision) => {
             if !decision.allowed {
+                if json_out {
+                    let obj = InjectDeniedJson {
+                        allowed: false,
+                        reason: &decision.reason,
+                    };
+                    let _ = writeln!(out, "{}", serde_json::to_string(&obj).unwrap_or_default());
+                }
                 eprintln!("lk inject: 已拒绝（{}）", reason_text(&decision.reason));
                 return 1;
             }
             // 只含被授权 key 的 env（值在此刻才离开守护进程，且只进子进程）
             let mut env = decision.env;
             if env.is_empty() {
+                // allowed 但无可注入 key：按 missing_keys 机读语义呈现（issue #103）
+                if json_out {
+                    let obj = InjectDeniedJson {
+                        allowed: false,
+                        reason: "missing_keys",
+                    };
+                    let _ = writeln!(out, "{}", serde_json::to_string(&obj).unwrap_or_default());
+                }
                 eprintln!("lk inject: 无可注入的 key（请求的 key 未被授权）");
                 return 1;
             }
@@ -2114,6 +2330,7 @@ fn cmd_inject(
             memguard::zeroize_env(&mut env);
             match child.status() {
                 Ok(status) => {
+                    // 允许路径 lk 自身零输出（值只进子进程 env，issue #103）
                     let code = status.code().unwrap_or(1);
                     let _ = out;
                     code
@@ -2124,7 +2341,7 @@ fn cmd_inject(
                 }
             }
         }
-        Err(e) => rpc_fail(&e),
+        Err(e) => rpc_fail(out, &e, json_out),
     }
 }
 
@@ -2568,6 +2785,7 @@ mod rpc_fail_text_tests {
     fn fallback_transport_response_texts() {
         assert_eq!(
             rpc_fail_text(&RpcError::Other {
+                code: -32601,
                 message: "method not found".into(),
                 detail: "".into()
             }),
@@ -2575,6 +2793,7 @@ mod rpc_fail_text_tests {
         );
         assert_eq!(
             rpc_fail_text(&RpcError::Other {
+                code: -32603,
                 message: "boom".into(),
                 detail: "d".into()
             }),
@@ -2609,5 +2828,494 @@ mod rpc_fail_text_tests {
             }
         ));
         assert_eq!(rpc_fail_text(&err), "尝试过于频繁，请在 7 秒后重试");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试（issue #103：CLI 机器可读契约——--json 错误对象 / --name / 过滤 /
+// inject reason；缝 = cmd_* 级函数 + 注入 fake transport，断言 stdout JSON
+// 形状与退出码，不测内部映射）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod agent_contract_tests {
+    use super::*;
+    use lk_core::model::{ItemKind, ItemSummary};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// 按调用序回放的 fake transport：steps 依次出队；记录全部调用供断言。
+    #[derive(Clone, Default)]
+    struct Script {
+        calls: Rc<RefCell<Vec<(String, Value)>>>,
+    }
+
+    impl Script {
+        fn client(
+            &self,
+            steps: Vec<Result<Value, RpcError>>,
+        ) -> RpcClient<impl FnMut(&str, Value) -> Result<Value, RpcError> + '_> {
+            let queue = Rc::new(RefCell::new(steps));
+            let calls = self.calls.clone();
+            RpcClient::new(move |method, params| {
+                calls
+                    .borrow_mut()
+                    .push((method.to_string(), params.clone()));
+                let mut q = queue.borrow_mut();
+                if q.is_empty() {
+                    panic!("脚本回放耗尽：method={method} params={params}");
+                }
+                q.remove(0)
+            })
+        }
+    }
+
+    fn summary(id: &str, name: &str, kind: ItemKind, deleted: bool) -> ItemSummary {
+        ItemSummary {
+            id: uuid::Uuid::parse_str(id).unwrap(),
+            name: name.to_string(),
+            kind,
+            revision: "rev-1".to_string(),
+            deleted,
+        }
+    }
+
+    const SECRET_JSON: &str = r#"{
+        "type": "secret", "id": "00000000-0000-0000-0000-0000000000aa",
+        "name": "API_KEY", "revision": "rev-1", "deleted": false,
+        "value": "sk-123", "purpose": "", "expiresAt": null
+    }"#;
+
+    /// 双平台静默成功命令（允许路径 stdout 零输出断言用）。
+    fn silent_ok_cmd() -> Vec<String> {
+        if cfg!(windows) {
+            vec!["cmd".into(), "/c".into(), "exit".into(), "0".into()]
+        } else {
+            vec!["true".into()]
+        }
+    }
+
+    // ------------------------- --json 失败对象 -------------------------
+
+    /// 失败对象形状：ok/error/code/message 四字段，顺序钉死；人类文案照旧
+    /// stderr（stdout 只承载机器可读对象）。
+    #[test]
+    fn json_error_object_shape_and_field_order() {
+        let mut out = Vec::new();
+        let code = rpc_fail(&mut out, &RpcError::AuthzDenied, true);
+        assert_eq!(code, 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with(r#"{"ok":false,"error":"authz.denied","code":-32017,"message":""#),
+            "字段顺序须钉死 ok,error,code,message，got: {text}"
+        );
+        let v: Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "authz.denied");
+        assert_eq!(v["code"], -32017);
+        assert_eq!(
+            v["message"],
+            "读取被授权门拒绝（无规则且未批准/超时）；可用 `lk rule add --read` 为该项目目录预授权"
+        );
+    }
+
+    /// --json 关闭时 stdout 零输出（人类文案只在 stderr，行为不变）。
+    #[test]
+    fn json_error_off_keeps_stdout_empty() {
+        let mut out = Vec::new();
+        let code = rpc_fail(&mut out, &RpcError::SessionInvalid, false);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+    }
+
+    /// -32014 双义消歧落到失败对象：channel.forbidden 与 bridge.no_daemon
+    /// 同码不同名（error 名是 skill 的主匹配键）。
+    #[test]
+    fn json_error_32014_dual_meaning_disambiguated() {
+        let mut out = Vec::new();
+        rpc_fail(&mut out, &RpcError::ChannelForbidden, true);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"], "channel.forbidden");
+        assert_eq!(v["code"], -32014);
+
+        let mut out = Vec::new();
+        rpc_fail(
+            &mut out,
+            &RpcError::BridgeNoDaemon {
+                detail: String::new(),
+            },
+            true,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"], "bridge.no_daemon");
+        assert_eq!(v["code"], -32014);
+    }
+
+    /// 未知服务端码 → error 归 other、code 兜底保留原始数字。
+    #[test]
+    fn json_error_unknown_code_is_other_with_raw_code() {
+        let mut out = Vec::new();
+        rpc_fail(
+            &mut out,
+            &RpcError::Other {
+                code: -32601,
+                message: "method not found".into(),
+                detail: String::new(),
+            },
+            true,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"], "other");
+        assert_eq!(v["code"], -32601);
+    }
+
+    // ------------------------- item get --name -------------------------
+
+    /// --name 命中唯一名 → 经 item.list 解析 id 后走同一 item.get RPC
+    /// （值披露裁决路径与 id 版完全一致）；墓碑同名条目不参与解析。
+    #[test]
+    fn item_get_by_name_resolves_then_discloses_via_item_get() {
+        let script = Script::default();
+        let items = vec![
+            summary(
+                "00000000-0000-0000-0000-0000000000aa",
+                "API_KEY",
+                ItemKind::Secret,
+                false,
+            ),
+            summary(
+                "00000000-0000-0000-0000-0000000000bb",
+                "other",
+                ItemKind::Note,
+                false,
+            ),
+            summary(
+                "00000000-0000-0000-0000-0000000000cc",
+                "API_KEY",
+                ItemKind::Secret,
+                true,
+            ),
+        ];
+        let mut c = script.client(vec![
+            Ok(json!({ "items": items })),
+            Ok(serde_json::from_str(SECRET_JSON).unwrap()),
+        ]);
+        let mut out = Vec::new();
+        let code = item_command(
+            &mut out,
+            &mut c,
+            &ItemCommand::Get {
+                id: None,
+                name: Some("API_KEY".into()),
+            },
+            true,
+        );
+        assert_eq!(code, 0);
+        let calls = script.calls.borrow();
+        assert_eq!(calls[0].0, "item.list");
+        assert_eq!(calls[1].0, "item.get");
+        assert_eq!(
+            calls[1].1,
+            json!({ "id": "00000000-0000-0000-0000-0000000000aa" })
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["name"], "API_KEY");
+        assert_eq!(v["value"], "sk-123");
+    }
+
+    /// 重名 → exit 2 + 结构化歧义错误（agent 据此向用户澄清，不猜一个）。
+    #[test]
+    fn item_get_by_name_ambiguous_is_exit_2_with_json() {
+        let script = Script::default();
+        let items = vec![
+            summary(
+                "00000000-0000-0000-0000-0000000000aa",
+                "dup",
+                ItemKind::Secret,
+                false,
+            ),
+            summary(
+                "00000000-0000-0000-0000-0000000000bb",
+                "dup",
+                ItemKind::Note,
+                false,
+            ),
+        ];
+        let mut c = script.client(vec![Ok(json!({ "items": items }))]);
+        let mut out = Vec::new();
+        let code = item_command(
+            &mut out,
+            &mut c,
+            &ItemCommand::Get {
+                id: None,
+                name: Some("dup".into()),
+            },
+            true,
+        );
+        assert_eq!(code, 2);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "item.name_ambiguous");
+        assert_eq!(v["code"], 0);
+        let msg = v["message"].as_str().unwrap();
+        assert!(
+            msg.contains("dup") && msg.contains('2'),
+            "文案应含名字与条数：{msg}"
+        );
+        assert_eq!(script.calls.borrow().len(), 1, "歧义时不得继续取值");
+    }
+
+    /// 无命中 → 与 id 版同形：item.not_found / -32004 / exit 1。
+    #[test]
+    fn item_get_by_name_not_found_matches_id_version_shape() {
+        let script = Script::default();
+        let mut c = script.client(vec![Ok(json!({ "items": [] }))]);
+        let mut out = Vec::new();
+        let code = item_command(
+            &mut out,
+            &mut c,
+            &ItemCommand::Get {
+                id: None,
+                name: Some("ghost".into()),
+            },
+            true,
+        );
+        assert_eq!(code, 1);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "item.not_found");
+        assert_eq!(v["code"], -32004);
+    }
+
+    /// 位置 id 与 --name 互斥 / 至少给一个（clap 用法层，exit 2）。
+    #[test]
+    fn item_get_id_and_name_are_mutually_exclusive() {
+        let both = Cli::try_parse_from(["lk", "item", "get", "abc", "--name", "x"]);
+        assert!(both.is_err(), "id 与 --name 同给必须用法错误");
+        let neither = Cli::try_parse_from(["lk", "item", "get"]);
+        assert!(neither.is_err(), "缺 id 与 --name 必须用法错误");
+        let name_only = Cli::try_parse_from(["lk", "item", "get", "--name", "x"]).unwrap();
+        match &name_only.command {
+            Command::Item(args) => match &args.command {
+                ItemCommand::Get { id, name } => {
+                    assert_eq!(id, &None);
+                    assert_eq!(name.as_deref(), Some("x"));
+                }
+                _ => panic!("应为 item get 子命令"),
+            },
+            _ => panic!("应为 item 子命令"),
+        }
+    }
+
+    /// 歧义错误在 --json 关闭时退回纯 stderr（stdout 空）。
+    #[test]
+    fn item_get_by_name_ambiguous_without_json_is_stderr_only() {
+        let script = Script::default();
+        let items = vec![
+            summary(
+                "00000000-0000-0000-0000-0000000000aa",
+                "dup",
+                ItemKind::Secret,
+                false,
+            ),
+            summary(
+                "00000000-0000-0000-0000-0000000000bb",
+                "dup",
+                ItemKind::Note,
+                false,
+            ),
+        ];
+        let mut c = script.client(vec![Ok(json!({ "items": items }))]);
+        let mut out = Vec::new();
+        let code = item_command(
+            &mut out,
+            &mut c,
+            &ItemCommand::Get {
+                id: None,
+                name: Some("dup".into()),
+            },
+            false,
+        );
+        assert_eq!(code, 2);
+        assert!(out.is_empty());
+    }
+
+    // ------------------------- item list 过滤 -------------------------
+
+    /// --type / --name 过滤（CLI 侧，协议不变）：单过滤、组合、无命中、全量。
+    #[test]
+    fn item_list_filters_type_and_name_substring() {
+        let items = vec![
+            summary(
+                "00000000-0000-0000-0000-000000000001",
+                "GitHub",
+                ItemKind::Login,
+                false,
+            ),
+            summary(
+                "00000000-0000-0000-0000-000000000002",
+                "API_KEY",
+                ItemKind::Secret,
+                false,
+            ),
+            summary(
+                "00000000-0000-0000-0000-000000000003",
+                "API_TOKEN",
+                ItemKind::Secret,
+                false,
+            ),
+            summary(
+                "00000000-0000-0000-0000-000000000004",
+                "ri-ji",
+                ItemKind::Note,
+                false,
+            ),
+        ];
+        let by_type = filter_items(&items, Some(ItemKindFilter::Secret), None);
+        assert_eq!(by_type.len(), 2);
+        assert!(by_type.iter().all(|it| it.kind == ItemKind::Secret));
+
+        let by_name = filter_items(&items, None, Some("API"));
+        assert_eq!(
+            by_name.iter().map(|it| it.name.clone()).collect::<Vec<_>>(),
+            vec!["API_KEY".to_string(), "API_TOKEN".to_string()]
+        );
+
+        let both = filter_items(&items, Some(ItemKindFilter::Secret), Some("TOKEN"));
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].name, "API_TOKEN");
+
+        assert!(filter_items(&items, Some(ItemKindFilter::File), None).is_empty());
+        assert_eq!(filter_items(&items, None, None).len(), 4);
+    }
+
+    /// `--json` 裸数组形状钉死：以 `[` 开头的 ItemSummary 数组，只含过滤后
+    /// 条目；过滤不改变协议参数（item.list 无参数）。
+    #[test]
+    fn item_list_json_is_bare_array_with_filters() {
+        let script = Script::default();
+        let items = vec![
+            summary(
+                "00000000-0000-0000-0000-000000000001",
+                "GitHub",
+                ItemKind::Login,
+                false,
+            ),
+            summary(
+                "00000000-0000-0000-0000-000000000002",
+                "API_KEY",
+                ItemKind::Secret,
+                false,
+            ),
+        ];
+        let mut c = script.client(vec![Ok(json!({ "items": items }))]);
+        let mut out = Vec::new();
+        let code = item_command(
+            &mut out,
+            &mut c,
+            &ItemCommand::List {
+                item_type: Some(ItemKindFilter::Secret),
+                name: None,
+            },
+            true,
+        );
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.trim_start().starts_with('['), "必须是裸数组：{text}");
+        let v: Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert!(v.is_array());
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["name"], "API_KEY");
+        assert_eq!(v[0]["type"], "secret");
+        assert_eq!(script.calls.borrow()[0].1, json!({}), "协议不变");
+    }
+
+    /// --type 非法值 → clap 用法错误（exit 2 语义）。
+    #[test]
+    fn item_list_type_rejects_unknown_value() {
+        assert!(Cli::try_parse_from(["lk", "item", "list", "--type", "wallet"]).is_err());
+    }
+
+    // ------------------------- inject --json -------------------------
+
+    /// 拒绝路径：7 个 reason 枚举逐一输出 {"allowed":false,"reason":…}，
+    /// 退出码 1；对象只含两字段（值不落 stdout）。
+    #[test]
+    fn inject_json_denial_covers_all_seven_reasons() {
+        const REASONS: [&str; 7] = [
+            "unknown_starter",
+            "no_cwd",
+            "missing_keys",
+            "rule_corrupt",
+            "no_ui",
+            "rejected",
+            "timeout",
+        ];
+        for reason in REASONS {
+            let script = Script::default();
+            let mut c = script.client(vec![Ok(
+                json!({ "allowed": false, "reason": reason, "env": {} }),
+            )]);
+            let mut out = Vec::new();
+            let code = inject_command(
+                &mut out,
+                &mut c,
+                &["K".to_string()],
+                &["placeholder-exe".to_string()],
+                true,
+            );
+            assert_eq!(code, 1, "reason={reason}");
+            let v: Value = serde_json::from_slice(&out).unwrap_or(Value::Null);
+            assert_eq!(v["allowed"], false, "reason={reason}");
+            assert_eq!(v["reason"], reason, "reason={reason}");
+            assert_eq!(
+                v.as_object().unwrap().len(),
+                2,
+                "拒绝对象只含 allowed/reason：{v}（reason={reason}）"
+            );
+        }
+    }
+
+    /// 允许路径：stdout 零输出（值只进子进程 env），退出码透传子进程。
+    #[test]
+    fn inject_json_allowed_writes_nothing_to_stdout() {
+        let script = Script::default();
+        let mut c = script.client(vec![Ok(json!({
+            "allowed": true, "reason": "", "env": { "K": "secret-value" }
+        }))]);
+        let mut out = Vec::new();
+        let code = inject_command(&mut out, &mut c, &["K".to_string()], &silent_ok_cmd(), true);
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "允许路径 stdout 必须零输出：{out:?}");
+    }
+
+    /// RPC 级失败（如锁态 session.invalid）走统一错误对象，不与裁决拒绝的
+    /// {"allowed":false} 形状混淆。
+    #[test]
+    fn inject_json_rpc_failure_uses_error_object() {
+        let script = Script::default();
+        let mut c = script.client(vec![Err(RpcError::SessionInvalid)]);
+        let mut out = Vec::new();
+        let code = inject_command(&mut out, &mut c, &["K".to_string()], &silent_ok_cmd(), true);
+        assert_eq!(code, 1);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "session.invalid");
+        assert_eq!(v["code"], -32002);
+    }
+
+    /// allowed=true 但无可注入 key → 按 missing_keys 机读语义拒绝（exit 1）。
+    #[test]
+    fn inject_allowed_but_empty_env_maps_to_missing_keys() {
+        let script = Script::default();
+        let mut c = script.client(vec![Ok(
+            json!({ "allowed": true, "reason": "", "env": {} }),
+        )]);
+        let mut out = Vec::new();
+        let code = inject_command(&mut out, &mut c, &["K".to_string()], &silent_ok_cmd(), true);
+        assert_eq!(code, 1);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["allowed"], false);
+        assert_eq!(v["reason"], "missing_keys");
     }
 }
