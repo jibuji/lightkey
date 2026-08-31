@@ -57,6 +57,17 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** 解析后的审批类型（补充拍板 #22 增 `rule`）。未知/缺失 → `"unknown"`
+ *  **防御性渲染**（明确提示，不回退按 inject 渲染——协议演进时旧 UI
+ *  不误导，规格 #102 故事 25）。 */
+type ParsedKind = "inject" | "read" | "export" | "rule" | "unknown";
+
+function parseApprovalKind(raw: unknown): ParsedKind {
+  return raw === "inject" || raw === "read" || raw === "export" || raw === "rule"
+    ? raw
+    : "unknown";
+}
+
 interface ApprovalItem {
   request: AuthzRequestPayload;
   /** 剩余秒数（倒计时环形）。 */
@@ -72,8 +83,11 @@ interface ApprovalItem {
  *  masterPassword 回传。
  *  M2.9 值披露：按 `kind` 选形态——`read`（条目名 Tag、无命令框、
  *  「允许并为此项目记住」= allow + rule.add）；`export`（额外展示数据包
- *  规模，无记住按钮——导出恒弹窗，规则不豁免）；`inject` 为既有形态
- *  （缺省：旧帧无 kind 字段时按 inject 渲染）。 */
+ *  规模，无记住按钮——导出恒弹窗，规则不豁免）；`inject` 为既有形态。
+ *  规则管理审批门（补充拍板 #22）：`rule` 展示命令框（`rule.add <name>` /
+ *  `rule.remove <name>`）+ keys Tag + 30s 倒计时，**无「记住」按钮**（规则
+ *  操作本身就是持久动作）。未知 kind **防御性渲染**：明确提示未知，不回退
+ *  按 inject 渲染（协议演进时旧 UI 不误导）。 */
 export function ApprovalDialog({
   item,
   onResolve,
@@ -89,9 +103,12 @@ export function ApprovalDialog({
 }) {
   const req = item.request;
   const needsUnlock = req.needsUnlock;
-  const kind = req.kind ?? "inject";
+  const kind = parseApprovalKind(req.kind);
   const isRead = kind === "read";
   const isExport = kind === "export";
+  const isRule = kind === "rule";
+  const isUnknown = kind === "unknown";
+  const isRuleRemove = isRule && req.command.startsWith("rule.remove");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -137,7 +154,13 @@ export function ApprovalDialog({
               ? "Agent 请求读取该项目目录下条目的值（值不会显示，批准后仅返回给发起程序）"
               : isExport
                 ? "Agent 请求导出条目数据包（附件明文将离开守护进程，请确认）"
-                : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
+                : isRule
+                  ? isRuleRemove
+                    ? "Agent 请求删除既有授权规则（撤销已授予的读取/注入能力；批准后立即生效并随同步传播）"
+                    : "Agent 请求建立持久化授权规则（批准后写入规则库；此为持久授权，请确认范围）"
+                  : isUnknown
+                    ? `未知审批类型（kind=${String(req.kind ?? "缺失")}）：当前界面版本不认识该请求，请升级应用后处理；无法确认内容前建议拒绝`
+                    : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
         </p>
         <div className="approval-source">
           <span className="approval-avatar">
@@ -156,7 +179,15 @@ export function ApprovalDialog({
             {req.exportMeta.name} · {req.exportMeta.mime} · {formatSize(req.exportMeta.size)}
           </div>
         ) : null}
-        {!isRead && !isExport ? <div className="approval-cmd-box">$ {req.command}</div> : null}
+        {isRule ? (
+          // 规则门（补充拍板 #22）：命令框承载操作（非 shell 命令，无 $ 前缀）
+          <div className="approval-cmd-box">
+            {isRuleRemove ? "移除规则：" : "新建规则："}
+            {req.command}
+          </div>
+        ) : !isRead && !isExport && !isUnknown ? (
+          <div className="approval-cmd-box">$ {req.command}</div>
+        ) : null}
         <div className="approval-keys">
           {req.keys.map((k) => (
             <span className="key-tag" key={k}>

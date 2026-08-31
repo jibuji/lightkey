@@ -97,7 +97,7 @@ export interface RuleInput {
 export type AuditResult = "allowed" | "denied" | "timeout";
 
 /** 审计来源通道。 */
-export type AuditChannel = "cli" | "desktop" | "approval" | "wsl-bridge";
+export type AuditChannel = "cli" | "desktop" | "approval" | "wsl-bridge" | "auto-approve";
 
 /** 审计事件（对齐 lk-core audit::AuditEvent；无密钥值）。 */
 export interface AuditEvent {

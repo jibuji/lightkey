@@ -79,8 +79,9 @@ export interface AuthzRequestPayload {
    *  一次交互），允许决策回传 `masterPassword`；守护进程临时解锁后
    *  不签发会话令牌——本次注入不产生 item.* 全量能力（#65）。 */
   needsUnlock: boolean;
-  /** 审批类型（M2.9 值披露）：弹窗按 kind 选形态；缺省视为 inject。 */
-  kind?: "inject" | "read" | "export";
+  /** 审批类型（M2.9 值披露 + 补充拍板 #22 规则门）：弹窗按 kind 选形态；
+   *  缺省视为未知（防御渲染，不再回退 inject——协议演进时旧 UI 不误导）。 */
+  kind?: "inject" | "read" | "export" | "rule";
   /** export 审批的数据包规模元信息（仅 kind=export；不含数据本身）。 */
   exportMeta?: { name: string; mime: string; size: number } | null;
 }
