@@ -165,6 +165,36 @@ pub const M_RULE_REMOVE: &str = "rule.remove";
 pub const M_SUBSCRIBE: &str = "subscribe";
 
 // ---------------------------------------------------------------------------
+// 通知名 / 通道（协议面 Rust 权威源；TS 镜像 = frontend/src/ipc/protocol.ts，
+// 双向对齐由 frontend/src/__tests__/protocolContract.test.ts 钉死）
+// ---------------------------------------------------------------------------
+
+/// 通知帧方法名（JSON-RPC notification，无 `id`，决策 #3 A）。bus.rs
+/// [`crate::bus::VaultEvent::name`] 引用本组常量——通知名只在协议模块
+/// 定义一次，notifier 与 TS 侧不再手写字面量。
+pub const NOTIFY_ITEM_CHANGED: &str = "item.changed";
+pub const NOTIFY_SESSION_UNLOCKED: &str = "session.unlocked";
+pub const NOTIFY_SESSION_LOCKED: &str = "session.locked";
+pub const NOTIFY_AUTHZ_REQUEST: &str = "authz.request";
+
+/// 审计通道值（请求 `channel` 参数；规则/值披露方法按来源标注）。
+pub const CHANNEL_CLI: &str = "cli";
+pub const CHANNEL_WSL_BRIDGE: &str = "wsl-bridge";
+pub const CHANNEL_DESKTOP: &str = "desktop";
+
+/// 携带 `channel` 参数的方法（授权门 + 规则 + 值披露裁决）。CLI / 桥 /
+/// 桌面三侧据此覆写来源标注（main.rs bridge 覆写、client.rs 钉 "cli"、
+/// tauriAdapter 钉 "desktop" 共享本清单，见 frontend/src/ipc/protocol.ts）。
+pub const CHANNEL_BEARING_METHODS: &[&str] = &[
+    M_AUTHZ_EVALUATE,
+    M_RULE_ADD,
+    M_RULE_LIST,
+    M_RULE_REMOVE,
+    M_ITEM_GET,
+    M_ITEM_EXPORT,
+];
+
+// ---------------------------------------------------------------------------
 // 各方法参数/结果类型（最小字段）
 // ---------------------------------------------------------------------------
 

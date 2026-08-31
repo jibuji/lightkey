@@ -425,7 +425,7 @@ impl Daemon {
                     if let Some(v) = vault.as_ref() {
                         let _ = self.audit.append(
                             v.keys(),
-                            &caller.event("approval.result", AuditResult::Denied),
+                            &caller.event(M_APPROVAL_RESULT, AuditResult::Denied),
                         );
                     }
                     RpcResponse::err(
@@ -614,8 +614,8 @@ impl CallerId {
 /// （cross-subsystem.md §7.5）。
 fn audit_channel(channel: &str) -> AuditChannel {
     match channel {
-        "desktop" => AuditChannel::Desktop,
-        "wsl-bridge" => AuditChannel::WslBridge,
+        CHANNEL_DESKTOP => AuditChannel::Desktop,
+        CHANNEL_WSL_BRIDGE => AuditChannel::WslBridge,
         _ => AuditChannel::Cli,
     }
 }

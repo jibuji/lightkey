@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 
 use lk_core::audit::AuditEvent;
 use lk_core::ipc::{
-    RpcResponse, ERR_AUTHZ_DENIED, ERR_ITEM_CONFLICT, ERR_ITEM_NOT_FOUND, ERR_LIMIT, ERR_PARSE,
-    ERR_RATE_LIMITED, ERR_SESSION_INVALID, ERR_SYNC_ANOMALY, ERR_SYNC_CREDENTIALS,
+    RpcResponse, CHANNEL_CLI, ERR_AUTHZ_DENIED, ERR_ITEM_CONFLICT, ERR_ITEM_NOT_FOUND, ERR_LIMIT,
+    ERR_PARSE, ERR_RATE_LIMITED, ERR_SESSION_INVALID, ERR_SYNC_ANOMALY, ERR_SYNC_CREDENTIALS,
     ERR_SYNC_NOT_CONFIGURED, ERR_SYNC_STORAGE, ERR_VAULT_EXISTS, ERR_VAULT_INVALID,
     ERR_WEAK_PASSWORD, M_AUDIT_LIST, M_AUDIT_VERIFY, M_AUTHZ_EVALUATE, M_ITEM_DELETE,
     M_ITEM_EXPORT, M_ITEM_GET, M_ITEM_LIST, M_ITEM_PUT, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE,
@@ -401,7 +401,7 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
             "name": name,
             "command": command,
             "keys": keys,
-            "channel": "cli",
+            "channel": CHANNEL_CLI,
         });
         if let Some(cap) = capability {
             params["capability"] = json!(cap);
@@ -421,13 +421,13 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
 
     /// `rule.list` → 规则列表（解析失败兜底空列表，同重构前）。
     pub fn rule_list(&mut self) -> Result<Vec<Rule>, RpcError> {
-        let res = self.call(M_RULE_LIST, json!({ "channel": "cli" }))?;
+        let res = self.call(M_RULE_LIST, json!({ "channel": CHANNEL_CLI }))?;
         Ok(serde_json::from_value(res["rules"].clone()).unwrap_or_default())
     }
 
     /// `rule.remove`（软删除，墓碑）。
     pub fn rule_remove(&mut self, id: &str) -> Result<(), RpcError> {
-        self.call(M_RULE_REMOVE, json!({ "id": id, "channel": "cli" }))?;
+        self.call(M_RULE_REMOVE, json!({ "id": id, "channel": CHANNEL_CLI }))?;
         Ok(())
     }
 
@@ -440,7 +440,7 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
     ) -> Result<AuthzDecision, RpcError> {
         let res = self.call(
             M_AUTHZ_EVALUATE,
-            json!({ "command": command, "keys": keys, "channel": "cli" }),
+            json!({ "command": command, "keys": keys, "channel": CHANNEL_CLI }),
         )?;
         Ok(AuthzDecision {
             allowed: res["allowed"].as_bool().unwrap_or(false),

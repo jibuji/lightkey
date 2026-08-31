@@ -18,26 +18,23 @@ use serde_json::json;
 use crate::transport::PushHub;
 
 /// 事件 → notification 帧（协议面字段，`docs/plugin-architecture.md` §5.2）。
+/// 方法名取 [`VaultEvent::name`]（常量在 `lk_core::ipc`，TS 镜像
+/// `frontend/src/ipc/protocol.ts`）——本模块不手写通知名字面量。
 pub fn frame_for_event(event: &VaultEvent) -> String {
-    let (method, params) = match event {
+    let params = match event {
         VaultEvent::ItemChanged {
             item_id,
             revision_date,
             kind,
             deleted,
-        } => (
-            "item.changed",
-            json!({
-                "itemId": item_id,
-                "revisionDate": revision_date,
-                "type": kind,
-                "deleted": deleted,
-            }),
-        ),
-        VaultEvent::SessionUnlocked { via } => ("session.unlocked", json!({ "via": via.as_str() })),
-        VaultEvent::SessionLocked { reason } => {
-            ("session.locked", json!({ "reason": reason.as_str() }))
-        }
+        } => json!({
+            "itemId": item_id,
+            "revisionDate": revision_date,
+            "type": kind,
+            "deleted": deleted,
+        }),
+        VaultEvent::SessionUnlocked { via } => json!({ "via": via.as_str() }),
+        VaultEvent::SessionLocked { reason } => json!({ "reason": reason.as_str() }),
         VaultEvent::AuthzRequest {
             request_id,
             starter,
@@ -48,26 +45,23 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
             needs_unlock,
             kind,
             export_meta,
-        } => (
-            "authz.request",
-            json!({
-                "requestId": request_id,
-                "starter": starter,
-                "projectDir": project_dir,
-                "command": command,
-                "keys": keys,
-                "challenge": challenge,
-                "needsUnlock": needs_unlock,
-                // M2.9 值披露：审批类型（弹窗按形态渲染）+ export 数据包
-                // 规模元信息（仅 export 审批携带，帧不含数据本身）
-                "kind": serde_json::to_value(kind).unwrap_or(serde_json::json!("inject")),
-                "exportMeta": export_meta.as_ref().map(|m| json!({
-                    "name": m.name, "mime": m.mime, "size": m.size,
-                })),
-            }),
-        ),
+        } => json!({
+            "requestId": request_id,
+            "starter": starter,
+            "projectDir": project_dir,
+            "command": command,
+            "keys": keys,
+            "challenge": challenge,
+            "needsUnlock": needs_unlock,
+            // M2.9 值披露：审批类型（弹窗按形态渲染）+ export 数据包
+            // 规模元信息（仅 export 审批携带，帧不含数据本身）
+            "kind": serde_json::to_value(kind).unwrap_or(serde_json::json!("inject")),
+            "exportMeta": export_meta.as_ref().map(|m| json!({
+                "name": m.name, "mime": m.mime, "size": m.size,
+            })),
+        }),
     };
-    json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string()
+    json!({ "jsonrpc": "2.0", "method": event.name(), "params": params }).to_string()
 }
 
 /// 是否为仅桌面可见的帧（#72/#78：`authz.request` 携带一次性审批挑战，

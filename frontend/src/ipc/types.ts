@@ -30,24 +30,25 @@ import type {
   RuleInput,
   SyncStatus,
 } from "../types";
+import { ERROR_CODES } from "./protocol";
 
 export class ConflictError extends Error {
   constructor() {
-    super("item.conflict");
+    super(ERROR_CODES.ITEM_CONFLICT);
     this.name = "ConflictError";
   }
 }
 
 export class VaultInvalidError extends Error {
   constructor() {
-    super("vault.invalid");
+    super(ERROR_CODES.VAULT_INVALID);
     this.name = "VaultInvalidError";
   }
 }
 
 export class SessionInvalidError extends Error {
   constructor() {
-    super("session.invalid");
+    super(ERROR_CODES.SESSION_INVALID);
     this.name = "SessionInvalidError";
   }
 }

@@ -21,6 +21,7 @@
 | [../CONTEXT.md](../CONTEXT.md) | 领域术语表（统一叫法 + Avoid 清单；命名/写作/评审以此为准） | 全部 |
 | [adr/](adr/) | 架构决策记录（ADR；0001 daemon RPC 单一执行计划路由） | M2 |
 | [architecture.md](architecture.md) | 总体架构、组件边界、技术栈、workspace | 全部 |
+| [plugin-architecture.md](plugin-architecture.md) | 插件化架构（四层插件边界、事件总线、装配机制；M1.5 落地层） | M1.5 |
 | [milestones.md](milestones.md) | M0–M3 里程碑范围与验收（含 M1.5 / M2.5 / M2.75） | 全部 |
 | [crypto.md](crypto.md) | 加密原语、KDF、密钥分叉、自描述密文格式 | M0 |
 | [data-model.md](data-model.md) | 条目/附件/索引/墓碑、CAS、schema | M0 |
@@ -35,6 +36,7 @@
 | [browser-fill.md](browser-fill.md) | 浏览器填充通道协议（Native Messaging） | M3 |
 | [testing.md](testing.md) | 三层测试策略与 CI | 全部 |
 | [cli.md](cli.md) | `lk` CLI 命令参考 | 全部 |
+| [agents/](agents/) | Agent 技能文档（领域术语 / issue 追踪 / triage 标签） | 全部 |
 | [design/spec.md](design/spec.md) | 前端设计规范（tokens/组件/流程） | M2（界面） |
 | [design/prototype](design/prototype/) | 高保真单页原型（可交互、可截图评审；含 M2.5 初始化向导） | M2/M2.5（界面） |
 

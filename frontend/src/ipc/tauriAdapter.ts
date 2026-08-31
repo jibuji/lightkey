@@ -32,6 +32,7 @@ import {
   type NotificationFrame,
   type UpdateOptions,
 } from "./types";
+import { CHANNELS, ERROR_CODES, METHODS } from "./protocol";
 
 /** 会话令牌：解锁后由 vault.unlock 签发，随每次解锁轮换（ipc.md §3） */
 let sessionToken: string | null = null;
@@ -55,11 +56,17 @@ async function rpc<T>(
 function mapError(e: unknown): Error {
   const code = (e as { code?: string; message?: string })?.code;
   const message = (e as { message?: string })?.message;
-  if (code === "item.conflict" || message === "item.conflict") return new ConflictError();
-  if (code === "vault.invalid" || message === "vault.invalid") return new VaultInvalidError();
+  if (code === ERROR_CODES.ITEM_CONFLICT || message === ERROR_CODES.ITEM_CONFLICT) {
+    return new ConflictError();
+  }
+  if (code === ERROR_CODES.VAULT_INVALID || message === ERROR_CODES.VAULT_INVALID) {
+    return new VaultInvalidError();
+  }
   // 初始化向导统一文案：主密码校验失败 / 库已存在不区分（ipc.md §3 防探测）
-  if (code === "vault.exists" || code === "vault.weak_password") return new VaultInvalidError();
-  if (message === "session.invalid") return new SessionInvalidError();
+  if (code === ERROR_CODES.VAULT_EXISTS || code === ERROR_CODES.WEAK_PASSWORD) {
+    return new VaultInvalidError();
+  }
+  if (message === ERROR_CODES.SESSION_INVALID) return new SessionInvalidError();
   return e instanceof Error ? e : new Error(String(e));
 }
 
@@ -90,7 +97,7 @@ function assertArray<T>(value: unknown, method: string, field: string): T[] {
  */
 async function ensureSubscribed(): Promise<void> {
   try {
-    await invoke("subscribe", { token: sessionToken ?? "" });
+    await invoke(METHODS.SUBSCRIBE, { token: sessionToken ?? "" });
   } catch {
     // 订阅失败不阻断主流程（通知为增强通道；会话事件经 ipc-bridge 本地兜底）
   }
@@ -104,12 +111,12 @@ export class TauriAdapter implements LightKeyIpc {
     initialized: boolean;
     auditAnchorOk?: boolean;
   }> {
-    return rpc("vault.status");
+    return rpc(METHODS.VAULT_STATUS);
   }
 
   async init(masterPassword: string): Promise<{ recoveryCode: string }> {
     try {
-      return rpc<{ recoveryCode: string }>("vault.init", { masterPassword });
+      return rpc<{ recoveryCode: string }>(METHODS.VAULT_INIT, { masterPassword });
     } catch (e) {
       throw mapError(e);
     }
@@ -117,7 +124,7 @@ export class TauriAdapter implements LightKeyIpc {
 
   async unlock(masterPassword: string): Promise<void> {
     try {
-      const res = await rpc<{ token: string }>("vault.unlock", { masterPassword });
+      const res = await rpc<{ token: string }>(METHODS.VAULT_UNLOCK, { masterPassword });
       sessionToken = res.token;
       await ensureSubscribed();
     } catch (e) {
@@ -127,7 +134,7 @@ export class TauriAdapter implements LightKeyIpc {
 
   async lock(): Promise<void> {
     try {
-      await rpc("vault.lock");
+      await rpc(METHODS.VAULT_LOCK);
     } catch (e) {
       throw mapError(e);
     } finally {
@@ -138,7 +145,10 @@ export class TauriAdapter implements LightKeyIpc {
 
   async recover(recoveryCode: string, newPassword: string): Promise<{ recoveryCode: string }> {
     try {
-      const res = await rpc<{ recoveryCode: string }>("vault.recover", { recoveryCode, newPassword });
+      const res = await rpc<{ recoveryCode: string }>(METHODS.VAULT_RECOVER, {
+        recoveryCode,
+        newPassword,
+      });
       sessionToken = null;
       return res;
     } catch (e) {
@@ -150,8 +160,8 @@ export class TauriAdapter implements LightKeyIpc {
     try {
       // 守护进程返回 `ItemListResult{items}`（ipc.rs）；解包为数组本体 +
       // 契约断言（非数组即抛，issue #85）
-      const res = await rpc<{ items?: unknown }>("item.list");
-      return assertArray<ItemSummary>(res.items, "item.list", "items");
+      const res = await rpc<{ items?: unknown }>(METHODS.ITEM_LIST);
+      return assertArray<ItemSummary>(res.items, METHODS.ITEM_LIST, "items");
     } catch (e) {
       throw mapError(e);
     }
@@ -159,7 +169,7 @@ export class TauriAdapter implements LightKeyIpc {
 
   async get(id: string): Promise<Item> {
     try {
-      return rpc<Item>("item.get", { id });
+      return rpc<Item>(METHODS.ITEM_GET, { id });
     } catch (e) {
       throw mapError(e);
     }
@@ -169,7 +179,7 @@ export class TauriAdapter implements LightKeyIpc {
   async create(draft: ItemDraft): Promise<Item> {
     try {
       // 守护进程返回 `ItemPutResult{item}`（ipc.rs）；解包为条目本体
-      const res = await rpc<{ item: Item }>("item.put", { item: draft });
+      const res = await rpc<{ item: Item }>(METHODS.ITEM_PUT, { item: draft });
       return res.item;
     } catch (e) {
       throw mapError(e);
@@ -179,7 +189,7 @@ export class TauriAdapter implements LightKeyIpc {
   /** 整条替换（CAS）：item.put，expectedRevision 必填 */
   async update(id: string, draft: ItemDraft, opts?: UpdateOptions): Promise<Item> {
     try {
-      const res = await rpc<{ item: Item }>("item.put", {
+      const res = await rpc<{ item: Item }>(METHODS.ITEM_PUT, {
         id,
         item: draft,
         expectedRevision: opts?.expectedRevision,
@@ -192,7 +202,7 @@ export class TauriAdapter implements LightKeyIpc {
 
   async remove(id: string): Promise<void> {
     try {
-      await rpc("item.delete", { id }); // ipc.md §4（软删除 → 墓碑）
+      await rpc(METHODS.ITEM_DELETE, { id }); // ipc.md §4（软删除 → 墓碑）
     } catch (e) {
       throw mapError(e);
     }
@@ -201,7 +211,7 @@ export class TauriAdapter implements LightKeyIpc {
   async syncStatus(): Promise<SyncStatus> {
     try {
       // 最近一轮同步摘要与水位（不触发新轮次）；UI 只消费 watermark（上次同步时间）
-      const res = await rpc<{ summary?: unknown; watermark?: string | null }>("sync.poll");
+      const res = await rpc<{ summary?: unknown; watermark?: string | null }>(METHODS.SYNC_POLL);
       return { lastSync: res.watermark ?? null };
     } catch (e) {
       throw mapError(e);
@@ -210,7 +220,7 @@ export class TauriAdapter implements LightKeyIpc {
 
   async syncTrigger(): Promise<SyncStatus> {
     try {
-      await rpc("sync.trigger");
+      await rpc(METHODS.SYNC_TRIGGER);
       // sync.trigger 只返回变更摘要（不含水位）；触发后再查一轮水位回填 lastSync
       return this.syncStatus();
     } catch (e) {
@@ -222,8 +232,8 @@ export class TauriAdapter implements LightKeyIpc {
     try {
       // 守护进程返回 `AuditListResult{events,total}`（ipc.rs）；解包为事件
       // 数组 + 契约断言（非数组即抛，issue #85）
-      const res = await rpc<{ events?: unknown; total?: number }>("audit.list");
-      return assertArray<AuditEvent>(res.events, "audit.list", "events");
+      const res = await rpc<{ events?: unknown; total?: number }>(METHODS.AUDIT_LIST);
+      return assertArray<AuditEvent>(res.events, METHODS.AUDIT_LIST, "events");
     } catch (e) {
       throw mapError(e);
     }
@@ -233,8 +243,8 @@ export class TauriAdapter implements LightKeyIpc {
     try {
       // 守护进程返回 `RuleListResult{rules}`（ipc.rs）；解包为规则数组 +
       // 契约断言（非数组即抛，issue #85）
-      const res = await rpc<{ rules?: unknown }>("rule.list", { channel: "desktop" });
-      return assertArray<AuthRule>(res.rules, "rule.list", "rules");
+      const res = await rpc<{ rules?: unknown }>(METHODS.RULE_LIST, { channel: CHANNELS.DESKTOP });
+      return assertArray<AuthRule>(res.rules, METHODS.RULE_LIST, "rules");
     } catch (e) {
       throw mapError(e);
     }
@@ -243,7 +253,10 @@ export class TauriAdapter implements LightKeyIpc {
   async ruleAdd(input: RuleInput): Promise<AuthRule> {
     try {
       // 守护进程返回 `RuleAddResult{rule}`（ipc.rs）；解包为规则本体
-      const res = await rpc<{ rule: AuthRule }>("rule.add", { ...input, channel: "desktop" });
+      const res = await rpc<{ rule: AuthRule }>(METHODS.RULE_ADD, {
+        ...input,
+        channel: CHANNELS.DESKTOP,
+      });
       return res.rule;
     } catch (e) {
       throw mapError(e);
@@ -252,7 +265,7 @@ export class TauriAdapter implements LightKeyIpc {
 
   async ruleRemove(id: string): Promise<void> {
     try {
-      await rpc("rule.remove", { id, channel: "desktop" });
+      await rpc(METHODS.RULE_REMOVE, { id, channel: CHANNELS.DESKTOP });
     } catch (e) {
       throw mapError(e);
     }
@@ -265,7 +278,7 @@ export class TauriAdapter implements LightKeyIpc {
     masterPassword?: string,
   ): Promise<{ accepted: boolean }> {
     try {
-      return rpc<{ accepted: boolean }>("approval.result", {
+      return rpc<{ accepted: boolean }>(METHODS.APPROVAL_RESULT, {
         requestId,
         decision,
         challenge,

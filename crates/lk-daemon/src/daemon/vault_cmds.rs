@@ -93,7 +93,7 @@ impl Daemon {
                 self.unlock_guard.on_success();
                 let _ = self.audit.append(
                     vault.keys(),
-                    &caller.event("vault.unlock", AuditResult::Allowed),
+                    &caller.event(M_VAULT_UNLOCK, AuditResult::Allowed),
                 );
                 // C 层装配：vault-store 挂总线（写成功 → `item.changed`）
                 self.core.attach_vault(&mut vault);
@@ -165,7 +165,7 @@ impl Daemon {
         if let Some(v) = vault {
             let _ = self
                 .audit
-                .append(v.keys(), &caller.event("vault.lock", AuditResult::Allowed));
+                .append(v.keys(), &caller.event(M_VAULT_LOCK, AuditResult::Allowed));
         }
         // 注：审计锚点写入（sync_anchor）**不在此处**——本函数在调用方持有
         // vault 写锁时执行，而锚点写入含同步 I/O（读审计文件 + keyring），

@@ -18,6 +18,12 @@
  *
  * 分发语义：`emit`（观察广播，fire-and-forget）；`authz.request` 的审批结果
  * 经 IPC 方法 `approval.result` 回传（跨进程无同步事件返回值，§5.3）。
+ *
+ * 事件名字符串（item.changed / session.unlocked / session.locked /
+ * authz.request）的单一来源是协议契约 `frontend/src/ipc/protocol.ts`
+ * （NOTIFICATIONS，镜像 `lk_core::ipc::NOTIFY_*`）。本文件的类型级字面量
+ * 键必须与其值一致——双向对齐由 `__tests__/protocolContract.test.ts` 钉死，
+ * 跨层（notifier / ipc-bridge / mock）不再手写字面量。
  */
 
 import type { Context } from "@cordisjs/core";
