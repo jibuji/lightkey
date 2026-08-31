@@ -332,4 +332,67 @@ needs-decision，不得自行变更。
     落盘：`.github/workflows/release.yml`、AGENTS.md（「常用命令」CI 条目 +
     「交付纪律」）、本条。
 
+22. **规则管理审批门 + E2E 自动批准通道（2026-08-31 · 来源：issue #102/#104
+    agent 集成 grilling 收敛稿，船长拍板）**：socket/pipe 通道的 `rule.add` /
+    `rule.remove` 从「仅验会话令牌」升为**桌面审批门**——对称原则：授权的
+    建立（agent 给自己 `rule add --read` 持久授权 = 自我提权）与撤销
+    （`rule remove` 删用户既有规则 = 拆墙）都是授权事件（补充拍板 #20 的
+    自然延伸）。裁定：
+    - **范围**：socket/pipe 的 `rule.add` / `rule.remove` 走 ApprovalDeferred
+      三阶段（ADR-0001 编排复用）；GUI desktop 直调受信豁免（设置页、读值
+      弹窗「允许并为此项目记住」内部的 ruleAdd——人在 GUI 前零摩擦）；bridge
+      通道对端非 desktop 自然受门；`rule.list` 维持令牌门（只读元数据，
+      M2.9「值是边界，名称如实降级」同口径）；锁态 `session.invalid` 先行
+      （规则在加密库内；锁态规则管理一体化在规格 Out of Scope——规则是参与
+      同步的持久对象，管理低频，先解锁再管理）。
+    - **协议加性变更，不升版本**：`ApprovalKind` 新增 `Rule`（serde 小写
+      `"rule"`）；**单一 kind + command 字段承载操作**（`rule.add <name>` /
+      `rule.remove <name>`，不拆两个 kind）；remove 由 daemon 解析 id→规则
+      补全 name/keys/projectDir 供弹窗展示。错误码**复用 -32017
+      `authz.denied`**（协议零新增；既有 -32014 撞码是「新增码会漂移」的
+      实证）；CLI 按命令上下文渲染「规则变更被授权门拒绝…」（同码不同命令
+      语境区分，机器契约 error 名不变）。
+    - **finalize 锁内重校验（TOCTOU）**：30s 等待窗内规则库可能被并发审批
+      落盘或同步轮次改变；finalize 必须在锁内重验 vault 解锁态与（remove 的）
+      规则存在性（按**未删除**口径——`get_rule` 含墓碑、幂等 delete 会静默
+      成功，不能用作重验），失效则拒绝并落审计，不产生基于过期快照的写入。
+    - **审计全路径**（现状仅成功路径写）：批准 → channel=approval + Allowed；
+      拒绝/超时/无 UI → Denied/Timeout（socket 归因如实，wsl-bridge 照旧）。
+    - **前端**：approval 插件 kind=rule 分支（命令框 + keys Tag + 30s 倒计时，
+      无「记住」按钮——规则操作本身就是持久动作）+ **未知 kind 防御性渲染**
+      （明确提示而非回退按 inject 渲染，协议演进时旧 UI 不误导）；D 层单测
+      钉住。
+    - **E2E AutoApproveChannel**：`ApprovalChannel` trait 新增 env 门控装饰器
+      ——daemon **启动时**读一次 `LIGHTKEY_E2E_AUTO_APPROVE=rule`，仅对
+      `ApprovalKind::Rule` 立即 Allowed（不碰 inject/披露审批，
+      `available()` 语义原样透传，headless inject 照旧立即拒绝）；审计
+      channel=auto-approve（command 含 requestId 与规则内容）+ daemon 启动
+      日志横幅——**测试通道绝不静默**。
+    - **release 二进制保留 auto-approve 路径是有意决策**：E2E 必须测发布物
+      本体；编译期 feature/cfg 门为被否选项（会测非发布物、削弱 E2E 价值）。
+      攻击面结论：env 仅在 daemon 启动时读取，攻击者自带该变量拉起的新
+      daemon 库是锁的、`rule.add` 仍过会话门（`session.invalid`），无权限增益。
+    - **集成形态钉死为「skill 包装 `lk` CLI」，MCP server 作为被否替代留档**：
+      daemon 归因依赖 IPC 对端 PID 进程链回溯与 cwd 绑定；MCP 常驻 server 会
+      把归因目标变成 server 自身，若让 server 转发客户端自报身份则违反
+      「不信客户端自报」第一原则，且新增一整块协议面。未来可复议。
+    - 被否选项：
+      | 选项 | 否因 |
+      |------|------|
+      | MCP server 集成 | 归因失真（server 自身）或违反「不信客户端自报」；新增协议面；本条留档可复议 |
+      | 编译期 feature/cfg 门 auto-approve | E2E 会测非发布物、削弱 E2E 价值；env 门 + 审计标注 + 启动横幅已足够可见 |
+      | 拆 `ApprovalKind::RuleAdd` / `RuleRemove` 两个 kind | 协议面翻倍；单一 kind + command 字段已可承载操作与弹窗渲染 |
+      | 新错误码区分规则门拒绝 | 应用段错误码已现撞码实证（-32014 双义）；复用 -32017 + CLI 语境文案零协议变更 |
+      | 锁态规则管理一体化解锁 | 规则是参与同步的持久对象（revision/CAS/墓碑），管理低频；先解锁再管理 |
+      | 规则门走读规则豁免（如「已有同名规则不弹窗」） | 规则变更本身就是授权事件，任何豁免都重开自我提权面 |
+    - 测试分工：shell E2E（env 门生效主流程 + 「无 env 时 headless rule add
+      被拒」）；daemon 集成测试进程内驱动 `LocalApprovalChannel`（模拟桌面
+      订阅 + `approval.result` 直调）覆盖人工批准/deny/超时/no_ui/remove 门/
+      锁态/TOCTOU 竞争/auto 通道。
+    实现：`crates/lk-core/src/{authz,audit}.rs` +
+    `crates/lk-daemon/src/{router.rs,daemon/{mod,rules}.rs}` +
+    `crates/lk-cli/src/main.rs` + 前端 `{events.ts,ipc/mockAdapter.ts,types.ts,
+    plugins/{approval,ui-audit}.tsx}` + `scripts/e2e_{m0,m1,m2,cross_subsystem}.sh`；
+    规格：authorization-gate.md §9。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

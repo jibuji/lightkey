@@ -361,7 +361,7 @@ export class MockAdapter implements LightKeyIpc {
     keys: string[];
     challenge?: string;
     needsUnlock?: boolean;
-    kind?: "inject" | "read" | "export";
+    kind?: "inject" | "read" | "export" | "rule";
     exportMeta?: { name: string; mime: string; size: number } | null;
   }): void {
     this.pendingApprovals.add(params.requestId);

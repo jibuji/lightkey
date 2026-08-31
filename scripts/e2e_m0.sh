@@ -17,6 +17,10 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export LIGHTKEY_HOME="$WORK"
 export LK_JSON=0
+# 规则管理审批门（补充拍板 #22）：headless 无 UI 的 rule.add/rule.remove 会被
+# fail-closed 拒绝；本脚本主流程含 rule add --read 预插，经 E2E 自动批准通道
+# 放行（仅规则审批，inject/披露不受影响；daemon 启动时读一次 env）。
+export LIGHTKEY_E2E_AUTO_APPROVE=rule
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $1"; }

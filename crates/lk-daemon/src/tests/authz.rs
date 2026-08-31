@@ -16,7 +16,9 @@ fn authz_rule_hit_injects_env_and_audits() {
             json!({ "projectDir": proj.path(), "name": "publish",
                     "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "cli" }),
         ),
-        &PeerInfo::unknown(),
+        // 规则预插走 desktop 直调豁免（补充拍板 #22：socket 通道的 rule.add
+        // 走审批门；本组用例测的是 inject 裁决而非规则门）
+        &PeerInfo::desktop(),
     ));
     assert!(add["rule"]["id"].as_str().is_some());
 
@@ -93,7 +95,7 @@ fn authz_ignores_client_cwd_and_uses_peer_cwd() {
             json!({ "projectDir": proj.path(), "name": "p",
                     "command": "npm *", "keys": ["NPM_TOKEN"] }),
         ),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     );
     let handler = make_handler(&state, &shared);
     // 客户端自报 cwd = 项目目录（伪造）；真实 cwd = other → 必须拒绝
@@ -895,7 +897,9 @@ fn authz_deferred_invalid_token_session_gated_on_both_seams() {
             json!({ "projectDir": proj.path(), "name": "publish",
                     "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "cli" }),
         ),
-        &PeerInfo::unknown(),
+        // 规则预插走 desktop 直调豁免（补充拍板 #22：socket 通道的 rule.add
+        // 走审批门；本组用例测的是 inject 裁决而非规则门）
+        &PeerInfo::desktop(),
     ));
     assert!(add["rule"]["id"].as_str().is_some());
 

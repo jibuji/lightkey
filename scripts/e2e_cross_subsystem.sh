@@ -16,6 +16,12 @@
 #
 # 主密码：Windows 侧真实库的主密码，交互输入（read -s 不回显），或经环境变量
 #         LK_CROSS_MASTER_PW 提供（--auto-approve 无人值守时用）。
+# 规则管理审批门（补充拍板 #22）：WSL 侧 rule.add/rule.remove 经 bridge 受门；
+# 本脚本导出 LIGHTKEY_E2E_AUTO_APPROVE=rule 并经 WSLENV 向 interop 拉起的
+# Windows 进程传播。注意：Windows 守护实例由桌面应用持有、env 仅在其启动时
+# 读取——--auto-approve 模式要求桌面应用从带该 env 的会话启动（如 PowerShell：
+# $env:LIGHTKEY_E2E_AUTO_APPROVE='rule'; & LightKey），否则 rule add 会在桌面
+# 弹审批窗（交互模式本就如此）。
 # 用法：bash scripts/e2e_cross_subsystem.sh [lk-binary-path] [--auto-approve]
 #
 # 事实来源（均已 grep 核实，勿臆造）：
@@ -51,6 +57,11 @@ PROJ="$WORK/proj"
 trap 'rm -rf "$WORK"' EXIT
 export LIGHTKEY_HOME="$WORK"   # 本地侧数据目录仅作兜底；bridge 模式下端点来自 Windows 侧
 export LK_JSON=0
+# 规则管理审批门（补充拍板 #22）：E2E 自动批准（仅规则审批）；WSLENV 使
+# interop 拉起的 lk.exe 及其子进程继承该变量（守护实例若由桌面应用持有，
+# 见头部注释的启动要求）
+export LIGHTKEY_E2E_AUTO_APPROVE=rule
+export WSLENV="LIGHTKEY_E2E_AUTO_APPROVE${WSLENV:+:$WSLENV}"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -154,7 +165,7 @@ check "item add secret $KEY_NAME" 0 $?
 
 echo "== 5. authz.evaluate → 注入（channel=wsl-bridge）=="
 if [ "$AUTO" = 1 ]; then
-  echo "（--auto-approve 模式：rule add 第②层白名单命中，自动放行，无弹窗）"
+  echo "（--auto-approve 模式：规则门经 E2E 自动批准放行；要求 Windows 守护实例带 LIGHTKEY_E2E_AUTO_APPROVE=rule 启动，见脚本头注释）"
   # 显式 wsl://<发行版> 规范形：非交互环境下默认发行版解析必须拒绝
   # （cross-subsystem.md §7.4 回显确认），故用显式形态绕开确认而非跳过校验。
   # $PROJ 为 WSL 内路径（本脚本工作目录），规范形即 wsl://<distro><abs-path>。

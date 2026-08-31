@@ -14,8 +14,8 @@ use base64::Engine as _;
 use lk_core::audit::{AuditChannel, AuditLog, AuditResult, EventInput};
 use lk_core::audit_anchor::{AnchorCheck, CompositeAuditAnchor};
 use lk_core::authz::{
-    ApprovalChannel, ApprovalDecision, ApprovalRequest, AuthzGate, AuthzRequest, DenyReason,
-    LayerResult, LocalApprovalChannel, PendingApprovals,
+    ApprovalChannel, ApprovalDecision, ApprovalRequest, AuthzGate, AuthzRequest,
+    AutoApproveChannel, DenyReason, LayerResult, LocalApprovalChannel, PendingApprovals,
 };
 use lk_core::bus::LockReason;
 use lk_core::ipc::*;
@@ -37,6 +37,7 @@ use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 use self::authz::AuthzBegin;
 use self::disclosure::PendingDisclosure;
 use self::lifecycle::{install_shutdown_handlers, load_config};
+use self::rules::{PendingRuleChange, RuleBegin};
 
 /// 会话令牌文件名（0600；CLI 进程间传递，锁定即删除）。
 pub const SESSION_TOKEN_FILE: &str = "session.token";
@@ -120,6 +121,8 @@ pub struct Daemon {
     pending_authz: Mutex<HashMap<uuid::Uuid, PendingAuthz>>,
     /// 进行中的值披露审批（M2.9；request_id → 条目/方法/归因）。
     pending_disclosure: Mutex<HashMap<uuid::Uuid, PendingDisclosure>>,
+    /// 进行中的规则管理审批（补充拍板 #22；request_id → 操作/归因）。
+    pending_rule: Mutex<HashMap<uuid::Uuid, PendingRuleChange>>,
 }
 
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
@@ -137,8 +140,18 @@ struct PendingAuthz {
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 impl Daemon {
-    /// 启动（加载配置、装配总线/授权门/通知桥）。
+    /// 启动（加载配置、装配总线/授权门/通知桥）。规则 E2E 自动批准门按
+    /// 进程环境（daemon 启动时读一次）装配。
     pub fn start(dir: &Path) -> std::result::Result<Daemon, String> {
+        Daemon::start_with_rule_auto(dir, AutoApproveChannel::env_rule_enabled())
+    }
+
+    /// 装配入口（env 探测与装配分离；集成测试显式传门控，避免并行测试
+    /// 竞争进程环境变量）。
+    pub(crate) fn start_with_rule_auto(
+        dir: &Path,
+        rule_auto: bool,
+    ) -> std::result::Result<Daemon, String> {
         let dir = dir.to_path_buf();
         let audit = AuditLog::open(&dir).map_err(|e| e.to_string())?;
         let anchor = crate::audit_anchor::make_audit_anchor(&dir);
@@ -154,13 +167,30 @@ impl Daemon {
         // #72/#78 方案 A：`has_ui` 只数**桌面来源**订阅者——socket 订阅者
         // （任何持令牌进程可建立）不算「有界面」；审批挑战帧也只投给桌面
         // 订阅者（notifier），双重收紧第 3 层的信任前提。
-        let approval: Arc<dyn ApprovalChannel> = Arc::new(LocalApprovalChannel::new(
+        let local: Arc<dyn ApprovalChannel> = Arc::new(LocalApprovalChannel::new(
             Arc::clone(&approvals),
             Arc::clone(core.bus()),
             Box::new({
                 let push = Arc::clone(&push);
                 move || push.desktop_subscriber_count() > 0
             }),
+        ));
+        // 规则管理审批门（补充拍板 #22）：E2E 自动批准装饰器套本地通道外
+        // ——env 门开启时仅规则审批立即 Allowed（不碰 inject/披露审批）。
+        // release 二进制保留此路径是有意决策（E2E 测发布物本体）；启用即
+        // 打启动横幅，测试通道绝不静默。
+        if rule_auto {
+            eprintln!(
+                "lk daemon: 警告：E2E 自动批准通道已启用（{}=rule）——仅规则审批立即放行，\
+                 inject/披露审批不受影响；审计以 channel=auto-approve 留痕。\
+                 测试专用，勿在生产环境使用。",
+                AutoApproveChannel::ENV
+            );
+        }
+        let approval: Arc<dyn ApprovalChannel> = Arc::new(AutoApproveChannel::with_rule_enabled(
+            local,
+            Arc::clone(&approvals),
+            rule_auto,
         ));
         core.subscribe(Arc::new(Notifier::new(Arc::clone(&push))));
         let gate = AuthzGate::new(approval);
@@ -186,6 +216,7 @@ impl Daemon {
             gate,
             pending_authz: Mutex::new(HashMap::new()),
             pending_disclosure: Mutex::new(HashMap::new()),
+            pending_rule: Mutex::new(HashMap::new()),
         };
         // 启动自检：锚点 vs 链（截断检测，无需 K_audit），置 `anchor_ok`。
         daemon.anchor_selfcheck();
@@ -347,6 +378,24 @@ impl Daemon {
                 };
                 return resp;
             }
+            // 规则管理审批门（补充拍板 #22）：锁态先失败（session.invalid——
+            // 规则在加密库内）；desktop 直调豁免 / socket 审批门在 begin 内
+            // 分派（daemon/rules.rs）
+            if method == M_RULE_ADD || method == M_RULE_REMOVE {
+                if !self.rule_precheck(token.as_deref()) {
+                    return rpc_string(session_invalid(id));
+                }
+                let resp = match self.rule_begin(id.clone(), &method, params, peer) {
+                    RuleBegin::Final(resp) => resp,
+                    RuleBegin::Pending { request_id } => {
+                        let decision = self.shared.approvals.await_decision(request_id);
+                        let r = self.rule_finalize(id.clone(), request_id, decision);
+                        self.touch_activity();
+                        r
+                    }
+                };
+                return resp;
+            }
             // M2.9 值披露（`item.get` / `item.export`）：锁态先失败
             // （session.invalid，spec §3——读通道不做解锁一体化）；desktop
             // 直调受信豁免在 begin 内直返。
@@ -445,14 +494,10 @@ impl Daemon {
                     })
                 }
             }
-            M_RULE_ADD => self.require_session(id.clone(), token, |me| {
-                me.rule_add(id.clone(), params, &caller)
-            }),
+            // M_RULE_ADD / M_RULE_REMOVE = ApprovalDeferred 策略（补充拍板
+            // #22 规则管理审批门，见 dispatch 开头的策略分派与 daemon/rules.rs）
             M_RULE_LIST => self.require_session(id.clone(), token, |me| {
                 me.rule_list(id.clone(), params, &caller)
-            }),
-            M_RULE_REMOVE => self.require_session(id.clone(), token, |me| {
-                me.rule_remove(id.clone(), params, &caller)
             }),
             // authz.evaluate = ApprovalDeferred 策略（见 dispatch 开头的策略
             // 分派；此臂仅为表完整性兜底，正常不会到达）
@@ -652,7 +697,7 @@ pub(crate) mod authz;
 pub(crate) mod disclosure;
 mod items;
 pub(crate) mod lifecycle;
-mod rules;
+pub(crate) mod rules;
 mod session;
 mod sync_cmds;
 mod vault_cmds;

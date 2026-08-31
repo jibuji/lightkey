@@ -158,6 +158,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-a",
         command: "npm publish",
         keys: ["NPM_TOKEN", "GH_TOKEN"],
+        kind: "inject",
       });
     });
     await flushApproval();
@@ -191,6 +192,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-i",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+        kind: "inject",
       });
     });
     await flushApproval();
@@ -214,6 +216,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-j",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+        kind: "inject",
       });
     });
     await flushApproval();
@@ -237,6 +240,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-k",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+        kind: "inject",
       });
     });
     await flushApproval();
@@ -256,6 +260,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-a",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+        kind: "inject",
       });
     });
     await flushApproval();
@@ -285,6 +290,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-b",
         command: "git push",
         keys: ["GH_TOKEN"],
+        kind: "inject",
       });
     });
     await flushApproval();
@@ -315,6 +321,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-c",
         command: "aws s3 sync *",
         keys: ["AWS_ACCESS_KEY_ID"],
+        kind: "inject",
       });
     });
     await flushApproval();
@@ -340,6 +347,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-d",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+      kind: "inject",
       });
     });
     await flushApproval();
@@ -365,6 +373,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         command: "npm publish",
         keys: ["NPM_TOKEN"],
         needsUnlock: false,
+      kind: "inject",
       });
     });
     expect(document.body.querySelector(".approval-dialog")).toBeNull();
@@ -382,6 +391,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         command: "npm publish",
         keys: ["NPM_TOKEN"],
         needsUnlock: true,
+      kind: "inject",
       });
     });
     await flushApproval();
@@ -419,6 +429,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         command: "npm publish",
         keys: ["NPM_TOKEN"],
         needsUnlock: true,
+      kind: "inject",
       });
     });
     await flushApproval();
@@ -461,6 +472,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-f",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+      kind: "inject",
       });
     });
     await flushApproval();
@@ -478,6 +490,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-g",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+      kind: "inject",
       });
     });
     expect(document.body.querySelector(".approval-dialog")).toBeNull();
@@ -494,6 +507,7 @@ describe("approval 弹窗闭环（spec §6.5）", () => {
         projectDir: "/work/proj-h",
         command: "npm publish",
         keys: ["NPM_TOKEN"],
+      kind: "inject",
       });
     });
     await flushApproval();
@@ -725,5 +739,120 @@ describe("M2.9 值披露弹窗（kind=read/export；docs/value-disclosure.md §6
         b.textContent?.includes("允许并为此项目记住"),
       ),
     ).toBe(false);
+  });
+});
+
+describe("规则管理审批弹窗（kind=rule；补充拍板 #22 / issue #104）", () => {
+  it("rule.add 帧：命令框展示操作、keys Tag、无「记住」按钮（规则操作本身即持久动作）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-rule-add",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "rule.add publish",
+        keys: ["NPM_TOKEN", "GH_TOKEN"],
+        kind: "rule",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    // 命令框承载操作（无 $ 前缀——非 shell 命令）
+    expect(dialog.querySelector(".approval-cmd-box")!.textContent).toContain("rule.add publish");
+    expect(dialog.querySelector(".approval-cmd-box")!.textContent).not.toContain("$");
+    // 持久授权提示 + keys Tag
+    expect(dialog.textContent).toContain("持久");
+    expect(dialog.textContent).toContain("NPM_TOKEN");
+    expect(dialog.textContent).toContain("GH_TOKEN");
+    // 倒计时照常
+    expect(dialog.querySelector(".ring-num")).not.toBeNull();
+    // 无「允许并为此项目记住」（规则操作本身即持久动作，补充拍板 #22）
+    expect(
+      Array.from(dialog.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("允许并为此项目记住"),
+      ),
+    ).toBe(false);
+
+    // 允许本次 = approvalResult(allowed)；不追加 rule.add（与 read 的记住路径区分）
+    const allowBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许本次"),
+    )!;
+    act(() => {
+      allowBtn.click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(resultSpy).toHaveBeenCalledWith("req-rule-add", "allowed", "mock-challenge");
+    expect(ruleSpy).not.toHaveBeenCalled();
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+
+  it("rule.remove 帧：提示删除既有规则（撤销能力），展示操作", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-rule-remove",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "rule.remove publish",
+        keys: ["NPM_TOKEN"],
+        kind: "rule",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    expect(dialog.textContent).toContain("删除既有授权规则");
+    expect(dialog.querySelector(".approval-cmd-box")!.textContent).toContain("rule.remove publish");
+    // 拒绝照常可用
+    expect(
+      Array.from(dialog.querySelectorAll("button")).some((b) => b.textContent?.includes("拒绝")),
+    ).toBe(true);
+  });
+
+  it("未知 kind：防御性渲染——明确提示未知，不回退按 inject 渲染（无 $ 命令框）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-unknown-kind",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "telemetry.dump",
+        keys: ["NPM_TOKEN"],
+        // 协议演进：新版守护进程发来的未知 kind 字符串
+        kind: "telemetry" as unknown as "inject",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    // 明确提示未知类型（含原始 kind 值）与升级指引
+    expect(dialog.textContent).toContain("未知审批类型");
+    expect(dialog.textContent).toContain("telemetry");
+    // 不按 inject 渲染：不出现 $ 命令框（防御，规格 #102 故事 25）
+    expect(dialog.querySelector(".approval-cmd-box")).toBeNull();
+    // 拒绝/允许照常可用（不 crash；建议拒绝的文案在场）
+    expect(dialog.textContent).toContain("建议拒绝");
+    expect(
+      Array.from(dialog.querySelectorAll("button")).some((b) => b.textContent?.includes("拒绝")),
+    ).toBe(true);
+    // kind 缺失的畸形帧同样走防御分支
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-missing-kind",
+        starter: "zsh",
+        projectDir: "/work/proj-b",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+        kind: undefined,
+      });
+    });
+    await flushApproval();
+    const dialog2 = document.body.querySelectorAll(".approval-dialog");
+    expect(dialog2.length).toBeGreaterThan(0);
   });
 });

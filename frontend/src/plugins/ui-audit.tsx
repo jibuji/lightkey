@@ -23,6 +23,8 @@ const CHANNEL_LABEL: Record<AuditChannel, string> = {
   desktop: "桌面",
   approval: "审批",
   "wsl-bridge": "WSL 桥接",
+  // E2E 自动批准（补充拍板 #22）：测试通道，规则审批经 env 门立即放行
+  "auto-approve": "自动批准（E2E）",
 };
 
 const FILTERS: { value: "all" | AuditResult; label: string }[] = [

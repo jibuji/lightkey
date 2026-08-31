@@ -12,6 +12,8 @@
 - 新增 **M1.5 —— 插件化改造**，插入 M1 之后、M2 之前。
 - 新增 **M2.75 —— 跨子系统 stdio 桥**（补充拍板 #14），插入 M2.5 之后、M3 之前；
   完整规格见 [cross-subsystem.md](cross-subsystem.md)。
+- 新增 **M2.95 —— 规则管理审批门**（补充拍板 #22，issue #104），插入 M2.9
+  之后、M3 之前；规则建立/撤销升为桌面审批事件（authorization-gate.md §9）。
 - **M2 / M3 标签保持不变**：M2 = Agent 授权门 + 桌面端（在插件化骨架上），
   M3 = 浏览器填充（V1 之后）。此编号方案避免波及其它文档的 M2/M3 引用，
   并已落地（M1.5 独立里程碑已完成）。
@@ -207,6 +209,43 @@ headless 读值经 `rule add --read` 预授权（条目名改 env 安全名）�
 export 转为恒拒绝断言（附件往返由 lk-core/daemon 测试覆盖）。
 
 > 本里程碑为补充拍板 #20 新增（插入 M2.8 之后、M3 之前）。
+
+## M2.95 —— 规则管理审批门（rule.add / rule.remove 走桌面审批）（已完成）
+
+**目标**：issue #104，按补充拍板 #22 落地——socket/pipe 通道的 `rule.add` /
+`rule.remove` 从「仅验会话令牌」升为**桌面审批门**（对称原则：授权的建立与
+撤销都是授权事件），headless fail-closed，GUI desktop 直调豁免；配套 E2E
+自动批准通道与全路径审计。实现规格见 [authorization-gate.md](authorization-gate.md)
+§9（规则门判定矩阵、三阶段执行计划、TOCTOU 重校验、审计路径、E2E 适配）。
+
+范围：
+
+- lk-core：`ApprovalKind::Rule`（serde `"rule"`，加性变更不升协议版本）+ 单一
+  kind + command 字段承载操作（`rule.add <name>` / `rule.remove <name>`）；
+  `ApprovalChannel` 新增 `auto_approves` 默认假 + `AutoApproveChannel`
+  （env 门控装饰器，`LIGHTKEY_E2E_AUTO_APPROVE=rule` 仅对规则审批立即放行）；
+  审计 `AuditChannel::AutoApprove`（`channel=auto-approve`）。
+- lk-daemon：`strategy_of` 升 `rule.add` / `rule.remove` 为 ApprovalDeferred
+  （`rule.list` 维持 Inline）；`rule_begin`（参数校验/归一化 + id→规则解析
+  补全 + desktop 豁免 + fail-closed 登记/广播）→ 锁外等待 → `rule_finalize`
+  （**锁内 TOCTOU 重校验** vault 解锁态 + 规则存在性，失效拒绝落审计）；
+  失败路径审计（denied/timeout/no_ui/unknown starter）。
+- lk-cli：规则门拒绝（-32017）按命令上下文渲染「规则变更被授权门拒绝…」
+  （`rpc_fail_ctx`；机器契约 error 名不变）。
+- 前端：approval 插件 kind=rule 分支（命令框 + keys Tag + 30s 倒计时，无
+  「记住」按钮）+ **未知 kind 防御渲染**（不回退 inject）；events.ts kind
+  联合类型更新。
+- E2E：`e2e_m0/m1/m2/cross_subsystem.sh` 传 env 保持主流程（规则预插经
+  自动批准放行）；`e2e_m2.sh` 新增「无 env 时 headless rule add 被拒」
+  断言 + auto-approve 审计断言。
+
+**出口**：`cargo test` + vitest 全绿；M0/M1/M2/M2.75/M2.8/M2.9 E2E 回归 +
+规则门集成测试（tests/rule_gate.rs：desktop 豁免 / no_ui / 未知启动者 / 批准
+/ deny / 超时 / remove 门 / 锁态 session.invalid / 等待期锁定 / TOCTOU 竞争 /
+auto 通道）通过；clippy/fmt 全绿；文档同步（decisions #22、authorization-gate
+§9、milestones、audit.md）；**#104 关闭**。
+
+> 本里程碑为补充拍板 #22 新增（插入 M2.9 之后、M3 之前）。
 
 ## M3 —— 浏览器填充（V1 之后）
 
