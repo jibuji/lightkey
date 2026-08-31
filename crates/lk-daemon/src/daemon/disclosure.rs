@@ -261,7 +261,7 @@ impl Daemon {
     }
 }
 
-/// 统一「值披露拒绝」错误响应（`authz.denied` / -32015）。
+/// 统一「值披露拒绝」错误响应（`authz.denied` / -32017）。
 pub(crate) fn authz_denied(id: Value) -> RpcResponse {
     RpcResponse::err(id, ERR_AUTHZ_DENIED, MSG_AUTHZ_DENIED, None)
 }

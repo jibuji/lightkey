@@ -211,7 +211,7 @@ vitest（mock 适配器）。
    - desktop 直调 get/export → 直返值，不登记审批；
    - socket + 读规则命中 → 静默放行 + 审计 allowed；
    - socket 无规则 + 有桌面订阅 → allow/deny/timeout 三态 + 审计；
-   - socket 无规则 + 无桌面订阅 → `authz.denied`(-32015) + 审计；
+   - socket 无规则 + 无桌面订阅 → `authz.denied`(-32017) + 审计；
    - export：即使读规则命中也弹窗；无 UI → 拒绝；
    - starter 未知 → fail-closed 拒绝且不弹窗；
    - socket 提交 `approval.result` → `channel.forbidden`（#78 回归）；
