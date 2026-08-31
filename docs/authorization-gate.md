@@ -218,3 +218,80 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 - 已按规格落地（M2.9）：拒绝错误码实现为 `authz.denied`（-32017，spec
   §5.4 实现注记——-32014~-32016 已被 bridge 错误码占用）；读规则 CLI
   形态 `--read --keys`（spec §7 实现注记）；#65 已闭合。
+
+## 9. 规则管理审批门：`rule.add` / `rule.remove`（补充拍板 #22，已实现）
+
+> 对称原则：授权的建立（agent 给自己 `rule add --read` 持久授权 = 自我
+> 提权）与撤销（`rule remove` 删用户既有规则 = 拆墙）都是授权事件——
+> §8 的自然延伸。实现：`crates/lk-daemon/src/daemon/rules.rs` +
+> `router.rs strategy_of`。
+
+### 9.1 范围与判定矩阵
+
+| 通道 / 状态 | 行为 |
+|-------------|------|
+| GUI desktop 直调（设置页、读值弹窗「允许并记住」内部 ruleAdd） | 受信豁免，直执行（零摩擦） |
+| socket / pipe（CLI、bridge、外部 agent），解锁态 + 桌面 UI 在场 | 弹窗审批（30s 超时默认拒绝） |
+| socket / pipe，headless（无桌面订阅） | fail-closed 立即拒绝（-32017，不阻塞） |
+| 启动者未知（进程链回溯失败） | fail-closed 拒绝，不弹窗（与 inject 同口径） |
+| 锁定态 | `session.invalid` 先行（规则在加密库内；锁态一体化在 Out of Scope） |
+| `rule.list` | 维持令牌门（只读元数据，「值是边界」同口径，§8） |
+
+### 9.2 执行计划（ApprovalDeferred 三阶段，ADR-0001）
+
+- **begin（命令锁内，非阻塞）**：参数解析 + 字段校验 + projectDir 归一化/
+  canonicalize（与既有 Inline 语义一致，无效参数原错误直返）；remove 顺带
+  解析 id→规则补全 name/keys/projectDir（弹窗展示「拆了哪堵墙」）；desktop
+  直调豁免直执行；socket 走 fail-closed 检查后登记 `PendingApprovals`
+  （challenge 防伪 #78）+ 广播 `authz.request`。
+- **锁外等待**（≤30s 超时默认拒绝，G1：不持命令锁）。
+- **finalize（重取命令锁）**：**TOCTOU 锁内重校验**——等待窗内规则库可能
+  被并发审批落盘或同步轮次改变，vault 解锁态与（remove 的）规则存在性
+  （按**未删除**口径——`get_rule` 含墓碑、幂等 delete 会静默成功）失效则
+  拒绝并落审计；通过则落盘（`put_rule` / `delete_rule`，`item.changed
+  (kind="rule")` 广播照旧）+ 审计。
+
+### 9.3 协议与错误码
+
+- `ApprovalKind` 新增 `Rule`（serde `"rule"`，加性变更不升协议版本）；
+  **单一 kind + command 字段承载操作**：`rule.add <name>` /
+  `rule.remove <name>`；`keys` = 规则 keys；`projectDir` = 规则项目目录；
+  `needs_unlock` 恒 false。
+- 拒绝统一复用 **-32017 `authz.denied`**（协议零新增）；CLI 按命令上下文
+  渲染「规则变更被授权门拒绝（需桌面审批…）」，与值披露文案区分（同码
+  不同命令语境，`--json` 机器契约 error 名不变）。
+
+### 9.4 审计（全路径；现状仅成功路径写）
+
+| 路径 | 审计 |
+|------|------|
+| desktop 豁免执行 | command=`rule.add <name>` / `rule.remove <id>`，channel=desktop（现状） |
+| 弹窗批准 | 同 command，channel=approval，Allowed |
+| 弹窗拒绝 / 超时 | 同 command，channel=approval，Denied / Timeout |
+| 无 UI / 启动者未知 | 同 command，socket 归因（cli / wsl-bridge），Denied |
+| E2E 自动批准 | channel=auto-approve，command 附 `[auto-approve <requestId>]`（含规则内容，绝不静默） |
+
+锁定后（K_audit 擦除）无法签名 → 跳过审计（与授权路径同口径）。
+
+### 9.5 E2E 自动批准通道（AutoApproveChannel）
+
+- `ApprovalChannel` 的 env 门控装饰器：daemon **启动时**读一次
+  `LIGHTKEY_E2E_AUTO_APPROVE=rule`，仅对 `ApprovalKind::Rule` 立即 Allowed
+  （登记后即刻 resolve，**不广播** `authz.request`——无 UI 参与）；
+  `available()` 语义原样透传内层，**inject/披露审批不受影响**（headless
+  照旧立即拒绝，不等待）。
+- 启用即打 daemon 启动日志横幅；放行留 channel=auto-approve 审计。
+- **release 二进制保留此路径是有意决策**（E2E 测发布物本体；编译期
+  feature/cfg 门为被否选项）。攻击面：env 仅启动时读取，攻击者自带该变量
+  拉起的新 daemon 库是锁的、`rule.add` 仍过会话门，无权限增益。
+
+### 9.6 测试
+
+- daemon 集成（`lk-daemon/src/tests/rule_gate.rs`）：desktop 豁免 / no_ui
+  拒绝 / 未知启动者 / pending→批准→落规则 / deny / 超时 / remove 弹窗展示
+  解析规则 / 锁态 session.invalid / 等待期锁定 / TOCTOU 竞争 / auto 通道
+  （进程内驱动 `LocalApprovalChannel` 模拟桌面订阅）。
+- shell E2E：`e2e_m2.sh` 传 env 主流程 + 「无 env 时 headless rule add
+  被拒」（独立数据目录另起无 env 守护）+ auto-approve 审计断言；
+  `e2e_m0/m1` 传 env（主流程含 rule add 预插）；`e2e_cross_subsystem.sh`
+  传 env + WSLENV（Windows 守护实例由桌面应用持有，见脚本头注释）。

@@ -123,6 +123,16 @@
   拒绝 = `authz.denied`（**-32017**，spec 原定 -32015 被 bridge 码占用）。
   实现规格 `docs/value-disclosure.md`（唯一出处；实现注记：read 规则 CLI
   形态 `--read --keys <name...>`）；#65 已关闭
+- [x] M2.95 规则管理审批门（补充拍板 #22，issue #104）：socket/pipe 的
+  `rule.add` / `rule.remove` 升为桌面审批门——对称原则（建立/撤销授权都是
+  授权事件）；desktop 直调豁免、headless fail-closed（复用 -32017）、锁态
+  `session.invalid` 先行；`ApprovalKind::Rule`（serde `"rule"`，单一 kind +
+  command 承载操作，remove 由 daemon 补全 name/keys/projectDir 供弹窗）；
+  ApprovalDeferred 三阶段 + **finalize 锁内 TOCTOU 重校验**；审计全路径
+  （失败路径新增）+ `channel=auto-approve`（E2E 自动批准，env 门控
+  `LIGHTKEY_E2E_AUTO_APPROVE=rule`，release 保留是有意决策，启动横幅）；
+  CLI 规则门语境文案；前端 kind=rule 分支 + 未知 kind 防御渲染。见
+  `docs/authorization-gate.md` §9 与 `docs/decisions.md` #22
 - [ ] M3 浏览器填充
 
 ## Agent skills

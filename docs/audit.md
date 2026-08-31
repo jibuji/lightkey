@@ -23,7 +23,7 @@
   "target": "<目标程序>",             // 例如 npm、node、python3
   "command": "<命令摘要>",            // 命令摘要——见「摘要原则」
   "result": "allowed | denied | timeout",
-  "channel": "cli | desktop | approval | wsl-bridge",   // 来源通道（wsl-bridge = WSL 内客户端经 interop stdio 桥，补充拍板 #14，见 [cross-subsystem.md](cross-subsystem.md) §7.5）
+  "channel": "cli | desktop | approval | wsl-bridge | auto-approve",   // 来源通道（wsl-bridge = WSL 内客户端经 interop stdio 桥，补充拍板 #14，见 [cross-subsystem.md](cross-subsystem.md) §7.5；auto-approve = E2E 自动批准通道，仅规则审批、command 附 requestId，补充拍板 #22）
   "hmac": "<base64, HMAC-SHA256(K_audit, 事件规范化字节)>"
 }
 ```

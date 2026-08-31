@@ -22,14 +22,14 @@
 | [adr/](adr/) | 架构决策记录（ADR；0001 daemon RPC 单一执行计划路由） | M2 |
 | [architecture.md](architecture.md) | 总体架构、组件边界、技术栈、workspace | 全部 |
 | [plugin-architecture.md](plugin-architecture.md) | 插件化架构（四层插件边界、事件总线、装配机制；M1.5 落地层） | M1.5 |
-| [milestones.md](milestones.md) | M0–M3 里程碑范围与验收（含 M1.5 / M2.5 / M2.75） | 全部 |
+| [milestones.md](milestones.md) | M0–M3 里程碑范围与验收（含 M1.5 / M2.5 / M2.75 / M2.95） | 全部 |
 | [crypto.md](crypto.md) | 加密原语、KDF、密钥分叉、自描述密文格式 | M0 |
 | [data-model.md](data-model.md) | 条目/附件/索引/墓碑、CAS、schema | M0 |
 | [ipc.md](ipc.md) | 本地 IPC、守护进程、会话令牌 | M0 |
 | [audit.md](audit.md) | 审计日志格式、HMAC 防篡改、保留策略 | M0 |
 | [recovery.md](recovery.md) | 恢复码、恢复信封、已信任设备宽限 | M0 |
 | [sync.md](sync.md) | BYO 同步、变更发现（轮询）、冲突收敛 | M1 |
-| [authorization-gate.md](authorization-gate.md) | Agent 授权门三层模型、规则库、`lk inject` | M2 |
+| [authorization-gate.md](authorization-gate.md) | Agent 授权门三层模型、规则库、`lk inject`、规则管理审批门（§9，补充拍板 #22） | M2 / M2.95 |
 | [value-disclosure.md](value-disclosure.md) | 值披露裁决：`item.get`/`item.export` 升为裁决方法、读规则（补充拍板 #20，issue #65） | M2.9 |
 | [cross-subsystem.md](cross-subsystem.md) | 跨子系统 stdio 桥（WSL CLI ↔ Windows 桌面守护实例；补充拍板 #14） | M2.75 |
 | [testing-cross-subsystem.md](testing-cross-subsystem.md) | 跨子系统桥测试 Runbook：下载哪些 Release 产物、安装步骤、E2E/手动测试与排障 | M2.75 |
