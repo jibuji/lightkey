@@ -22,7 +22,7 @@ members = ["crates/lk-core", "crates/lk-daemon", "crates/lk-cli", "crates/lk-app
 default-members = ["crates/lk-core", "crates/lk-daemon", "crates/lk-cli"]
 
 [workspace.package]
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 rust-version = "1.94"
 license = "MIT"
