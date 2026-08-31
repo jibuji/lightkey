@@ -134,7 +134,8 @@ fn socket_get_with_matching_read_rule_allowed_silently() {
                     "command": "", "capability": "read", "keys": ["APIKey"],
                     "channel": "cli" }),
         ),
-        &PeerInfo::unknown(),
+        // 读规则预插走 desktop 直调豁免（补充拍板 #22）
+        &PeerInfo::desktop(),
     );
     let item_id = {
         let resp = state.lock().unwrap().handle(
@@ -340,7 +341,7 @@ fn socket_export_always_prompts_even_with_read_rule() {
                     "command": "", "capability": "read", "keys": ["report.bin"],
                     "channel": "cli" }),
         ),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     );
     let file_id = put_file_item(&state, &token, "report.bin", b"payload");
     let handler = make_handler(&state, &shared);
@@ -617,7 +618,7 @@ fn socket_get_matches_wsl_read_rule() {
                     "command": "", "capability": "read", "keys": ["WSLKEY"],
                     "channel": "cli" }),
         ),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     );
     let item_id = {
         let resp = state.lock().unwrap().handle(

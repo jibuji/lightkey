@@ -11,6 +11,8 @@ fn rule_add_stores_normalized_project_dir() {
     let dir = tempfile::tempdir().unwrap();
     let proj = tempfile::tempdir().unwrap();
     let (state, _shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    // desktop 直调豁免（补充拍板 #22：socket 通道 rule.add 走审批门；
+    // 本用例测存储归一化形态，不测门）
     let add = rpc_result(&state.lock().unwrap().handle(
         &rpc_line(
             M_RULE_ADD,
@@ -18,7 +20,7 @@ fn rule_add_stores_normalized_project_dir() {
             json!({ "projectDir": proj.path(), "name": "p",
                     "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "cli" }),
         ),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     ));
     let stored = add["rule"]["projectDir"]
         .as_str()
@@ -61,7 +63,9 @@ fn rule_crud_audits_and_broadcasts() {
             json!({ "projectDir": proj.path(), "name": "pub",
                     "command": "npm publish", "keys": ["NPM_TOKEN"], "channel": "desktop" }),
         ),
-        &PeerInfo::unknown(),
+        // desktop 直调豁免（补充拍板 #22；socket 通道的规则门覆盖见
+        // tests/rule_gate.rs）
+        &PeerInfo::desktop(),
     );
     let v: Value = serde_json::from_str(&add).unwrap();
     let rule = &v["result"]["rule"];
@@ -93,7 +97,7 @@ fn rule_crud_audits_and_broadcasts() {
     // remove → 广播 deleted=true
     state.lock().unwrap().handle(
         &rpc_line(M_RULE_REMOVE, Some(&token), json!({ "id": id })),
-        &PeerInfo::unknown(),
+        &PeerInfo::desktop(),
     );
     let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();
@@ -129,10 +133,12 @@ fn rule_crud_audits_and_broadcasts() {
 fn rule_add_rejects_invalid_fields() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _shared, token) = m2_daemon(dir.path(), None);
+    // desktop 直调豁免下的校验路径（补充拍板 #22：字段校验先于通道判定，
+    // socket 通道同样先报 invalid params）
     let handle = |params: Value| -> Value {
         let resp = state.lock().unwrap().handle(
             &rpc_line(M_RULE_ADD, Some(&token), params),
-            &PeerInfo::unknown(),
+            &PeerInfo::desktop(),
         );
         serde_json::from_str(&resp).unwrap()
     };
@@ -179,7 +185,8 @@ fn rule_add_and_authz_normalize_wsl_namespace() {
             json!({ "projectDir": r"\\wsl.localhost\Debian\home\u\p", "name": "wsl",
                     "command": "npm *", "keys": ["NPM_TOKEN"], "channel": "wsl-bridge" }),
         ),
-        &PeerInfo::unknown(),
+        // desktop 直调豁免（补充拍板 #22）；channel=wsl-bridge 标注照旧入审计
+        &PeerInfo::desktop(),
     );
     let add = rpc_result(&raw);
     assert_eq!(

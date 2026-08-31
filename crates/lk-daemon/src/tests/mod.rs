@@ -99,11 +99,21 @@ fn m2_daemon(
     dir: &std::path::Path,
     secret: Option<(&str, &str)>,
 ) -> (Arc<Mutex<Daemon>>, Arc<SharedDaemon>, String) {
+    m2_daemon_with(dir, secret, false)
+}
+
+/// [`m2_daemon`] 的装配变体：显式指定规则 E2E 自动批准门（补充拍板 #22；
+/// 生产经 `Daemon::start` 读 env 一次，测试显式传值避免并行竞争）。
+fn m2_daemon_with(
+    dir: &std::path::Path,
+    secret: Option<(&str, &str)>,
+    rule_auto: bool,
+) -> (Arc<Mutex<Daemon>>, Arc<SharedDaemon>, String) {
     {
         let mut audit = AuditLog::open(dir).unwrap();
         init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
     }
-    let mut daemon = Daemon::start(dir).unwrap();
+    let mut daemon = Daemon::start_with_rule_auto(dir, rule_auto).unwrap();
     // 审批窗口维持生产默认 30s（#92）：需要审批回传落地的测试不再与
     // 真实时钟赛跑（并行满载下测试线程从收到帧到提交回传可被调度延迟
     // 挤出 1s 窗口）；只测超时边界的测试在本测试内显式调小（秒级等待
@@ -167,6 +177,7 @@ mod audit_anchor;
 mod audit_attribution;
 mod authz;
 mod disclosure;
+mod rule_gate;
 mod rules;
 mod session_token;
 mod sync_race;
