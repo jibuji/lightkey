@@ -189,9 +189,10 @@ fn authz_evaluate_deferred(
 }
 
 /// 值披露编排（`item.get` / `item.export`，M2.9）：同一三阶段骨架——
-/// ①命令锁内 `disclosure_begin`（会话预检 + 条目解析 + 通道判定：desktop
-/// 直调受信豁免直返；socket 走读规则匹配 → 命中静默放行，未命中弹窗/拒绝）
-/// → ②命令锁外等待决策 → ③重取命令锁收尾（披露值/数据包 + 审计）。
+/// ①命令锁内 `disclosure_begin`（预检分流 + 条目解析 + 通道判定：desktop
+/// 直调受信豁免直返；socket 走读规则匹配 → 命中静默放行，未命中弹窗/拒绝；
+/// **锁态 + 桌面 UI 在场 → 一体化解锁弹窗**，补充拍板 #23，读通道锁态
+/// 必弹窗）→ ②命令锁外等待决策 → ③重取命令锁收尾（披露值/数据包 + 审计）。
 fn disclosure_deferred(
     state: &Arc<Mutex<Daemon>>,
     shared: &Arc<SharedDaemon>,
@@ -200,8 +201,9 @@ fn disclosure_deferred(
 ) -> String {
     let id = req.id.clone();
     let token = extract_token(&req.params);
-    // ① 命令锁内：锁态先失败（session.invalid，spec §3——读通道不做 #67
-    // 式一体化，§12）
+    // ① 命令锁内：解锁态验令牌；锁态 + 已初始化 + 桌面 UI 在场 → 放行至
+    // disclosure_begin 一体化弹窗（headless / 未初始化库 fail-closed
+    // session.invalid，补充拍板 #23）
     let begin = {
         let mut guard = state.lock().expect("daemon mutex poisoned");
         guard.auto_lock_if_idle();

@@ -396,8 +396,9 @@ impl Daemon {
                 };
                 return resp;
             }
-            // M2.9 值披露（`item.get` / `item.export`）：锁态先失败
-            // （session.invalid，spec §3——读通道不做解锁一体化）；desktop
+            // M2.9 值披露（`item.get` / `item.export`）：锁态 + 桌面 UI 在场
+            // → 一体化解锁弹窗（补充拍板 #23，disclosure_precheck 分流）；
+            // headless / 未初始化库 → fail-closed session.invalid。desktop
             // 直调受信豁免在 begin 内直返。
             if !self.disclosure_precheck(token.as_deref()) {
                 return rpc_string(session_invalid(id));
@@ -525,20 +526,15 @@ impl Daemon {
         }
     }
 
-    /// `approval.result` 是否命中锁定态一体化待审条目（#67）：params 里
-    /// 的 request_id 对应一个带 `needs_unlock` 的 pending → 是。锁态无
-    /// 会话令牌，桌面来源 + 一次性 challenge 已是双重绑定，故这类回传
-    /// 跳过 `require_session`（dispatch 用）。
+    /// `approval.result` 是否命中锁定态一体化待审条目（#67 inject /
+    /// #23 读通道）：params 里的 request_id 对应一个带 `needs_unlock` 的
+    /// pending → 是。锁态无会话令牌，桌面来源 + 一次性 challenge 已是双重
+    /// 绑定，故这类回传跳过 `require_session`（dispatch 用；判定查
+    /// pending_authz 与 pending_disclosure 两张表，daemon/session.rs）。
     fn approval_needs_unlock(&self, params: &Value) -> bool {
         serde_json::from_value::<ApprovalResultParams>(params.clone())
             .ok()
-            .and_then(|p| {
-                self.pending_authz
-                    .lock()
-                    .unwrap()
-                    .get(&p.request_id)
-                    .map(|e| e.needs_unlock)
-            })
+            .map(|p| self.pending_needs_unlock(p.request_id))
             .unwrap_or(false)
     }
 

@@ -570,8 +570,9 @@ fn disclosure_allowed_but_locked_during_wait_returns_session_invalid() {
     );
 }
 
-/// 锁定态读值 → `session.invalid`（spec §3：require_session 先失败；
-/// 本项不做读通道的解锁一体化，spec §12）。
+/// 锁定态 + 无桌面订阅（纯 headless）读值 → `session.invalid`（补充拍板
+/// #23：一体化解锁弹窗只在**桌面 UI 在场**时提供；headless 维持 fail-closed，
+/// 与 spec §3 原始语义一致——有 UI 的锁态一体化路径见下方 #23 用例组）。
 #[test]
 fn disclosure_locked_vault_session_invalid() {
     let dir = tempfile::tempdir().unwrap();
@@ -592,6 +593,7 @@ fn disclosure_locked_vault_session_invalid() {
         &rpc_line(M_VAULT_LOCK, Some(&token), json!({})),
         &PeerInfo::desktop(),
     );
+    // 无桌面订阅（headless）→ session.invalid（#23 维持 fail-closed）
     let handler = make_handler(&state, &_shared);
     let resp = handler(
         &rpc_line(M_ITEM_GET, Some(&token), json!({ "id": item_id })),
@@ -600,8 +602,475 @@ fn disclosure_locked_vault_session_invalid() {
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(
         v["error"]["code"], ERR_SESSION_INVALID,
-        "锁定态 session.invalid：{resp}"
+        "锁定态 headless session.invalid：{resp}"
     );
+}
+
+// -------------------------------------------------------------------------
+// #23 读通道一体化解锁（锁定态 + 桌面 UI 在场 → 主密码 + 解锁并允许窗；
+// issue #105 / docs/decisions.md #23）
+// -------------------------------------------------------------------------
+
+/// 锁态夹具中按名称取条目 id：临时解锁 → list → 锁回（夹具语义；锁态下
+/// 无法读加密索引）。断言回到锁态。
+fn locked_item_id(state: &Arc<Mutex<Daemon>>, name: &str) -> String {
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::unknown(),
+    );
+    let token = rpc_result(&resp)["token"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(M_ITEM_LIST, Some(&token), json!({})),
+        &PeerInfo::unknown(),
+    );
+    let items = rpc_result(&resp)["items"].as_array().unwrap().clone();
+    let id = items.iter().find(|i| i["name"] == name).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    state.lock().unwrap().handle(
+        &rpc_line(M_VAULT_LOCK, Some(&token), json!({})),
+        &PeerInfo::unknown(),
+    );
+    id
+}
+
+/// 锁态两种子的 dominant flow helper：往锁态库种一个条目（临时解锁 →
+/// 种 → 锁回），返回条目 id。
+fn locked_seed_item(state: &Arc<Mutex<Daemon>>, item: Value) -> String {
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::unknown(),
+    );
+    let token = rpc_result(&resp)["token"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(M_ITEM_PUT, Some(&token), item),
+        &PeerInfo::unknown(),
+    );
+    let id = rpc_result(&resp)["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    state.lock().unwrap().handle(
+        &rpc_line(M_VAULT_LOCK, Some(&token), json!({})),
+        &PeerInfo::unknown(),
+    );
+    id
+}
+
+/// 锁态 get 全流程：登记 Pending{needs_unlock:true} + 广播 authz.request
+/// (needsUnlock=true, kind=read) → approval.result(allowed + masterPassword)
+/// → 临时解锁 → 在临时 vault 披露值 + 审计；**临时 vault 无痕**（shared
+/// vault 仍锁定、session.token 不存在、vault.status 仍 locked）——即
+/// #23「单次披露即毁」+ #65 边界。
+#[test]
+fn locked_disclosure_get_unified_unlock_returns_value_trace_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon(dir.path(), Some(("APIKey", "sk-1")), None);
+    // 锁态自检：vault 未解锁、令牌文件不存在
+    assert!(!shared.vault.read().unwrap().is_some());
+    assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
+
+    // 锁态下取条目 id（临时解锁 → list → 锁回，夹具语义）
+    let item_id = locked_item_id(&state, "APIKey");
+    assert!(!shared.vault.read().unwrap().is_some(), "夹具应回到锁态");
+
+    // 桌面订阅在场 → has_ui=true
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let audit_before = audit_events(dir.path()).len();
+    // 线程内发起 get（锁态、无 token——一体化流程应放行到审批等待）
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(M_ITEM_GET, None, json!({ "id": item_id }));
+    let h = {
+        let handler = handler.clone();
+        let peer = peer.clone();
+        std::thread::spawn(move || handler(&line, &peer))
+    };
+    // 广播帧：kind=read + needsUnlock=true + command=item.get
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(fv["method"], "authz.request");
+    assert_eq!(fv["params"]["kind"], "read", "读通道一体化帧 kind=read");
+    assert_eq!(
+        fv["params"]["needsUnlock"], true,
+        "锁态读帧必须标注 needsUnlock：{frame}"
+    );
+    assert_eq!(fv["params"]["command"], "item.get");
+    assert!(!frame.contains("sk-1"), "审批帧不含值");
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    // 审批回传：desktop + allowed + masterPassword（锁态无会话令牌，跳过
+    // require_session 由 needs_unlock 待审保证）
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["result"]["accepted"],
+        true
+    );
+    // get 返回放行 + 值
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["value"], "sk-1", "锁态一体化应放行：{resp}");
+    // 关键约束（#23/#65）：临时 vault 即用即毁——无 session.token、
+    // shared vault 仍锁定、vault.status 仍 locked
+    assert!(
+        shared.vault.read().unwrap().is_none(),
+        "临时解锁不得改写共享 vault（须保持锁定）"
+    );
+    assert!(
+        !dir.path().join(crate::SESSION_TOKEN_FILE).exists(),
+        "临时解锁不得写 session.token"
+    );
+    let status = state.lock().unwrap().handle(
+        &rpc_line(M_VAULT_STATUS, None, json!({})),
+        &PeerInfo::unknown(),
+    );
+    let sv: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(sv["result"]["unlocked"], false, "vault.status 仍 locked");
+    assert_eq!(sv["result"]["initialized"], true);
+    // 审计两条：#23 —— vault.unlock(desktop) + item.get(allowed, approval,
+    // target=条目名——finalize 在临时 vault 上解析)
+    let flow_events = &audit_events(dir.path())[audit_before..];
+    let unlock_evs: Vec<_> = flow_events
+        .iter()
+        .filter(|e| e.command == "vault.unlock")
+        .collect();
+    assert_eq!(unlock_evs.len(), 1, "解锁事件须留痕");
+    assert_eq!(unlock_evs[0].channel, lk_core::audit::AuditChannel::Desktop);
+    let get_evs: Vec<_> = flow_events
+        .iter()
+        .filter(|e| e.command == "item.get")
+        .collect();
+    assert_eq!(get_evs.len(), 1);
+    assert_eq!(get_evs[0].result, lk_core::audit::AuditResult::Allowed);
+    assert_eq!(get_evs[0].channel, lk_core::audit::AuditChannel::Approval);
+    assert_eq!(get_evs[0].target, "APIKey");
+}
+
+/// 锁态 export 全流程：与 get 同机制（#23 范围：get/export 都做）——
+/// kind=export 一体化帧 → 解锁 + 允许 → 返回数据包；临时 vault 无痕。
+#[test]
+fn locked_disclosure_export_unified_unlock_returns_bundle() {
+    use base64::Engine as _;
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    // 锁态库种 file 条目（临时解锁 → 种 → 锁回；夹具语义）
+    let file_id = {
+        let (state, _shared) = locked_daemon(dir.path(), None, None);
+        locked_seed_item(
+            &state,
+            json!({ "item": {
+                "type": "file", "name": "report.bin", "note": "",
+                "fileType": "application/octet-stream", "attachment": "report.bin",
+                "fileData": base64::engine::general_purpose::STANDARD
+                    .encode(b"payload-bytes"),
+            } }),
+        )
+    };
+    let (state, shared) = {
+        // 复用同一数据目录的新守护实例（锁定态）
+        let daemon = Daemon::start(dir.path()).unwrap();
+        let shared = daemon.shared();
+        let state = Arc::new(std::sync::Mutex::new(daemon));
+        (state, shared)
+    };
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(M_ITEM_EXPORT, None, json!({ "id": file_id }));
+    let h = {
+        let handler = handler.clone();
+        let peer = peer.clone();
+        std::thread::spawn(move || handler(&line, &peer))
+    };
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(fv["method"], "authz.request");
+    assert_eq!(fv["params"]["kind"], "export");
+    assert_eq!(fv["params"]["needsUnlock"], true);
+    assert_eq!(fv["params"]["command"], "item.export");
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["result"]["accepted"],
+        true
+    );
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["name"], "report.bin");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(v["result"]["data"].as_str().unwrap())
+            .unwrap(),
+        b"payload-bytes"
+    );
+    // 临时 vault 无痕
+    assert!(!shared.vault.read().unwrap().is_some());
+    assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
+}
+
+/// 锁态必弹窗：即使该条目已有 read 规则命中（capability=read、projectDir/
+/// keys 匹配）也必弹一体化窗——规则在加密库内无法预载（与 #67 inject 同款
+/// 妥协，补充拍板 #23）。批准后放行。
+#[test]
+fn locked_disclosure_with_matching_read_rule_still_prompts() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon(
+        dir.path(),
+        Some(("APIKey", "sk-1")),
+        Some((proj.path(), "APIKey")),
+    );
+    // 锁态下取条目 id（临时解锁 → list → 锁回，夹具语义）
+    let item_id = locked_item_id(&state, "APIKey");
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(M_ITEM_GET, None, json!({ "id": item_id }));
+    let h = {
+        let handler = handler.clone();
+        let peer = peer.clone();
+        std::thread::spawn(move || handler(&line, &peer))
+    };
+    // 锁态 read 规则命中仍必弹窗：needsUnlock=true 一体化帧，不是静默放行
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(fv["method"], "authz.request");
+    assert_eq!(fv["params"]["kind"], "read");
+    assert_eq!(fv["params"]["needsUnlock"], true);
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["result"]["accepted"],
+        true
+    );
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["value"], "sk-1");
+}
+
+/// 密码错重试：错误主密码 → `vault.invalid` 统一文案（防探测）+ 条目保留
+/// （弹窗可重试）→ 正确密码 → 放行；期间 vault 保持锁定、无令牌。
+#[test]
+fn locked_disclosure_wrong_password_keeps_pending_then_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon(dir.path(), Some(("APIKey", "sk-1")), None);
+    let item_id = locked_item_id(&state, "APIKey");
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(M_ITEM_GET, None, json!({ "id": item_id }));
+    let h = {
+        let handler = handler.clone();
+        let peer = peer.clone();
+        std::thread::spawn(move || handler(&line, &peer))
+    };
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+
+    // 错误主密码：vault.invalid 统一文案（不区分原因防探测）、条目未消费
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "WRONG-PW" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["code"], ERR_VAULT_INVALID, "{resp}");
+    assert_eq!(v["error"]["message"], MSG_VAULT_INVALID);
+    assert_eq!(shared.approvals.pending_count(), 1, "错误密码不得消费条目");
+
+    // 弹窗内重试：正确密码 → 放行
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["result"]["accepted"],
+        true
+    );
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["value"], "sk-1", "重试成功应放行：{resp}");
+    assert!(!shared.vault.read().unwrap().is_some());
+    assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
+}
+
+/// 等待期整库被解锁 → finalize 走**常态路径**（共享 vault 披露 + 共享
+/// K_audit 审计）：用户绕开弹窗直接解锁（GUI 解锁页）后放行照常成功。
+#[test]
+fn locked_disclosure_unlocked_during_wait_finalize_normal_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon(dir.path(), Some(("APIKey", "sk-1")), None);
+    let item_id = locked_item_id(&state, "APIKey");
+    assert!(!shared.vault.read().unwrap().is_some());
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(M_ITEM_GET, None, json!({ "id": item_id }));
+    let h = {
+        let handler = handler.clone();
+        let peer = peer.clone();
+        std::thread::spawn(move || handler(&line, &peer))
+    };
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+
+    // 等待期间整库被解锁（GUI 解锁页路径：命令行锁 handle 等价）
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::unknown(),
+    );
+    assert!(rpc_result(&resp)["token"].as_str().is_some(), "{resp}");
+    assert!(shared.vault.read().unwrap().is_some(), "整库已被解锁");
+
+    // 弹窗允许（带主密码；临时 unlock 冗余但无害）→ finalize 走常态路径
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["result"]["accepted"],
+        true
+    );
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["value"], "sk-1", "常态路径放行：{resp}");
+    // 整库确实保持解锁（finalize 走常态路径后不额外锁定）
+    assert!(shared.vault.read().unwrap().is_some());
+}
+
+/// 未初始化的库（initialized=false）+ 有桌面 UI：锁态不弹解锁窗、维持
+/// fail-closed（补充拍板 #23——空库无从解锁，一体化解锁无意义）。
+#[test]
+fn uninitialized_locked_disclosure_fail_closed_even_with_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).unwrap();
+    let shared = daemon.shared();
+    // 桌面订阅在场（UI 就绪）
+    let (_sid, _rx) = shared.push.subscribe(true);
+    let state = Arc::new(std::sync::Mutex::new(daemon));
+    // 库未初始化；locked（vault=None）
+    assert!(!shared.vault.read().unwrap().is_some());
+    let handler = make_handler(&state, &shared);
+    let resp = handler(
+        &rpc_line(M_ITEM_GET, None, json!({ "id": uuid::Uuid::new_v4() })),
+        &test_peer(None),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["error"]["code"], ERR_SESSION_INVALID,
+        "未初始化库锁态 fail-closed session.invalid：{resp}"
+    );
+    assert_eq!(shared.approvals.pending_count(), 0, "不弹窗、不登记");
+}
+
+/// 锁态一体化拒绝：denied（无需主密码）→ authz.denied + 不解锁 + 无审计
+/// （锁态无 K_audit，拒绝不留内容，与 #67 注入拒绝同口径）。
+#[test]
+fn locked_disclosure_denied_fails_closed_without_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared) = locked_daemon(dir.path(), Some(("APIKey", "sk-1")), None);
+    let item_id = locked_item_id(&state, "APIKey");
+    let audit_before = audit_events(dir.path()).len();
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(M_ITEM_GET, None, json!({ "id": item_id }));
+    let h = {
+        let handler = handler.clone();
+        let peer = peer.clone();
+        std::thread::spawn(move || handler(&line, &peer))
+    };
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "denied", "challenge": challenge }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["result"]["accepted"],
+        true
+    );
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["error"]["code"], ERR_AUTHZ_DENIED,
+        "拒绝→authz.denied：{resp}"
+    );
+    assert!(!shared.vault.read().unwrap().is_some(), "拒绝不触发解锁");
+    assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
+    let flow_events = &audit_events(dir.path())[audit_before..];
+    assert!(
+        !flow_events.iter().any(|e| e.command == "vault.unlock"),
+        "拒绝不得产生解锁事件"
+    );
+    assert!(!flow_events.iter().any(|e| e.command == "item.get"));
 }
 
 /// WSL 跨子系统（spec §9）：`wsl://` 规范形读规则 + bridge 侧归一化 cwd

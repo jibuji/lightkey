@@ -92,23 +92,28 @@
   （`vault.exists`）错误码不同，但 UI 层统一文案不区分（防探测语义同
   §3 的 `session.invalid`）；`vault.recover` 的新主密码同策略。
 
-### 4.1 锁定态一体化审批（#67，补充拍板 #19）
+### 4.1 锁定态一体化审批（#67 注入 / #23 读通道，补充拍板 #19/#23）
 
 - **锁定态解除 + 本次授权一次交互**：库锁定 + 桌面审批界面在场时，锁态
-  `authz.evaluate` 广播 `authz.request`（帧带 `needsUnlock=true`）→ 桌面弹窗
-  同时收集主密码（身份确认）与 Allow/Deny（行为授权）；headless →
-  fail-closed `session.invalid`。详见 [authorization-gate.md](authorization-gate.md) §5.1。
+  `authz.evaluate`（#67 注入）**以及锁态 `item.get` / `item.export`（#23
+  读通道）**广播 `authz.request`（帧带 `needsUnlock=true`）→ 桌面弹窗
+  同时收集主密码（身份确认）与 Allow/Deny（行为授权）；headless /
+  未初始化库 → fail-closed `session.invalid`。详见
+  [authorization-gate.md](authorization-gate.md) §5.1/§5.2。
 - **`authz.request` 帧扩展**：`needsUnlock`（bool）标注锁定态一体化审批（弹窗
   须收集主密码），缺省 false。M2.9 值披露：`kind`（`inject`\|`read`\|`export`）
-  标注审批类型（弹窗按形态渲染），缺省 `inject`；`kind=export` 时带
-  `exportMeta`（`name`/`mime`/`size`，数据包规模，不含数据本身）。
+  标注审批类型（弹窗按形态渲染），缺省 `inject`；锁态读/导出统一走 `kind`=
+  `read`/`export` 且 `needsUnlock=true` 的窗口；`kind=export` 时带
+  `exportMeta`（`name`/`mime`/`size`，数据包规模，不含数据本身——锁态无法
+  解密故缺省）。
 - **`approval.result` 扩展**：可选 `masterPassword`——仅 `needs_unlock` 待审
   条目 + `allowed` 决策时使用并校验；守护进程以其做**临时解锁**（AuthGuard
   限流照常），错误主密码计失败计数并以错误响应退回弹窗（条目保留可重试）。
 - **临时解锁安全边界**：允许决策后守护进程以主密码临时解锁 vault 内存态，
-  仅供本次注入解析 env + 审计签名；**不签发会话令牌 / 不写 `session.token` /
-  不置 `shared.vault`**——vault 保持锁定，临时态随 finalize 结束销毁，不产生
-  `item.*` 全量读能力（#65 配套）。
+  仅供本次注入解析 env / 本次披露解析条目 + 审计签名；**不签发会话令牌 /
+  不写 `session.token` / 不置 `shared.vault`**——vault 保持锁定，临时态随
+  finalize 结束销毁，不产生 `item.*` 全量读能力（#65 配套；#23 读通道单次
+  披露即毁同此边界）。
 
 ## 5. 自动锁定（D10）
 

@@ -44,17 +44,11 @@ impl Daemon {
                 )
             }
         };
-        // 锁定态一体化（#67）：allowed 需先临时解锁（主密码），失败不回传
-        // 决策——错误响应让弹窗停留，倒计时内可重试（AuthGuard 防暴破）。
-        if decision == ApprovalDecision::Allowed
-            && self
-                .pending_authz
-                .lock()
-                .unwrap()
-                .get(&p.request_id)
-                .map(|e| e.needs_unlock)
-                .unwrap_or(false)
-        {
+        // 锁定态一体化（#67 注入 / #23 读通道）：allowed 需先临时解锁（主
+        // 密码），失败不回传决策——错误响应让弹窗停留，倒计时内可重试
+        // （AuthGuard 防暴破）。两条待审表（pending_authz / pending_disclosure）
+        // 的 needs_unlock 条目都要求携带主密码（dispatch 的会话绕过亦查同表）。
+        if decision == ApprovalDecision::Allowed && self.pending_needs_unlock(p.request_id) {
             return self.approval_result_unlock(id, p, caller);
         }
         let accepted = self
@@ -76,10 +70,10 @@ impl Daemon {
         RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
     }
 
-    /// 锁定态一体化审批的 `allowed` 分支（#67）：AuthGuard 限流 → 主密码
-    /// 临时解锁 → 审计 `vault.unlock`（via=inject-gui，channel=desktop）→
-    /// 临时 vault 存入待审条目 → `resolve(Allowed)` 唤醒 CLI。主密码错误 →
-    /// 错误响应（弹窗显示「解锁失败」，条目保留可重试）；被限流 →
+    /// 锁定态一体化审批的 `allowed` 分支（#67 inject / #23 读通道）：AuthGuard
+    /// 限流 → 主密码临时解锁 → 审计 `vault.unlock`（via=inject-gui，channel=
+    /// desktop）→ 临时 vault 存入待审条目 → `resolve(Allowed)` 唤醒 CLI。主密码
+    /// 错误 → 错误响应（弹窗显示「解锁失败」，条目保留可重试）；被限流 →
     /// `ERR_RATE_LIMITED`（AuthGuard 不绕过，issue #67 约束 #5）。
     fn approval_result_unlock(
         &mut self,
@@ -115,14 +109,11 @@ impl Daemon {
                     vault.keys(),
                     &caller.event(M_VAULT_UNLOCK, AuditResult::Allowed),
                 );
-                // 临时 vault 存入待审条目（authz_finalize 消费后即销毁；
-                // 不置 shared.vault、不签发令牌、不写 session.token）
-                self.pending_authz
-                    .lock()
-                    .unwrap()
-                    .get_mut(&p.request_id)
-                    .expect("needs_unlock 条目在 dispatch 已确认存在")
-                    .temp_vault = Some(vault);
+                // 临时 vault 存入待审条目（finalize 消费后即销毁；不置
+                // shared.vault、不签发令牌、不写 session.token）。
+                // inject（#67）与读通道（#23）的待审条目都可能命中——
+                // 条目已被消费（超时竞态）则放弃存储，随本函数结束 drop。
+                let _ = self.store_temp_vault(p.request_id, vault);
                 let accepted = self.shared.approvals.resolve(
                     p.request_id,
                     ApprovalDecision::Allowed,
@@ -138,6 +129,39 @@ impl Daemon {
                 RpcResponse::err(id, ERR_VAULT_INVALID, MSG_VAULT_INVALID, None)
             }
         }
+    }
+
+    /// 待审条目是否带锁定态一体化标志（#67 inject / #23 读通道）：
+    /// 查 `pending_authz`（inject 一体化）与 `pending_disclosure`（读通道
+    /// get/export 一体化）两张表。`approval.result` 的 allowed 决策对这类
+    /// 条目要求携带 masterPassword 先做临时解锁（dispatch 会话绕过与
+    /// [`Self::approval_result`] 共用本判定，见 daemon/mod.rs
+    /// `approval_needs_unlock`）。
+    pub(super) fn pending_needs_unlock(&self, request_id: uuid::Uuid) -> bool {
+        if let Some(e) = self.pending_authz.lock().unwrap().get(&request_id) {
+            return e.needs_unlock;
+        }
+        if let Some(e) = self.pending_disclosure.lock().unwrap().get(&request_id) {
+            return e.needs_unlock;
+        }
+        false
+    }
+
+    /// 把临时解锁 vault 存入对应待审条目（inject #67 → pending_authz；
+    /// 读通道 #23 → pending_disclosure）。返回条目是否存在（true = 已存储）。
+    /// 条目已被 finalize 消费（超时竞态）→ false，vault 随调用方作用域 drop。
+    fn store_temp_vault(&self, request_id: uuid::Uuid, vault: UnlockedVault) -> bool {
+        let mut authz = self.pending_authz.lock().unwrap();
+        if let Some(e) = authz.get_mut(&request_id) {
+            e.temp_vault = Some(vault);
+            return true;
+        }
+        drop(authz);
+        if let Some(e) = self.pending_disclosure.lock().unwrap().get_mut(&request_id) {
+            e.temp_vault = Some(vault);
+            return true;
+        }
+        false
     }
 
     /// 审批超时（config 可配；默认 30s，第 3 层超时默认拒绝）。

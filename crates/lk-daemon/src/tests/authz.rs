@@ -938,48 +938,13 @@ fn authz_deferred_invalid_token_session_gated_on_both_seams() {
 // #67 锁定态一体化（临时解锁 + 本次授权一次交互）
 // -------------------------------------------------------------------------
 
-/// 锁定态夹具：初始化 + 建条目后**锁定**（无会话令牌、vault=None），
-/// 模拟「库存在但未解锁、GUI 已运行」场景。返回（命令锁, 共享态）。
+/// 锁定态夹具：`locked_daemon`（tests/mod.rs）封装——初始化 + 建条目 +
+/// 锁定（#67 注入一体化用例；#23 读通道用例见 tests/disclosure.rs）。
 fn locked_daemon_with_secret(
     dir: &std::path::Path,
     secret: Option<(&str, &str)>,
 ) -> (Arc<Mutex<Daemon>>, Arc<SharedDaemon>) {
-    {
-        let mut audit = AuditLog::open(dir).unwrap();
-        init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
-    }
-    let mut daemon = Daemon::start(dir).unwrap();
-    // 审批窗口维持生产默认 30s（同 m2_daemon，#92）
-    // 解锁建条目，再锁定（回到锁态）
-    let unlock = rpc_result(&daemon.handle(
-        &rpc_line(
-            M_VAULT_UNLOCK,
-            None,
-            json!({ "masterPassword": "pw123456" }),
-        ),
-        &PeerInfo::unknown(),
-    ));
-    let token = unlock["token"].as_str().unwrap().to_string();
-    if let Some((name, value)) = secret {
-        daemon.handle(
-            &rpc_line(
-                M_ITEM_PUT,
-                Some(&token),
-                json!({ "item": {
-                    "type": "secret", "name": name, "value": value,
-                    "purpose": "", "expiresAt": null
-                } }),
-            ),
-            &PeerInfo::unknown(),
-        );
-    }
-    daemon.handle(
-        &rpc_line(M_VAULT_LOCK, None, json!({})),
-        &PeerInfo::unknown(),
-    );
-    let shared = daemon.shared();
-    let state = Arc::new(Mutex::new(daemon));
-    (state, shared)
+    locked_daemon(dir, secret, None)
 }
 
 /// 锁定态 + 桌面订阅：authz.evaluate → 广播 authz.request(needsUnlock=true)

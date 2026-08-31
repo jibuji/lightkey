@@ -127,6 +127,42 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 - 示例：`NPM_TOKEN=... lk inject --keys NPM_TOKEN -- npm publish` 的等价效果（但经授权门裁决）。
 - 内建脱敏：注入值在审计/命令摘要中永不明文（见 [audit.md](audit.md) §2）。
 
+### 5.2 读通道一体化：锁定态 `item.get` / `item.export`（#23，补充拍板 #23）
+
+> §5.1 的机制扩展到**值披露**（读通道）——锁定态 + 桌面 UI 在场时，
+> `item.get` / `item.export` 弹「主密码 + 解锁并允许」一体化窗，一次交互
+> 完成（临时解锁 + 本次披露），临时 vault 单次披露即毁、无痕。完整规格见
+> [value-disclosure.md](value-disclosure.md) §3 锁态行 / §5.2-5.3（唯一出处）。
+
+- **触发**：锁定态收到 `item.get` / `item.export`，且库**已初始化** +
+  `has_ui`（桌面来源推送订阅在场）→ 登记 `Pending{needs_unlock:true}` +
+  广播 `authz.request(needsUnlock=true)`（协议零新增：`needsUnlock` /
+  `masterPassword` / `kind` 三要素即 #67 已就位）。未初始化库 / 无 UI →
+  fail-closed `session.invalid`（不弹窗）；解锁态行为零变化。
+- **锁态必弹窗**：即使该条目已有 read 规则命中也必弹——规则在加密库内
+  无法预载（与 #67 inject 同款妥协）。文档明示「锁态下一切披露都要一次
+  交互」。
+- **一次性交互**：弹窗同时展示主密码输入栏（身份确认）+ 行为授权栏
+  （启动者 / 项目目录 / kind 形态 / 倒计时）。用户一次性完成 临时解锁 +
+  本次披露。
+- **守护进程侧**：
+  1. `approval.result`（allowed）须携带 `masterPassword`——`approval_result_unlock`
+     先做**临时解锁**（#67 同款编排；AuthGuard 限流照常、审计 `vault.unlock`）；
+     主密码错误 → `vault.invalid` 统一文案防探测、条目保留、弹窗倒计时内可
+     重试；
+  2. finalize 在**临时 vault** 上执行披露（get/export exec 支持传入 vault
+     引用）+ 审计（channel=approval，用临时 vault 的 K_audit 签名）；
+  3. **关键约束**（#65 边界）：临时 vault 即用即毁——不签发会话令牌 / 不写
+     `session.token` / 不置 `shared.vault`，本次交互不产生任何持久能力。
+  4. **等待期竞争**（与 #67 同口径）：整库被解锁（用户绕开弹窗直接解锁）→
+     finalize 走**常态路径**（共享 vault 披露 + 审计）；被锁定 → `session.invalid`。
+- **前端**：主密码栏复用、「解锁并允许」按钮；**「允许并为此项目记住」渲染
+  条件 = `isRead && !needsUnlock`**——锁态 read 弹窗无记住按钮（临时 vault
+  无法持久化规则），D 层单测钉住。
+- **已知限制**（补充拍板 #23 留档）：锁态下 agent 循环重试可致弹窗轰炸
+  （每个 pending 30s 超时默认拒）；同 (starter, 条目) 合并去重 + 并发上限/
+  限流为后续可选加固，不阻塞本规格。
+
 ## 6. 审批通道抽象（D8）
 
 - 审批通道 = 接口（trait）`ApprovalChannel`（本地/远程可切换）；两阶段接口
@@ -215,6 +251,10 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 - `item.get` 走三层（读规则 → 弹窗 → 拒绝）；`item.export` **恒弹窗**，
   任何规则不豁免（整条目数据包含附件原始数据，单次披露量最大）。
 - 元数据（`item.list` / `rule.list`）维持令牌门（§2 承诺修订）。
+- **锁态 + 桌面 UI 在场**：`item.get` / `item.export` 走「主密码 + 解锁并
+  允许」一体化弹窗（**锁态必弹窗**，read 规则命中也不豁免——规则在加密库
+  内无法预载；headless / 未初始化库维持 fail-closed `session.invalid`）——
+  见 §5.2 与 value-disclosure.md §3/§5.2-5.3（补充拍板 #23）。
 - 已按规格落地（M2.9）：拒绝错误码实现为 `authz.denied`（-32017，spec
   §5.4 实现注记——-32014~-32016 已被 bridge 错误码占用）；读规则 CLI
   形态 `--read --keys`（spec §7 实现注记）；#65 已闭合。
