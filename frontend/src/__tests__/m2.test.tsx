@@ -742,6 +742,102 @@ describe("M2.9 值披露弹窗（kind=read/export；docs/value-disclosure.md §6
   });
 });
 
+describe("读通道一体化解锁弹窗（kind=read/export + needsUnlock；补充拍板 #23 / issue #105）", () => {
+  // 钉住：记住按钮渲染条件 = `isRead && !needsUnlock`（真实代码变更——
+  // 锁态 read 弹窗不再渲染「允许并为此项目记住」，remember 不被静默丢弃）
+  it("锁态 read 弹窗：无「记住」按钮（真正变更断言）、主密码栏在场；解锁并允许携带 masterPassword 且不追加 rule.add", async () => {
+    const { ctx, mock } = await mountHost(); // 不解锁（锁态一体化流程）
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-locked-read",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.get",
+        keys: ["API_KEY"],
+        needsUnlock: true,
+        kind: "read",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    // 主密码栏在场（临时解锁，不创建会话）+ 提示不带「注入」误导
+    expect(dialog.textContent).toContain("主密码");
+    expect(dialog.textContent).toContain("不创建会话");
+    // 锁态 read：无「允许并为此项目记住」（isRead && !needsUnlock 为假——
+    // 临时 vault 无法持久化规则，不承诺做不到的事）
+    expect(
+      Array.from(dialog.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("允许并为此项目记住"),
+      ),
+    ).toBe(false);
+    // read 形态仍不渲染 $ 命令框（读值无命令绑定）
+    expect(dialog.querySelector(".approval-cmd-box")).toBeNull();
+    // 解锁并允许 → approvalResult(allowed, masterPassword)，不追加 rule.add
+    const input = dialog.querySelector('input[aria-label="主密码"]') as HTMLInputElement;
+    setInput(input, "demo-password");
+    const allowBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("解锁并允许"),
+    )!;
+    await act(async () => {
+      allowBtn.click();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(resultSpy).toHaveBeenCalledWith(
+      "req-locked-read",
+      "allowed",
+      "mock-challenge",
+      "demo-password",
+    );
+    expect(ruleSpy).not.toHaveBeenCalled();
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+
+  it("锁态 export 弹窗：无记住按钮、主密码栏在场；解锁并允许携带 masterPassword", async () => {
+    const { ctx, mock } = await mountHost(); // 不解锁（锁态一体化流程）
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-locked-export",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.export",
+        keys: ["合同.pdf"],
+        needsUnlock: true,
+        kind: "export",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    expect(dialog.textContent).toContain("导出条目数据包");
+    expect(dialog.textContent).toContain("主密码");
+    // export 恒无记住按钮（锁态/解锁态一致）
+    expect(
+      Array.from(dialog.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("允许并为此项目记住"),
+      ),
+    ).toBe(false);
+    // 解锁并允许携带主密码（不经 remember 分支）
+    const input = dialog.querySelector('input[aria-label="主密码"]') as HTMLInputElement;
+    setInput(input, "demo-password");
+    const allowBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("解锁并允许"),
+    )!;
+    await act(async () => {
+      allowBtn.click();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(resultSpy).toHaveBeenCalledWith(
+      "req-locked-export",
+      "allowed",
+      "mock-challenge",
+      "demo-password",
+    );
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+});
+
 describe("规则管理审批弹窗（kind=rule；补充拍板 #22 / issue #104）", () => {
   it("rule.add 帧：命令框展示操作、keys Tag、无「记住」按钮（规则操作本身即持久动作）", async () => {
     const { ctx, mock } = await mountHost();

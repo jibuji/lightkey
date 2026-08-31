@@ -7,13 +7,15 @@
  * · 「允许本次」「拒绝」；Esc = 拒绝；超时自动关闭（守护进程侧超时审计
  * `timeout`，弹窗本地倒计时到期即关闭，不重复回传）。
  *
- * **锁定态一体化（#67）**：帧携带 `needsUnlock=true` 时（守护进程锁态收到
- * `authz.evaluate` 且桌面在场），弹窗额外渲染**主密码输入栏**（身份确认）：
- * 「解锁并允许」= 一次性完成 临时解锁 + 本次授权；解锁失败（VaultInvalidError
- * / 限流）→ 弹窗停留显示错误，倒计时继续（守护进程侧条目保留可重试，AuthGuard
- * 不绕过）。允许后**不创建会话**——本次注入不产生 item.* 全量能力（#65）。
+ * **锁定态一体化（#67 注入 / #23 读通道）**：帧携带 `needsUnlock=true` 时
+ * （守护进程锁态收到 `authz.evaluate` / 锁态 `item.get` / `item.export` 且
+ * 桌面在场），弹窗额外渲染**主密码输入栏**（身份确认）：「解锁并允许」=
+ * 一次性完成 临时解锁 + 本次授权；解锁失败（VaultInvalidError / 限流）→
+ * 弹窗停留显示错误，倒计时继续（守护进程侧条目保留可重试，AuthGuard
+ * 不绕过）。允许后**不创建会话**——本次交互不产生 item.* 全量能力（#65）。
  * 锁态（`session.unlocked=false`）下只有 needsUnlock 帧会弹窗；普通
- * authz.request 仍被门控丢弃（QA P1 语义不变）。
+ * authz.request 仍被门控丢弃（QA P1 语义不变）。锁态 read/export 弹窗
+ * 无「允许并为此项目记住」（临时 vault 无法持久化规则，补充拍板 #23）。
  *
  * 决策权始终在 Rust 侧（plugin-architecture.md §5.3）：本插件只把用户
  * 选择经 `approval.result` 回传，不持有裁决权；伪造/已超时 requestId →
@@ -149,7 +151,11 @@ export function ApprovalDialog({
         <h3 className="modal-title">授权请求 · {req.starter}</h3>
         <p className="modal-desc">
           {needsUnlock
-            ? "解锁态未就绪：输入主密码完成临时解锁并授权本次注入（不创建会话）"
+            ? isRead
+              ? "解锁态未就绪：输入主密码完成临时解锁并读取该项目目录下条目的值（不创建会话，仅本次披露）"
+              : isExport
+                ? "解锁态未就绪：输入主密码完成临时解锁并导出条目数据包（不创建会话，仅本次披露）"
+                : "解锁态未就绪：输入主密码完成临时解锁并授权本次注入（不创建会话）"
             : isRead
               ? "Agent 请求读取该项目目录下条目的值（值不会显示，批准后仅返回给发起程序）"
               : isExport
@@ -240,8 +246,11 @@ export function ApprovalDialog({
             拒绝
           </button>
           {/* read 专属「记住」：allow 决策 + 追加一条 read 规则（默认不持久化，
-              用户显式选择；export 恒弹窗语义 → 不提供记住） */}
-          {isRead ? (
+              用户显式选择；export 恒弹窗语义 → 不提供记住）。锁态一体化
+              （#23，补充拍板 #23）：临时 vault 无法持久化规则——记住按钮
+              渲染条件 = `isRead && !needsUnlock`，锁态 read 弹窗不承诺做
+              不到的事（配合主密码离开流程，规则也名不正言不顺）。 */}
+          {isRead && !needsUnlock ? (
             <button
               className="btn"
               onClick={() => void allow(true)}
