@@ -104,7 +104,8 @@ pub enum ApprovalDecision {
     Timeout,
 }
 
-/// 审批请求类型（M2.9 值披露；弹窗按 kind 选形态，value-disclosure.md §6）。
+/// 审批请求类型（M2.9 值披露；弹窗按 kind 选形态，value-disclosure.md §6；
+/// 补充拍板 #22 增 `Rule`）。加性变更，不升协议版本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalKind {
@@ -114,6 +115,11 @@ pub enum ApprovalKind {
     Read,
     /// 导出条目数据包（`item.export`；恒弹窗，规则不豁免）。
     Export,
+    /// 规则管理（`rule.add` / `rule.remove`；补充拍板 #22）。单一 kind +
+    /// `command` 字段承载操作（`rule.add <name>` / `rule.remove <name>`），
+    /// 不拆两个 kind——remove 由 daemon 解析 id→规则补全 name/keys/projectDir
+    /// 供弹窗展示。
+    Rule,
 }
 
 /// export 审批的数据包元信息（弹窗展示规模用；不含数据本身）。
@@ -180,6 +186,14 @@ pub trait ApprovalChannel: Send + Sync {
     /// 装配只数**桌面来源**订阅者——socket 订阅不计，见 lk-daemon 装配）。
     /// `false` → fail-closed 立即拒绝，不登记、不阻塞（authorization-gate.md §7）。
     fn available(&self) -> bool;
+    /// 该通道是否会**立即自动裁决**给定类型的审批（E2E 门控，补充拍板 #22；
+    /// 默认 false = 无自动路径）。仅 [`AutoApproveChannel`] 在 env 门开启时
+    /// 对 [`ApprovalKind::Rule`] 返回 true；调用方据此跳过 `available()` 的
+    /// UI 在场判定（inject/披露审批不受影响，照旧要求 UI）。
+    fn auto_approves(&self, kind: ApprovalKind) -> bool {
+        let _ = kind;
+        false
+    }
     /// 登记待审批 + 广播 `authz.request`（非阻塞；守护进程命令锁内调用）。
     fn open(&self, req: &ApprovalRequest, expires_at: Instant);
     /// 等待决策（守护进程命令锁外调用；最多等到 `expires_at`，超时默认拒绝）。
@@ -359,6 +373,104 @@ impl ApprovalChannel for LocalApprovalChannel {
         // 到期时刻以登记值为准（`expires_at` 参数为远程通道语义预留）
         let _ = expires_at;
         self.approvals.await_decision(request_id)
+    }
+}
+
+/// E2E 自动批准通道（补充拍板 #22；装饰器，套在 [`LocalApprovalChannel`] 外）。
+///
+/// **env 门控**：daemon **启动时**读一次 [`AutoApproveChannel::ENV`]，值为
+/// `rule` 时对 [`ApprovalKind::Rule`] 的审批**立即 Allowed**（登记后即刻
+/// resolve，不广播 `authz.request`——无 UI 参与）。inject/读/导出审批一律
+/// 不碰（`available()` 语义原样透传内层，headless 照旧 fail-closed 立即拒绝）。
+///
+/// 取舍（decisions #22，勿自行变更）：
+/// - **release 二进制保留此路径是有意决策**——E2E 必须测发布物本体；
+///   编译期 feature/cfg 门为被否选项（会测非发布物、削弱 E2E 价值）。
+/// - 攻击面：env 仅在 daemon 启动时读取；攻击者自带该变量拉起的新 daemon
+///   库是锁的，`rule.add` 仍过会话门（`session.invalid`），无权限增益。
+/// - 审计独立标注：经此通道放行的规则变更在 daemon 侧落
+///   `channel=auto-approve`（含 requestId 与规则内容），绝不静默。
+pub struct AutoApproveChannel {
+    inner: Arc<dyn ApprovalChannel>,
+    approvals: Arc<PendingApprovals>,
+    rule_enabled: bool,
+}
+
+impl AutoApproveChannel {
+    /// env 变量名（值 `rule` = 仅规则审批自动批准）。
+    pub const ENV: &'static str = "LIGHTKEY_E2E_AUTO_APPROVE";
+
+    /// 生产构造：daemon 启动时读一次 env。
+    pub fn new(
+        inner: Arc<dyn ApprovalChannel>,
+        approvals: Arc<PendingApprovals>,
+    ) -> AutoApproveChannel {
+        let rule_enabled = Self::env_rule_enabled();
+        AutoApproveChannel {
+            inner,
+            approvals,
+            rule_enabled,
+        }
+    }
+
+    /// 当前 env 是否开启规则自动批准（`LIGHTKEY_E2E_AUTO_APPROVE=rule`）。
+    pub fn env_rule_enabled() -> bool {
+        std::env::var(Self::ENV).ok().as_deref() == Some("rule")
+    }
+
+    /// 测试/装配构造：显式给定门控状态（不读 env，避免并行测试竞争；
+    /// lk-daemon 装配在 `Daemon::start` 读一次 env 后传入）。
+    pub fn with_rule_enabled(
+        inner: Arc<dyn ApprovalChannel>,
+        approvals: Arc<PendingApprovals>,
+        rule_enabled: bool,
+    ) -> AutoApproveChannel {
+        AutoApproveChannel {
+            inner,
+            approvals,
+            rule_enabled,
+        }
+    }
+
+    /// 门控当前状态（daemon 启动横幅用）。
+    pub fn rule_enabled(&self) -> bool {
+        self.rule_enabled
+    }
+
+    /// 测试专用：翻转门控（生产路径不调用）。
+    #[doc(hidden)]
+    pub fn set_rule_enabled_for_tests(&mut self, enabled: bool) {
+        self.rule_enabled = enabled;
+    }
+}
+
+impl ApprovalChannel for AutoApproveChannel {
+    fn available(&self) -> bool {
+        // UI 在场性不因 E2E 门改变：inject/披露审批照旧据此 fail-closed
+        self.inner.available()
+    }
+
+    fn auto_approves(&self, kind: ApprovalKind) -> bool {
+        self.rule_enabled && kind == ApprovalKind::Rule
+    }
+
+    fn open(&self, req: &ApprovalRequest, expires_at: Instant) {
+        if self.auto_approves(req.kind) {
+            // 登记 + 立即 Allowed（同一挑战值 resolve；等待者即刻拿到决策）；
+            // 不广播 authz.request——自动批准无 UI 参与，弹窗不该出现
+            self.approvals
+                .register(req.request_id, expires_at, req.challenge.clone());
+            let _ =
+                self.approvals
+                    .resolve(req.request_id, ApprovalDecision::Allowed, &req.challenge);
+            return;
+        }
+        self.inner.open(req, expires_at);
+    }
+
+    fn await_decision(&self, request_id: Uuid, expires_at: Instant) -> ApprovalDecision {
+        // 内外层共用同一注册表（装饰器只改 open 的规则分支）
+        self.inner.await_decision(request_id, expires_at)
     }
 }
 
@@ -1069,8 +1181,102 @@ mod tests {
             serde_json::to_value(ApprovalKind::Export).unwrap(),
             serde_json::json!("export")
         );
+        // 规则管理审批门（补充拍板 #22）：kind=rule，加性变更不升协议版本
+        assert_eq!(
+            serde_json::to_value(ApprovalKind::Rule).unwrap(),
+            serde_json::json!("rule")
+        );
+        let back: ApprovalKind = serde_json::from_value(serde_json::json!("rule")).unwrap();
+        assert_eq!(back, ApprovalKind::Rule);
         let back: ApprovalKind = serde_json::from_value(serde_json::json!("read")).unwrap();
         assert_eq!(back, ApprovalKind::Read);
+    }
+
+    // -- 规则管理审批门（补充拍板 #22）：E2E 自动批准通道 --------------------
+
+    fn auto_rule_req(kind: ApprovalKind) -> ApprovalRequest {
+        ApprovalRequest {
+            request_id: Uuid::new_v4(),
+            starter: "/bin/zsh".into(),
+            project_dir: "/proj".into(),
+            command: "rule.add pub".into(),
+            keys: vec!["NPM_TOKEN".into()],
+            challenge: "chal".into(),
+            needs_unlock: false,
+            kind,
+            export_meta: None,
+        }
+    }
+
+    /// env 门控开启时仅规则审批立即 Allowed：不广播（无 UI 参与）、
+    /// 等待者即刻拿到决策；inject/read/export 不受影响（走内层通道）。
+    #[test]
+    fn auto_channel_allows_rule_kind_immediately() {
+        let reg = Arc::new(PendingApprovals::new());
+        let bus = Arc::new(EventBus::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let e = Arc::clone(&events);
+        bus.subscribe(Arc::new(crate::bus::FnSink::new(move |ev| {
+            e.lock().unwrap().push(ev.clone());
+        })));
+        let inner =
+            LocalApprovalChannel::new(Arc::clone(&reg), Arc::clone(&bus), Box::new(|| false));
+        let ch = AutoApproveChannel::with_rule_enabled(Arc::new(inner), Arc::clone(&reg), true);
+        // auto_approves 仅对 rule 为真；available 语义不因 E2E 门改变（无 UI）
+        assert!(ch.auto_approves(ApprovalKind::Rule));
+        assert!(!ch.auto_approves(ApprovalKind::Inject));
+        assert!(!ch.auto_approves(ApprovalKind::Read));
+        assert!(
+            !ch.available(),
+            "无 UI 时 available 仍为 false（inject 照旧 fail-closed）"
+        );
+        // open(rule)：登记 + 立即 Allowed，不广播 authz.request
+        let req = auto_rule_req(ApprovalKind::Rule);
+        ch.open(&req, Instant::now() + Duration::from_secs(10));
+        assert_eq!(
+            events.lock().unwrap().len(),
+            0,
+            "自动批准不广播（无 UI 参与）"
+        );
+        let d = ch.await_decision(req.request_id, Instant::now() + Duration::from_secs(10));
+        assert_eq!(d, ApprovalDecision::Allowed);
+        assert_eq!(reg.pending_count(), 0, "消费后清理");
+    }
+
+    /// env 门控关闭（生产缺省）：一切 kind 都走内层通道（auto_approves 恒 false）。
+    #[test]
+    fn auto_channel_disabled_delegates_to_inner() {
+        let reg = Arc::new(PendingApprovals::new());
+        let bus = Arc::new(EventBus::new());
+        let inner =
+            LocalApprovalChannel::new(Arc::clone(&reg), Arc::clone(&bus), Box::new(|| true));
+        let mut ch = AutoApproveChannel::with_rule_enabled(Arc::new(inner), Arc::clone(&reg), true);
+        ch.set_rule_enabled_for_tests(false);
+        assert!(!ch.auto_approves(ApprovalKind::Rule));
+        // open(rule) 走内层：广播 authz.request（桌面弹窗语义不变）
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let e = Arc::clone(&events);
+        bus.subscribe(Arc::new(crate::bus::FnSink::new(move |ev| {
+            e.lock().unwrap().push(ev.clone());
+        })));
+        ch.open(
+            &auto_rule_req(ApprovalKind::Rule),
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert_eq!(events.lock().unwrap().len(), 1, "未启用时照常广播");
+        assert_eq!(reg.pending_count(), 1, "等待桌面回传");
+    }
+
+    /// env 读取：LIGHTKEY_E2E_AUTO_APPROVE=rule → 开启（daemon 启动时读一次）。
+    /// 测试环境不设置该变量 → 关闭（不与并行测试竞争 env）。
+    #[test]
+    fn auto_channel_env_probe() {
+        assert_eq!(
+            std::env::var(AutoApproveChannel::ENV).ok().as_deref(),
+            None,
+            "测试进程不得携带 E2E 自动批准变量（否则用例互相污染）"
+        );
+        assert!(!AutoApproveChannel::env_rule_enabled());
     }
 
     /// 审批请求携带 kind + export 数据包元信息（export 弹窗展示规模用）。

@@ -541,6 +541,23 @@ fn rpc_fail(out: &mut impl Write, err: &RpcError, json_out: bool) -> i32 {
     1
 }
 
+/// [`rpc_fail`] 的命令上下文变体（issue #104）：同码不同命令的**人类文案**
+/// 按语境渲染——`rule add/remove` 的 -32017 是「规则变更被授权门拒绝」，
+/// 不是值披露的「读取被拒绝」；`--json` 机器契约不变（error 名/code 唯一键
+/// 照旧，message 字段用语境文案）。
+fn rpc_fail_ctx(out: &mut impl Write, err: &RpcError, json_out: bool, ctx_text: &str) -> i32 {
+    if json_out {
+        let (name, code) = err.machine();
+        write_json_error(out, name, code, ctx_text);
+    }
+    eprintln!("lk: {ctx_text}");
+    1
+}
+
+/// 规则命令被授权门拒绝的上下文文案（issue #104 / 补充拍板 #22）。
+const RULE_GATE_DENIED_TEXT: &str =
+    "规则变更被授权门拒绝（需桌面审批：无界面/未批准/超时均拒绝）；请在 LightKey 桌面应用处理审批弹窗，或于桌面端「设置 → 规则」管理规则";
+
 /// 生产传输适配（[`client::RpcClient`] 的注入点）：按探测分型分流 local /
 /// bridge。会话令牌注入、bridge 的 channel 覆写都在此层完成。
 ///
@@ -2036,7 +2053,15 @@ fn cmd_rule_add(
             }
             0
         }
-        Err(e) => rpc_fail(out, &e, json_out),
+        Err(e) => {
+            // 规则门拒绝（-32017）按命令语境渲染（issue #104）：区别于值披露
+            // 文案；机器契约（error 名/code）不变
+            if matches!(e, RpcError::AuthzDenied) {
+                rpc_fail_ctx(out, &e, json_out, RULE_GATE_DENIED_TEXT)
+            } else {
+                rpc_fail(out, &e, json_out)
+            }
+        }
     }
 }
 
@@ -2248,7 +2273,14 @@ fn cmd_rule_remove(out: &mut impl Write, dir: &std::path::Path, id: &str, json_o
             let _ = json_out;
             0
         }
-        Err(e) => rpc_fail(out, &e, json_out),
+        Err(e) => {
+            // 规则门拒绝（-32017）按命令语境渲染（issue #104）
+            if matches!(e, RpcError::AuthzDenied) {
+                rpc_fail_ctx(out, &e, json_out, RULE_GATE_DENIED_TEXT)
+            } else {
+                rpc_fail(out, &e, json_out)
+            }
+        }
     }
 }
 
@@ -2926,6 +2958,31 @@ mod agent_contract_tests {
         let code = rpc_fail(&mut out, &RpcError::SessionInvalid, false);
         assert_eq!(code, 1);
         assert!(out.is_empty());
+    }
+
+    /// 规则门拒绝（补充拍板 #22）：-32017 同码按命令语境渲染「规则变更被
+    /// 授权门拒绝…」（区别于值披露文案）；机器契约 error 名/code 不变。
+    #[test]
+    fn json_error_rule_gate_context_message() {
+        let mut out = Vec::new();
+        let code = rpc_fail_ctx(
+            &mut out,
+            &RpcError::AuthzDenied,
+            true,
+            RULE_GATE_DENIED_TEXT,
+        );
+        assert_eq!(code, 1);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "authz.denied", "机器契约 error 名不因语境而变");
+        assert_eq!(v["code"], -32017);
+        assert_eq!(v["message"], RULE_GATE_DENIED_TEXT);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("规则变更被授权门拒绝"),
+            "message 为规则门语境文案"
+        );
     }
 
     /// -32014 双义消歧落到失败对象：channel.forbidden 与 bridge.no_daemon

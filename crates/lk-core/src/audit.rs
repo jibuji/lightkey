@@ -55,6 +55,11 @@ pub enum AuditChannel {
     /// 补充拍板 #14）。
     #[serde(rename = "wsl-bridge")]
     WslBridge,
+    /// E2E 自动批准通道（`LIGHTKEY_E2E_AUTO_APPROVE=rule`，仅规则审批立即
+    /// 放行；补充拍板 #22）——测试通道绝不静默：经此放行的规则变更以本
+    /// 通道留痕，command 含 requestId 与规则内容。
+    #[serde(rename = "auto-approve")]
+    AutoApprove,
 }
 
 /// 审计事件（D11 字段集；轮换事件扩展 `oldKeyId`/`newKeyId`）。
