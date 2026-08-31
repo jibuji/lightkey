@@ -68,7 +68,7 @@ impl Daemon {
             if let Some(v) = vault.as_ref() {
                 let _ = self.audit.append(
                     v.keys(),
-                    &caller.event("approval.result", AuditResult::Denied),
+                    &caller.event(M_APPROVAL_RESULT, AuditResult::Denied),
                 );
             }
         }
@@ -113,7 +113,7 @@ impl Daemon {
                 // 但临时临时 vault 持 K_audit 可签名。
                 let _ = self.audit.append(
                     vault.keys(),
-                    &caller.event("vault.unlock", AuditResult::Allowed),
+                    &caller.event(M_VAULT_UNLOCK, AuditResult::Allowed),
                 );
                 // 临时 vault 存入待审条目（authz_finalize 消费后即销毁；
                 // 不置 shared.vault、不签发令牌、不写 session.token）

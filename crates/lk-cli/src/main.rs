@@ -38,9 +38,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use client::{RpcClient, RpcError};
-use lk_core::ipc::{
-    M_AUTHZ_EVALUATE, M_ITEM_EXPORT, M_ITEM_GET, M_RULE_ADD, M_RULE_LIST, M_RULE_REMOVE,
-};
+use lk_core::ipc::{CHANNEL_BEARING_METHODS, CHANNEL_WSL_BRIDGE};
 use lk_core::model::ItemDraft;
 use serde_json::{json, Value};
 
@@ -534,13 +532,12 @@ fn rpc_via_bridge(
         }
     }
     // 审计 channel 如实标注桥接来源（cross-subsystem.md §7.5）：经 bridge 的
-    // authz.evaluate / rule.* 必须以 `wsl-bridge` 留痕，不得记作本地 cli
-    // （客户端硬编码的 "cli" 在此路径被覆写；其余方法无 channel 字段，不动）。
-    if matches!(
-        method,
-        M_AUTHZ_EVALUATE | M_RULE_ADD | M_RULE_LIST | M_RULE_REMOVE | M_ITEM_GET | M_ITEM_EXPORT
-    ) {
-        params["channel"] = json!("wsl-bridge");
+    // 授权门/规则/值披露方法必须以 `wsl-bridge` 留痕，不得记作本地 cli
+    // （客户端钉的 "cli" 在此路径被覆写；其余方法无 channel 字段，不动）。
+    // 携带 channel 的方法清单 = lk_core::ipc::CHANNEL_BEARING_METHODS（与
+    // client.rs / 前端 protocol.ts 共享——协议契约单一来源）。
+    if CHANNEL_BEARING_METHODS.contains(&method) {
+        params["channel"] = json!(CHANNEL_WSL_BRIDGE);
     }
     let req = json!({
         "jsonrpc": "2.0",

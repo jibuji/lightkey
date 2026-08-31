@@ -107,13 +107,14 @@ pub enum VaultEvent {
 }
 
 impl VaultEvent {
-    /// 事件名（与 `docs/plugin-architecture.md` §5.2 契约一致）。
+    /// 事件名（与 `docs/plugin-architecture.md` §5.2 契约一致；常量定义在
+    /// `crate::ipc`——通知名只在协议模块出现一次，TS 镜像见 protocol.ts）。
     pub fn name(&self) -> &'static str {
         match self {
-            VaultEvent::ItemChanged { .. } => "item.changed",
-            VaultEvent::SessionUnlocked { .. } => "session.unlocked",
-            VaultEvent::SessionLocked { .. } => "session.locked",
-            VaultEvent::AuthzRequest { .. } => "authz.request",
+            VaultEvent::ItemChanged { .. } => crate::ipc::NOTIFY_ITEM_CHANGED,
+            VaultEvent::SessionUnlocked { .. } => crate::ipc::NOTIFY_SESSION_UNLOCKED,
+            VaultEvent::SessionLocked { .. } => crate::ipc::NOTIFY_SESSION_LOCKED,
+            VaultEvent::AuthzRequest { .. } => crate::ipc::NOTIFY_AUTHZ_REQUEST,
         }
     }
 }

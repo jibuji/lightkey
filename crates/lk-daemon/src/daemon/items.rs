@@ -12,7 +12,7 @@ impl Daemon {
             Ok(items) => {
                 let _ = self
                     .audit
-                    .append(me.keys(), &caller.event("item.list", AuditResult::Allowed));
+                    .append(me.keys(), &caller.event(M_ITEM_LIST, AuditResult::Allowed));
                 let result = ItemListResult { items };
                 RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
             }
@@ -41,7 +41,7 @@ impl Daemon {
                     &EventInput {
                         starter: starter.to_string(),
                         target: item.name().to_string(),
-                        command: "item.get".into(),
+                        command: M_ITEM_GET.into(),
                         result: AuditResult::Allowed,
                         channel,
                         old_key_id: None,
@@ -78,7 +78,7 @@ impl Daemon {
                     &EventInput {
                         starter: starter.to_string(),
                         target: name,
-                        command: "item.export".into(),
+                        command: M_ITEM_EXPORT.into(),
                         result: AuditResult::Allowed,
                         channel,
                         old_key_id: None,
@@ -111,7 +111,7 @@ impl Daemon {
                 let _ = self.audit.append(
                     me.keys(),
                     &caller.event(
-                        format!("item.put {} <redacted>", kind),
+                        format!("{} {} <redacted>", M_ITEM_PUT, kind),
                         AuditResult::Allowed,
                     ),
                 );
@@ -139,7 +139,7 @@ impl Daemon {
             Ok(_tomb) => {
                 let _ = self.audit.append(
                     me.keys(),
-                    &caller.event(format!("item.delete {}", p.id), AuditResult::Allowed),
+                    &caller.event(format!("{} {}", M_ITEM_DELETE, p.id), AuditResult::Allowed),
                 );
                 RpcResponse::ok(id, json!({}))
             }
@@ -163,7 +163,7 @@ impl Daemon {
         let events = self.audit.read();
         let _ = self
             .audit
-            .append(me.keys(), &caller.event("audit.list", AuditResult::Allowed));
+            .append(me.keys(), &caller.event(M_AUDIT_LIST, AuditResult::Allowed));
         match events {
             Ok(all) => {
                 let total = all.len();

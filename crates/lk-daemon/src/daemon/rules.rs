@@ -99,7 +99,7 @@ impl Daemon {
                     &EventInput {
                         starter: caller.starter.clone(),
                         target: "daemon".into(),
-                        command: "rule.list".into(),
+                        command: M_RULE_LIST.into(),
                         result: AuditResult::Allowed,
                         channel,
                         old_key_id: None,

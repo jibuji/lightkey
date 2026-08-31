@@ -35,6 +35,7 @@ import {
   type NotificationFrame,
   type UpdateOptions,
 } from "./types";
+import { ERROR_CODES, NOTIFICATIONS } from "./protocol";
 import {
   DEMO_RECOVERY_CODE,
   MOCK_AUDIT,
@@ -114,7 +115,7 @@ export class MockAdapter implements LightKeyIpc {
   }
 
   private requireUnlocked() {
-    if (!this.unlocked) throw new Error("session.invalid");
+    if (!this.unlocked) throw new Error(ERROR_CODES.SESSION_INVALID);
   }
 
   /* ---------- vault ---------- */
@@ -192,7 +193,7 @@ export class MockAdapter implements LightKeyIpc {
   async get(id: string): Promise<Item> {
     this.requireUnlocked();
     const it = this.items.find((x) => x.id === id);
-    if (!it) return delayReject(new Error("item.not_found"));
+    if (!it) return delayReject(new Error(ERROR_CODES.ITEM_NOT_FOUND));
     // 返回副本：前端持有的条目与 mock 库隔离，模拟真实 IPC 的序列化边界
     // （否则外部修改会经共享引用泄漏进前端 state，CAS 冲突无法复现）
     return delay(structuredClone(it));
@@ -209,7 +210,7 @@ export class MockAdapter implements LightKeyIpc {
   async update(id: string, draft: ItemDraft, opts?: UpdateOptions): Promise<Item> {
     this.requireUnlocked();
     const idx = this.items.findIndex((x) => x.id === id);
-    if (idx < 0) return delayReject(new Error("item.not_found"));
+    if (idx < 0) return delayReject(new Error(ERROR_CODES.ITEM_NOT_FOUND));
     const current = this.items[idx];
     if (opts?.expectedRevision !== undefined && opts.expectedRevision !== current.revision) {
       return delayReject(new ConflictError());
@@ -369,7 +370,7 @@ export class MockAdapter implements LightKeyIpc {
     }
     this.onFrame?.({
       jsonrpc: "2.0",
-      method: "authz.request",
+      method: NOTIFICATIONS.AUTHZ_REQUEST,
       params: {
         challenge: "mock-challenge",
         needsUnlock: params.needsUnlock ?? false,
@@ -385,7 +386,7 @@ export class MockAdapter implements LightKeyIpc {
     type: string;
     deleted: boolean;
   }): void {
-    this.onFrame?.({ jsonrpc: "2.0", method: "item.changed", params });
+    this.onFrame?.({ jsonrpc: "2.0", method: NOTIFICATIONS.ITEM_CHANGED, params });
   }
 
   /** 模拟目录选择结果（pickDir 返回值；null = 用户取消）。 */
@@ -437,7 +438,7 @@ export class MockAdapter implements LightKeyIpc {
   private emitItemChanged(item: Item, deleted = false) {
     this.onFrame?.({
       jsonrpc: "2.0",
-      method: "item.changed",
+      method: NOTIFICATIONS.ITEM_CHANGED,
       params: { itemId: item.id, revisionDate: item.revision, type: item.type, deleted },
     });
   }

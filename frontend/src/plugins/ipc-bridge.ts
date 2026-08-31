@@ -22,6 +22,7 @@ import type { Context, Plugin } from "@cordisjs/core";
 import type { AuthzRequestPayload, ItemChangedPayload } from "../events";
 import { createIpc } from "../ipc";
 import type { LightKeyIpc, NotificationFrame } from "../ipc/types";
+import { NOTIFICATIONS } from "../ipc/protocol";
 import type { SessionService } from "../services/types";
 
 export interface IpcBridgeConfig {
@@ -29,13 +30,9 @@ export interface IpcBridgeConfig {
   adapter?: LightKeyIpc;
 }
 
-/** 通知帧可翻译的事件名（Rust 事件 → IPC 通知 → 本层重新 emit，§5.2）。 */
-const NOTIFICATION_EVENTS = new Set([
-  "item.changed",
-  "session.unlocked",
-  "session.locked",
-  "authz.request",
-]);
+/** 通知帧可翻译的事件名（Rust 事件 → IPC 通知 → 本层重新 emit，§5.2）。
+ *  名字取自协议契约（protocol.ts = lk_core::ipc::NOTIFY_* 镜像），不手写。 */
+const NOTIFICATION_EVENTS = new Set<string>(Object.values(NOTIFICATIONS));
 
 export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assign(
   (ctx: Context, config: IpcBridgeConfig = {}) => {
@@ -48,12 +45,18 @@ export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assig
     /** 库是否已初始化（首启门控；null = 状态探测中，宿主渲染检测占位）。 */
     let initialized: boolean | null = null;
     /** 本地解锁/锁定广播的抑制标记（对应推送帧到达即消费，防双发）。 */
-    let suppress: "session.unlocked" | "session.locked" | null = null;
+    let suppress:
+      | typeof NOTIFICATIONS.SESSION_UNLOCKED
+      | typeof NOTIFICATIONS.SESSION_LOCKED
+      | null = null;
 
     const translate = (frame: NotificationFrame) => {
       const { method, params } = frame;
       if (!NOTIFICATION_EVENTS.has(method)) return;
-      if (method === "session.unlocked" || method === "session.locked") {
+      if (
+        method === NOTIFICATIONS.SESSION_UNLOCKED ||
+        method === NOTIFICATIONS.SESSION_LOCKED
+      ) {
         if (suppress === method) {
           suppress = null; // 本地已广播（订阅建立前的首次解锁）；防双发
           return;
@@ -61,21 +64,24 @@ export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assig
         // 其它会话事件到达：陈旧标记失效（订阅建立前的本地广播无对应推送
         // 帧，标记须在下一个会话事件时清除，防吞掉后续外部推送）
         suppress = null;
-        unlocked = method === "session.unlocked";
+        unlocked = method === NOTIFICATIONS.SESSION_UNLOCKED;
       }
       // 帧负载 = 事件契约负载（最小字段；事件名逐一为已知类型）
       switch (method) {
-        case "item.changed":
-          ctx.emit("item.changed", params as unknown as ItemChangedPayload);
+        case NOTIFICATIONS.ITEM_CHANGED:
+          ctx.emit(NOTIFICATIONS.ITEM_CHANGED, params as unknown as ItemChangedPayload);
           break;
-        case "session.unlocked":
-          ctx.emit("session.unlocked", params as { via: "password" | "biometric" | "recovery" });
+        case NOTIFICATIONS.SESSION_UNLOCKED:
+          ctx.emit(
+            NOTIFICATIONS.SESSION_UNLOCKED,
+            params as { via: "password" | "biometric" | "recovery" },
+          );
           break;
-        case "session.locked":
-          ctx.emit("session.locked", params as { reason: "manual" | "timeout" | "lockscreen" | "daemon-exit" });
+        case NOTIFICATIONS.SESSION_LOCKED:
+          ctx.emit(NOTIFICATIONS.SESSION_LOCKED, params as { reason: "manual" | "timeout" | "lockscreen" | "daemon-exit" });
           break;
-        case "authz.request":
-          ctx.emit("authz.request", params as unknown as AuthzRequestPayload);
+        case NOTIFICATIONS.AUTHZ_REQUEST:
+          ctx.emit(NOTIFICATIONS.AUTHZ_REQUEST, params as unknown as AuthzRequestPayload);
           break;
       }
     };
@@ -97,7 +103,7 @@ export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assig
         }
         unlocked = true;
         initialized = true; // 解锁成功 = 库必已初始化（vault.status 同源）
-        ctx.emit("session.unlocked", { via: "password" });
+        ctx.emit(NOTIFICATIONS.SESSION_UNLOCKED, { via: "password" });
         if (!pushMode) suppress = null; // mock 无推送：立即清标记
       },
       async initialize(masterPassword: string) {
@@ -117,12 +123,12 @@ export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assig
           throw e;
         }
         unlocked = false;
-        ctx.emit("session.locked", { reason: "manual" });
+        ctx.emit(NOTIFICATIONS.SESSION_LOCKED, { reason: "manual" });
         if (!pushMode) suppress = null;
       },
       notifyItemChanged(payload: ItemChangedPayload) {
         // 翻译路径：Rust 事件 → IPC 通知 → 本层重新 emit（§5.3）
-        ctx.emit("item.changed", payload);
+        ctx.emit(NOTIFICATIONS.ITEM_CHANGED, payload);
       },
     };
 
@@ -137,7 +143,7 @@ export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assig
       initialized = s.initialized;
       if (s.unlocked && !unlocked) {
         unlocked = true;
-        ctx.emit("session.unlocked", { via: "password" });
+        ctx.emit(NOTIFICATIONS.SESSION_UNLOCKED, { via: "password" });
       }
       ctx.emit("vault.initialized", { initialized: s.initialized });
     });

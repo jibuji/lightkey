@@ -61,6 +61,12 @@ _Avoid_: 分发表、dispatch 拦截
 同步轮次的并发结构——抓取阶段只持短读锁并完成全部网络 I/O，应用阶段在短写锁内落盘；网络 I/O 全程不持命令锁。
 _Avoid_: 无锁同步、后台同步
 
+### 协议层
+
+**协议契约**：
+线协议（RPC 方法名 / 通知帧名 / 字符串错误码 / 审计通道值）的单一事实来源——Rust 权威源 `crates/lk-core/src/ipc.rs`，TS 镜像 `frontend/src/ipc/protocol.ts`，双向对齐由 `frontend/src/__tests__/protocolContract.test.ts` 钉死（漂移在 CI 失败，不在用户端错配）；适配器/桥只取常量，不手写字面量。
+_Avoid_: 协议（「协议契约」强调跨语言单一来源 + 对齐测试，防 #85/#86 类漂移）
+
 ### 授权门
 
 **授权门**：
