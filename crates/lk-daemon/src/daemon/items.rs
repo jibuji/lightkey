@@ -23,7 +23,7 @@ impl Daemon {
     /// `item.get` 披露执行核心（M2.9 值披露：值离开守护进程=授权事件）。
     /// 调用方已过裁决（desktop 豁免 / 读规则命中 / 弹窗批准，见
     /// `daemon/disclosure.rs`）；审计 command=`item.get`、target=条目名
-    /// （spec §8），channel/starter 由裁决路径给出。
+    /// （spec §8），channel/starter 由裁决路径给出。解锁态：共享 vault。
     pub(crate) fn item_get_exec(
         &mut self,
         id: Value,
@@ -34,6 +34,20 @@ impl Daemon {
         let shared = Arc::clone(&self.shared);
         let guard = shared.vault.read().unwrap();
         let me = guard.as_ref().unwrap();
+        self.item_get_exec_from(me, id, item_id, starter, channel)
+    }
+
+    /// `item.get` 披露执行核心的**外部 vault 引用**变体（锁定态一体化
+    /// #23：在临时 vault 上执行单次披露）。语义与共享 vault 版完全一致；
+    /// 审计用传入 vault 的 K_audit 签名（channel 由裁决路径给出）。
+    pub(crate) fn item_get_exec_from(
+        &mut self,
+        me: &UnlockedVault,
+        id: Value,
+        item_id: uuid::Uuid,
+        starter: &str,
+        channel: AuditChannel,
+    ) -> RpcResponse {
         match me.get(item_id) {
             Ok(item) => {
                 let _ = self.audit.append(
@@ -55,7 +69,7 @@ impl Daemon {
     }
 
     /// `item.export` 披露执行核心（恒弹窗路径的批准后披露）；审计
-    /// command=`item.export`、target=条目名（spec §8）。
+    /// command=`item.export`、target=条目名（spec §8）。解锁态：共享 vault。
     pub(crate) fn item_export_exec(
         &mut self,
         id: Value,
@@ -66,6 +80,19 @@ impl Daemon {
         let shared = Arc::clone(&self.shared);
         let guard = shared.vault.read().unwrap();
         let me = guard.as_ref().unwrap();
+        self.item_export_exec_from(me, id, item_id, starter, channel)
+    }
+
+    /// `item.export` 披露执行核心的**外部 vault 引用**变体（锁定态一体化
+    /// #23：在临时 vault 上执行单次披露）。语义与共享 vault 版完全一致。
+    pub(crate) fn item_export_exec_from(
+        &mut self,
+        me: &UnlockedVault,
+        id: Value,
+        item_id: uuid::Uuid,
+        starter: &str,
+        channel: AuditChannel,
+    ) -> RpcResponse {
         // 条目名先按 id 解析（target=条目名，与附件文件名可不同）
         let name = match me.get(item_id) {
             Ok(item) => item.name().to_string(),
