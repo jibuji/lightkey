@@ -28,6 +28,9 @@ WORK="$(mktemp -d)"
 A="$WORK/a"; B="$WORK/b"; C="$WORK/c"; REMOTE="$WORK/remote"
 trap 'rm -rf "$WORK"' EXIT
 export LK_JSON=0
+# 规则管理审批门（补充拍板 #22）：headless rule.add fail-closed；主流程的
+# rule add --read 预插经 E2E 自动批准通道放行（仅规则审批；daemon 启动读一次）。
+export LIGHTKEY_E2E_AUTO_APPROVE=rule
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $1"; }

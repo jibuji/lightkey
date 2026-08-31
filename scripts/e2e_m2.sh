@@ -17,9 +17,16 @@ LK="${1:-target/debug/lk}"
 LK="$(cd "$(dirname "$LK")" && pwd)/$(basename "$LK")"
 WORK="$(mktemp -d)"
 PROJ="$(mktemp -d)"
-trap 'rm -rf "$WORK" "$PROJ"' EXIT
+WORK2=""
+PROJ2=""
+trap 'rm -rf "$WORK" "$PROJ" "$WORK2" "$PROJ2"' EXIT
 export LIGHTKEY_HOME="$WORK"
 export LK_JSON=0
+# 规则管理审批门（补充拍板 #22）：headless 无 UI 的 rule.add/rule.remove 会被
+# fail-closed 拒绝；本脚本主流程含 rule add/remove，经 E2E 自动批准通道放行
+# （仅规则审批，inject/披露不受影响；daemon 启动时读一次 env）。门本身的
+# headless 拒绝在末段用无 env 独立实例断言。
+export LIGHTKEY_E2E_AUTO_APPROVE=rule
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -144,6 +151,33 @@ RULE_ID="$("$LK" rule list | awk '/publish/{print $1}')"
 "$LK" rule remove "$RULE_ID" >/dev/null
 check "rule remove" 0 $?
 "$LK" rule list | grep -q publish && bad "rule remove 未生效" || ok "rule remove 生效"
+
+echo "== 13. 规则门（补充拍板 #22）：无 env 时 headless rule add 被拒 =="
+# env 仅 daemon 启动时读取：本脚本主守护带 LIGHTKEY_E2E_AUTO_APPROVE=rule，
+# 须用独立数据目录另起无 env 守护实例，验证审批门本身的 fail-closed。
+WORK2="$(mktemp -d)"
+PROJ2="$(mktemp -d)"
+env -u LIGHTKEY_E2E_AUTO_APPROVE LIGHTKEY_HOME="$WORK2" "$LK" init --stdin >/dev/null 2>&1 <<<"$MASTER_PW"
+check "独立实例 init（无 env 守护）" 0 $?
+echo "$MASTER_PW" | env -u LIGHTKEY_E2E_AUTO_APPROVE LIGHTKEY_HOME="$WORK2" "$LK" unlock --stdin >/dev/null 2>&1
+check "独立实例 unlock" 0 $?
+( cd "$PROJ2" && env -u LIGHTKEY_E2E_AUTO_APPROVE LIGHTKEY_HOME="$WORK2"     "$LK" rule add "$PROJ2" "npm *" --name gate NPM_TOKEN >/dev/null 2>"$WORK2/rule.err" )
+check "无 env headless rule add 拒绝（exit 1）" 1 $?
+if grep -q "规则变更被授权门拒绝" "$WORK2/rule.err"; then
+  ok "拒绝文案提示桌面审批（规则门上下文）"
+else
+  bad "规则门拒绝文案不符：$(cat "$WORK2/rule.err")"
+fi
+# 审计留痕：denied + channel=auto-approve 主实例对照（无 env 实例的拒绝
+# 落 channel=cli 的 denied 行）
+DENIED_RULE=$(env -u LIGHTKEY_E2E_AUTO_APPROVE LIGHTKEY_HOME="$WORK2" "$LK" audit --json | jq '[.[] | select(.command | startswith("rule.add")) | select(.result == "denied")] | length')
+[ "${DENIED_RULE:-0}" -ge 1 ] && ok "规则门拒绝写审计（失败路径）" || bad "规则门拒绝未写审计"
+
+echo "== 14. 规则门：自动批准审计 channel=auto-approve（主实例，绝不静默）=="
+AUTO_EV=$("$LK" audit --json | jq -r '[.[] | select(.channel == "auto-approve")] | length')
+[ "${AUTO_EV:-0}" -ge 1 ] && ok "审计含 channel=auto-approve 事件" || bad "审计缺 auto-approve 事件"
+AUTO_CMD=$("$LK" audit --json | jq -r '[.[] | select(.channel == "auto-approve")][0].command')
+echo "$AUTO_CMD" | grep -q "auto-approve" && ok "auto-approve 审计 command 含 requestId（$AUTO_CMD）" || bad "auto-approve 审计缺 requestId：$AUTO_CMD"
 
 echo
 echo "M2 E2E：$PASS 通过 / $FAIL 失败"
