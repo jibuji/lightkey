@@ -860,6 +860,10 @@ impl UnlockedVault {
             keys: draft.keys,
             capability: draft.capability,
             actions: draft.actions,
+            // M2.98：RuleDraft 暂不携带指纹（T1）；替换现存规则时保留其指纹
+            // （指纹随规则对象同步，替换语义 = 规则更新而非清空绑定），新建
+            // （无现存规则）为 None（未绑定）。T2/T3 经草稿扩展指纹时调整。
+            fingerprint: existing.as_ref().and_then(|r| r.fingerprint.clone()),
             created: existing.map(|r| r.created).unwrap_or_else(now_iso),
         };
         let rev = self.next_revision();

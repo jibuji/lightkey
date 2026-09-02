@@ -704,6 +704,7 @@ mod tests {
             keys: keys.iter().map(|s| s.to_string()).collect(),
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
             actions: crate::model::default_rule_actions(),
+            fingerprint: None,
             created: "2026-01-01T00:00:00.000000Z".into(),
         }
     }
@@ -1616,5 +1617,76 @@ mod tests {
             ..areq.clone()
         };
         assert!(inject_req.export_meta.is_none());
+    }
+
+    // -- M2.98 规则程序指纹（补充拍板 #25）：未绑定匹配路径零变化回归 ---------
+
+    /// 给规则绑定一个任意指纹，`rule_matches` / `read_rule_matches` /
+    /// `write_rule_matches` 的结果必须与未绑定（None）完全一致——指纹是
+    /// **正交追加门**，不在三条匹配路径上内联；T2 daemon 装配 `fingerprint_matches`
+    /// 作为追加裁决。fingerprint=None = 现状语义（identity-binding.md §4「匹配
+    /// 函数行为零变化」）。
+    #[test]
+    fn fingerprint_does_not_change_base_matcher_behavior() {
+        use crate::model::ProgramFingerprint;
+
+        // 注：三分支的匹配结果与有无指纹无关，恒由 capability/cwd/keys 决定；
+        // 此处钉住「绑定 vs 未绑定」结果一致，防未来误把指纹塞进 matcher 内联
+        // 而改变未绑定路径行为。
+        let fp_some = Some(ProgramFingerprint {
+            exe_path: "/usr/bin/node".into(),
+            sha256: "a".repeat(64),
+            size: 100,
+        });
+
+        // inject 规则
+        let mut inj = rule("/proj", "npm *", &["A"]);
+        let inj_unbound = rule("/proj", "npm *", &["A"]);
+        inj.fingerprint = fp_some.clone();
+        assert_eq!(
+            rule_matches(&inj, "/proj/sub", "npm publish"),
+            rule_matches(&inj_unbound, "/proj/sub", "npm publish"),
+        );
+        assert!(rule_matches(&inj_unbound, "/proj/sub", "npm publish"));
+
+        // read 规则
+        let mut rd = read_rule("/proj", &["A"]);
+        let rd_unbound = read_rule("/proj", &["A"]);
+        rd.fingerprint = fp_some.clone();
+        assert_eq!(
+            read_rule_matches(&rd, "/proj", "A"),
+            read_rule_matches(&rd_unbound, "/proj", "A"),
+        );
+        assert!(read_rule_matches(&rd_unbound, "/proj", "A"));
+
+        // write 规则（create）
+        let mut wr = write_rule("/proj", &["a.ini"], &["create", "update"]);
+        let wr_unbound = write_rule("/proj", &["a.ini"], &["create", "update"]);
+        wr.fingerprint = fp_some;
+        assert_eq!(
+            write_rule_matches(&wr, "/proj", WriteAction::Create, None, "a.ini"),
+            write_rule_matches(&wr_unbound, "/proj", WriteAction::Create, None, "a.ini"),
+        );
+        assert!(write_rule_matches(
+            &wr_unbound,
+            "/proj",
+            WriteAction::Create,
+            None,
+            "a.ini"
+        ));
+    }
+
+    /// 绑定规则与未绑定规则占据同一片授权空间，指纹门不改变未命中语义：
+    /// 匹配器继续负责 capability/cwd/keys，未绑定的始终未命中时与现状一致。
+    #[test]
+    fn unbound_rule_matchers_unchanged_for_miss_cases() {
+        // read 规则未命中 cases（现状语义原样）
+        let rd = read_rule("/proj", &["A"]);
+        assert!(!read_rule_matches(&rd, "/proj", "B"));
+        assert!(!read_rule_matches(&rd, "/other", "A"));
+        // inject 未命中：cwd 不匹配 / command glob 不匹配
+        let inj = rule("/proj", "npm *", &["A"]);
+        assert!(!rule_matches(&inj, "/other", "npm publish"));
+        assert!(!rule_matches(&inj, "/proj", "yarn publish"));
     }
 }
