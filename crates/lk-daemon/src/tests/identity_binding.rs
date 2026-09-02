@@ -35,12 +35,9 @@ impl PeerEnv for FakePeerEnv {
 
 /// 注入假对端 env 到守护进程（替换平台真实读取）。
 fn inject_fake_env(state: &Arc<Mutex<Daemon>>, bin_dir: &Path) {
-    state
-        .lock()
-        .unwrap()
-        .set_peer_env(Arc::new(FakePeerEnv {
-            path: bin_dir.to_string_lossy().into_owned(),
-        }));
+    state.lock().unwrap().set_peer_env(Arc::new(FakePeerEnv {
+        path: bin_dir.to_string_lossy().into_owned(),
+    }));
 }
 
 /// 建一个伪装可执行文件（内容 → 真实指纹 + canonical 路径）。
@@ -129,10 +126,7 @@ fn binding_hit_silently_allows() {
         &peer,
     );
     let v: Value = serde_json::from_str(&resp).unwrap();
-    assert_eq!(
-        v["result"]["allowed"], true,
-        "绑定命中应静默放行：{resp}"
-    );
+    assert_eq!(v["result"]["allowed"], true, "绑定命中应静默放行：{resp}");
     assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit", "放行注入值");
     assert!(
         shared.approvals.pending_count() == 0,
@@ -190,7 +184,9 @@ fn binding_mismatch_folds_to_approval() {
     assert_eq!(short.len(), 8, "仅展示 8 位哈希摘要，非完整值");
     // 完整 64 位哈希不得出现在帧里
     assert!(
-        !serde_json::to_string(&fv).unwrap().contains(fp_v1.sha256.as_str())
+        !serde_json::to_string(&fv)
+            .unwrap()
+            .contains(fp_v1.sha256.as_str())
             || fp_v1.sha256.len() == 8,
         "审批帧不得携带完整哈希"
     );
@@ -303,12 +299,14 @@ fn reauthorize_via_rule_gate_persists_recomputed_fingerprint() {
     // 落盘指纹 = daemon 侧重算（真实 hash/size，非客户端假值）
     let stored = rule["fingerprint"].clone();
     assert_eq!(
-        stored["size"], std::fs::metadata(&canonical).unwrap().len(),
+        stored["size"],
+        std::fs::metadata(&canonical).unwrap().len(),
         "size 为 daemon 侧重算值"
     );
     assert!(
         stored["sha256"].as_str().unwrap().len() == 64
-            && stored["sha256"] != "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            && stored["sha256"]
+                != "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
         "sha256 为 daemon 侧重算的真实值"
     );
     // 审计 command 以 rule.add 开头
@@ -361,7 +359,10 @@ fn cache_meta_unchanged_reuses_hash() {
 /// 缓存 + 决策：改内容 + mtime 变 → 重算 → 失配（同径同长覆盖也重算）。
 #[test]
 fn content_change_recomputes_and_mismatches() {
-    for content in [b"#!/bin/sh\necho v2-longer\n".as_slice(), b"#!/bin/sh\necho v2\n".as_slice()] {
+    for content in [
+        b"#!/bin/sh\necho v2-longer\n".as_slice(),
+        b"#!/bin/sh\necho v2\n".as_slice(),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let proj = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
@@ -386,8 +387,10 @@ fn content_change_recomputes_and_mismatches() {
         // 重算并失配，与未命中共用拒绝路径）
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(
-            v["result"]["allowed"], false,
-            "内容改后应重算并失配：{resp}（content len={}）", content.len()
+            v["result"]["allowed"],
+            false,
+            "内容改后应重算并失配：{resp}（content len={}）",
+            content.len()
         );
         assert_eq!(
             v["result"]["reason"].as_str(),
@@ -409,7 +412,10 @@ fn locked_session_invalid_regression() {
     let bin = tempfile::tempdir().unwrap();
     let (_exe, fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     // 建 daemon → 建规则 → 锁定
-    let proj_canon = std::fs::canonicalize(proj.path()).unwrap().to_string_lossy().into_owned();
+    let proj_canon = std::fs::canonicalize(proj.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     seed_bound_rule(&shared, proj.path(), &fp, "pgm deploy", &["NPM_TOKEN"]);
     state.lock().unwrap().handle(
@@ -418,7 +424,11 @@ fn locked_session_invalid_regression() {
     );
     inject_fake_env(&state, bin.path());
     let handler = make_handler(&state, &shared);
-    let peer = PeerInfo { pid: std::process::id(), cwd: Some(proj_canon), origin: PeerOrigin::Socket };
+    let peer = PeerInfo {
+        pid: std::process::id(),
+        cwd: Some(proj_canon),
+        origin: PeerOrigin::Socket,
+    };
     let resp = handler(
         &rpc_line(
             M_AUTHZ_EVALUATE,
@@ -448,7 +458,16 @@ fn unknown_starter_denied_first() {
     // 桌面订阅在场（有审批界面）——但启动者未知仍第 1 层拒绝，不进指纹/审批
     let (_sid, _rx) = shared.push.subscribe(true);
     // pid=0（未知启动者）+ 有效 cwd
-    let peer = PeerInfo { pid: 0, cwd: Some(std::fs::canonicalize(proj.path()).unwrap().to_string_lossy().into_owned()), origin: PeerOrigin::Socket };
+    let peer = PeerInfo {
+        pid: 0,
+        cwd: Some(
+            std::fs::canonicalize(proj.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        origin: PeerOrigin::Socket,
+    };
     let resp = handler(
         &rpc_line(
             M_AUTHZ_EVALUATE,
@@ -458,7 +477,10 @@ fn unknown_starter_denied_first() {
         &peer,
     );
     let v: Value = serde_json::from_str(&resp).unwrap();
-    assert_eq!(v["result"]["allowed"], false, "未知启动者第 1 层拒绝：{resp}");
+    assert_eq!(
+        v["result"]["allowed"], false,
+        "未知启动者第 1 层拒绝：{resp}"
+    );
     assert_eq!(
         v["result"]["reason"].as_str(),
         Some(lk_core::authz::DenyReason::UnknownStarter.as_str()),

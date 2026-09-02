@@ -230,9 +230,7 @@ fn read_peer_path_peb(pid: u32) -> Option<String> {
             }
             // sanity：Buffer 有效 + Length 在合理上界（错位读到的小句柄值不
             // 触发拷贝，交由 NULL 判断 + 上界双防线；与 starter.rs 同口径）。
-            if env.Buffer.is_null()
-                || env.Length == 0
-                || env.Length as usize > MAX_ENV_BLOCK_BYTES
+            if env.Buffer.is_null() || env.Length == 0 || env.Length as usize > MAX_ENV_BLOCK_BYTES
             {
                 return None;
             }
@@ -289,7 +287,11 @@ pub fn resolve_exe_path(
     let sep = ';';
     #[cfg(not(windows))]
     let sep = ':';
-    let path_dirs: Vec<PathBuf> = path_str.split(sep).filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+    let path_dirs: Vec<PathBuf> = path_str
+        .split(sep)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
     // resolve_exe 内置 `cwd` 兜底（PATH 全未命中时的最后一个候选）
     let resolved = fingerprint::resolve_exe(command, &path_dirs, Path::new(cwd), |p| p.is_file())?;
     std::fs::canonicalize(&resolved).ok()
@@ -362,10 +364,8 @@ pub fn adjudicate_binding(
 
 /// 构造失配展示信息（当前解析路径 + 8 位哈希摘要；不展示完整值）。
 fn mismatch_info(path: &Path, cache: &mut FingerprintCache) -> FingerprintMismatch {
-    let sha256_short = match cache.resolve_sha256_short(path) {
-        Some(s) => s,
-        None => String::new(), // 展示时有缓存则给摘要，否则留空（安全不泄露）
-    };
+    // 展示时有缓存则给摘要，否则留空（安全不泄露完整值）。
+    let sha256_short = cache.resolve_sha256_short(path).unwrap_or_default();
     FingerprintMismatch {
         resolved_exe_path: path.to_string_lossy().into_owned(),
         sha256_short,
@@ -496,7 +496,15 @@ impl FingerprintCache {
             hash_calls: std::sync::atomic::AtomicU64::new(0),
         }
     }
+}
 
+impl Default for FingerprintCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FingerprintCache {
     /// stat 取样 → 元信息快照（文件不存在 / 不可读 → `None` → 调用方 fail-closed）。
     /// 每次调用计数 `stat_calls`。
     pub fn stat(&mut self, path: &Path) -> Option<MetaSnapshot> {
@@ -674,7 +682,9 @@ mod tests {
     #[test]
     fn platform_peer_env_dispatches_read() {
         // 至少验证 trait 对象可调用（生产平台装配路径不变）。
-        let env: Box<dyn PeerEnv> = Box::new(FakePeerEnv { path: Some("/bin".into()) });
+        let env: Box<dyn PeerEnv> = Box::new(FakePeerEnv {
+            path: Some("/bin".into()),
+        });
         assert_eq!(env.peer_path(123), Some("/bin".into()));
     }
 }

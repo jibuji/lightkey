@@ -148,9 +148,9 @@ pub struct ExportMeta {
 ///
 /// M2.98 程序指纹失配（identity-binding.md §7）：`fingerprint_mismatch` 携带
 /// 「绑定注入规则命中命令形态但指纹不符」的展示信息——弹窗据「指纹不符」主题
-/// + 当前解析路径 + 8 位哈希摘要 + 「以新指纹重新授权」；未失配为 `None`（常规
-/// 审批）。**不含完整哈希、任何值或错误码差异化**（失配视同未命中，headless
-/// 统一 `authz.denied`，防探测）。
+/// 展示当前解析路径、8 位哈希摘要并给「以新指纹重新授权」入口；未失配为
+/// `None`（常规审批）。**不含完整哈希、任何值或错误码差异化**（失配视同
+/// 未命中，headless 统一 `authz.denied`，防探测）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FingerprintMismatch {
     /// 当前解析到的 canonical 绝对路径（daemon 侧重算；展示用，非安全依据）。

@@ -25,8 +25,9 @@ pub(crate) enum RuleBegin {
 
 /// 规则门待办操作（begin 期已校验/归一化；finalize 重执行）。
 pub(crate) enum PendingRuleOp {
-    /// `rule.add`（project_dir 已 canonical / wsl:// 规范形）。
-    Add(RuleAddParams),
+    /// `rule.add`（project_dir 已 canonical / wsl:// 规范形）。Box 逃逸
+    /// `large_enum_variant`（`RuleAddParams` 含可选指纹，相对 `Remove` 较大）。
+    Add(Box<RuleAddParams>),
     /// `rule.remove`（目标规则 id；finalize 锁内重验存在性）。
     Remove(uuid::Uuid),
 }
@@ -297,7 +298,7 @@ impl Daemon {
                     }
                 };
                 Ok(ParsedRuleOp {
-                    op: PendingRuleOp::Add(RuleAddParams {
+                    op: PendingRuleOp::Add(Box::new(RuleAddParams {
                         project_dir: project_dir.clone(),
                         name: p.name.clone(),
                         command: p.command.clone(),
@@ -309,7 +310,7 @@ impl Daemon {
                         // M2.98 指纹绑定请求（请求侧仅声明「绑哪个 exe」；daemon
                         // 在审批 finalize 侧重算后落库——身份绑定.md §5.3）
                         fingerprint: p.fingerprint.clone(),
-                    }),
+                    })),
                     display_name: p.name.clone(),
                     display_keys: p.keys.clone(),
                     display_project_dir: project_dir,

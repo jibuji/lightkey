@@ -594,7 +594,7 @@ fn rule_lww_conflict_resolves_by_revision() {
             keys: vec!["B".into()],
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
             actions: crate::model::default_rule_actions(),
-                fingerprint: None,
+            fingerprint: None,
         },
         Some(rule.id),
     )
@@ -779,7 +779,7 @@ fn rule_revived_not_falsely_deleted_on_remote_index_loss() {
             keys: vec!["A".into()],
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
             actions: crate::model::default_rule_actions(),
-                fingerprint: None,
+            fingerprint: None,
         },
         Some(rule.id),
     )

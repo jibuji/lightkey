@@ -169,10 +169,11 @@ impl Daemon {
                     .unwrap_or(Value::Null),
                 )))
             }
-            LayerResult::NeedsApproval => {
-                // 第 3 层：登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）。
-                // 无审批界面 → fail-closed 立即拒绝（不阻塞）。
-                return self.open_inject_approval(id, req, channel, false, None);
+            LayerResult::NeedsApproval =>
+            // 第 3 层：登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）；
+            // 无审批界面 → fail-closed 立即拒绝（不阻塞）。
+            {
+                self.open_inject_approval(id, req, channel, false, None)
             }
         }
     }
@@ -220,7 +221,9 @@ impl Daemon {
             &mut self.fingerprint_cache,
         ) {
             crate::identity::BindingOutcome::Allowed => FingerprintVerdict::Allowed,
-            crate::identity::BindingOutcome::Mismatch(m) => FingerprintVerdict::NeedsApproval(Some(m)),
+            crate::identity::BindingOutcome::Mismatch(m) => {
+                FingerprintVerdict::NeedsApproval(Some(m))
+            }
             crate::identity::BindingOutcome::Unresolved => FingerprintVerdict::NeedsApproval(None),
         }
     }
