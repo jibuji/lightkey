@@ -25,6 +25,7 @@ fn started_daemon(dir: &std::path::Path) -> Daemon {
 #[test]
 fn socket_peer_item_reads_audit_real_starter() {
     let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
     let mut daemon = started_daemon(dir.path());
     // 解锁同样经 socket 对端 → vault.unlock 应记真实回溯 starter
     let unlock = rpc_result(&daemon.handle(
@@ -37,6 +38,45 @@ fn socket_peer_item_reads_audit_real_starter() {
     ));
     let token = unlock["token"].as_str().unwrap().to_string();
 
+    // M2.97 写门：socket 写是授权事件——预插写规则（desktop 豁免，与桌面
+    // 规则页同路径）让 socket put 走「规则命中静默放行」的常规授权路径，
+    // 归因链路（#66 真实 starter + channel=cli）不受门影响；读规则同理
+    // （值披露读通道，M2.9）
+    let canonical = lk_core::path_ns::canonical_project_dir(
+        &std::fs::canonicalize(proj.path())
+            .unwrap()
+            .to_string_lossy(),
+    );
+    {
+        let shared = daemon.shared();
+        let mut guard = shared.vault.write().unwrap();
+        guard
+            .as_mut()
+            .unwrap()
+            .put_rule(
+                lk_core::model::RuleDraft {
+                    project_dir: canonical.clone(),
+                    name: "write-seed".into(),
+                    command: String::new(),
+                    keys: vec!["k1".into()],
+                    capability: lk_core::model::RULE_CAPABILITY_WRITE.into(),
+                    actions: vec![lk_core::model::RULE_ACTION_CREATE.into()],
+                },
+                None,
+            )
+            .unwrap();
+    }
+    let _ = daemon.handle(
+        &rpc_line(
+            M_RULE_ADD,
+            Some(&token),
+            json!({ "projectDir": canonical, "name": "read-seed",
+                    "command": "", "capability": "read", "keys": ["k1"],
+                    "channel": "cli" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let peer = test_peer(Some(proj.path()));
     let put = rpc_result(&daemon.handle(
         &rpc_line(
             M_ITEM_PUT,
@@ -46,15 +86,15 @@ fn socket_peer_item_reads_audit_real_starter() {
                 "purpose": "", "expiresAt": null
             } }),
         ),
-        &test_peer(None),
+        &peer,
     ));
     let item_id = put["item"]["id"].as_str().unwrap().to_string();
     let _ = daemon.handle(
         &rpc_line(M_ITEM_GET, Some(&token), json!({ "id": item_id })),
-        &test_peer(None),
+        &peer,
     );
 
-    for cmd in ["vault.unlock", "item.put", "item.get"] {
+    for cmd in ["vault.unlock", "item.create", "item.get"] {
         let e = last_event_like(dir.path(), cmd);
         assert_ne!(e.starter, "lk", "{cmd} 不得硬编码 starter=lk（#66）");
         assert_ne!(

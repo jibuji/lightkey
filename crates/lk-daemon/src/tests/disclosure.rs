@@ -19,7 +19,8 @@ fn put_file_item(state: &Arc<Mutex<Daemon>>, token: &str, name: &str, data: &[u8
                 "fileData": base64::engine::general_purpose::STANDARD.encode(data),
             } }),
         ),
-        &PeerInfo::unknown(),
+        // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+        &PeerInfo::desktop(),
     );
     rpc_result(&resp)["item"]["id"]
         .as_str()
@@ -46,13 +47,11 @@ fn disclosure_strategies_are_approval_deferred() {
         crate::strategy_of(M_ITEM_EXPORT),
         crate::ExecutionStrategy::ApprovalDeferred
     );
-    // 其余 item 方法维持 Inline（元数据不裁决，spec §3）
+    // 其余 item 方法维持 Inline（元数据不裁决，spec §3）；
+    // M2.97 起 item.put 升 ApprovalDeferred（写入授权门，write-gate.md §5.1，
+    // 断言迁移到 tests/write_gate.rs——此处只回归 Inline 面）
     assert_eq!(
         crate::strategy_of(M_ITEM_LIST),
-        crate::ExecutionStrategy::Inline
-    );
-    assert_eq!(
-        crate::strategy_of(M_ITEM_PUT),
         crate::ExecutionStrategy::Inline
     );
 }
@@ -74,7 +73,8 @@ fn desktop_direct_get_and_export_exempt_with_audit() {
                     "type": "secret", "name": "APIKey2", "value": "sk-2",
                     "purpose": "", "expiresAt": null } }),
             ),
-            &PeerInfo::unknown(),
+            // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+            &PeerInfo::desktop(),
         );
         rpc_result(&resp)["item"]["id"]
             .as_str()
@@ -146,7 +146,8 @@ fn socket_get_with_matching_read_rule_allowed_silently() {
                     "type": "secret", "name": "APIKey", "value": "sk-1",
                     "purpose": "", "expiresAt": null } }),
             ),
-            &PeerInfo::unknown(),
+            // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+            &PeerInfo::desktop(),
         );
         rpc_result(&resp)["item"]["id"]
             .as_str()
@@ -219,7 +220,8 @@ fn socket_get_without_rule_approval_allow_deny_timeout() {
                     "type": "secret", "name": "APIKey", "value": "sk-1",
                     "purpose": "", "expiresAt": null } }),
             ),
-            &PeerInfo::unknown(),
+            // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+            &PeerInfo::desktop(),
         );
         rpc_result(&resp)["item"]["id"]
             .as_str()
@@ -465,7 +467,8 @@ fn disclosure_socket_cannot_self_approve() {
                     "type": "secret", "name": "APIKey", "value": "sk-1",
                     "purpose": "", "expiresAt": null } }),
             ),
-            &PeerInfo::unknown(),
+            // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+            &PeerInfo::desktop(),
         );
         rpc_result(&resp)["item"]["id"]
             .as_str()
@@ -520,7 +523,8 @@ fn disclosure_allowed_but_locked_during_wait_returns_session_invalid() {
                     "type": "secret", "name": "APIKey", "value": "sk-1",
                     "purpose": "", "expiresAt": null } }),
             ),
-            &PeerInfo::unknown(),
+            // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+            &PeerInfo::desktop(),
         );
         rpc_result(&resp)["item"]["id"]
             .as_str()
@@ -653,7 +657,8 @@ fn locked_seed_item(state: &Arc<Mutex<Daemon>>, item: Value) -> String {
     let token = rpc_result(&resp)["token"].as_str().unwrap().to_string();
     let resp = state.lock().unwrap().handle(
         &rpc_line(M_ITEM_PUT, Some(&token), item),
-        &PeerInfo::unknown(),
+        // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+        &PeerInfo::desktop(),
     );
     let id = rpc_result(&resp)["item"]["id"]
         .as_str()
@@ -1098,7 +1103,8 @@ fn socket_get_matches_wsl_read_rule() {
                     "type": "secret", "name": "WSLKEY", "value": "sk-wsl",
                     "purpose": "", "expiresAt": null } }),
             ),
-            &PeerInfo::unknown(),
+            // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+            &PeerInfo::desktop(),
         );
         rpc_result(&resp)["item"]["id"]
             .as_str()

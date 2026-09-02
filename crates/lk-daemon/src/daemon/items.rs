@@ -124,23 +124,35 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn item_put(&mut self, id: Value, params: Value, caller: &CallerId) -> RpcResponse {
-        let p: ItemPutParams = match serde_json::from_value(params) {
-            Ok(p) => p,
-            Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
-        };
-        let kind = p.item.kind().as_str();
+    /// `item.put` create 执行核心（M2.97 写门拆分，write-gate.md §5.2：
+    /// action 由 daemon 从 `ItemPutParams.id` 权威派生，协议不拆——本函数
+    /// 只服务 id=None 的 create 形态）。调用方已过裁决（desktop 豁免 /
+    /// 写规则命中 / 弹窗批准，见 daemon/write.rs）；审计 command=
+    /// `item.create <name>`、target=条目名（§8），channel/starter 由裁决
+    /// 路径给出。解锁态：共享 vault（调用方预检/finalize 已保证）。
+    pub(crate) fn item_create_exec(
+        &mut self,
+        id: Value,
+        draft: ItemDraft,
+        starter: &str,
+        channel: AuditChannel,
+    ) -> RpcResponse {
         let shared = Arc::clone(&self.shared);
         let mut guard = shared.vault.write().unwrap();
         let me = guard.as_mut().unwrap();
-        match me.put(p.id, p.item, p.expected_revision) {
+        match me.put(None, draft, None) {
             Ok(item) => {
                 let _ = self.audit.append(
                     me.keys(),
-                    &caller.event(
-                        format!("{} {} <redacted>", M_ITEM_PUT, kind),
-                        AuditResult::Allowed,
-                    ),
+                    &EventInput {
+                        starter: starter.to_string(),
+                        target: item.name().to_string(),
+                        command: format!("item.create {}", item.name()),
+                        result: AuditResult::Allowed,
+                        channel,
+                        old_key_id: None,
+                        new_key_id: None,
+                    },
                 );
                 let result = ItemPutResult { item };
                 RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
@@ -149,24 +161,73 @@ impl Daemon {
         }
     }
 
-    pub(crate) fn item_delete(
+    /// `item.put` update 执行核心（写门拆分，§5.2：只服务 id=Some 的整条
+    /// 替换形态；CAS 语义不变——冲突照旧 `item.conflict`）。审计 command=
+    /// `item.update <name>`、target=条目名（§8）。
+    pub(crate) fn item_update_exec(
         &mut self,
         id: Value,
-        params: Value,
-        caller: &CallerId,
+        item_id: uuid::Uuid,
+        draft: ItemDraft,
+        expected_revision: Option<String>,
+        starter: &str,
+        channel: AuditChannel,
     ) -> RpcResponse {
-        let p: ItemDeleteParams = match serde_json::from_value(params) {
-            Ok(p) => p,
-            Err(_) => return RpcResponse::err(id, ERR_INVALID_PARAMS, "invalid params", None),
-        };
         let shared = Arc::clone(&self.shared);
         let mut guard = shared.vault.write().unwrap();
         let me = guard.as_mut().unwrap();
-        match me.delete(p.id) {
+        match me.put(Some(item_id), draft, expected_revision) {
+            Ok(item) => {
+                let _ = self.audit.append(
+                    me.keys(),
+                    &EventInput {
+                        starter: starter.to_string(),
+                        target: item.name().to_string(),
+                        command: format!("item.update {}", item.name()),
+                        result: AuditResult::Allowed,
+                        channel,
+                        old_key_id: None,
+                        new_key_id: None,
+                    },
+                );
+                let result = ItemPutResult { item };
+                RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
+            }
+            Err(e) => self.err_response(id, &e),
+        }
+    }
+
+    /// `item.delete` 执行核心（写门批准后调用；审计 command=
+    /// `item.delete <name>`、target=条目名——写门口径替换旧
+    /// `item.delete <uuid>`，write-gate.md §8）。
+    pub(crate) fn item_delete_exec(
+        &mut self,
+        id: Value,
+        item_id: uuid::Uuid,
+        starter: &str,
+        channel: AuditChannel,
+    ) -> RpcResponse {
+        let shared = Arc::clone(&self.shared);
+        let mut guard = shared.vault.write().unwrap();
+        let me = guard.as_mut().unwrap();
+        // 条目名先按 id 解析（target=条目名，§8）；不存在 → 原错误直返
+        let name = match me.get(item_id) {
+            Ok(item) => item.name().to_string(),
+            Err(e) => return self.err_response(id, &e),
+        };
+        match me.delete(item_id) {
             Ok(_tomb) => {
                 let _ = self.audit.append(
                     me.keys(),
-                    &caller.event(format!("{} {}", M_ITEM_DELETE, p.id), AuditResult::Allowed),
+                    &EventInput {
+                        starter: starter.to_string(),
+                        target: name.clone(),
+                        command: format!("item.delete {}", name),
+                        result: AuditResult::Allowed,
+                        channel,
+                        old_key_id: None,
+                        new_key_id: None,
+                    },
                 );
                 RpcResponse::ok(id, json!({}))
             }

@@ -171,7 +171,8 @@ fn physical_truncation_of_log_tail_is_detected() {
             h["item"]["name"] = json!(format!("C{i}"));
             daemon.handle(
                 &rpc_line(M_ITEM_PUT, Some(&token), h.clone()),
-                &PeerInfo::unknown(),
+                // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+                &PeerInfo::desktop(),
             );
         }
         // 现在把锚点更新到此刻的链尾（模拟在一次低频点已同步过）

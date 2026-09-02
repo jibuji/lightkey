@@ -53,12 +53,16 @@ pub enum ExecutionStrategy {
 /// ApprovalDeferred——授权的建立与撤销都是授权事件（desktop 直调豁免、
 /// headless fail-closed，见 daemon/rules.rs）；`rule.list` 维持 Inline
 /// （只读元数据）。
+///
+/// 写入授权门（补充拍板 #24，write-gate.md §5.1）：`item.put` /
+/// `item.delete` 升为 ApprovalDeferred——**写 = 授权事件**（写规则命中
+/// 静默放行 / 桌面弹窗批准 / 否则拒绝；delete 恒弹窗）；`item.list`
+/// 维持 Inline。
 pub fn strategy_of(method: &str) -> ExecutionStrategy {
     match method {
         M_SYNC_TRIGGER => ExecutionStrategy::OutsideLock,
-        M_AUTHZ_EVALUATE | M_ITEM_GET | M_ITEM_EXPORT | M_RULE_ADD | M_RULE_REMOVE => {
-            ExecutionStrategy::ApprovalDeferred
-        }
+        M_AUTHZ_EVALUATE | M_ITEM_GET | M_ITEM_EXPORT | M_ITEM_PUT | M_ITEM_DELETE | M_RULE_ADD
+        | M_RULE_REMOVE => ExecutionStrategy::ApprovalDeferred,
         _ => ExecutionStrategy::Inline,
     }
 }
@@ -129,7 +133,9 @@ fn sync_trigger_outside_lock(
 /// （`authz_begin` / `authz_finalize`），`item.get` / `item.export` 走值披露
 /// 裁决（`disclosure_begin` / `disclosure_finalize`，daemon/disclosure.rs），
 /// `rule.add` / `rule.remove` 走规则管理审批门（`rule_begin` /
-/// `rule_finalize`，daemon/rules.rs，补充拍板 #22）。
+/// `rule_finalize`，daemon/rules.rs，补充拍板 #22），`item.put` /
+/// `item.delete` 走写入授权门（`write_begin` / `write_finalize`，
+/// daemon/write.rs，补充拍板 #24）。
 fn approval_deferred(
     state: &Arc<Mutex<Daemon>>,
     shared: &Arc<SharedDaemon>,
@@ -141,6 +147,8 @@ fn approval_deferred(
         authz_evaluate_deferred(state, shared, &req, peer)
     } else if req.method == M_RULE_ADD || req.method == M_RULE_REMOVE {
         rule_deferred(state, shared, &req, peer)
+    } else if req.method == M_ITEM_PUT || req.method == M_ITEM_DELETE {
+        write_deferred(state, shared, &req, peer)
     } else {
         disclosure_deferred(state, shared, &req, peer)
     }
@@ -261,6 +269,47 @@ fn rule_deferred(
             let resp = {
                 let mut guard = state.lock().expect("daemon mutex poisoned");
                 let r = guard.rule_finalize(id, request_id, decision);
+                guard.touch_activity();
+                r
+            };
+            Some(resp)
+        }
+    }
+    .unwrap_or_else(|| "{}".into())
+}
+
+/// 写入授权门编排（`item.put` / `item.delete`，补充拍板 #24，write-gate.md
+/// §5）：同一三阶段骨架——①命令锁内 `write_begin`（会话/锁态预检 + 目标
+/// 条目解析 + action 权威派生 + 通道判定：desktop 直调受信豁免直返；socket
+/// 走 fail-closed 检查 → 写规则匹配命中静默放行 → delete 跳过规则直接
+/// 登记（恒弹窗）→ 无 UI 立即拒绝；否则登记 + 广播）→ ②命令锁外等待决策
+/// → ③重取命令锁收尾（TOCTOU 锁内重校验后执行 + 审计，daemon/write.rs）。
+fn write_deferred(
+    state: &Arc<Mutex<Daemon>>,
+    shared: &Arc<SharedDaemon>,
+    req: &RpcRequest,
+    peer: &PeerInfo,
+) -> String {
+    let id = req.id.clone();
+    let token = extract_token(&req.params);
+    // ① 命令锁内：锁态先失败（session.invalid——写门不弹解锁窗，spec §3）
+    let begin = {
+        let mut guard = state.lock().expect("daemon mutex poisoned");
+        guard.auto_lock_if_idle();
+        if !guard.write_precheck(token.as_deref()) {
+            return rpc_string(session_invalid(id));
+        }
+        guard.write_begin(id.clone(), &req.method, req.params.clone(), peer)
+    };
+    match begin {
+        crate::WriteBegin::Final(resp) => Some(resp),
+        crate::WriteBegin::Pending { request_id } => {
+            // ② 锁外等待（≤超时默认拒绝；G1）
+            let decision = shared.approvals.await_decision(request_id);
+            // ③ 重取命令锁收尾
+            let resp = {
+                let mut guard = state.lock().expect("daemon mutex poisoned");
+                let r = guard.write_finalize(id, request_id, decision);
                 guard.touch_activity();
                 r
             };

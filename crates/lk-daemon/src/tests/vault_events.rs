@@ -43,7 +43,8 @@ fn daemon_emits_session_and_item_events_on_bus() {
                 "password": "p", "uris": [], "custom": []
             } }),
         ),
-        &PeerInfo::unknown(),
+        // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+        &PeerInfo::desktop(),
     );
     daemon.handle(
         &rpc_line(M_VAULT_LOCK, Some(&token), json!({})),
@@ -219,7 +220,8 @@ fn push_channel_notifies_session_and_item_events() {
                 "password": "p", "uris": [], "custom": []
             } }),
         ),
-        &PeerInfo::unknown(),
+        // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+        &PeerInfo::desktop(),
     );
     let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
     let fv: Value = serde_json::from_str(&frame).unwrap();

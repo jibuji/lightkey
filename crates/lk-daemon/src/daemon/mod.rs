@@ -19,7 +19,7 @@ use lk_core::authz::{
 };
 use lk_core::bus::LockReason;
 use lk_core::ipc::*;
-use lk_core::model::{Rule, RuleDraft};
+use lk_core::model::{ItemDraft, Rule, RuleDraft};
 use lk_core::recovery::RecoveryCode;
 use lk_core::service::CoreServices;
 use lk_core::session::SessionManager;
@@ -38,6 +38,7 @@ use self::authz::AuthzBegin;
 use self::disclosure::PendingDisclosure;
 use self::lifecycle::{install_shutdown_handlers, load_config};
 use self::rules::{PendingRuleChange, RuleBegin};
+use self::write::PendingWrite;
 
 /// 会话令牌文件名（0600；CLI 进程间传递，锁定即删除）。
 pub const SESSION_TOKEN_FILE: &str = "session.token";
@@ -123,6 +124,8 @@ pub struct Daemon {
     pending_disclosure: Mutex<HashMap<uuid::Uuid, PendingDisclosure>>,
     /// 进行中的规则管理审批（补充拍板 #22；request_id → 操作/归因）。
     pending_rule: Mutex<HashMap<uuid::Uuid, PendingRuleChange>>,
+    /// 进行中的条目写入审批（补充拍板 #24；request_id → 操作/归因）。
+    pending_write: Mutex<HashMap<uuid::Uuid, PendingWrite>>,
 }
 
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
@@ -217,6 +220,7 @@ impl Daemon {
             pending_authz: Mutex::new(HashMap::new()),
             pending_disclosure: Mutex::new(HashMap::new()),
             pending_rule: Mutex::new(HashMap::new()),
+            pending_write: Mutex::new(HashMap::new()),
         };
         // 启动自检：锚点 vs 链（截断检测，无需 K_audit），置 `anchor_ok`。
         daemon.anchor_selfcheck();
@@ -396,6 +400,24 @@ impl Daemon {
                 };
                 return resp;
             }
+            // 写入授权门（补充拍板 #24，write-gate.md §5）：锁态先失败
+            // （session.invalid——写门不弹解锁窗）；desktop 直调豁免 /
+            // socket 写规则匹配 / 审批门在 begin 内分派（daemon/write.rs）
+            if method == M_ITEM_PUT || method == M_ITEM_DELETE {
+                if !self.write_precheck(token.as_deref()) {
+                    return rpc_string(session_invalid(id));
+                }
+                let resp = match self.write_begin(id.clone(), &method, params, peer) {
+                    write::WriteBegin::Final(resp) => resp,
+                    write::WriteBegin::Pending { request_id } => {
+                        let decision = self.shared.approvals.await_decision(request_id);
+                        let r = self.write_finalize(id, request_id, decision);
+                        self.touch_activity();
+                        r
+                    }
+                };
+                return resp;
+            }
             // M2.9 值披露（`item.get` / `item.export`）：锁态 + 桌面 UI 在场
             // → 一体化解锁弹窗（补充拍板 #23，disclosure_precheck 分流）；
             // headless / 未初始化库 → fail-closed session.invalid。desktop
@@ -431,12 +453,8 @@ impl Daemon {
             }
             // M_ITEM_GET / M_ITEM_EXPORT = ApprovalDeferred 策略（M2.9 值披露
             // 裁决，见 dispatch 开头的策略分派与 daemon/disclosure.rs）
-            M_ITEM_PUT => self.require_session(id.clone(), token, |me| {
-                me.item_put(id.clone(), params, &caller)
-            }),
-            M_ITEM_DELETE => self.require_session(id.clone(), token, |me| {
-                me.item_delete(id.clone(), params, &caller)
-            }),
+            // M_ITEM_PUT / M_ITEM_DELETE = ApprovalDeferred 策略（M2.97 写入
+            // 授权门，见 dispatch 开头的策略分派与 daemon/write.rs）
             M_AUDIT_LIST => self.require_session(id.clone(), token, |me| {
                 me.audit_list(id.clone(), params, &caller)
             }),
@@ -697,3 +715,4 @@ pub(crate) mod rules;
 mod session;
 mod sync_cmds;
 mod vault_cmds;
+pub(crate) mod write;
