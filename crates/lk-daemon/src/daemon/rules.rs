@@ -368,6 +368,10 @@ impl Daemon {
                     command: p.command.clone(),
                     keys: p.keys.clone(),
                     capability: capability.to_string(),
+                    // 最小编译修复（T1，issue #112）：RPC 尚无 actions 参数
+                    // （PR C 经 `rule.add --actions` 贯通）；缺省 create+update
+                    // 与 serde 缺省一致，capability!=write 时本就不参与匹配。
+                    actions: lk_core::model::default_rule_actions(),
                 };
                 match me.put_rule(draft, None) {
                     Ok(rule) => {

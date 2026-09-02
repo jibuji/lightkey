@@ -105,7 +105,7 @@ pub enum ApprovalDecision {
 }
 
 /// 审批请求类型（M2.9 值披露；弹窗按 kind 选形态，value-disclosure.md §6；
-/// 补充拍板 #22 增 `Rule`）。加性变更，不升协议版本。
+/// 补充拍板 #22 增 `Rule`，#24 增 `Write`）。加性变更，不升协议版本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalKind {
@@ -120,6 +120,11 @@ pub enum ApprovalKind {
     /// 不拆两个 kind——remove 由 daemon 解析 id→规则补全 name/keys/projectDir
     /// 供弹窗展示。
     Rule,
+    /// 条目写入（`item.put` / `item.delete`；M2.97 写入门，补充拍板 #24，
+    /// write-gate.md §6）。单一 kind + `command` 字段承载动作
+    /// （`item.put <name>` / `item.delete <name>`）；keys = 单元素
+    /// [目标条目名]；export_meta 恒 None。
+    Write,
 }
 
 /// export 审批的数据包元信息（弹窗展示规模用；不含数据本身）。
@@ -571,6 +576,58 @@ pub fn read_rule_matches(rule: &Rule, canonical_cwd: &str, item_name: &str) -> b
         && rule.keys.iter().any(|k| k == item_name)
 }
 
+/// 写动作（M2.97 写入门，write-gate.md §4/§5.2）：守护进程从
+/// `ItemPutParams.id: Option<Uuid>` **权威派生**（None = create，Some =
+/// update），不信任客户端自报。**无 Delete 变体**——delete 恒弹窗由协议
+/// 保证（§3），根本不进规则匹配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAction {
+    /// 新建（id=None）：keys 精确包含草稿名。
+    Create,
+    /// 整条替换（id=Some）：keys 同时包含存储名与草稿名（双向名约束）。
+    Update,
+}
+
+/// 写规则是否匹配 `(cwd, action, 存储名?, 草稿名)`（写门路径，write-gate.md
+/// §4）：**capability=write**（三能力两两不互授）+ projectDir 祖先匹配（与
+/// inject/read 同一套归一化/祖先匹配，`wsl://` 规范形两侧同函数）+ 按动作：
+///
+/// - [`WriteAction::Create`]：actions 含 `create` 且 keys **精确包含草稿名**；
+/// - [`WriteAction::Update`]：actions 含 `update` 且 keys **同时包含存储名
+///   与草稿名**——改名不得「进出」授权名集合（堵改名逃生 / 改名植毒，§4）；
+///   存储名未知（`None`）→ 不命中（fail-closed）。
+///
+/// 重名语义「名字即身份」：keys 按名匹配，覆盖全部同名条目（与读规则同构）。
+pub fn write_rule_matches(
+    rule: &Rule,
+    canonical_cwd: &str,
+    action: WriteAction,
+    stored_name: Option<&str>,
+    draft_name: &str,
+) -> bool {
+    if rule.capability != crate::model::RULE_CAPABILITY_WRITE {
+        return false;
+    }
+    if !project_dir_matches(&rule.project_dir, canonical_cwd) {
+        return false;
+    }
+    match action {
+        WriteAction::Create => {
+            rule.actions
+                .iter()
+                .any(|a| a == crate::model::RULE_ACTION_CREATE)
+                && rule.keys.iter().any(|k| k == draft_name)
+        }
+        WriteAction::Update => {
+            rule.actions
+                .iter()
+                .any(|a| a == crate::model::RULE_ACTION_UPDATE)
+                && stored_name.is_some_and(|s| rule.keys.iter().any(|k| k == s))
+                && rule.keys.iter().any(|k| k == draft_name)
+        }
+    }
+}
+
 /// projectDir 祖先匹配：`cwd` 等于 `project_dir`，或 `cwd` 是 `project_dir`
 /// 的路径前缀（**按路径组件**比较——目录边界 `/a/b/cd` 不匹配 `/a/b/c`；
 /// 分隔符随平台，Windows `C:\\a\\b` 与 `/` 写法均正确）。
@@ -646,6 +703,7 @@ mod tests {
             command: command.into(),
             keys: keys.iter().map(|s| s.to_string()).collect(),
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+            actions: crate::model::default_rule_actions(),
             created: "2026-01-01T00:00:00.000000Z".into(),
         }
     }
@@ -1166,6 +1224,246 @@ mod tests {
         assert!(rule_matches(&r, "/proj/sub", "npm publish"));
     }
 
+    // -- M2.97 写入门（补充拍板 #24）：写规则匹配矩阵（write-gate.md §4/§10.1）-
+
+    /// 写规则 helper：capability=write；command 恒空串（spec §4），keys =
+    /// 条目名（精确，不做通配），actions = 写动作子集。
+    fn write_rule(project_dir: &str, keys: &[&str], actions: &[&str]) -> Rule {
+        let mut r = rule(project_dir, "", keys);
+        r.capability = crate::model::RULE_CAPABILITY_WRITE.into();
+        r.actions = actions.iter().map(|s| s.to_string()).collect();
+        r
+    }
+
+    /// create：keys 精确包含草稿名 + projectDir 祖先匹配。
+    #[test]
+    fn write_rule_create_matches_draft_name() {
+        let r = write_rule("/proj", &["config.ini"], &["create", "update"]);
+        assert!(write_rule_matches(
+            &r,
+            "/proj",
+            WriteAction::Create,
+            None,
+            "config.ini"
+        ));
+        assert!(write_rule_matches(
+            &r,
+            "/proj/sub",
+            WriteAction::Create,
+            None,
+            "config.ini"
+        ));
+        assert!(
+            !write_rule_matches(&r, "/proj", WriteAction::Create, None, "other.ini"),
+            "keys 未包含草稿名 → 不命中"
+        );
+        assert!(
+            !write_rule_matches(&r, "/other", WriteAction::Create, None, "config.ini"),
+            "cwd 不匹配 → 不命中"
+        );
+        assert!(
+            !write_rule_matches(&r, "/projc", WriteAction::Create, None, "config.ini"),
+            "目录边界不匹配"
+        );
+    }
+
+    /// update：keys 同时包含存储名与草稿名（双向名约束）。
+    #[test]
+    fn write_rule_update_requires_both_names() {
+        let r = write_rule("/proj", &["config.ini"], &["create", "update"]);
+        assert!(write_rule_matches(
+            &r,
+            "/proj",
+            WriteAction::Update,
+            Some("config.ini"),
+            "config.ini"
+        ));
+        // 同目录改名（两名字都在授权集）：命中
+        let multi = write_rule("/proj", &["old.ini", "new.ini"], &["update"]);
+        assert!(write_rule_matches(
+            &multi,
+            "/proj",
+            WriteAction::Update,
+            Some("old.ini"),
+            "new.ini"
+        ));
+    }
+
+    /// 改名逃生：存储名不在 keys → 不命中（把授权条目改名出集合）。
+    #[test]
+    fn write_rule_rename_escape_denied() {
+        let r = write_rule("/proj", &["config.ini"], &["create", "update"]);
+        assert!(!write_rule_matches(
+            &r,
+            "/proj",
+            WriteAction::Update,
+            Some("secret.ini"),
+            "config.ini"
+        ));
+    }
+
+    /// 改名植毒：草稿名不在 keys → 不命中（把非授权条目改名进集合）。
+    #[test]
+    fn write_rule_rename_poisoning_denied() {
+        let r = write_rule("/proj", &["config.ini"], &["create", "update"]);
+        assert!(!write_rule_matches(
+            &r,
+            "/proj",
+            WriteAction::Update,
+            Some("config.ini"),
+            "poison.ini"
+        ));
+    }
+
+    /// 重名语义「名字即身份」：规则按名覆盖全部同名条目（data-model.md
+    /// 无名称唯一约束，重名允许）。匹配函数签名只收（存储名, 草稿名）
+    /// 字符串、不收条目 id——同名条目无论 id 均命中同一规则，本用例把
+    /// 该 API 形态钉住。
+    #[test]
+    fn write_rule_covers_all_same_named_items() {
+        let r = write_rule("/proj", &["config.ini"], &["create", "update"]);
+        assert!(write_rule_matches(
+            &r,
+            "/proj",
+            WriteAction::Update,
+            Some("config.ini"),
+            "config.ini"
+        ));
+    }
+
+    /// actions 子集语义：create-only 不授 update，update-only 不授 create。
+    #[test]
+    fn write_rule_actions_are_per_action() {
+        let create_only = write_rule("/proj", &["a.ini"], &["create"]);
+        assert!(write_rule_matches(
+            &create_only,
+            "/proj",
+            WriteAction::Create,
+            None,
+            "a.ini"
+        ));
+        assert!(!write_rule_matches(
+            &create_only,
+            "/proj",
+            WriteAction::Update,
+            Some("a.ini"),
+            "a.ini"
+        ));
+        let update_only = write_rule("/proj", &["a.ini"], &["update"]);
+        assert!(!write_rule_matches(
+            &update_only,
+            "/proj",
+            WriteAction::Create,
+            None,
+            "a.ini"
+        ));
+        assert!(write_rule_matches(
+            &update_only,
+            "/proj",
+            WriteAction::Update,
+            Some("a.ini"),
+            "a.ini"
+        ));
+    }
+
+    /// delete 不参与匹配（write-gate.md §3 恒弹窗）：即使规则 actions 防御性
+    /// 含 "delete"，也不产生任何放行面——写门匹配只服务 create/update；
+    /// `WriteAction` 无 Delete 变体（delete 根本不进规则匹配，daemon 直开弹窗）。
+    #[test]
+    fn delete_never_participates_in_rule_matching() {
+        let r = write_rule("/proj", &["a.ini"], &["delete"]);
+        assert!(!write_rule_matches(
+            &r,
+            "/proj",
+            WriteAction::Create,
+            None,
+            "a.ini"
+        ));
+        assert!(!write_rule_matches(
+            &r,
+            "/proj",
+            WriteAction::Update,
+            Some("a.ini"),
+            "a.ini"
+        ));
+        // actions 含 delete + create：delete 部分无效果，create 照常
+        let mixed = write_rule("/proj", &["a.ini"], &["create", "delete"]);
+        assert!(write_rule_matches(
+            &mixed,
+            "/proj",
+            WriteAction::Create,
+            None,
+            "a.ini"
+        ));
+    }
+
+    /// 跨命名空间：`wsl://` 规范形规则命中归一化后的 WSL cwd（与 inject/read
+    /// 同一套 project_dir_matches，两侧同函数）。
+    #[test]
+    fn write_rule_matches_wsl_normalized_cwd() {
+        let r = write_rule("wsl://Debian/home/u/p", &["a.ini"], &["create", "update"]);
+        let cwd = crate::path_ns::canonical_project_dir(r"\\wsl.localhost\DEBIAN\home\u\p\sub");
+        assert!(write_rule_matches(
+            &r,
+            &cwd,
+            WriteAction::Create,
+            None,
+            "a.ini"
+        ));
+        assert!(write_rule_matches(
+            &r,
+            &cwd,
+            WriteAction::Update,
+            Some("a.ini"),
+            "a.ini"
+        ));
+        let cwd2 = crate::path_ns::canonical_project_dir(r"\\wsl$\Debian\home\u\p2");
+        assert!(!write_rule_matches(
+            &r,
+            &cwd2,
+            WriteAction::Create,
+            None,
+            "a.ini"
+        ));
+    }
+
+    /// 三能力两两不互授（双向）：write 不授权读/注入；read/inject 不授权写。
+    #[test]
+    fn write_capability_does_not_grant_read_or_inject() {
+        let w = write_rule("/proj", &["A"], &["create", "update"]);
+        // write 规则不命中注入 / 读路径
+        assert!(!rule_matches(&w, "/proj", "npm publish"));
+        assert!(!read_rule_matches(&w, "/proj", "A"));
+        // read / inject 规则不命中写路径
+        let rd = read_rule("/proj", &["A"]);
+        assert!(!write_rule_matches(
+            &rd,
+            "/proj",
+            WriteAction::Create,
+            None,
+            "A"
+        ));
+        assert!(!write_rule_matches(
+            &rd,
+            "/proj",
+            WriteAction::Update,
+            Some("A"),
+            "A"
+        ));
+        let inj = rule("/proj", "*", &["A"]);
+        assert!(!write_rule_matches(
+            &inj,
+            "/proj",
+            WriteAction::Create,
+            None,
+            "A"
+        ));
+        // 带伪造 command 的 write 规则同样不得命中注入（capability 过滤在前）
+        let mut rogue = w.clone();
+        rogue.command = "npm *".into();
+        assert!(!rule_matches(&rogue, "/proj", "npm publish"));
+    }
+
     /// ApprovalKind 协议面序列化（serde camelCase 单词 → 小写）。
     #[test]
     fn approval_kind_serializes_lowercase() {
@@ -1190,6 +1488,18 @@ mod tests {
         assert_eq!(back, ApprovalKind::Rule);
         let back: ApprovalKind = serde_json::from_value(serde_json::json!("read")).unwrap();
         assert_eq!(back, ApprovalKind::Read);
+    }
+
+    /// 写入门审批 kind（补充拍板 #24，write-gate.md §6）：kind=write，
+    /// serde 往返，加性变更不升协议版本。
+    #[test]
+    fn approval_kind_write_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(ApprovalKind::Write).unwrap(),
+            serde_json::json!("write")
+        );
+        let back: ApprovalKind = serde_json::from_value(serde_json::json!("write")).unwrap();
+        assert_eq!(back, ApprovalKind::Write);
     }
 
     // -- 规则管理审批门（补充拍板 #22）：E2E 自动批准通道 --------------------

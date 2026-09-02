@@ -164,6 +164,7 @@ mod tests {
             command: command.into(),
             keys: vec!["A".into()],
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+            actions: crate::model::default_rule_actions(),
             created: "2026-01-01T00:00:00.000000Z".into(),
         }
     }

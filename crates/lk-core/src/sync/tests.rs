@@ -428,6 +428,7 @@ fn rule_sync_pulls_and_self_heals_missing_object() {
         command: "npm publish".into(),
         keys: vec!["NPM_TOKEN".into()],
         capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+        actions: crate::model::default_rule_actions(),
         created: "2026-01-01T00:00:00.000000Z".into(),
     };
     let key = format!("{}.rule.lk", rule_obj.id);
@@ -526,6 +527,7 @@ fn rule_push_pull_and_delete_propagate() {
                 command: "npm publish".into(),
                 keys: vec!["NPM_TOKEN".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                actions: crate::model::default_rule_actions(),
             },
             None,
         )
@@ -572,6 +574,7 @@ fn rule_lww_conflict_resolves_by_revision() {
                 command: "npm publish".into(),
                 keys: vec!["A".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                actions: crate::model::default_rule_actions(),
             },
             None,
         )
@@ -587,6 +590,7 @@ fn rule_lww_conflict_resolves_by_revision() {
             command: "npm *".into(),
             keys: vec!["B".into()],
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+            actions: crate::model::default_rule_actions(),
         },
         Some(rule.id),
     )
@@ -619,6 +623,7 @@ fn rule_tombstone_propagates_and_hard_delete_after_confirmation() {
                 command: "npm publish".into(),
                 keys: vec!["NPM_TOKEN".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                actions: crate::model::default_rule_actions(),
             },
             None,
         )
@@ -684,6 +689,7 @@ fn rule_deleted_not_resurrected_on_remote_index_loss() {
                 command: "npm publish".into(),
                 keys: vec!["NPM_TOKEN".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                actions: crate::model::default_rule_actions(),
             },
             None,
         )
@@ -741,6 +747,7 @@ fn rule_revived_not_falsely_deleted_on_remote_index_loss() {
                 command: "npm publish".into(),
                 keys: vec!["NPM_TOKEN".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                actions: crate::model::default_rule_actions(),
             },
             None,
         )
@@ -764,6 +771,7 @@ fn rule_revived_not_falsely_deleted_on_remote_index_loss() {
             command: "npm *".into(),
             keys: vec!["A".into()],
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+            actions: crate::model::default_rule_actions(),
         },
         Some(rule.id),
     )
