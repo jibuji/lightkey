@@ -138,15 +138,23 @@
   无痕（不签发令牌/不写 session.token/不置共享 vault，#65 边界）；锁态
   read 规则命中**也必弹**（规则在加密库内无法预载）；headless/未初始化库
   维持 fail-closed；等待期整库解锁 → finalize 常态路径、被锁 → session.invalid；
-  「记住」按钮条件 `isRead && !needsUnlock`（D 层单测钉住）。见
+  「记住」按钮条件 `isRead && !needsUnlock`（D 层单测钉住；M2.97 扩为
+  `(isRead || write put) && !needsUnlock`）。见
   `docs/authorization-gate.md` §5.2/§9、`docs/value-disclosure.md` §3/§5、
   `docs/decisions.md` #22/#23
-- [ ] M2.97 写入授权门（补充拍板 #24 草案，2026-09-02 拍板，待实现；spec
-  唯一出处 `docs/write-gate.md`）：`item.put`/`item.delete` 升裁决方法（写 =
-  授权事件）；写规则 `capability=write` + `actions`（缺省 create+update，
-  双向名称约束）；**delete 恒弹窗**任何规则不豁免；RPC 不拆（action 由
-  daemon 派生）+ `ApprovalKind::Write`；锁态 `session.invalid` 先行；同步
-  应用不受门、真相源投毒为已知限制；E2E 不扩 auto-approve。
+- [x] M2.97 写入授权门（补充拍板 #24，2026-09-02 拍板；spec 唯一出处
+  `docs/write-gate.md`）：`item.put`/`item.delete` 升裁决方法（写 = 授权
+  事件）；写规则 `capability=write` + `actions`（serde 缺省 create+update，
+  update 双向名称约束）；**delete 恒弹窗**任何规则不豁免；RPC 不拆（action
+  由 daemon 从 `ItemPutParams.id` 有无权威派生）+ `ApprovalKind::Write`
+  （serde `"write"`）；拒绝复用 -32017；desktop 直调豁免、headless
+  fail-closed、锁态 `session.invalid` 先行（写门无一体化解锁窗，留档）；
+  全路径审计 command 派生 `item.create/update/delete <name>`；
+  `lk rule add --write`（actions 校验拒绝 delete）+ 写拒绝语境文案；
+  前端 kind=write 弹窗（动作/条目名/projectDir/倒计时，不展示值）+
+  「记住」仅 put（最小写规则 keys=[条目名]+actions=[create,update]）、
+  delete 无记住；规则页展示 capability+actions、审计页 §8 口径；E2E 不扩
+  auto-approve；同步应用不受门、真相源投毒为已知限制。issues #112-#115。
 - [ ] M3 浏览器填充
 
 ## Agent skills

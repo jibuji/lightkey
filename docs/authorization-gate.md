@@ -340,17 +340,18 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   `e2e_m0/m1` 传 env（主流程含 rule add 预插）；`e2e_cross_subsystem.sh`
   传 env + WSLENV（Windows 守护实例由桌面应用持有，见脚本头注释）。
 
-## 10. 写入授权门（write gate，M2.97，规划中）
+## 10. 写入授权门（write gate，M2.97，已实现）
 
 > 完整实现规格见 [write-gate.md](write-gate.md)（**唯一出处**）；本节只留
-> 边界摘要（补充拍板 #24，2026-09-02 拍板，待实现）。
+> 边界摘要（补充拍板 #24，2026-09-02 拍板，已实现）。
 
 - **写 = 授权事件**（值披露裁决 #20 的对称完成面）：`item.put`（create /
   update）与 `item.delete` 从「仅验会话令牌」升为裁决方法（ApprovalDeferred
   三阶段复用）；desktop 直调受信豁免；headless fail-closed（`authz.denied`
   -32017 复用）；锁态 `session.invalid` 先行（规则在加密库内）。
-- **写规则**（`capability=write` + `actions ⊆ {create, update, delete}`，
-  缺省 create+update）：按条目名匹配——create 草稿名 ∈ keys；update 存储名
+- **写规则**（`capability=write` + `actions`（create/update 子集，缺省
+  create+update；**delete 不存在于 actions**——恒弹窗由协议保证，规则写不
+  进去））：按条目名匹配——create 草稿名 ∈ keys；update 存储名
   **且** 草稿名都 ∈ keys（双向名称约束：名字不得「进出」授权集合，防改名
   逃生 / 改名植毒）；重名语义 = 名字即身份（覆盖全部同名条目，与读规则
   同构）。**delete 恒弹窗，任何规则不豁免**（无用户级恢复路径）。

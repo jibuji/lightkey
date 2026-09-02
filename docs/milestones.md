@@ -262,7 +262,7 @@ milestones、AGENTS.md、CONTEXT.md）；**#104/#105 关闭**。
 
 > 本里程碑为补充拍板 #22/#23 新增（插入 M2.9 之后、M3 之前）。
 
-## M2.97 —— 写入授权门（write gate）（规划中，未实现）
+## M2.97 —— 写入授权门（write gate）（已完成）
 
 **目标**：补充拍板 #24（2026-09-02 write-gate grilling 拍板）——`item.put`
 （create/update）与 `item.delete` 从「仅验会话令牌」升为裁决方法（对称原则
@@ -299,7 +299,8 @@ milestones、decisions #24 状态翻转、AGENTS.md、CONTEXT.md）；写门 iss
 立项并关闭。
 
 > 本里程碑为 write-gate grilling 会话拍板（补充拍板 #24）新增（插入
-> M2.95 之后、M3 之前）；现状未实现。
+> M2.95 之后、M3 之前）；已按 write-gate.md §11 PR A-D 序列落地
+> （issues #112-#115）。
 
 ## M3 —— 浏览器填充（V1 之后）
 

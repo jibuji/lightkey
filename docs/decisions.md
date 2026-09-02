@@ -438,7 +438,8 @@ needs-decision，不得自行变更。
     value-disclosure.md（判定矩阵锁态行）、authorization-gate.md §5.2。
 
 24. **写入授权门（write gate）：写 = 授权事件（2026-09-02 · 来源：
-    write-gate grilling-with-docs 会话收敛，船长拍板，**待实现**）**：
+    write-gate grilling-with-docs 会话收敛，船长拍板，**已实现**——M2.97
+    PR A-D 序列经 PR CI 门禁落地，issues #112-#115）**：
     `item.put` / `item.delete` 从「仅验会话令牌」升为裁决方法——值披露是
     授权事件（#20），**写入同样是授权事件**（对称原则完成面）：解锁窗口内
     任何同用户进程持令牌即可静默新建/整条替换/删除任意条目，与 #65 同源
@@ -483,7 +484,7 @@ needs-decision，不得自行变更。
     实现规格：[write-gate.md](write-gate.md)（**唯一出处**）；落点：
     authorization-gate.md §10（摘要）、ipc.md / cli.md / agent-cli.md /
     data-model.md（标注）、milestones.md M2.97、CONTEXT.md（写入/写动作/
-    写规则/恒弹窗词条）；**issue 待立项**（实现走 PR CI 门禁序列，
-    write-gate.md §11）。
+    写规则/恒弹窗词条）；**已立项并按 PR 序列落地**（epic #111，issues
+    #112-#115，实现走 PR CI 门禁序列，write-gate.md §11）。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

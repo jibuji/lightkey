@@ -257,15 +257,16 @@ export class MockAdapter implements LightKeyIpc {
     this.requireUnlocked();
     // 对齐真实守护进程校验：目录须为绝对路径（浏览器无文件系统，「存在」
     // 只能由真实侧判定；mock 至少拦截相对路径，保证前端 invalid 分支可达）。
-    // capability 感知（M2.9）：read 规则 command 恒为空串（不绑定命令）
+    // capability 感知（M2.9 / M2.97）：read/write 规则不绑定命令（command
+    // 恒为空串）；inject 规则必须带命令。
     const isAbsolute = /^([a-zA-Z]:[\\/]|\/)/.test(input.projectDir);
-    const isRead = input.capability === "read";
+    const noCommand = input.capability === "read" || input.capability === "write";
     if (
       !input.projectDir ||
       !isAbsolute ||
       !input.name ||
       !input.keys.length ||
-      (isRead ? !!input.command : !input.command)
+      (noCommand ? !!input.command : !input.command)
     ) {
       return delayReject(new Error("invalid params"));
     }
@@ -351,8 +352,8 @@ export class MockAdapter implements LightKeyIpc {
   /** 模拟守护进程推送 authz.request 帧（审批弹窗演示/测试入口）。
    *  `challenge` 缺省给固定值（mock 不校验，仅透传给弹窗回传）。
    *  `needsUnlock`（#67）：锁定态一体化——弹窗须收集主密码；见
-   *  `unlockApprovals`。`kind` / `exportMeta`（M2.9 值披露）：审批类型
-   *  与 export 数据包规模元信息。 */
+   *  `unlockApprovals`。`kind`（M2.9 值披露 + M2.97 写门）/
+   *  `exportMeta`：审批类型与 export 数据包规模元信息。 */
   simulateAuthzRequest(params: {
     requestId: string;
     starter: string;
@@ -361,7 +362,7 @@ export class MockAdapter implements LightKeyIpc {
     keys: string[];
     challenge?: string;
     needsUnlock?: boolean;
-    kind?: "inject" | "read" | "export" | "rule";
+    kind?: "inject" | "read" | "export" | "rule" | "write";
     exportMeta?: { name: string; mime: string; size: number } | null;
   }): void {
     this.pendingApprovals.add(params.requestId);

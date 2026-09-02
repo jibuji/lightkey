@@ -17,6 +17,13 @@
  * authz.request 仍被门控丢弃（QA P1 语义不变）。锁态 read/export 弹窗
  * 无「允许并为此项目记住」（临时 vault 无法持久化规则，补充拍板 #23）。
  *
+ * **写入门（M2.97，补充拍板 #24；write-gate.md §6）**：kind=write 帧
+ * （command=`item.put/delete <name>`，keys=单元素[目标条目名]）渲染动作 +
+ * 目标条目名 + projectDir + 30s 倒计时，**不展示值**；「允许并为此项目
+ * 记住」仅 put（create/update）提供（= allow + 最小写规则
+ * `keys=[条目名] + actions=[create,update]`），**delete 无记住按钮**
+ * （恒弹窗语义，任何规则不豁免——对齐 export）。
+ *
  * 决策权始终在 Rust 侧（plugin-architecture.md §5.3）：本插件只把用户
  * 选择经 `approval.result` 回传，不持有裁决权；伪造/已超时 requestId →
  * 守护进程忽略（accepted=false）。
@@ -31,6 +38,7 @@ import type { AuthzRequestPayload } from "../events";
 import { CountdownRing } from "../components/atoms";
 import { Icon } from "../components/Icons";
 import { VaultInvalidError } from "../ipc";
+import { APPROVAL_KINDS } from "../ipc/protocol";
 import { formatProjectDir } from "../utils/projectDir";
 
 /** 审批超时默认值（秒；与守护进程 `approval_timeout_secs` 默认值对齐）。
@@ -59,14 +67,18 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** 解析后的审批类型（补充拍板 #22 增 `rule`）。未知/缺失 → `"unknown"`
- *  **防御性渲染**（明确提示，不回退按 inject 渲染——协议演进时旧 UI
- *  不误导，规格 #102 故事 25）。 */
-type ParsedKind = "inject" | "read" | "export" | "rule" | "unknown";
+/** 解析后的审批类型（补充拍板 #22 增 `rule`；M2.97 写门 #24 增 `write`）。
+ *  白名单单一来源 = `ipc/protocol.ts` 的 `APPROVAL_KINDS`（镜像 Rust
+ *  `ApprovalKind` serde 值）。未知/缺失 → `"unknown"` **防御性渲染**（明确
+ *  提示，不回退按 inject 渲染——协议演进时旧 UI 不误导，规格 #102 故事 25）。 */
+type ApprovalKindValue = (typeof APPROVAL_KINDS)[keyof typeof APPROVAL_KINDS];
+type ParsedKind = ApprovalKindValue | "unknown";
+
+const KIND_WHITELIST: readonly string[] = Object.values(APPROVAL_KINDS);
 
 function parseApprovalKind(raw: unknown): ParsedKind {
-  return raw === "inject" || raw === "read" || raw === "export" || raw === "rule"
-    ? raw
+  return typeof raw === "string" && KIND_WHITELIST.includes(raw)
+    ? (raw as ParsedKind)
     : "unknown";
 }
 
@@ -88,8 +100,12 @@ interface ApprovalItem {
  *  规模，无记住按钮——导出恒弹窗，规则不豁免）；`inject` 为既有形态。
  *  规则管理审批门（补充拍板 #22）：`rule` 展示命令框（`rule.add <name>` /
  *  `rule.remove <name>`）+ keys Tag + 30s 倒计时，**无「记住」按钮**（规则
- *  操作本身就是持久动作）。未知 kind **防御性渲染**：明确提示未知，不回退
- *  按 inject 渲染（协议演进时旧 UI 不误导）。 */
+ *  操作本身就是持久动作）。写入门（补充拍板 #24，M2.97）：`write` 展示
+ *  动作（item.put=create/update / item.delete=delete）+ 目标条目名 Tag +
+ *  projectDir + 30s 倒计时，**不展示值**；「允许并为此项目记住」仅
+ *  put（create/update）提供（= allow + 写规则），**delete 无记住按钮**
+ *  （恒弹窗语义，对齐 export）。未知 kind **防御性渲染**：明确提示未知，
+ *  不回退按 inject 渲染（协议演进时旧 UI 不误导）。 */
 export function ApprovalDialog({
   item,
   onResolve,
@@ -109,8 +125,14 @@ export function ApprovalDialog({
   const isRead = kind === "read";
   const isExport = kind === "export";
   const isRule = kind === "rule";
+  const isWrite = kind === "write";
   const isUnknown = kind === "unknown";
   const isRuleRemove = isRule && req.command.startsWith("rule.remove");
+  // 写门动作派生（M2.97，write-gate.md §6）：帧 command 恒为
+  // `item.put <name>` / `item.delete <name>`（§5.3 展示用；create/update
+  // 由 daemon 从 id 有无权威派生、不进帧——§5.2 RPC 不拆）。既有先例同
+  // isRuleRemove：`command.startsWith` 判定动作。
+  const isWriteDelete = isWrite && req.command.startsWith("item.delete");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -160,10 +182,14 @@ export function ApprovalDialog({
               ? "Agent 请求读取该项目目录下条目的值（值不会显示，批准后仅返回给发起程序）"
               : isExport
                 ? "Agent 请求导出条目数据包（附件明文将离开守护进程，请确认）"
-                : isRule
-                  ? isRuleRemove
-                    ? "Agent 请求删除既有授权规则（撤销已授予的读取/注入能力；批准后立即生效并随同步传播）"
-                    : "Agent 请求建立持久化授权规则（批准后写入规则库；此为持久授权，请确认范围）"
+              : isRule
+                ? isRuleRemove
+                  ? "Agent 请求删除既有授权规则（撤销已授予的读取/注入能力；批准后立即生效并随同步传播）"
+                  : "Agent 请求建立持久化授权规则（批准后写入规则库；此为持久授权，请确认范围）"
+                : isWrite
+                  ? isWriteDelete
+                    ? "Agent 请求删除该项目目录下的条目（破坏性操作；任何规则不豁免，恒需本次审批）"
+                    : "Agent 请求写入该项目目录下的条目（新建或整条替换；条目值不会显示）"
                   : isUnknown
                     ? `未知审批类型（kind=${String(req.kind ?? "缺失")}）：当前界面版本不认识该请求，请升级应用后处理；无法确认内容前建议拒绝`
                     : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
@@ -189,6 +215,14 @@ export function ApprovalDialog({
           // 规则门（补充拍板 #22）：命令框承载操作（非 shell 命令，无 $ 前缀）
           <div className="approval-cmd-box">
             {isRuleRemove ? "移除规则：" : "新建规则："}
+            {req.command}
+          </div>
+        ) : isWrite ? (
+          // 写门（M2.97）：命令框承载动作 + 目标条目名（`item.put/delete
+          // <name>` 是 RPC 摘要而非 shell 命令，无 $ 前缀——同规则门先例）。
+          // put 在帧面不可分 create/update（§5.2 RPC 不拆），按动作类展示。
+          <div className="approval-cmd-box">
+            {isWriteDelete ? "删除条目（delete）：" : "写入条目（create/update）："}
             {req.command}
           </div>
         ) : !isRead && !isExport && !isUnknown ? (
@@ -245,12 +279,15 @@ export function ApprovalDialog({
           <button className="btn btn-ghost" onClick={deny} disabled={submitting}>
             拒绝
           </button>
-          {/* read 专属「记住」：allow 决策 + 追加一条 read 规则（默认不持久化，
-              用户显式选择；export 恒弹窗语义 → 不提供记住）。锁态一体化
+          {/* 「允许并为此项目记住」：allow 决策 + 追加一条最小授权规则（默认
+              不持久化，用户显式选择）。适用面 = read（追加 read 规则，M2.9）
+              + write 的 put（追加写规则，M2.97）；export 恒弹窗语义 → 不提供
+              记住；delete 同为恒弹窗（任何规则不豁免）→ 亦不提供。锁态一体化
               （#23，补充拍板 #23）：临时 vault 无法持久化规则——记住按钮
-              渲染条件 = `isRead && !needsUnlock`，锁态 read 弹窗不承诺做
-              不到的事（配合主密码离开流程，规则也名不正言不顺）。 */}
-          {isRead && !needsUnlock ? (
+              渲染条件 = `(isRead || (isWrite && !isWriteDelete)) &&
+              !needsUnlock`（write 帧守护进程恒 needs_unlock=false，防御保持
+              同一条件），锁态弹窗不承诺做不到的事。 */}
+          {(isRead || (isWrite && !isWriteDelete)) && !needsUnlock ? (
             <button
               className="btn"
               onClick={() => void allow(true)}
@@ -351,19 +388,26 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
                   );
             if (decision === "allowed") {
               ctx.toast.show(accepted ? "已允许本次（env 仅注入被批准 key）" : "请求已超时，未生效");
-              // read 审批的「允许并为此项目记住」：allow 后追加一条 read 规则
-              // （M2.9 值披露 §6：channel=desktop、capability=read、keys=[条目名]、
-              // projectDir=弹窗展示的 cwd）。仅 accepted 时写（超时/伪造回传
-              // 不预授权）；失败不阻塞弹窗关闭，仅提示。
-              if (remember && accepted && queue[0]?.request.kind === "read") {
-                const r = queue[0].request;
+              // 审批的「允许并为此项目记住」：allow 后追加一条最小授权规则。
+              // read（M2.9 值披露 §6）：channel=desktop、capability=read、
+              // keys=[条目名]。write put（M2.97 写门 §6）：capability=write、
+              // keys=[条目名] + actions=[create, update]——帧 command 恒为
+              // `item.put <name>`，create/update 由 daemon 权威派生、不进帧
+              // （§5.2 RPC 不拆），记住授予的是 put 全类；delete 无记住入口
+              // （恒弹窗）。projectDir=弹窗展示的 cwd。仅 accepted 时写
+              // （超时/伪造回传不预授权）；失败不阻塞弹窗关闭，仅提示。
+              const r = queue[0]?.request;
+              const isReadFrame = r?.kind === "read";
+              const isWritePutFrame = r?.kind === "write" && r.command.startsWith("item.put");
+              if (remember && accepted && r && (isReadFrame || isWritePutFrame)) {
                 try {
                   await ctx.ipc.ruleAdd({
                     projectDir: r.projectDir,
-                    name: `read-${r.keys[0] ?? "item"}`,
+                    name: `${isReadFrame ? "read" : "write"}-${r.keys[0] ?? "item"}`,
                     command: "",
                     keys: r.keys,
-                    capability: "read",
+                    capability: isReadFrame ? "read" : "write",
+                    ...(isReadFrame ? {} : { actions: ["create", "update"] }),
                   });
                 } catch {
                   ctx.toast.show("记住规则写入失败（可稍后在规则页手动添加）");

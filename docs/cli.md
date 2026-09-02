@@ -27,9 +27,9 @@
 |------|------|--------|
 | `lk item list [--type <login\|note\|secret\|file>] [--name <子串>]` | 列出条目（最小字段）；`--type`/`--name` 为 CLI 侧过滤（协议不变；`--name` 是子串匹配，与 `item get --name` 的精确匹配不同），机器可读形状见 [agent-cli.md](agent-cli.md) | M0 |
 | `lk item get (<id> \| --name <名>)` | 取单条（完整解密字段）；`--name` 经 item.list 精确解析 id（重名 exit 2 报歧义、与位置 id 互斥），值披露裁决路径与 id 版完全一致 | M0 |
-| `lk item add` | 新建条目（四类：login / note / secret / file；交互或 flag，见 [design/spec.md](design/spec.md) §4）。**写门规划中（M2.97）**：socket/CLI 通道走三层裁决（写规则命中静默 → 弹窗 → `authz.denied`），见 [write-gate.md](write-gate.md) | M0 |
-| `lk item edit <id>` | 编辑条目（CAS，见 [data-model.md](data-model.md) §4）。**写门规划中（M2.97）**：同 `item add` 三层裁决（update 双向名称约束），见 [write-gate.md](write-gate.md) | M0 |
-| `lk item delete <id>` | 软删除（墓碑，30 天硬删）。**写门规划中（M2.97）**：**恒弹窗**，任何规则不豁免（无用户级恢复路径），见 [write-gate.md](write-gate.md) | M0 |
+| `lk item add` | 新建条目（四类：login / note / secret / file；交互或 flag，见 [design/spec.md](design/spec.md) §4）。**写门已实现（M2.97）**：socket/CLI 通道走三层裁决（写规则命中静默 → 弹窗 → `authz.denied`，CLI 按命令语境渲染拒绝文案），见 [write-gate.md](write-gate.md) | M0 |
+| `lk item edit <id>` | 编辑条目（CAS，见 [data-model.md](data-model.md) §4）。**写门已实现（M2.97）**：同 `item add` 三层裁决（update 双向名称约束），见 [write-gate.md](write-gate.md) | M0 |
+| `lk item delete <id>` | 软删除（墓碑，30 天硬删）。**写门已实现（M2.97）**：**恒弹窗**，任何规则不豁免（无用户级恢复路径），见 [write-gate.md](write-gate.md) | M0 |
 | `lk item copy <id> <field>` | 复制字段到剪贴板（30s 自动清除，见 [browser-fill.md](browser-fill.md) §2 同款行为） | M0 |
 | `lk item export <id> --output <path>` | 导出 file 条目附件到本地文件 | M0 |
 
@@ -45,8 +45,8 @@
 
 | 命令 | 语义 | 里程碑 |
 |------|------|--------|
-| `lk rule add <projectDir> <command> --name <name> <keys...>` | 新增白名单规则（入库加密）。**socket/pipe 通道走桌面审批门**（授权的建立 = 授权事件；desktop 直调豁免、headless fail-closed `authz.denied`，见 [authorization-gate.md](authorization-gate.md) §9）。**写规则形态（M2.97 规划）**：`--write [--actions create,update]`（省略 command；`--actions` 缺省 create+update，delete 恒弹窗不在 actions 内），见 [write-gate.md](write-gate.md) §7 | M2 |
-| `lk rule list` | 列出规则（最小字段；维持令牌门） | M2 |
+| `lk rule add <projectDir> <command> --name <name> <keys...>` | 新增白名单规则（入库加密）。**socket/pipe 通道走桌面审批门**（授权的建立 = 授权事件；desktop 直调豁免、headless fail-closed `authz.denied`，见 [authorization-gate.md](authorization-gate.md) §9）。**写规则形态（M2.97 已实现）**：`<projectDir> --write [--actions create,update] --name <规则名> --keys <条目名...>`（省略 command；`--actions` 缺省 create+update，传 `delete` 校验拒绝——恒弹窗由协议保证、规则写不进去），见 [write-gate.md](write-gate.md) §7 | M2 |
+| `lk rule list` | 列出规则（最小字段；含 `capability` + 写规则 `actions`；维持令牌门） | M2 |
 | `lk rule remove <id>` | 删除规则。**socket/pipe 通道走桌面审批门**（授权的撤销 = 授权事件；判定矩阵同 `rule add`，见 [authorization-gate.md](authorization-gate.md) §9） | M2 |
 | `lk inject --keys <name...> -- <command...>` | 给具名命令注入被批准 env（三层模型，见 [authorization-gate.md](authorization-gate.md) §5；`--keys` 必需，且只可指名 **secret 类型条目**的名称——login/note/file 条目不支持注入，与「不存在」同样拒绝、不另行区分，不泄露库内 key 名单）。**值生命周期**：值会经 lk CLI 进程内存传递一次（已做 zeroize 擦除 + 防 core dump/WER 加固，见 [decisions.md](decisions.md) 补充拍板 #17），仅排除 stdout/日志/审计；不防**同用户调试器**（同用户进程互信在防护边界外，补充拍板 #15）。**锁定态**（#67）：vault 锁定 + 桌面审批界面在场 → CLI 触发 GUI 弹「临时解锁 + 本次授权」一次性交互（CLI 侧等待决策；见 [authorization-gate.md](authorization-gate.md) §5.1）；GUI 不在运行（headless）→ fail-closed `session.invalid`（CLI 仍提示先解锁）。**`--json`**（issue #103）：拒绝输出 `{"allowed":false,"reason":…}`（reason 7 枚举）、允许路径 stdout 零输出，机器可读契约见 [agent-cli.md](agent-cli.md) | M2 |
 
@@ -54,7 +54,7 @@
 
 | 命令 | 语义 | 里程碑 |
 |------|------|--------|
-| `lk audit [--tail <N>] [--verify]` | 查看审计日志（只读；无密钥值；`--tail` 最近 N 条、`--verify` 校验 HMAC 链 + **交叉核对文件外锚点**，见下方 §5.0） | M0 |
+| `lk audit [--tail <N>] [--verify]` | 查看审计日志（只读；无密钥值；`--tail` 最近 N 条、`--verify` 校验 HMAC 链 + **交叉核对文件外锚点**，见下方 §5.0。写门（M2.97）起写入事件 command 按 action 派生：`item.create/update/delete <条目名>`——替换旧 `item.delete <uuid>` 口径，见 [write-gate.md](write-gate.md) §8） | M0 |
 | `lk daemon` | 以守护进程方式常驻（解锁态、密钥仅内存；由客户端自动拉起，也可手动前台运行） | M0 |
 | `lk bridge` | （Windows）stdio 中继：stdin 逐行读 JSON-RPC 帧 → named pipe → stdout 回写，一进程一请求后退出；不做业务解析（除版本校验外原样透传）；错误码 `bridge.no_daemon` / `bridge.version_incompatible` / `bridge.io`，退出码非 0。随桌面包安装，供 WSL 侧 Linux `lk` 经 interop 调用 | M2.75 |
 
