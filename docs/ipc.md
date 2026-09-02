@@ -75,12 +75,12 @@
 | `vault.recover` | 恢复：恢复码 + 新主密码（重置主密码，数据保留） | 新恢复码（仅展示一次） |
 | `item.list` | 索引（解密态最小字段） | id/name/type/revision/deleted |
 | `item.get` | 单条（M2.9 值裁决：桌面直调豁免；socket 走**读规则 → 弹窗 → 拒绝**三层，未命中且无批准 → `authz.denied`（-32017）） | 完整解密条目 |
-| `item.put` / `item.delete` | 写 | 新 revision |
+| `item.put` / `item.delete` | 写（**写门规划中 M2.97**：socket 通道走三层——写规则命中静默、未命中弹窗、headless `authz.denied`；update 双向名称约束、**delete 恒弹窗任何规则不豁免**；desktop 直调受信豁免；锁态 `session.invalid` 先行。完整规格见 [write-gate.md](write-gate.md)） | 新 revision |
 | `item.export` | 导出 file 条目附件（整包下载；M2.9：**恒弹窗**，任何规则不豁免；headless 无 GUI → `authz.denied`） | 名称/MIME/大小 + base64 数据 |
 | `sync.trigger` / `sync.poll` | 同步控制 | 变更摘要（不返回内容） |
 | `authz.evaluate` | 授权门判定（M2）；`channel` 枚举 `cli` \| `desktop` \| `wsl-bridge`（跨子系统桥，补充拍板 #14，审计如实记录）。锁定态一体化（#67/补充拍板 #19）：库锁态 + 桌面审批界面在场 → 走临时解锁+本次授权一次交互（§4.1 锁定态）；headless 锁态 → fail-closed `session.invalid` | 允许/拒绝 + 最小 env 集 |
 | `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`）。**仅桌面内嵌直调可提交**——socket/pipe 连接 → `channel.forbidden`（-32014）；params 含 `challenge`（`authz.request` 帧下发的一次性应答值，错值 → `accepted=false` 且条目保留；#72/#78 / 补充拍板 #16）；锁定态一体化待审+allowed 时含可选 `masterPassword`（守护进程临时解锁，§4.1） | accepted（是否接受） |
-| `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6；M2.9 起规则含 `capability`：`inject`（注入，缺省）\|`read`（读值，command 恒空串、keys=可读条目名），能力不互授） | 规则 / 规则列表 / 无 |
+| `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6；M2.9 起规则含 `capability`：`inject`（注入，缺省）\|`read`（读值，command 恒空串、keys=可读条目名），能力不互授）。**M2.95（#104）**：socket/pipe 通道的 `rule.add` / `rule.remove` 升为桌面审批门（制定/撤销授权都是授权事件；desktop 直调豁免、headless fail-closed 复用 `authz.denied`，见 [authorization-gate.md](authorization-gate.md) §9）；`rule.list` 维持令牌门 | 规则 / 规则列表 / 无 |
 | `audit.list` | 审计查询 | 事件（无密钥值） |
 | `audit.verify` | 校验审计 HMAC 链 | 已验证事件数 |
 | `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A）。来源标签：桌面壳为进程内直调订阅，socket 流连接为普通订阅——后者**不计入审批界面判定、也收不到 `authz.request` 帧**（#72/#78：帧内 challenge 是审批应答凭据，只走桌面通道）。**锁定态订阅**（#67）：desktop 来源允许锁态订阅（推送目标注册，桌面直调无需会话令牌；socket 订阅照旧要求有效会话），使锁态 `authz.request` 帧到达 GUI；帧无密钥值，不泄露明文 | 无 |

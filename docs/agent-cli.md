@@ -151,21 +151,27 @@ stdout 直接是数组（不包对象），元素为条目摘要：
 
 ## 6. 锁定 / 无 UI 行为表
 
-当前实现（M2.9；读通道一体化解锁属 #105 未实现）：
+当前实现（M2.95，补充拍板 #22/#23：规则管理审批门 + 读通道一体化解锁已落地）：
 
 | 命令 | 解锁态 + 桌面 UI 在场 | 解锁态 headless（无 UI） | 锁定态 + 桌面 UI 在场 | 锁定态 headless |
 |------|----------------------|--------------------------|----------------------|-----------------|
 | `lk inject` | 无规则 → 审批弹窗（30s，默认拒绝） | 无规则 → `{"allowed":false,"reason":"no_ui"}` | **一体化弹窗**（主密码 + Allow/Deny 一次交互，#67/M2.8） | `session.invalid` 错误对象 |
-| `lk item get`（id 或 --name） | 无读规则 → 读值弹窗 | `authz.denied` | `session.invalid` | `session.invalid` |
-| `lk item export` | **恒弹窗**（读规则也不豁免） | `authz.denied` | `session.invalid` | `session.invalid` |
+| `lk item get`（id 或 --name） | 无读规则 → 读值弹窗 | `authz.denied` | **一体化弹窗**（主密码 + 解锁并允许一次交互，#23/M2.95） | `session.invalid` |
+| `lk item export` | **恒弹窗**（读规则也不豁免） | `authz.denied` | **一体化弹窗**（主密码 + 解锁并允许一次交互，#23/M2.95） | `session.invalid` |
 | `lk item list` | 正常（令牌门，元数据不裁决） | 正常 | `session.invalid` | `session.invalid` |
-| `lk rule add/list/remove` | 正常（令牌门） | 正常 | `session.invalid` | `session.invalid` |
+| `lk rule add` / `lk rule remove` | **审批弹窗**（规则的建立与撤销都是授权事件，#22/M2.95；30s 超时默认拒绝；desktop 直调豁免） | `authz.denied`（headless 无 UI，除非 daemon 以 `LIGHTKEY_E2E_AUTO_APPROVE=rule` 启动；测试专用） | `session.invalid` | `session.invalid` |
+| `lk rule list` | 正常（令牌门，只读元数据） | 正常 | `session.invalid` | `session.invalid` |
 | `lk status` | 正常（无需令牌） | 正常 | 正常（报告 `unlocked:false`） | 正常 |
 
 - 解锁态的判定前提：守护进程持有有效会话令牌（`lk unlock` 或桌面端解锁后
   自动落盘）。
 - 锁定态下**一切值披露都要先解锁**（inject 的一体化弹窗除外）；
   `session.invalid` 的建议动作固定为「解锁桌面端后重试」。
+- **写门（M2.97 规划中，未上线）**：`lk item add / edit / delete` 当前仍为
+  令牌门；落地后按 [write-gate.md](write-gate.md) 判定矩阵执行——
+  create/update 命中写规则静默、未命中弹窗、headless `authz.denied`；
+  delete 恒弹窗任何规则不豁免；锁态 `session.invalid`。
+  本表其余行不受写门影响。
 
 ## 7. 值披露与 inject 的裁决语义（速查）
 
@@ -174,7 +180,11 @@ stdout 直接是数组（不包对象），元素为条目摘要：
 - `item export`：恒弹窗，无规则豁免路径。
 - `inject`：注入规则白名单（projectDir + command + keys）→ 静默放行；
   否则弹窗；拒绝以 `{"allowed":false,"reason":…}` 呈现（§4.3）。
-- 读规则与注入规则**能力不互授**（read 规则不授权 inject，反之亦然）。
+- 读规则与注入规则**能力不互授**（read 规则不授权 inject，反之亦然；
+  M2.97 写门规划再扩 write——三能力两两不互授）。
+- 写命令（M2.97 规划中）：`item add/edit` 走写规则/弹窗/拒绝三层（update
+  双向名称约束），`item delete` **恒弹窗**任何规则不豁免；拒绝统一复用
+  `authz.denied`（-32017，CLI 按命令语境渲染文案）。
 
 ## 8. 平台注记
 
