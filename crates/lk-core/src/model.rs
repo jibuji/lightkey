@@ -420,10 +420,27 @@ impl ItemDraft {
 pub const RULE_CAPABILITY_INJECT: &str = "inject";
 /// 规则能力类型：读值（M2.9 值披露；授权 socket 通道按名读条目）。
 pub const RULE_CAPABILITY_READ: &str = "read";
+/// 规则能力类型：写入（M2.97 写入门；write-gate.md §4）。
+pub const RULE_CAPABILITY_WRITE: &str = "write";
+
+/// 写动作名：新建（`item.put` id=None；write-gate.md §4）。
+pub const RULE_ACTION_CREATE: &str = "create";
+/// 写动作名：整条替换（`item.put` id=Some）。
+/// **delete 不是动作名**——恒弹窗由协议保证，不存在于 actions（§4）。
+pub const RULE_ACTION_UPDATE: &str = "update";
 
 /// 读规则 `capability` 的 serde 缺省（既有规则密文无该字段 → inject，无迁移）。
 fn default_rule_capability() -> String {
     RULE_CAPABILITY_INJECT.to_string()
+}
+
+/// `actions` 的 serde 缺省：`["create","update"]`（write-gate.md §4——最小
+/// 破坏面缺省；delete 不在缺省集）。
+pub fn default_rule_actions() -> Vec<String> {
+    vec![
+        RULE_ACTION_CREATE.to_string(),
+        RULE_ACTION_UPDATE.to_string(),
+    ]
 }
 
 /// 授权门白名单规则（`docs/authorization-gate.md` §4，字段含 `name`——决策 #6）。
@@ -437,6 +454,12 @@ fn default_rule_capability() -> String {
 /// M2.9 值披露（value-disclosure.md §4）：`capability` 区分注入/读值，
 /// **能力不互授**——inject 规则不授权读，read 规则不授权注入；带 serde
 /// 缺省，既有规则密文反序列化不受影响。
+///
+/// M2.97 写入门（write-gate.md §4，补充拍板 #24）：`capability=write` +
+/// `actions` 写动作子集；三能力**两两不互授**（write 不授权读/注入，反之
+/// 亦然）。`actions` 带 serde 缺省，`capability != write` 时忽略（匹配函数
+/// 按 capability 过滤）；`delete` 恒弹窗由协议保证——**不存在于 actions**，
+/// 规则写不进去。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
@@ -446,14 +469,18 @@ pub struct Rule {
     /// 规则名（决策 #6；与前端 AuthRule.name 对齐）。
     pub name: String,
     /// 具名命令，可 glob（如 `npm publish` 精确、`npm *` 通配；大小写敏感）。
-    /// capability=read 时为空串（读规则无命令绑定）。
+    /// capability=read/write 时为空串（读/写规则无命令绑定）。
     pub command: String,
-    /// 授权注入的 key 名（最小集合）；capability=read 时语义为**可读条目名**
-    /// （精确匹配，不做通配）。
+    /// 授权注入的 key 名（最小集合）；capability=read/write 时语义为
+    /// **条目名**（精确匹配，不做通配）。
     pub keys: Vec<String>,
-    /// 规则能力类型：inject（注入，默认）| read（读值）。
+    /// 规则能力类型：inject（注入，默认）| read（读值）| write（写入，M2.97）。
     #[serde(default = "default_rule_capability")]
     pub capability: String,
+    /// write 能力下的写动作子集；serde(default) = ["create","update"]
+    /// （write-gate.md §4）。capability != write 时忽略。
+    #[serde(default = "default_rule_actions")]
+    pub actions: Vec<String>,
     /// 创建时间（ISO-8601 UTC；替换时保留）。
     pub created: String,
 }
@@ -466,9 +493,12 @@ pub struct RuleDraft {
     pub name: String,
     pub command: String,
     pub keys: Vec<String>,
-    /// 规则能力类型（inject | read；缺省 inject，见 [`Rule::capability`] 语义）。
+    /// 规则能力类型（inject | read | write；缺省 inject，见 [`Rule::capability`] 语义）。
     #[serde(default = "default_rule_capability")]
     pub capability: String,
+    /// write 能力下的写动作子集（缺省 create+update，见 [`Rule::actions`]）。
+    #[serde(default = "default_rule_actions")]
+    pub actions: Vec<String>,
 }
 
 impl Rule {
@@ -490,6 +520,7 @@ impl Rule {
             command: draft.command,
             keys: draft.keys,
             capability: draft.capability,
+            actions: draft.actions,
             created,
         }
     }
@@ -748,11 +779,77 @@ mod tests {
             command: String::new(),
             keys: vec!["DATABASE_URL".into()],
             capability: RULE_CAPABILITY_READ.into(),
+            actions: default_rule_actions(),
             created: rev(),
         };
         let bytes = rule.to_plaintext().unwrap();
         let back = Rule::from_plaintext(&bytes).unwrap();
         assert_eq!(back, rule);
         assert_eq!(back.capability, RULE_CAPABILITY_READ);
+    }
+
+    // -- M2.97 写入门（补充拍板 #24）：Rule.actions --------------------------
+
+    /// write 规则 actions 密封/解密封往返保持。
+    #[test]
+    fn rule_write_actions_roundtrip_through_plaintext() {
+        let rule = Rule {
+            id: Uuid::new_v4(),
+            project_dir: "/proj".into(),
+            name: "write-ini".into(),
+            command: String::new(),
+            keys: vec!["config.ini".into()],
+            capability: RULE_CAPABILITY_WRITE.into(),
+            actions: vec![RULE_ACTION_CREATE.into(), RULE_ACTION_UPDATE.into()],
+            created: rev(),
+        };
+        let bytes = rule.to_plaintext().unwrap();
+        let back = Rule::from_plaintext(&bytes).unwrap();
+        assert_eq!(back, rule);
+        assert_eq!(
+            back.actions,
+            vec!["create".to_string(), "update".to_string()]
+        );
+    }
+
+    /// actions 缺省 = ["create","update"]（serde default；write-gate.md §4）。
+    /// delete 不存在于缺省——恒弹窗由协议保证，规则写不进去。
+    #[test]
+    fn rule_actions_default_create_and_update() {
+        let json = serde_json::json!({
+            "id": Uuid::nil(),
+            "projectDir": "/proj",
+            "name": "w",
+            "command": "",
+            "keys": ["config.ini"],
+            "capability": "write",
+            "created": "2026-01-01T00:00:00.000000Z",
+        });
+        let rule: Rule = serde_json::from_value(json).unwrap();
+        assert_eq!(rule.capability, RULE_CAPABILITY_WRITE);
+        assert_eq!(
+            rule.actions,
+            vec!["create".to_string(), "update".to_string()]
+        );
+    }
+
+    /// 旧 JSON（无 capability/actions）→ inject 且 actions 缺省，无迁移
+    /// （既有规则密文反序列化不受影响）。
+    #[test]
+    fn rule_legacy_json_without_actions_parses_with_defaults() {
+        let legacy = serde_json::json!({
+            "id": Uuid::nil(),
+            "projectDir": "/proj",
+            "name": "publish",
+            "command": "npm *",
+            "keys": ["NPM_TOKEN"],
+            "created": "2026-01-01T00:00:00.000000Z",
+        });
+        let rule: Rule = serde_json::from_value(legacy).unwrap();
+        assert_eq!(rule.capability, RULE_CAPABILITY_INJECT);
+        assert_eq!(
+            rule.actions,
+            vec!["create".to_string(), "update".to_string()]
+        );
     }
 }

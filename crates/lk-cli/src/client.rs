@@ -462,6 +462,7 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
             command: command.to_string(),
             keys: keys.to_vec(),
             capability: lk_core::model::RULE_CAPABILITY_INJECT.into(),
+            actions: lk_core::model::default_rule_actions(),
             created: String::new(),
         };
         Ok(serde_json::from_value(res["rule"].clone()).unwrap_or(fallback))

@@ -851,6 +851,7 @@ impl UnlockedVault {
             command: draft.command,
             keys: draft.keys,
             capability: draft.capability,
+            actions: draft.actions,
             created: existing.map(|r| r.created).unwrap_or_else(now_iso),
         };
         let rev = self.next_revision();
@@ -1884,6 +1885,7 @@ mod tests {
                     command: "npm publish".into(),
                     keys: vec!["NPM_TOKEN".into()],
                     capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                    actions: crate::model::default_rule_actions(),
                 },
                 None,
             )
@@ -1919,6 +1921,7 @@ mod tests {
                 command: "npm *".into(),
                 keys: vec!["A".into(), "B".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                actions: crate::model::default_rule_actions(),
             },
             Some(rule.id),
         )
@@ -2010,6 +2013,7 @@ mod tests {
                     command: "npm publish".into(),
                     keys: vec!["NPM_TOKEN".into()],
                     capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                    actions: crate::model::default_rule_actions(),
                 },
                 None,
             )
@@ -2024,6 +2028,7 @@ mod tests {
                 command: "npm *".into(),
                 keys: vec!["A".into(), "B".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
+                actions: crate::model::default_rule_actions(),
             },
             Some(rule.id),
         )
