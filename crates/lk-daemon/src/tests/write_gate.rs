@@ -59,6 +59,7 @@ fn seed_write_rule(
                 keys: keys.iter().map(|s| s.to_string()).collect(),
                 capability: lk_core::model::RULE_CAPABILITY_WRITE.into(),
                 actions: actions.iter().map(|s| s.to_string()).collect(),
+                fingerprint: None,
             },
             None,
         )

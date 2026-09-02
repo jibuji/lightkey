@@ -103,6 +103,10 @@ pub enum VaultEvent {
         needs_unlock: bool,
         kind: crate::authz::ApprovalKind,
         export_meta: Option<crate::authz::ExportMeta>,
+        /// 程序指纹失配信息（M2.98）：绑定注入规则命中命令形态但指纹不符时
+        /// 携带（弹窗「指纹不符」主题 + 当前路径 + 8 位哈希摘要）；None = 常规
+        /// 审批（未失配 / 非绑定规则）。
+        fingerprint_mismatch: Option<crate::authz::FingerprintMismatch>,
     },
 }
 
@@ -271,6 +275,7 @@ mod tests {
                 needs_unlock: false,
                 kind: crate::authz::ApprovalKind::Inject,
                 export_meta: None,
+                fingerprint_mismatch: None,
             }
             .name(),
             "authz.request"

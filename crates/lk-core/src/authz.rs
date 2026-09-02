@@ -145,6 +145,20 @@ pub struct ExportMeta {
 /// M2.9 值披露（value-disclosure.md §5.2/§6）：`kind` 区分注入/读/导出
 /// 审批形态；`command` 字段填 `"item.get"` / `"item.export"`（展示用），
 /// `keys` 为单元素 [条目名]；`export_meta` 仅 export 审批有值。
+///
+/// M2.98 程序指纹失配（identity-binding.md §7）：`fingerprint_mismatch` 携带
+/// 「绑定注入规则命中命令形态但指纹不符」的展示信息——弹窗据「指纹不符」主题
+/// + 当前解析路径 + 8 位哈希摘要 + 「以新指纹重新授权」；未失配为 `None`（常规
+/// 审批）。**不含完整哈希、任何值或错误码差异化**（失配视同未命中，headless
+/// 统一 `authz.denied`，防探测）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FingerprintMismatch {
+    /// 当前解析到的 canonical 绝对路径（daemon 侧重算；展示用，非安全依据）。
+    pub resolved_exe_path: String,
+    /// 8 位 SHA-256 前缀摘要（hex 小写；不展示完整值）。
+    pub sha256_short: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub request_id: Uuid,
@@ -162,6 +176,10 @@ pub struct ApprovalRequest {
     pub kind: ApprovalKind,
     /// export 审批的数据包规模元信息（kind=Export 时有值；读/注入为 None）。
     pub export_meta: Option<ExportMeta>,
+    /// 程序指纹失配信息（M2.98，identity-binding.md §7）：绑定注入规则命中
+    /// 命令形态但指纹不符时携带（弹窗据此显示「指纹不符」主题 + 当前路径 +
+    /// 8 位哈希摘要 + 「以新指纹重新授权」）；未失配为 `None`。
+    pub fingerprint_mismatch: Option<FingerprintMismatch>,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +389,7 @@ impl ApprovalChannel for LocalApprovalChannel {
             needs_unlock: req.needs_unlock,
             kind: req.kind,
             export_meta: req.export_meta.clone(),
+            fingerprint_mismatch: req.fingerprint_mismatch.clone(),
         });
     }
 
@@ -1003,6 +1022,7 @@ mod tests {
             needs_unlock: false,
             kind: ApprovalKind::Inject,
             export_meta: None,
+            fingerprint_mismatch: None,
         };
         // open：登记 + 广播（非阻塞）
         ch.open(&req, Instant::now() + Duration::from_secs(10));
@@ -1019,6 +1039,7 @@ mod tests {
                 needs_unlock,
                 kind,
                 export_meta,
+                fingerprint_mismatch,
             } => {
                 assert_eq!(*request_id, req.request_id);
                 assert_eq!(starter, "/bin/zsh");
@@ -1032,6 +1053,8 @@ mod tests {
                 // M2.9 值披露：inject 审批不带导出元信息
                 assert_eq!(*kind, ApprovalKind::Inject);
                 assert!(export_meta.is_none());
+                // M2.98：非失配注入审批不带指纹失配信息
+                assert!(fingerprint_mismatch.is_none());
             }
             other => panic!("应广播 authz.request：{other:?}"),
         }
@@ -1135,6 +1158,7 @@ mod tests {
                 needs_unlock: false,
                 kind: ApprovalKind::Inject,
                 export_meta: None,
+                fingerprint_mismatch: None,
             },
             Instant::now() + Duration::from_secs(10),
         );
@@ -1516,6 +1540,7 @@ mod tests {
             needs_unlock: false,
             kind,
             export_meta: None,
+            fingerprint_mismatch: None,
         }
     }
 
@@ -1607,6 +1632,7 @@ mod tests {
                 mime: "application/pdf".into(),
                 size: 1024,
             }),
+            fingerprint_mismatch: None,
         };
         assert_eq!(areq.kind, ApprovalKind::Export);
         assert_eq!(areq.export_meta.as_ref().unwrap().size, 1024);

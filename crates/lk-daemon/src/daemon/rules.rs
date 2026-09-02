@@ -126,6 +126,7 @@ impl Daemon {
             needs_unlock: false,
             kind: lk_core::authz::ApprovalKind::Rule,
             export_meta: None,
+            fingerprint_mismatch: None,
         };
         self.gate.approval().open(&areq, expires_at);
         self.pending_rule.lock().unwrap().insert(
@@ -305,6 +306,9 @@ impl Daemon {
                         // 校验后的有效 actions（write=参数展开缺省；其余=缺省）
                         actions: Some(actions),
                         channel: p.channel.clone(),
+                        // M2.98 指纹绑定请求（请求侧仅声明「绑哪个 exe」；daemon
+                        // 在审批 finalize 侧重算后落库——身份绑定.md §5.3）
+                        fingerprint: p.fingerprint.clone(),
                     }),
                     display_name: p.name.clone(),
                     display_keys: p.keys.clone(),
@@ -375,6 +379,31 @@ impl Daemon {
                     .capability
                     .as_deref()
                     .unwrap_or(lk_core::model::RULE_CAPABILITY_INJECT);
+                // M2.98 程序指纹（§5.3「以新指纹重新授权」）：绑定请求带指纹时，
+                // daemon **不信任客户端上报的 sha/size**——在批准后的 finalize
+                // 侧重算（canonicalize + stat + 流式 SHA-256，走缓存）。重算失败
+                // （exe 不可解析/不可读）→ 无法绑定 → 判失败（fail-closed）。
+                let fingerprint = match p.fingerprint.as_ref() {
+                    Some(fp) => {
+                        match crate::identity::recompute_fingerprint(
+                            &fp.exe_path,
+                            &mut self.fingerprint_cache,
+                        ) {
+                            Some(rf) => Some(rf),
+                            None => {
+                                return RpcResponse::err(
+                                    id,
+                                    ERR_INVALID_PARAMS,
+                                    "invalid params",
+                                    Some(json!({ "detail": format!(
+                                        "无法解析/读取要绑定的可执行文件：{}", fp.exe_path
+                                    ) })),
+                                )
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 let draft = RuleDraft {
                     project_dir: p.project_dir.clone(),
                     name: p.name.clone(),
@@ -387,6 +416,8 @@ impl Daemon {
                         .actions
                         .clone()
                         .unwrap_or_else(lk_core::model::default_rule_actions),
+                    // 指纹：daemon 侧重算后的固化值（见上方 recompute）。
+                    fingerprint,
                 };
                 match me.put_rule(draft, None) {
                     Ok(rule) => {

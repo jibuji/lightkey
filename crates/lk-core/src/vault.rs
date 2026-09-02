@@ -860,10 +860,13 @@ impl UnlockedVault {
             keys: draft.keys,
             capability: draft.capability,
             actions: draft.actions,
-            // M2.98：RuleDraft 暂不携带指纹（T1）；替换现存规则时保留其指纹
-            // （指纹随规则对象同步，替换语义 = 规则更新而非清空绑定），新建
-            // （无现存规则）为 None（未绑定）。T2/T3 经草稿扩展指纹时调整。
-            fingerprint: existing.as_ref().and_then(|r| r.fingerprint.clone()),
+            // M2.98 程序指纹：草稿携带则用草稿值（daemon 侧重算后落库，规则
+            // 更新为「以新指纹重新授权」语义）；草稿为 None 时保留现存规则的
+            // 既有绑定（替换语义 = 规则更新而非清空绑定），新建（无现存规则）
+            // 为 None（未绑定）。
+            fingerprint: draft
+                .fingerprint
+                .or_else(|| existing.as_ref().and_then(|r| r.fingerprint.clone())),
             created: existing.map(|r| r.created).unwrap_or_else(now_iso),
         };
         let rev = self.next_revision();
@@ -1898,6 +1901,7 @@ mod tests {
                     keys: vec!["NPM_TOKEN".into()],
                     capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                     actions: crate::model::default_rule_actions(),
+                    fingerprint: None,
                 },
                 None,
             )
@@ -1934,6 +1938,7 @@ mod tests {
                 keys: vec!["A".into(), "B".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                 actions: crate::model::default_rule_actions(),
+                fingerprint: None,
             },
             Some(rule.id),
         )
@@ -2026,6 +2031,7 @@ mod tests {
                     keys: vec!["NPM_TOKEN".into()],
                     capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                     actions: crate::model::default_rule_actions(),
+                    fingerprint: None,
                 },
                 None,
             )
@@ -2041,6 +2047,7 @@ mod tests {
                 keys: vec!["A".into(), "B".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                 actions: crate::model::default_rule_actions(),
+                fingerprint: None,
             },
             Some(rule.id),
         )
@@ -2081,6 +2088,7 @@ mod tests {
                 keys: vec!["K".into()],
                 capability: crate::model::RULE_CAPABILITY_READ.into(),
                 actions: crate::model::default_rule_actions(),
+                fingerprint: None,
             },
             None,
         )

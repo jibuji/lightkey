@@ -126,6 +126,12 @@ pub struct Daemon {
     pending_rule: Mutex<HashMap<uuid::Uuid, PendingRuleChange>>,
     /// 进行中的条目写入审批（补充拍板 #24；request_id → 操作/归因）。
     pending_write: Mutex<HashMap<uuid::Uuid, PendingWrite>>,
+    /// 对端真实 env PATH 读取（M2.98 程序指纹，identity-binding.md §5.1；
+    /// 生产 = 平台实现，测试注入假 PATH——信 daemon 不信客户端）。
+    peer_env: Arc<dyn crate::identity::PeerEnv>,
+    /// 内存指纹缓存（M2.98，§6）：exe_path → 元信息快照 + SHA-256；评估先
+    /// stat、一致即复用（O(stat)）、不一致流式重算。**不落盘**（防同用户投毒）。
+    fingerprint_cache: crate::identity::FingerprintCache,
 }
 
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
@@ -221,6 +227,9 @@ impl Daemon {
             pending_disclosure: Mutex::new(HashMap::new()),
             pending_rule: Mutex::new(HashMap::new()),
             pending_write: Mutex::new(HashMap::new()),
+            // M2.98 程序指纹：生产装配平台真实对端 env 读取 + 真实文件系统缓存。
+            peer_env: Arc::new(crate::identity::PlatformPeerEnv),
+            fingerprint_cache: crate::identity::FingerprintCache::new(),
         };
         // 启动自检：锚点 vs 链（截断检测，无需 K_audit），置 `anchor_ok`。
         daemon.anchor_selfcheck();

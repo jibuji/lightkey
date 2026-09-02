@@ -529,6 +529,7 @@ fn rule_push_pull_and_delete_propagate() {
                 keys: vec!["NPM_TOKEN".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                 actions: crate::model::default_rule_actions(),
+                fingerprint: None,
             },
             None,
         )
@@ -576,6 +577,7 @@ fn rule_lww_conflict_resolves_by_revision() {
                 keys: vec!["A".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                 actions: crate::model::default_rule_actions(),
+                fingerprint: None,
             },
             None,
         )
@@ -592,6 +594,7 @@ fn rule_lww_conflict_resolves_by_revision() {
             keys: vec!["B".into()],
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
             actions: crate::model::default_rule_actions(),
+                fingerprint: None,
         },
         Some(rule.id),
     )
@@ -625,6 +628,7 @@ fn rule_tombstone_propagates_and_hard_delete_after_confirmation() {
                 keys: vec!["NPM_TOKEN".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                 actions: crate::model::default_rule_actions(),
+                fingerprint: None,
             },
             None,
         )
@@ -691,6 +695,7 @@ fn rule_deleted_not_resurrected_on_remote_index_loss() {
                 keys: vec!["NPM_TOKEN".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                 actions: crate::model::default_rule_actions(),
+                fingerprint: None,
             },
             None,
         )
@@ -749,6 +754,7 @@ fn rule_revived_not_falsely_deleted_on_remote_index_loss() {
                 keys: vec!["NPM_TOKEN".into()],
                 capability: crate::model::RULE_CAPABILITY_INJECT.into(),
                 actions: crate::model::default_rule_actions(),
+                fingerprint: None,
             },
             None,
         )
@@ -773,6 +779,7 @@ fn rule_revived_not_falsely_deleted_on_remote_index_loss() {
             keys: vec!["A".into()],
             capability: crate::model::RULE_CAPABILITY_INJECT.into(),
             actions: crate::model::default_rule_actions(),
+                fingerprint: None,
         },
         Some(rule.id),
     )
