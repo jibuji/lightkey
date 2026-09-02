@@ -50,6 +50,7 @@ pub mod audit_anchor;
 pub mod authz;
 pub mod bus;
 pub mod crypto;
+pub mod fingerprint;
 pub mod ipc;
 pub mod model;
 pub mod path_ns;

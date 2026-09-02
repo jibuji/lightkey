@@ -429,6 +429,7 @@ fn rule_sync_pulls_and_self_heals_missing_object() {
         keys: vec!["NPM_TOKEN".into()],
         capability: crate::model::RULE_CAPABILITY_INJECT.into(),
         actions: crate::model::default_rule_actions(),
+        fingerprint: None,
         created: "2026-01-01T00:00:00.000000Z".into(),
     };
     let key = format!("{}.rule.lk", rule_obj.id);

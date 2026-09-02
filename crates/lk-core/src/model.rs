@@ -481,6 +481,11 @@ pub struct Rule {
     /// （write-gate.md §4）。capability != write 时忽略。
     #[serde(default = "default_rule_actions")]
     pub actions: Vec<String>,
+    /// 程序指纹（M2.98，identity-binding.md §4）：None = 现状语义（未绑定，
+    /// 匹配函数按现行逻辑短路，行为零变化）；Some = 严格绑定可执行文件身份。
+    /// serde(default) = None → 旧规则密文（无该字段）零迁移。
+    #[serde(default)]
+    pub fingerprint: Option<ProgramFingerprint>,
     /// 创建时间（ISO-8601 UTC；替换时保留）。
     pub created: String,
 }
@@ -499,6 +504,22 @@ pub struct RuleDraft {
     /// write 能力下的写动作子集（缺省 create+update，见 [`Rule::actions`]）。
     #[serde(default = "default_rule_actions")]
     pub actions: Vec<String>,
+}
+
+/// 程序指纹（M2.98 规则程序指纹绑定，identity-binding.md §4）：规则**可选**
+/// 声明可执行文件的 canonical 绝对路径 + SHA-256 + 固化时大小；失配视同未命中
+/// 走弹窗。**未绑定（`Rule.fingerprint=None`）= 现状语义，零迁移**。
+///
+/// - `exe_path`：canonical 绝对路径（daemon 侧解析/固化；展示与预筛用，
+///   非安全依据）。
+/// - `sha256`：内容 SHA-256（hex，小写）——**匹配的唯一安全依据**。
+/// - `size`：固化时的文件字节数（size 快速失配门，免哈希）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgramFingerprint {
+    pub exe_path: String,
+    pub sha256: String,
+    pub size: u64,
 }
 
 impl Rule {
@@ -521,6 +542,9 @@ impl Rule {
             keys: draft.keys,
             capability: draft.capability,
             actions: draft.actions,
+            // RuleDraft 暂不携带指纹（M2.98 T1；T2/T3 `rule.add --fingerprint`
+            // 落地时扩展草稿字段）。T1 阶段规则经草稿创建 = 未绑定（None）。
+            fingerprint: None,
             created,
         }
     }
@@ -780,6 +804,7 @@ mod tests {
             keys: vec!["DATABASE_URL".into()],
             capability: RULE_CAPABILITY_READ.into(),
             actions: default_rule_actions(),
+            fingerprint: None,
             created: rev(),
         };
         let bytes = rule.to_plaintext().unwrap();
@@ -801,6 +826,7 @@ mod tests {
             keys: vec!["config.ini".into()],
             capability: RULE_CAPABILITY_WRITE.into(),
             actions: vec![RULE_ACTION_CREATE.into(), RULE_ACTION_UPDATE.into()],
+            fingerprint: None,
             created: rev(),
         };
         let bytes = rule.to_plaintext().unwrap();
@@ -851,5 +877,93 @@ mod tests {
             rule.actions,
             vec!["create".to_string(), "update".to_string()]
         );
+    }
+
+    // -- M2.98 规则程序指纹绑定（identity-binding.md §4）：Rule.fingerprint --
+
+    fn fp(exe: &str, sha: &str, size: u64) -> ProgramFingerprint {
+        ProgramFingerprint {
+            exe_path: exe.into(),
+            sha256: sha.into(),
+            size,
+        }
+    }
+
+    /// fingerprint Some 密封/解密封往返保持（camelCase 字段名）。
+    #[test]
+    fn program_fingerprint_roundtrip_through_plaintext() {
+        let fp = fp(
+            "/usr/bin/node",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            123456789,
+        );
+        let rule = Rule {
+            id: Uuid::new_v4(),
+            project_dir: "/proj".into(),
+            name: "node-x".into(),
+            command: "node *".into(),
+            keys: vec!["NPM_TOKEN".into()],
+            capability: RULE_CAPABILITY_INJECT.into(),
+            actions: default_rule_actions(),
+            fingerprint: Some(fp),
+            created: rev(),
+        };
+        let bytes = rule.to_plaintext().unwrap();
+        let back = Rule::from_plaintext(&bytes).unwrap();
+        assert_eq!(back, rule);
+        assert_eq!(back.fingerprint.as_ref().unwrap().exe_path, "/usr/bin/node");
+        assert_eq!(back.fingerprint.as_ref().unwrap().size, 123456789);
+    }
+
+    /// serde 字段名为 camelCase：`exePath` / `sha256` / `size`。
+    #[test]
+    fn fingerprint_serde_camel_case_field_names() {
+        let fp = ProgramFingerprint {
+            exe_path: "/bin/sh".into(),
+            sha256: hex_like_64(),
+            size: 7,
+        };
+        let v = serde_json::to_value(&fp).unwrap();
+        assert_eq!(v["exePath"], serde_json::json!("/bin/sh"));
+        assert!(v.get("sha256").is_some());
+        assert!(v.get("size").is_some());
+        // sha256 保留原字段名（非 sha_256）
+        assert!(v.get("sha_256").is_none());
+    }
+
+    fn hex_like_64() -> String {
+        "b".repeat(64)
+    }
+
+    /// 旧规则 JSON（无 fingerprint 字段）→ None，零迁移（既有规则密文
+    /// 反序列化不受影响）。
+    #[test]
+    fn rule_legacy_json_without_fingerprint_parses_as_none() {
+        let legacy = serde_json::json!({
+            "id": Uuid::nil(),
+            "projectDir": "/proj",
+            "name": "publish",
+            "command": "npm *",
+            "keys": ["NPM_TOKEN"],
+            "created": "2026-01-01T00:00:00.000000Z",
+        });
+        let rule: Rule = serde_json::from_value(legacy).unwrap();
+        assert_eq!(rule.fingerprint, None);
+    }
+
+    /// 显式 fingerprint:null 反序列化 → None（缺省/空值与 None 等价）。
+    #[test]
+    fn rule_fingerprint_null_parses_as_none() {
+        let json = serde_json::json!({
+            "id": Uuid::nil(),
+            "projectDir": "/proj",
+            "name": "p",
+            "command": "npm *",
+            "keys": ["NPM_TOKEN"],
+            "fingerprint": null,
+            "created": "2026-01-01T00:00:00.000000Z",
+        });
+        let rule: Rule = serde_json::from_value(json).unwrap();
+        assert_eq!(rule.fingerprint, None);
     }
 }

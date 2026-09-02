@@ -472,6 +472,7 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
             actions: actions
                 .map(<[String]>::to_vec)
                 .unwrap_or_else(lk_core::model::default_rule_actions),
+            fingerprint: None,
             created: String::new(),
         };
         Ok(serde_json::from_value(res["rule"].clone()).unwrap_or(fallback))
