@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # LightKey M0 单机闭环 E2E（docs/testing.md §1 第二层；CI 之外本地/手动运行）
 #
-# 场景：init → unlock → 预授权读规则（M2.9 值披露：headless 读值须经
-#       rule add --read 预授权；条目名须为 env 安全名以过规则校验）→
-#       item add（四类各一）→ list/get → edit（CAS）→ delete（墓碑）→
-#       export headless 拒绝（恒弹窗，无 GUI；附件往返由 lk-core 单测覆盖）→
-#       lock → unlock → audit 可见 → 恢复流程（恢复码 + 新主密码）→
-#       旧密码失效 / 数据完好
+# 场景：init → unlock → 预授权读/写规则（M2.9 值披露：headless 读值须经
+#       rule add --read 预授权；M2.97 写门：headless item put 须经
+#       rule add --write 预授权——delete 恒弹窗 headless 一律拒绝；条目名须
+#       为 env 安全名以过规则校验）→ item add（四类各一）→ list/get →
+#       edit（CAS）→ delete 被写门拒绝（恒弹窗；墓碑机制由 lk-core/lk-daemon
+#       集成测试覆盖）→ export headless 拒绝（恒弹窗，附件往返由 lk-core
+#       单测覆盖）→ lock → unlock → audit 可见 → 恢复流程（恢复码 + 新主
+#       密码）→ 旧密码失效 / 数据完好
 #
 # 用法：bash scripts/e2e_m0.sh [lk-binary-path]
 set -u
@@ -46,9 +48,11 @@ check "错误密码解锁被拒（exit 1）" 1 $?
 echo "$MASTER_PW" | "$LK" unlock --stdin >/dev/null
 check "正确密码解锁成功" 0 $?
 
-echo "== 2.5 预授权读规则（M2.9 值披露：headless item get 须预授权）=="
+echo "== 2.5 预授权读/写规则（M2.9 值披露 + M2.97 写门：headless item get/put 须预授权）=="
 "$LK" rule add "$PWD" --read --name e2e0 --keys GitHub Diary API_KEY attachment >/dev/null
 check "rule add --read（绑定脚本 cwd）" 0 $?
+"$LK" rule add "$PWD" --write --name e2e0w --keys GitHub Diary API_KEY attachment >/dev/null
+check "rule add --write（绑定脚本 cwd，缺省 actions=create,update）" 0 $?
 
 echo "== 3. item add（四类各一）=="
 ID_LOGIN="$("$LK" item add login --name GitHub --username octocat --password s3cr3t --uris https://github.com,https://gist.github.com | awk '{print $2}')"
@@ -68,7 +72,7 @@ LIST="$("$LK" item list)"
 echo "$LIST" | grep -q "GitHub" && ok "list 含 login" || bad "list 缺 login"
 echo "$LIST" | grep -q "Diary" && ok "list 含 note" || bad "list 缺 note"
 echo "$LIST" | grep -q "API_KEY" && ok "list 含 secret" || bad "list 缺 secret"
-echo "$LIST" | grep -q "orig.bin" && ok "list 含 file" || bad "list 缺 file"
+echo "$LIST" | grep -q "attachment" && ok "list 含 file" || bad "list 缺 file"
 GET="$("$LK" item get "$ID_LOGIN")"
 echo "$GET" | grep -q "octocat" && ok "get 返回 username" || bad "get 缺 username"
 
@@ -83,12 +87,12 @@ R2="$("$LK" item get "$ID_LOGIN" --json | jq -r .revision)"
 check "刷新后重试收敛（last-write-wins）" 0 $?
 "$LK" item get "$ID_LOGIN" --json | jq -r .username | grep -q newuser2 && ok "编辑已生效" || bad "编辑未生效"
 
-echo "== 6. delete（墓碑）=="
-"$LK" item delete "$ID_NOTE" >/dev/null
-check "软删除成功" 0 $?
-"$LK" item get "$ID_NOTE" --json | jq -e .deleted >/dev/null && ok "条目进入 deleted 态" || bad "deleted 标记缺失"
-ls "$WORK" | grep -q "$ID_NOTE.tomb.lk" && ok "墓碑文件已写" || bad "墓碑文件缺失"
-"$LK" item list | grep "Diary" | grep -q "\[deleted\]" && ok "list 显示 deleted" || bad "list 未标 deleted"
+echo "== 6. delete（M2.97 写门：headless 恒弹窗 → 拒绝；写规则不豁免 delete）=="
+"$LK" item delete "$ID_NOTE" >/dev/null 2>"$WORK/del.err"
+check "headless item delete 被写门拒绝（exit 1）" 1 $?
+grep -q "写入被授权门拒绝" "$WORK/del.err" && ok "拒绝文案提示 rule add --write 预授权" || bad "拒绝文案不符：$(cat "$WORK/del.err")"
+# 墓碑/软删的落库与同步收敛由 lk-core vault 单测 + lk-daemon 集成测试覆盖
+# （headless E2E 无审批界面，delete 无法放行——write-gate.md §3 判定矩阵）
 
 echo "== 7. export（M2.9 值披露：headless 恒弹窗 → 拒绝）=="
 "$LK" item export "$ID_FILE" -o "$WORK/out.bin" >/dev/null 2>"$WORK/export.err"
@@ -106,7 +110,8 @@ echo "== 9. unlock → audit 可见 =="
 echo "$MASTER_PW" | "$LK" unlock --stdin >/dev/null
 AUDIT="$("$LK" audit)"
 echo "$AUDIT" | grep -q "vault.init" && ok "审计含 vault.init" || bad "审计缺 vault.init"
-echo "$AUDIT" | grep -q "item.put login <redacted>" && ok "审计含 item.put（已脱敏）" || bad "审计缺 item.put"
+# M2.97 写门审计口径（write-gate.md §8）：command 按 action 派生 `item.create <条目名>`
+echo "$AUDIT" | grep -q "item.create GitHub" && ok "审计含 item.create（写门派生命名）" || bad "审计缺 item.create"
 echo "$AUDIT" | grep -q "item.delete" && ok "审计含 item.delete" || bad "审计缺 item.delete"
 "$LK" audit --verify | grep -q "验证通过" && ok "审计 HMAC 链验证通过" || bad "审计验证失败"
 

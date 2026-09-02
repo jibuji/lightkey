@@ -167,28 +167,38 @@ enum RuleCommand {
     ///
     /// 注入规则：`lk rule add <projectDir> <command> --name <name> <keys...>`
     /// 读值规则（M2.9）：`lk rule add <projectDir> --read --name <name> --keys <name...>`
-    /// （读规则无 command 绑定，keys 经 `--keys` 选项给出——位置 keys 会被
+    /// 写规则（M2.97）：`lk rule add <projectDir> --write [--actions create,update] --name <name> --keys <name...>`
+    /// （读/写规则无 command 绑定，keys 经 `--keys` 选项给出——位置 keys 会被
     /// 可选的 `<command>` 占位吞掉，选项形态与 `lk inject --keys` 一致）
     Add {
         /// 项目目录（规范化绝对路径；须存在。以 / 开头且非现存本机路径时
         /// 按 WSL 默认发行版解析为 wsl://… 并回显确认）
         project_dir: String,
-        /// 具名命令（可 glob，如 "npm *"；含空格需引号）；--read 时省略
+        /// 具名命令（可 glob，如 "npm *"；含空格需引号）；--read/--write 时省略
         command: Option<String>,
         /// 规则名（如 publish）
         #[arg(long)]
         name: String,
         /// 读值规则（M2.9 值披露）：授权该项目目录按 key 名读取条目值
         /// （keys=条目名精确匹配）；不带命令绑定，与注入能力互不授权
-        #[arg(long)]
+        #[arg(long, conflicts_with = "write")]
         read: bool,
-        /// 授权注入的 key 名（1~32 个；值不可见、名可指名）；--read 时
-        /// 语义为可读条目名
+        /// 写规则（M2.97 写入门）：授权该项目目录对条目名新建/整条替换
+        /// （keys=条目名精确匹配；delete 恒弹窗，任何规则不豁免）；不带
+        /// 命令绑定；--actions 缺省 create,update
+        #[arg(long)]
+        write: bool,
+        /// 写动作子集（仅 --write；逗号分隔，如 create,update）。缺省
+        /// create,update；传 delete 被拒绝（删除恒弹窗由协议保证）
+        #[arg(long, value_name = "ACTIONS", requires = "write")]
+        actions: Option<String>,
+        /// 授权注入的 key 名（1~32 个；值不可见、名可指名）；--read/--write
+        /// 时语义为条目名
         keys: Vec<String>,
-        /// 读值规则的 key 名列表（`--read` 时使用，与 `lk inject --keys`
-        /// 同形态；`--read` 时忽略位置 keys）
-        #[arg(long = "keys", num_args = 1.., value_name = "NAME", requires = "read")]
-        read_keys: Vec<String>,
+        /// 读/写规则的条目名列表（`--read`/`--write` 时使用，与
+        /// `lk inject --keys` 同形态；此时忽略位置 keys）
+        #[arg(long = "keys", num_args = 1.., value_name = "NAME")]
+        opt_keys: Vec<String>,
     },
     /// 列出规则（最小字段）
     List,
@@ -557,6 +567,12 @@ fn rpc_fail_ctx(out: &mut impl Write, err: &RpcError, json_out: bool, ctx_text: 
 /// 规则命令被授权门拒绝的上下文文案（issue #104 / 补充拍板 #22）。
 const RULE_GATE_DENIED_TEXT: &str =
     "规则变更被授权门拒绝（需桌面审批：无界面/未批准/超时均拒绝）；请在 LightKey 桌面应用处理审批弹窗，或于桌面端「设置 → 规则」管理规则";
+
+/// 条目写入（item add/edit/delete）被写门拒绝的上下文文案（M2.97，
+/// write-gate.md §7 / issue #114）：区别于值披露的「读取被拒绝」；指引
+/// `--write` 预授权。`--json` 机器契约 error 名不变（`authz.denied`）。
+const WRITE_GATE_DENIED_TEXT: &str =
+    "写入被授权门拒绝（无规则且未批准/超时/无 UI）；可用 `lk rule add <projectDir> --write` 为该项目目录预授权";
 
 /// 生产传输适配（[`client::RpcClient`] 的注入点）：按探测分型分流 local /
 /// bridge。会话令牌注入、bridge 的 channel 覆写都在此层完成。
@@ -1093,7 +1109,15 @@ fn item_command<'a>(
                 let _ = writeln!(out, "已删除（软删除，30 天后硬删）");
                 0
             }
-            Err(e) => rpc_fail(out, &e, json_out),
+            Err(e) => {
+                // 写门拒绝（-32017）按命令语境渲染（write-gate.md §7，
+                // issue #114）；机器契约（error 名/code）不变
+                if matches!(e, RpcError::AuthzDenied) {
+                    rpc_fail_ctx(out, &e, json_out, WRITE_GATE_DENIED_TEXT)
+                } else {
+                    rpc_fail(out, &e, json_out)
+                }
+            }
         },
         ItemCommand::Copy { id, field } => cmd_item_copy(out, c, id, field, json_out),
         ItemCommand::Export { id, output } => match c.item_export(id) {
@@ -1322,7 +1346,14 @@ fn cmd_item_add<'a>(
             }
             0
         }
-        Err(e) => rpc_fail(out, &e, json_out),
+        Err(e) => {
+            // 写门拒绝（-32017）按命令语境渲染（write-gate.md §7，issue #114）
+            if matches!(e, RpcError::AuthzDenied) {
+                rpc_fail_ctx(out, &e, json_out, WRITE_GATE_DENIED_TEXT)
+            } else {
+                rpc_fail(out, &e, json_out)
+            }
+        }
     }
 }
 
@@ -1476,7 +1507,15 @@ fn cmd_item_edit<'a>(
             let _ = writeln!(out, "已更新: {} (revision {})", item.id(), item.revision());
             0
         }
-        Err(e) => rpc_fail(out, &e, json_out),
+        Err(e) => {
+            // 写门拒绝（-32017）按命令语境渲染（write-gate.md §7，issue #114）；
+            // 此前 item_get 的拒绝走通用「读取被授权门拒绝」文案（读门语境）
+            if matches!(e, RpcError::AuthzDenied) {
+                rpc_fail_ctx(out, &e, json_out, WRITE_GATE_DENIED_TEXT)
+            } else {
+                rpc_fail(out, &e, json_out)
+            }
+        }
     }
 }
 
@@ -1888,35 +1927,67 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
             command,
             name,
             read,
+            write,
+            actions,
             keys,
-            read_keys,
+            opt_keys,
         } => {
-            let capability = if *read { Some("read") } else { None };
-            // --read：keys 经 --keys 选项（位置 keys 被可选 <command> 占位，
-            // 无 command 可省略）；注入规则：keys 位置参数
-            if *read {
+            let capability = if *read {
+                Some("read")
+            } else if *write {
+                Some("write")
+            } else {
+                None
+            };
+            // --read/--write：keys 经 --keys 选项（位置 keys 被可选 <command>
+            // 占位，无 command 可省略）；注入规则：keys 位置参数
+            if *read || *write {
                 if !keys.is_empty() {
-                    eprintln!("lk rule add: --read 规则的 key 名请经 --keys <name...> 给出（位置参数留给 <command>）");
+                    eprintln!("lk rule add: --read/--write 规则的条目名请经 --keys <name...> 给出（位置参数留给 <command>）");
                     return 2;
                 }
-                if read_keys.is_empty() {
-                    eprintln!("lk rule add: --read 需要 --keys <name...> 指名可读条目名");
+                if opt_keys.is_empty() {
+                    eprintln!(
+                        "lk rule add: {} 需要 --keys <name...> 指名{}",
+                        if *write { "--write" } else { "--read" },
+                        if *write {
+                            "可写条目名"
+                        } else {
+                            "可读条目名"
+                        }
+                    );
                     return 2;
                 }
+                // --actions 仅配合 --write（clap requires 在 --read 与 --write
+                // 互斥时会被豁免，这里显式兜底——绝不静默丢弃参数）
+                if actions.is_some() && !*write {
+                    eprintln!("lk rule add: --actions 仅配合 --write 使用");
+                    return 2;
+                }
+                // --actions 解析（clap 已钉 requires=write；此处只做取值校验，
+                // delete 拒绝文案见 parse_write_actions）
+                let parsed_actions = match parse_write_actions(actions.as_deref()) {
+                    Ok(a) => a,
+                    Err(msg) => {
+                        eprintln!("lk rule add: {msg}");
+                        return 2;
+                    }
+                };
                 cmd_rule_add(
                     out,
                     dir,
                     project_dir,
                     name,
                     command.clone(),
-                    read_keys,
+                    opt_keys,
                     capability,
+                    parsed_actions.as_deref(),
                     json_out,
                 )
             } else {
-                if !read_keys.is_empty() {
+                if !opt_keys.is_empty() {
                     eprintln!(
-                        "lk rule add: --keys 仅配合 --read 使用（注入规则的 key 名用位置参数）"
+                        "lk rule add: --keys 仅配合 --read/--write 使用（注入规则的 key 名用位置参数）"
                     );
                     return 2;
                 }
@@ -1928,6 +1999,7 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
                     command.clone(),
                     keys,
                     capability,
+                    None,
                     json_out,
                 )
             }
@@ -1935,6 +2007,38 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
         RuleCommand::List => cmd_rule_list(out, dir, json_out),
         RuleCommand::Remove { id } => cmd_rule_remove(out, dir, id, json_out),
     }
+}
+
+/// `--actions` 取值解析（M2.97，write-gate.md §7）：逗号分隔的写动作子集；
+/// 缺省（None）→ `Ok(None)` = create,update（daemon/serde 缺省）。**delete
+/// 被拒绝**——恒弹窗由协议保证，规则不该也写不进去；非法动作名与空段同样
+/// 拒绝（用法错误，exit 2）。
+fn parse_write_actions(raw: Option<&str>) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut actions = Vec::new();
+    for seg in raw.split(',') {
+        let a = seg.trim();
+        if a.is_empty() {
+            return Err("--actions 含空动作（逗号分隔，如 create,update）".into());
+        }
+        if a == "delete" {
+            return Err(
+                "--actions 不接受 delete（删除恒弹窗，任何规则不豁免；actions 只允许 create、update）"
+                    .into(),
+            );
+        }
+        if a != lk_core::model::RULE_ACTION_CREATE && a != lk_core::model::RULE_ACTION_UPDATE {
+            return Err(format!(
+                "非法写动作：{a}（--actions 只允许 create、update）"
+            ));
+        }
+        if !actions.contains(&a.to_string()) {
+            actions.push(a.to_string());
+        }
+    }
+    Ok(Some(actions))
 }
 
 /// `lk rule add <projectDir> <command> --name <name> <keys...>`：
@@ -1956,6 +2060,7 @@ fn cmd_rule_add(
     command: Option<String>,
     keys: &[String],
     capability: Option<&str>,
+    actions: Option<&[String]>,
     json_out: bool,
 ) -> i32 {
     use std::io::IsTerminal;
@@ -1963,12 +2068,12 @@ fn cmd_rule_add(
         eprintln!("lk rule add: 至少需要 1 个 key 名（值不可见、名可指名）");
         return 2;
     }
-    // --read（读值规则）：command 位置参数省略，以空串入库（spec §4/§7）；
-    // 注入规则：command 必填
-    let is_read = capability == Some("read");
-    let command_owned: String = if is_read {
+    // --read（读值规则）/ --write（写规则，M2.97）：command 位置参数省略，
+    // 以空串入库（write-gate.md §7）；注入规则：command 必填
+    let no_command = capability == Some("read") || capability == Some("write");
+    let command_owned: String = if no_command {
         if command.is_some() {
-            eprintln!("lk rule add: --read 规则不绑定命令，请省略 <command> 位置参数");
+            eprintln!("lk rule add: --read/--write 规则不绑定命令，请省略 <command> 位置参数");
             return 2;
         }
         String::new()
@@ -1976,7 +2081,7 @@ fn cmd_rule_add(
         match command.as_deref() {
             Some(c) => c.to_string(),
             None => {
-                eprintln!("lk rule add: 需要 <command> 位置参数（注入规则绑定具名命令；读值规则用 --read）");
+                eprintln!("lk rule add: 需要 <command> 位置参数（注入规则绑定具名命令；读值规则用 --read，写规则用 --write）");
                 return 2;
             }
         }
@@ -2040,7 +2145,7 @@ fn cmd_rule_add(
             },
         };
     }
-    match client_for(dir).rule_add(&canonical, name, command, keys, capability) {
+    match client_for(dir).rule_add(&canonical, name, command, keys, capability, actions) {
         Ok(rule) => {
             if json_out {
                 let _ = writeln!(
@@ -2232,7 +2337,8 @@ fn parse_reg_value(output: &str, name: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// `lk rule list`：列出规则（最小字段）。
+/// `lk rule list`：列出规则（最小字段；capability + actions 展示——
+/// write-gate.md §7，issue #114）。
 fn cmd_rule_list(out: &mut impl Write, dir: &std::path::Path, json_out: bool) -> i32 {
     match client_for(dir).rule_list() {
         Ok(rules) => {
@@ -2244,17 +2350,25 @@ fn cmd_rule_list(out: &mut impl Write, dir: &std::path::Path, json_out: bool) ->
                 );
             } else {
                 if rules.is_empty() {
-                    let _ = writeln!(out, "（无规则。lk rule add <projectDir> <command> --name <name> <keys...> 添加；读值规则用 --read）");
+                    let _ = writeln!(out, "（无规则。lk rule add <projectDir> <command> --name <name> <keys...> 添加；读值规则用 --read，写规则用 --write）");
                 }
                 for r in &rules {
+                    // actions 列仅 write 规则有语义（write-gate.md §4）；
+                    // 其余能力不参与写动作匹配，展示 -
+                    let actions = if r.capability == lk_core::model::RULE_CAPABILITY_WRITE {
+                        r.actions.join(",")
+                    } else {
+                        "-".to_string()
+                    };
                     let _ = writeln!(
                         out,
-                        "{}\t{}\t{}\t{}\t[{}]\t{}",
+                        "{}\t{}\t{}\t{}\t[{}]\t{}\t{}",
                         r.id,
                         r.name,
                         r.project_dir,
                         r.command,
                         r.capability,
+                        actions,
                         r.keys.join(",")
                     );
                 }
@@ -2868,6 +2982,55 @@ mod rpc_fail_text_tests {
 // inject reason；缝 = cmd_* 级函数 + 注入 fake transport，断言 stdout JSON
 // 形状与退出码，不测内部映射）
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod write_rule_add_tests {
+    use super::*;
+
+    /// `--actions` 取值解析（write-gate.md §7，issue #114）：缺省 None；
+    /// create/update 子集解析 + 去重 + 容忍空白；delete / 非法动作 / 空段
+    /// 拒绝且文案清晰（delete 点破恒弹窗语义）。
+    #[test]
+    fn parse_write_actions_variants() {
+        // 缺省 → None（daemon/serde 侧按缺省 create,update 落库）
+        assert_eq!(parse_write_actions(None).unwrap(), None);
+        // 单动作 / 逗号分隔子集
+        assert_eq!(
+            parse_write_actions(Some("create")).unwrap(),
+            Some(vec!["create".to_string()])
+        );
+        assert_eq!(
+            parse_write_actions(Some("create,update")).unwrap(),
+            Some(vec!["create".to_string(), "update".to_string()])
+        );
+        // 容忍空白 + 去重（顺序保留）
+        assert_eq!(
+            parse_write_actions(Some(" update , create , update ")).unwrap(),
+            Some(vec!["update".to_string(), "create".to_string()])
+        );
+        // delete 拒绝且文案点破恒弹窗（协议保证，规则写不进去）
+        let e = parse_write_actions(Some("delete")).unwrap_err();
+        assert!(
+            e.contains("delete") && e.contains("弹窗"),
+            "文案不清晰：{e}"
+        );
+        // 子集混入 delete 同样拒绝
+        assert!(parse_write_actions(Some("create,delete")).is_err());
+        // 非法动作 / 空段拒绝
+        let e = parse_write_actions(Some("bogus")).unwrap_err();
+        assert!(e.contains("bogus"), "文案应指出非法动作：{e}");
+        assert!(parse_write_actions(Some("create,,update")).is_err());
+        assert!(parse_write_actions(Some("")).is_err());
+    }
+
+    /// 写拒绝语境文案钉死（write-gate.md §7 / issue #114）：点破写门 +
+    /// `--write` 预授权指引。
+    #[test]
+    fn write_gate_denied_text_pins_hint() {
+        assert!(WRITE_GATE_DENIED_TEXT.contains("写入被授权门拒绝"));
+        assert!(WRITE_GATE_DENIED_TEXT.contains("rule add <projectDir> --write"));
+    }
+}
 
 #[cfg(test)]
 mod agent_contract_tests {

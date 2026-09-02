@@ -249,12 +249,23 @@ impl Daemon {
                     .capability
                     .as_deref()
                     .unwrap_or(lk_core::model::RULE_CAPABILITY_INJECT);
+                // 写动作子集（write-gate.md §7）：capability=write 时取参数
+                // （缺省 create+update，与 serde 缺省一致）；capability !=
+                // write 时忽略——按缺省落库（匹配函数按 capability 过滤）。
+                let actions = if capability == lk_core::model::RULE_CAPABILITY_WRITE {
+                    p.actions
+                        .clone()
+                        .unwrap_or_else(lk_core::model::default_rule_actions)
+                } else {
+                    lk_core::model::default_rule_actions()
+                };
                 if let Err(e) = validate_rule_fields(
                     capability,
                     &project_dir_input,
                     &p.name,
                     &p.command,
                     &p.keys,
+                    &actions,
                 ) {
                     return Err(Box::new(RpcResponse::err(
                         Value::Null,
@@ -291,6 +302,8 @@ impl Daemon {
                         command: p.command.clone(),
                         keys: p.keys.clone(),
                         capability: p.capability.clone(),
+                        // 校验后的有效 actions（write=参数展开缺省；其余=缺省）
+                        actions: Some(actions),
                         channel: p.channel.clone(),
                     }),
                     display_name: p.name.clone(),
@@ -368,10 +381,12 @@ impl Daemon {
                     command: p.command.clone(),
                     keys: p.keys.clone(),
                     capability: capability.to_string(),
-                    // 最小编译修复（T1，issue #112）：RPC 尚无 actions 参数
-                    // （PR C 经 `rule.add --actions` 贯通）；缺省 create+update
-                    // 与 serde 缺省一致，capability!=write 时本就不参与匹配。
-                    actions: lk_core::model::default_rule_actions(),
+                    // 校验层已归一（write=参数/缺省；capability!=write=缺省
+                    // 忽略），此处原样落库（write-gate.md §7，issue #114）
+                    actions: p
+                        .actions
+                        .clone()
+                        .unwrap_or_else(lk_core::model::default_rule_actions),
                 };
                 match me.put_rule(draft, None) {
                     Ok(rule) => {

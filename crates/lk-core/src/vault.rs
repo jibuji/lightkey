@@ -605,11 +605,19 @@ impl UnlockedVault {
         let mut out = Vec::new();
         let mut ids: Vec<uuid::Uuid> = self.index.keys().copied().collect();
         ids.sort();
-        // 文件缺失的条目：自愈（从索引剔除）
+        // 文件缺失的条目：自愈（从索引剔除）。**仅限条目对象**——索引同时
+        // 覆盖规则（ObjectKind::Rule，`{uuid}.rule.lk`），按 item_file 判缺失
+        // 会把规则整批剪出索引并落盘（M0 潜伏缺陷，规则上线后暴露：任意
+        // item list 之后规则集体失明，授权门/规则列表一并受累）。
         let missing: Vec<uuid::Uuid> = ids
             .iter()
             .copied()
-            .filter(|id| !item_file(&self.dir, *id).exists())
+            .filter(|id| {
+                self.index
+                    .get(id)
+                    .is_some_and(|e| e.kind == ObjectKind::Item)
+                    && !item_file(&self.dir, *id).exists()
+            })
             .collect();
         for id in &missing {
             self.index.remove(id);
@@ -2047,6 +2055,44 @@ mod tests {
         assert_eq!(v.purge_expired(&future).unwrap(), 0);
         assert_eq!(v.list_rules().unwrap().len(), 1, "活跃规则不被过期清理误删");
         assert!(v.get_rule(rule.id).is_ok());
+    }
+
+    /// `list()` 自愈只剪**条目**索引（M2 潜伏缺陷回归，随 M2.97 E2E 暴露）：
+    /// 自愈按 `item_file` 存在性判缺失——规则对象是 `{uuid}.rule.lk`，不设
+    /// kind 保护会把规则整批剪出索引并落盘（规则文件还在、索引永久失踪，
+    /// 授权门/规则列表集体失明，直至重建规则）。
+    #[test]
+    fn list_self_heal_never_prunes_rule_entries() {
+        let (dir, _audit, _code) = temp_vault("list-rule-prune");
+        let mut v = unlock_vault(dir.path(), "pw123456").unwrap();
+        let proj = std::env::temp_dir()
+            .join("lk-test-proj")
+            .to_string_lossy()
+            .to_string();
+        v.put_rule(
+            RuleDraft {
+                project_dir: proj,
+                name: "read-all".into(),
+                command: String::new(),
+                keys: vec!["K".into()],
+                capability: crate::model::RULE_CAPABILITY_READ.into(),
+                actions: crate::model::default_rule_actions(),
+            },
+            None,
+        )
+        .unwrap();
+        v.put(None, login_draft("GitHub"), None).unwrap();
+        assert_eq!(v.list_rules().unwrap().len(), 1);
+        // 触发自愈路径（&mut list）
+        v.list().unwrap();
+        assert_eq!(
+            v.list_rules().unwrap().len(),
+            1,
+            "item list 自愈不得剪掉规则索引"
+        );
+        // 剪枝若发生会落盘：重启（重开 vault）后规则同样不得失踪
+        let v2 = unlock_vault(dir.path(), "pw123456").unwrap();
+        assert_eq!(v2.list_rules().unwrap().len(), 1, "索引落盘不得丢失规则");
     }
 
     #[test]

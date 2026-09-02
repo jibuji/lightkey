@@ -8,7 +8,9 @@
 #   2. A 添加条目与 2.5MiB 附件并 `lk sync`；断言远端布局与密文
 #   3. 双客户端离线双改同条目 → 上线 → last-write-wins 收敛（后改者胜，
 #      含并发同步的真实 CAS 竞争窗口；CAS 冲突机制由 lk-core 单测确定性覆盖）
-#   4. 一端删除 → 墓碑传播 → 对端收敛
+#   4. headless `item delete` 被写门拒绝（M2.97 恒弹窗；墓碑传播的触发面
+#      在 headless E2E 不可达——删除必须经桌面弹窗，该场景由 lk-core 同步
+#      引擎单测 + lk-daemon 集成测试（tests/write_gate.rs 桌面批准路径）覆盖）
 #   5. 附件分块断点续传（删远端分块 → 补传 → 远端分块齐全 + 对端元数据一致；
 #      M2.9 值披露起 headless `item export` 恒弹窗拒绝，附件重组一致性由
 #      lk-core vault 单测与 daemon 集成测试覆盖）
@@ -17,7 +19,9 @@
 #
 # 预授权：M2.9 值披露（docs/value-disclosure.md）后 headless `item get`
 # 须经读规则预授权——A 解锁后 `rule add --read` 绑定脚本 cwd（keys=条目名，
-# 须为 env 安全名）；B 经库复制继承同一规则。
+# 须为 env 安全名）；M2.97 写门（docs/write-gate.md）后 headless `item put`
+# （create/update）须经 `rule add --write` 预授权（delete 恒弹窗不参与规则）；
+# B 经库复制继承同一组规则。
 #
 # 用法：bash scripts/e2e_m1.sh [lk-binary-path]
 set -u
@@ -31,6 +35,10 @@ export LK_JSON=0
 # 规则管理审批门（补充拍板 #22）：headless rule.add fail-closed；主流程的
 # rule add --read 预插经 E2E 自动批准通道放行（仅规则审批；daemon 启动读一次）。
 export LIGHTKEY_E2E_AUTO_APPROVE=rule
+# 本脚本是 Linux 本地守护实例的双客户端同步回归：在 WSL 内跑时禁用 M2.75
+# bridge 自动探测（Windows 侧装有 LightKey 会被判定「装了」而试图桥接，
+# 与本地 file:// 模拟存储场景无关）。
+export LIGHTKEY_BRIDGE=off
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -86,6 +94,10 @@ check "A unlock" 0 $?
 # M2.9 值披露预授权：read 规则绑定脚本 cwd（B 经库复制继承）
 a rule add "$PWD" --read --name e2e1 --keys GitHub APIKey attachment attachment2 >/dev/null
 check "A rule add --read（headless 读值预授权）" 0 $?
+# M2.97 写门预授权：write 规则绑定脚本 cwd（缺省 actions=create,update；
+# delete 恒弹窗不参与规则——headless 一律拒绝，见 == 4 ==）
+a rule add "$PWD" --write --name e2e1w --keys GitHub APIKey attachment attachment2 >/dev/null
+check "A rule add --write（headless 写入预授权）" 0 $?
 
 echo "== 2. A 添加条目与附件并同步 ="
 ID_X=$(a item add login --name GitHub --username octocat --password s3cr3t | awk '{print $2}')
@@ -131,15 +143,15 @@ a sync >/dev/null
 [ "$(a item get "$ID_X" --json | jq -r .username)" = "bob2" ] && ok "并发双改收敛到后改者" || bad "并发双改未收敛"
 [ "$(b item get "$ID_X" --json | jq -r .username)" = "bob2" ] && ok "并发双改对端一致" || bad "并发双改对端不一致"
 
-echo "== 4. 一端删除 → 墓碑传播 =="
-a item delete "$ID_Z" >/dev/null
-check "A 软删除" 0 $?
-a sync >/dev/null
-[ -f "$REMOTE/$ID_Z.tomb.lk" ] && ok "远端墓碑文件已上传" || bad "远端墓碑文件缺失"
-b sync >/dev/null
-b item get "$ID_Z" --json | jq -e .deleted >/dev/null && ok "B 收敛删除态" || bad "B 未收敛删除态"
-[ -f "$B/$ID_Z.tomb.lk" ] && ok "B 本地墓碑已写" || bad "B 本地墓碑缺失"
-a item list | grep -q "APIKey" && ok "A 列表显示 deleted" || bad "A 列表未见 deleted"
+echo "== 4. 写门（M2.97）：headless item delete 恒弹窗拒绝 =="
+# delete 不参与写规则匹配（任何规则不豁免，write-gate.md §3）；无审批界面
+# → fail-closed 拒绝。墓碑传播场景由 lk-core 同步引擎单测 + lk-daemon 集成
+# 测试（tests/write_gate.rs 桌面批准路径）覆盖，headless E2E 无触发面。
+a item delete "$ID_Z" >/dev/null 2>"$WORK/del.err"
+check "headless item delete 被写门拒绝（恒弹窗，exit 1）" 1 $?
+grep -q "写入被授权门拒绝" "$WORK/del.err" && ok "拒绝文案提示 rule add --write 预授权" || bad "拒绝文案不符：$(cat "$WORK/del.err")"
+DEL_DENIED=$(a audit --json | jq '[.[] | select(.command == "item.delete APIKey") | select(.result == "denied")] | length')
+[ "${DEL_DENIED:-0}" -ge 1 ] && ok "审计含 item.delete denied" || bad "审计缺 item.delete denied"
 
 echo "== 5. 附件分块断点续传 =="
 # 5a. 真实中断语义：A 新建文件条目后，仅元数据 + 0 号分块到达远端
