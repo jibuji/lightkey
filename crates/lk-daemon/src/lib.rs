@@ -47,6 +47,7 @@ pub use daemon::{Daemon, SharedDaemon, SESSION_TOKEN_FILE};
 pub(crate) use daemon::authz::AuthzBegin;
 pub(crate) use daemon::disclosure::DisclosureBegin;
 pub(crate) use daemon::rules::RuleBegin;
+pub(crate) use daemon::write::WriteBegin;
 pub(crate) use daemon::{extract_token, rpc_string};
 
 #[cfg(test)]

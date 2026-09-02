@@ -49,7 +49,8 @@ fn sync_round_does_not_block_commands_and_apply_respects_races() {
                 "password": "p1", "uris": [], "custom": []
             } }),
         ),
-        &PeerInfo::unknown(),
+        // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+        &PeerInfo::desktop(),
     ));
     let x_id = put_x["item"]["id"].as_str().unwrap().to_string();
     let x_rev1 = put_x["item"]["revision"].as_str().unwrap().to_string();
@@ -98,7 +99,8 @@ fn sync_round_does_not_block_commands_and_apply_respects_races() {
                     "password": "p2", "uris": [], "custom": []
                 } }),
         ),
-        &PeerInfo::unknown(),
+        // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+        &PeerInfo::desktop(),
     );
     let (tx, rx) = mpsc::channel();
     // 慢后端间隔 800ms 与断言上界 700ms 成对：回归态（命令在网络 I/O 中
@@ -139,7 +141,8 @@ fn sync_round_does_not_block_commands_and_apply_respects_races() {
                 }
             }),
         ),
-        &PeerInfo::unknown(),
+        // M2.97 写门：与授权无关的竞争写走 desktop 直调豁免（GUI 同路径）
+        &PeerInfo::desktop(),
     );
     let put_result = rpc_result(&put);
     assert!(

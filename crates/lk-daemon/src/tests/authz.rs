@@ -412,9 +412,10 @@ fn push_stream_delivers_frames_over_real_named_pipe() {
     let v: Value = serde_json::from_str(&sub_resp).unwrap();
     assert!(v.get("error").is_none(), "subscribe 应成功：{sub_resp}");
 
-    // 触发 item.changed 事件（另一条连接的常规命令）
-    let _ = transport::request(
-        &ep,
+    // 触发 item.changed 事件：M2.97 写门后 socket 写是授权事件（本测试
+    // 与授权无关）→ desktop 直调豁免路径写入（GUI 同路径；bus → notifier
+    // → 推送通道照常把帧送到外部 socket 订阅连接）
+    let _ = state.lock().unwrap().handle(
         &rpc_line(
             M_ITEM_PUT,
             Some(&token),
@@ -423,8 +424,8 @@ fn push_stream_delivers_frames_over_real_named_pipe() {
                 "purpose": "", "expiresAt": null
             } }),
         ),
-    )
-    .unwrap();
+        &PeerInfo::desktop(),
+    );
 
     // 订阅连接必须收到 item.changed 通知帧（修复前：永远收不到）
     let frame = transport::read_line(&mut sub)

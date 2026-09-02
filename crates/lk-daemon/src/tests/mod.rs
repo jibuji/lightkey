@@ -128,6 +128,7 @@ fn m2_daemon_with(
     ));
     let token = unlock["token"].as_str().unwrap().to_string();
     if let Some((name, value)) = secret {
+        // M2.97 写门：写入是授权事件——种子走 desktop 直调豁免（GUI 同路径）
         daemon.handle(
             &rpc_line(
                 M_ITEM_PUT,
@@ -137,7 +138,7 @@ fn m2_daemon_with(
                     "purpose": "", "expiresAt": null
                 } }),
             ),
-            &PeerInfo::unknown(),
+            &PeerInfo::desktop(),
         );
     }
     let shared = daemon.shared();
@@ -184,6 +185,7 @@ fn locked_daemon(
     ));
     let token = unlock["token"].as_str().unwrap().to_string();
     if let Some((name, value)) = secret {
+        // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
         daemon.handle(
             &rpc_line(
                 M_ITEM_PUT,
@@ -193,7 +195,7 @@ fn locked_daemon(
                     "purpose": "", "expiresAt": null
                 } }),
             ),
-            &PeerInfo::unknown(),
+            &PeerInfo::desktop(),
         );
     }
     if let Some((proj, name)) = read_rule {
@@ -238,6 +240,7 @@ mod rule_gate;
 mod rules;
 mod session_token;
 mod sync_race;
+mod write_gate;
 
 /// 慢网络后端（G1 回归夹具，同 M1.5）。
 struct SlowBackend {
