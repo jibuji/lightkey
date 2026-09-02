@@ -437,4 +437,53 @@ needs-decision，不得自行变更。
     `crates/lk-daemon/src/tests/disclosure.rs`；规格：
     value-disclosure.md（判定矩阵锁态行）、authorization-gate.md §5.2。
 
+24. **写入授权门（write gate）：写 = 授权事件（2026-09-02 · 来源：
+    write-gate grilling-with-docs 会话收敛，船长拍板，**待实现**）**：
+    `item.put` / `item.delete` 从「仅验会话令牌」升为裁决方法——值披露是
+    授权事件（#20），**写入同样是授权事件**（对称原则完成面）：解锁窗口内
+    任何同用户进程持令牌即可静默新建/整条替换/删除任意条目，与 #65 同源
+    （value-disclosure §1 的镜像）。裁定：
+    - **结构**：`Rule.capability` 增 `write`（三能力 inject/read/write 两两
+      不互授）；写规则带 `actions ⊆ {create, update, delete}`，缺省
+      create+update；**delete 恒弹窗由协议保证**——不存在于 actions，规则
+      写不进去。
+    - **协议零变更，RPC 不拆**：单一 `item.put`（action 由 daemon 从
+      `ItemPutParams.id` 有无权威派生，不信客户端自报）+ `item.delete`；
+      `ApprovalKind::Write`（serde `"write"`）加性新增；拒绝复用
+      `-32017 authz.denied`（协议零新增）。拆分 `item.create/update` 为被否
+      选项（破坏性协议变更 + 三处契约镜像 + 表面翻倍）；清晰度由 daemon
+      内部函数拆分获得。
+    - **判定矩阵**：desktop 直调受信豁免；socket 写规则命中静默
+      （**双向名称约束**：create 草稿名 ∈ keys；update 存储名 **且** 草稿名
+      都 ∈ keys——名字不得「进出」授权集合，堵「改名逃生 / 改名植毒」）；
+      未命中 → 弹窗（30s 超时默认拒绝）/ headless `authz.denied`；
+      **delete 恒弹窗任何规则不豁免**（无用户级恢复路径——软删 30 天后
+      硬删、无 restore 命令；对齐 export 恒弹窗先例）；重名语义 = 名字即
+      身份（规则覆盖全部同名条目，与读规则同构）；锁态 `session.invalid`
+      先行（规则在加密库内）。
+    - **边界**：同步应用远端变更不受门（BYO 信任模型维持，与值披露同口径）；
+      真相源投毒（写规则静默改写 secret 值 → 后续合法读/注入拿污染值）接受
+      为已知限制（文档明示，delete 恒弹窗已压住最坏损失）。
+    - **测试**：E2E **不扩展** auto-approve 到写门（shell E2E 覆盖 headless
+      拒绝 / 写规则命中静默 / delete 恒弹窗拒绝，预插经既有
+      `auto-approve=rule`；弹窗批准路径由 daemon 集成测试
+      `LocalApprovalChannel` 覆盖——与值披露门测试分工一致）。
+    - 留档（后续可选，不进 MVP）：锁态写一体化（#67/#23 同款）；secret
+      类型 update 恒弹窗（规则级 flag）；写规则 id 键（对象级钉死，create
+      另案）；弹窗合并去重/并发上限（沿用 #23 留档）;规则绑定 exe+哈希
+      （进程身份绑定，整体可选加固）。
+    - 被否选项：
+      | 选项 | 否因 |
+      |------|------|
+      | 拆 `item.create` / `item.update` RPC | 破坏性协议变更（旧 daemon 不兼容、需升桥版本或留废弃别名）+ 三处契约镜像同步改 + 表面翻倍；daemon 内部函数拆分即可获得同等清晰度 |
+      | delete 可由写规则豁免 | 无用户级恢复路径（软删 30 天硬删、无 restore）；任何豁免重开「静默拆墙」面（对称 export 恒弹窗） |
+      | 写规则按条目 id 键匹配 | 规则不可读（UUID 配置表）、create 无 id 需另案、keys 一处两种语义；「名字即身份」符合用户直觉且与读规则同构 |
+      | E2E auto-approve 扩到写门 | release 二进制自动批准面扩大；headless 拒绝/规则静默/恒弹窗已被既有通道覆盖 |
+      | 锁态写一体化随 MVP 交付 | 写比读更重；规则在加密库内锁态无法预载；现维持 `session.invalid`，机制复用 #67/#23 后续可选 |
+    实现规格：[write-gate.md](write-gate.md)（**唯一出处**）；落点：
+    authorization-gate.md §10（摘要）、ipc.md / cli.md / agent-cli.md /
+    data-model.md（标注）、milestones.md M2.97、CONTEXT.md（写入/写动作/
+    写规则/恒弹窗词条）；**issue 待立项**（实现走 PR CI 门禁序列，
+    write-gate.md §11）。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

@@ -51,7 +51,11 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   starter 如实展示中继链顶层（如 `wsl.exe`/终端进程名）；cwd 取 bridge 进程
   PEB 真实 cwd（interop 继承的调用方项目目录 UNC），足以定位项目。审计
   `channel = wsl-bridge`。详见 [cross-subsystem.md](cross-subsystem.md) §7.5。
-- 结果供审计 `starter` 字段与规则匹配使用。
+- 结果用途（与代码一致，`crates/lk-core/src/authz.rs` `evaluate_layers`）：
+  `starter` 只用于审计字段与第 1 层兜底（unknown → fail-closed），**不参与
+  规则匹配**——规则命中仅看 `capability` + 项目目录（cwd，ancestor 匹配）+
+  command glob / keys，任何同用户进程在授权目录内复现授权命令形态即可命中；
+  `cwd` 供规则匹配与审计两用。
 
 ## 4. 规则库（D8）
 
@@ -301,7 +305,7 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   渲染「规则变更被授权门拒绝（需桌面审批…）」，与值披露文案区分（同码
   不同命令语境，`--json` 机器契约 error 名不变）。
 
-### 9.4 审计（全路径；现状仅成功路径写）
+### 9.4 审计（全路径，已实现）
 
 | 路径 | 审计 |
 |------|------|
@@ -335,3 +339,24 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   被拒」（独立数据目录另起无 env 守护）+ auto-approve 审计断言；
   `e2e_m0/m1` 传 env（主流程含 rule add 预插）；`e2e_cross_subsystem.sh`
   传 env + WSLENV（Windows 守护实例由桌面应用持有，见脚本头注释）。
+
+## 10. 写入授权门（write gate，M2.97，规划中）
+
+> 完整实现规格见 [write-gate.md](write-gate.md)（**唯一出处**）；本节只留
+> 边界摘要（补充拍板 #24，2026-09-02 拍板，待实现）。
+
+- **写 = 授权事件**（值披露裁决 #20 的对称完成面）：`item.put`（create /
+  update）与 `item.delete` 从「仅验会话令牌」升为裁决方法（ApprovalDeferred
+  三阶段复用）；desktop 直调受信豁免；headless fail-closed（`authz.denied`
+  -32017 复用）；锁态 `session.invalid` 先行（规则在加密库内）。
+- **写规则**（`capability=write` + `actions ⊆ {create, update, delete}`，
+  缺省 create+update）：按条目名匹配——create 草稿名 ∈ keys；update 存储名
+  **且** 草稿名都 ∈ keys（双向名称约束：名字不得「进出」授权集合，防改名
+  逃生 / 改名植毒）；重名语义 = 名字即身份（覆盖全部同名条目，与读规则
+  同构）。**delete 恒弹窗，任何规则不豁免**（无用户级恢复路径）。
+- **协议零变更，RPC 不拆**：单一 `item.put`（action 由 daemon 从
+  `ItemPutParams.id` 有无权威派生）+ `item.delete`；`ApprovalKind::Write`
+  加性新增。
+- **边界**：同步应用远端变更不受门（BYO 信任模型维持）；真相源投毒
+  （写规则静默改写 secret 值 → 后续合法读/注入拿污染值）= 已知限制（文档
+  明示）；exe+哈希身份绑定为整体可选加固，不随本规格。

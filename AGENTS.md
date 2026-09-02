@@ -141,6 +141,12 @@
   「记住」按钮条件 `isRead && !needsUnlock`（D 层单测钉住）。见
   `docs/authorization-gate.md` §5.2/§9、`docs/value-disclosure.md` §3/§5、
   `docs/decisions.md` #22/#23
+- [ ] M2.97 写入授权门（补充拍板 #24 草案，2026-09-02 拍板，待实现；spec
+  唯一出处 `docs/write-gate.md`）：`item.put`/`item.delete` 升裁决方法（写 =
+  授权事件）；写规则 `capability=write` + `actions`（缺省 create+update，
+  双向名称约束）；**delete 恒弹窗**任何规则不豁免；RPC 不拆（action 由
+  daemon 派生）+ `ApprovalKind::Write`；锁态 `session.invalid` 先行；同步
+  应用不受门、真相源投毒为已知限制；E2E 不扩 auto-approve。
 - [ ] M3 浏览器填充
 
 ## Agent skills

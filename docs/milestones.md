@@ -262,6 +262,45 @@ milestones、AGENTS.md、CONTEXT.md）；**#104/#105 关闭**。
 
 > 本里程碑为补充拍板 #22/#23 新增（插入 M2.9 之后、M3 之前）。
 
+## M2.97 —— 写入授权门（write gate）（规划中，未实现）
+
+**目标**：补充拍板 #24（2026-09-02 write-gate grilling 拍板）——`item.put`
+（create/update）与 `item.delete` 从「仅验会话令牌」升为裁决方法（对称原则
+完成面：值披露是授权事件（#20），写入同样是授权事件）；完备的判定矩阵、
+写规则（capability=write + actions）、delete 恒弹窗。实现规格唯一出处
+[write-gate.md](write-gate.md)。
+
+范围（按 [write-gate.md](write-gate.md) §11 的 PR 序列）：
+
+- lk-core：`Rule.actions`（serde 缺省 `["create","update"]`）+ 写规则双向
+  名称匹配（create 草稿名 ∈ keys；update 存储名 ∧ 草稿名 ⊆ keys）+ 能力
+  三向不互授 + `ApprovalKind::Write`（serde `"write"`，加性变更不升协议
+  版本）。
+- lk-daemon：`strategy_of` 升 `item.put` / `item.delete` 为 ApprovalDeferred
+  （`item.list` 维持 Inline)；`M_ITEM_PUT` RPC **不拆**（action 由 daemon
+  从 `ItemPutParams.id` 有无权威派生；内部处理函数拆 create/update exec）；
+  begin/finalize 编排复用规则门模式（desktop 豁免 / 写规则命中静默 /
+  弹窗 / headless `authz.denied`；finalize 锁内 TOCTOU 重校验）；delete
+  **恒弹窗**任何规则不豁免；锁态 `session.invalid` 先行；全路径审计。
+- lk-cli：`rule add --write [--actions create,update]`（省略 command）；
+  写拒绝按命令语境渲染文案（-32017 复用）；`--json` 契约 error 名不变。
+- 前端：approval 插件 kind=write 分支（动作 + 目标条目名 + 30s 倒计时，
+  不展示值）；「记住」按钮仅 create/update（生成 `keys=[条目名] +
+  actions=[当前动作]` 最小写规则），delete 无记住按钮；规则管理页展示
+  capability + actions。
+- E2E：**不扩展** auto-approve 到写门——shell E2E 覆盖 headless 拒绝 /
+  写规则命中静默（`auto-approve=rule` 预插）/ delete 恒弹窗拒绝；弹窗
+  批准路径由 daemon 集成测试（`LocalApprovalChannel`）覆盖。
+
+**出口**：`cargo test` + vitest 全绿；M0/M1/M2/M2.75/M2.8/M2.9/M2.95 回归 +
+写门集成测试（tests/write_gate.rs）通过；clippy/fmt 全绿；文档同步
+（write-gate.md、authorization-gate §10、ipc/cli/agent-cli/data-model/
+milestones、decisions #24 状态翻转、AGENTS.md、CONTEXT.md）；写门 issue
+立项并关闭。
+
+> 本里程碑为 write-gate grilling 会话拍板（补充拍板 #24）新增（插入
+> M2.95 之后、M3 之前）；现状未实现。
+
 ## M3 —— 浏览器填充（V1 之后）
 
 **目标**：浏览器扩展按 [browser-fill.md](browser-fill.md) 协议实现。
