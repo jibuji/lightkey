@@ -432,10 +432,11 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
 
     /// `rule.add` → 入库规则。daemon 返回的 rule 体无法解析时兜底合成
     /// （nil id + 请求参数回填），与重构前行为逐字一致。
-    /// `rule.add` → 入库规则。`capability`：`Some("read")` = 读值规则
-    /// （M2.9，`--read`）；`None` = 注入规则（不带 capability 字段，老
-    /// 守护进程兼容）。daemon 返回的 rule 体无法解析时兜底合成
-    /// （nil id + 请求参数回填），与重构前行为逐字一致。
+    /// `capability`：`Some("read")` = 读值规则（M2.9，`--read`）、
+    /// `Some("write")` = 写规则（M2.97，`--write`）；`None` = 注入规则
+    /// （不带 capability 字段，老守护进程兼容）。`actions` 仅写规则携带
+    /// （write-gate.md §7 加性字段）；daemon 返回的 rule 体无法解析时兜底
+    /// 合成（nil id + 请求参数回填），与重构前行为逐字一致。
     pub fn rule_add(
         &mut self,
         project_dir: &str,
@@ -443,6 +444,7 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
         command: &str,
         keys: &[String],
         capability: Option<&str>,
+        actions: Option<&[String]>,
     ) -> Result<Rule, RpcError> {
         let mut params = json!({
             "projectDir": project_dir,
@@ -454,6 +456,9 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
         if let Some(cap) = capability {
             params["capability"] = json!(cap);
         }
+        if let Some(actions) = actions {
+            params["actions"] = json!(actions);
+        }
         let res = self.call(M_RULE_ADD, params)?;
         let fallback = Rule {
             id: uuid::Uuid::nil(),
@@ -461,8 +466,12 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
             name: name.to_string(),
             command: command.to_string(),
             keys: keys.to_vec(),
-            capability: lk_core::model::RULE_CAPABILITY_INJECT.into(),
-            actions: lk_core::model::default_rule_actions(),
+            capability: capability
+                .unwrap_or(lk_core::model::RULE_CAPABILITY_INJECT)
+                .into(),
+            actions: actions
+                .map(<[String]>::to_vec)
+                .unwrap_or_else(lk_core::model::default_rule_actions),
             created: String::new(),
         };
         Ok(serde_json::from_value(res["rule"].clone()).unwrap_or(fallback))
@@ -760,14 +769,28 @@ mod tests {
         });
         let mut c = ok_client(&rec, json!({ "rule": rule }));
         let got = c
-            .rule_add("/p", "publish", "npm publish", &["T".to_string()], None)
+            .rule_add(
+                "/p",
+                "publish",
+                "npm publish",
+                &["T".to_string()],
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(got.id.to_string(), "00000000-0000-0000-0000-000000000002");
 
         let rec = Recorder::default();
         let mut c = ok_client(&rec, json!({}));
         let got = c
-            .rule_add("/p", "publish", "npm publish", &["T".to_string()], None)
+            .rule_add(
+                "/p",
+                "publish",
+                "npm publish",
+                &["T".to_string()],
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(got.id, uuid::Uuid::nil());
         assert_eq!(got.project_dir, "/p");
@@ -787,6 +810,7 @@ mod tests {
             "",
             &["APIKey".to_string()],
             Some("read"),
+            None,
         )
         .unwrap();
         assert_eq!(rec.last().0, "rule.add");
@@ -798,11 +822,54 @@ mod tests {
         // 注入规则：无 capability 字段（缺省 inject，向后兼容）
         let rec = Recorder::default();
         let mut c = ok_client(&rec, json!({ "rule": {} }));
-        c.rule_add("/p", "publish", "npm *", &["T".to_string()], None)
+        c.rule_add("/p", "publish", "npm *", &["T".to_string()], None, None)
             .unwrap();
         assert!(
             rec.last().1.get("capability").is_none(),
             "inject 规则不携带 capability 字段"
+        );
+    }
+
+    /// rule.add 参数形状（M2.97 写门，write-gate.md §7）：write 规则带
+    /// capability=write + actions 数组（加性字段）；read/inject 规则不带
+    /// actions 字段。
+    #[test]
+    fn rule_add_write_actions_params_shape() {
+        let rec = Recorder::default();
+        let mut c = ok_client(&rec, json!({ "rule": {} }));
+        c.rule_add(
+            "/p",
+            "write-e2e",
+            "",
+            &["NPM_TOKEN".to_string()],
+            Some("write"),
+            Some(&["create".to_string(), "update".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(rec.last().0, "rule.add");
+        assert_eq!(
+            rec.last().1,
+            json!({ "projectDir": "/p", "name": "write-e2e", "command": "",
+                    "keys": ["NPM_TOKEN"], "capability": "write",
+                    "actions": ["create", "update"], "channel": "cli" })
+        );
+        // read 规则不带 actions 字段
+        let rec = Recorder::default();
+        let mut c = ok_client(&rec, json!({ "rule": {} }));
+        c.rule_add("/p", "r", "", &["K".to_string()], Some("read"), None)
+            .unwrap();
+        assert!(
+            rec.last().1.get("actions").is_none(),
+            "read 规则不携带 actions"
+        );
+        // inject 规则不带 capability + actions 字段
+        let rec = Recorder::default();
+        let mut c = ok_client(&rec, json!({ "rule": {} }));
+        c.rule_add("/p", "pub", "npm *", &["T".to_string()], None, None)
+            .unwrap();
+        assert!(
+            rec.last().1.get("actions").is_none(),
+            "inject 规则不携带 actions"
         );
     }
 

@@ -451,6 +451,9 @@ pub struct ApprovalResultOutcome {
 ///
 /// M2.9 值披露（value-disclosure.md §4）：`capability` 选规则能力类型——
 /// `inject`（注入，默认）或 `read`（读值；`command` 必须为空串）。
+/// M2.97 写门（write-gate.md §7）：`capability=write` + `actions` 写动作
+/// 子集（缺省 create+update；**delete 不是合法动作**——恒弹窗由协议保证）；
+/// capability != write 时忽略。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleAddParams {
@@ -458,12 +461,16 @@ pub struct RuleAddParams {
     /// `wsl://<distro>/<rest>` 规范形（守护进程侧经 [`crate::path_ns`] 归一化）。
     pub project_dir: String,
     pub name: String,
-    /// 具名命令（可 glob）；capability=read 时空串。
+    /// 具名命令（可 glob）；capability=read/write 时空串。
     pub command: String,
     pub keys: Vec<String>,
-    /// 规则能力类型（`inject` | `read`；缺省 inject）。
+    /// 规则能力类型（`inject` | `read` | `write`；缺省 inject）。
     #[serde(default)]
     pub capability: Option<String>,
+    /// write 能力下的写动作子集（缺省 create+update；capability != write
+    /// 时忽略）。加性字段，协议零新增（write-gate.md §7）。
+    #[serde(default)]
+    pub actions: Option<Vec<String>>,
     /// 审计来源标注（`cli` | `desktop` | `wsl-bridge`；缺省 = cli）。
     #[serde(default)]
     pub channel: Option<String>,
@@ -495,27 +502,33 @@ pub struct RuleRemoveParams {
 
 /// 规则字段校验（超长/非法 → `Err`，不入库；testing.md 第三层 #19）。
 ///
-/// - `capability`：`inject` | `read`（值披露裁决，value-disclosure.md §4；
-///   能力不互授——校验层面即强制 inject 规则带命令、read 规则不带命令）；
+/// - `capability`：`inject` | `read` | `write`（值披露裁决 value-disclosure.md
+///   §4 + 写门 write-gate.md §4；能力不互授——校验层面即强制 inject 规则带
+///   命令、read/write 规则不带命令）；
 /// - `projectDir`：绝对路径且可 canonicalize（存在）；**合法**的
 ///   `wsl://<distro>[/<rest>]` 跨命名空间规范形（[`crate::path_ns`]，守护进程
 ///   侧已归一化）例外——非本机文件系统路径，无法 canonicalize，仅接受该形态
 ///   本身（缺 distro 段等畸形形态一律拒绝）；
-/// - `command`：inject 时非空、≤ 1024、无控制字符；read 时必须为空串；
+/// - `command`：inject 时非空、≤ 1024、无控制字符；read/write 时必须为空串；
 /// - `name`：非空、≤ 256、无控制字符；
 /// - `keys`：1..=32 个，均为合法环境变量名（`[A-Za-z_][A-Za-z0-9_]*`；
-///   read 规则语义为可读条目名，同一约束）。
+///   read/write 规则语义为条目名，同一约束）；
+/// - `actions`：仅 capability=write 时校验——非空且为 create/update 子集，
+///   **含 `delete` 拒绝**（删除恒弹窗由协议保证，规则写不进去）；
+///   capability != write 时忽略（调用方按 serde 缺省落库）。
 pub fn validate_rule_fields(
     capability: &str,
     project_dir: &str,
     name: &str,
     command: &str,
     keys: &[String],
+    actions: &[String],
 ) -> std::result::Result<(), String> {
     if capability != crate::model::RULE_CAPABILITY_INJECT
         && capability != crate::model::RULE_CAPABILITY_READ
+        && capability != crate::model::RULE_CAPABILITY_WRITE
     {
-        return Err("capability 必须是 inject 或 read".into());
+        return Err("capability 必须是 inject、read 或 write".into());
     }
     if !crate::path_ns::is_valid_wsl_canonical(project_dir) {
         if project_dir.is_empty() || !std::path::Path::new(project_dir).is_absolute() {
@@ -529,15 +542,35 @@ pub fn validate_rule_fields(
         return Err("name 必须是非空、≤256 字符且无控制字符的规则名".into());
     }
     match capability {
-        crate::model::RULE_CAPABILITY_READ => {
+        crate::model::RULE_CAPABILITY_READ | crate::model::RULE_CAPABILITY_WRITE => {
             if !command.is_empty() {
-                return Err("read 规则不绑定命令（command 必须为空）".into());
+                return Err("read/write 规则不绑定命令（command 必须为空）".into());
             }
         }
         _ => {
             if command.is_empty() || command.len() > 1024 || has_control_chars(command) {
                 return Err("command 必须是非空、≤1024 字符且无控制字符的命令".into());
             }
+        }
+    }
+    if capability == crate::model::RULE_CAPABILITY_WRITE {
+        if actions.is_empty() {
+            return Err("actions 不能为空（写规则至少一个动作：create、update）".into());
+        }
+        if let Some(bad) = actions.iter().find(|a| {
+            a.as_str() != crate::model::RULE_ACTION_CREATE
+                && a.as_str() != crate::model::RULE_ACTION_UPDATE
+        }) {
+            if bad == "delete" {
+                // 恒弹窗由协议保证（write-gate.md §3/§4）：任何规则不豁免
+                // delete，规则也不该写得进去——尽早拒绝并点破语义。
+                return Err(
+                    "actions 不接受 delete（删除恒弹窗，任何规则不豁免；actions 只允许 create、update）".into(),
+                );
+            }
+            return Err(format!(
+                "非法写动作：{bad}（actions 只允许 create、update）"
+            ));
         }
     }
     if keys.is_empty() || keys.len() > 32 {
@@ -635,5 +668,46 @@ mod tests {
             p.expected_revision.as_deref(),
             Some("2026-08-15T00:00:00.000000Z")
         );
+    }
+
+    /// 规则字段校验（M2.97 写门，write-gate.md §4/§7）：capability=write
+    /// 放行；actions 只接受 create/update 非空子集，delete 恒弹窗写不进去；
+    /// capability != write 时 actions 忽略。
+    #[test]
+    fn validate_rule_fields_write_capability_and_actions() {
+        let proj = std::env::temp_dir().to_string_lossy().to_string();
+        let ok = |capability: &str, command: &str, actions: &[&str]| {
+            let actions: Vec<String> = actions.iter().map(|s| s.to_string()).collect();
+            let keys = ["K".to_string()];
+            validate_rule_fields(capability, &proj, "w", command, &keys, &actions)
+        };
+        // write + actions 非空 create/update 子集 + 无命令绑定 → 放行
+        for actions in [
+            vec!["create", "update"], // 缺省集（调用方展开 serde 缺省后传入）
+            vec!["create"],
+            vec!["update"],
+        ] {
+            assert!(ok("write", "", &actions).is_ok(), "应放行：{actions:?}");
+        }
+        // delete 拒绝且文案点破恒弹窗（协议保证，规则不该也写不进去）
+        let e = ok("write", "", &["delete"]).unwrap_err();
+        assert!(
+            e.contains("delete") && e.contains("弹窗"),
+            "文案不清晰：{e}"
+        );
+        // 子集混入 delete 同样拒绝
+        assert!(ok("write", "", &["create", "delete"]).is_err());
+        // 空 actions / 非法动作名拒绝
+        assert!(ok("write", "", &[]).is_err());
+        let e = ok("write", "", &["bogus"]).unwrap_err();
+        assert!(e.contains("bogus"), "文案应指出非法动作：{e}");
+        // write 规则不绑定命令（与 read 同款）
+        assert!(ok("write", "npm *", &["create"]).is_err());
+        // capability != write：actions 忽略（不校验、不拒）
+        assert!(ok("inject", "npm *", &["bogus"]).is_ok());
+        assert!(ok("read", "", &["create"]).is_ok());
+        // 未知 capability 仍拒绝，文案覆盖三能力
+        let e = ok("admin", "", &[]).unwrap_err();
+        assert!(e.contains("inject") && e.contains("read") && e.contains("write"));
     }
 }

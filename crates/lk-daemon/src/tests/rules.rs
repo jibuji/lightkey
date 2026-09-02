@@ -219,6 +219,64 @@ fn rule_add_and_authz_normalize_wsl_namespace() {
     );
 }
 
+/// 写门 rule.add 贯通（write-gate.md §7，issue #114）：capability=write +
+/// actions 落库；actions 含 delete 被校验层拒绝（删除恒弹窗，规则写不进去）；
+/// capability != write 时 actions 忽略（serde 缺省 create+update 落库）。
+#[test]
+fn rule_add_write_capability_actions_passthrough() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _shared, token) = m2_daemon(dir.path(), None);
+    let handle = |params: Value| -> Value {
+        let resp = state.lock().unwrap().handle(
+            &rpc_line(M_RULE_ADD, Some(&token), params),
+            &PeerInfo::desktop(), // desktop 直调豁免规则门（补充拍板 #22）
+        );
+        serde_json::from_str(&resp).unwrap()
+    };
+    let add = |name: &str, extra: Value| {
+        let mut p = json!({
+            "projectDir": std::env::temp_dir(),
+            "name": name,
+            "command": "",
+            "keys": ["K"],
+            "channel": "cli",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        handle(p)
+    };
+    // 显式 actions=create,update → 原样落库
+    let v = add(
+        "w-full",
+        json!({ "capability": "write", "actions": ["create", "update"] }),
+    );
+    assert_eq!(v["result"]["rule"]["capability"], "write", "{v}");
+    assert_eq!(v["result"]["rule"]["actions"], json!(["create", "update"]));
+    // 缺省 actions → serde 缺省 create+update
+    let v = add("w-default", json!({ "capability": "write" }));
+    assert_eq!(v["result"]["rule"]["actions"], json!(["create", "update"]));
+    // 单动作子集原样落库
+    let v = add(
+        "w-create",
+        json!({ "capability": "write", "actions": ["create"] }),
+    );
+    assert_eq!(v["result"]["rule"]["actions"], json!(["create"]));
+    // actions 含 delete → 拒绝不入库（恒弹窗由协议保证）
+    let v = add(
+        "w-del",
+        json!({ "capability": "write", "actions": ["create", "delete"] }),
+    );
+    assert!(v["error"].is_object(), "含 delete 应被拒绝：{v}");
+    // capability != write：actions 忽略（inject 缺省落库）
+    let v = add(
+        "inject",
+        json!({ "command": "npm *", "capability": "inject", "actions": ["delete"] }),
+    );
+    assert_eq!(v["result"]["rule"]["capability"], "inject", "{v}");
+    assert_eq!(v["result"]["rule"]["actions"], json!(["create", "update"]));
+}
+
 /// 路由表完整性：全部 `M_*` 方法常量经 handle()（直调形态查同一张策略
 /// 表）均可命中——未解锁态下预期 session.invalid / invalid params 等，
 /// 但绝不 method-not-found。防「加方法忘登记」退回静默 not-found。
