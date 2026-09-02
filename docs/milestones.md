@@ -302,6 +302,38 @@ milestones、decisions #24 状态翻转、AGENTS.md、CONTEXT.md）；写门 iss
 > M2.95 之后、M3 之前）；已按 write-gate.md §11 PR A-D 序列落地
 > （issues #112-#115）。
 
+## M2.98 —— 规则程序指纹绑定（identity binding）（规划中，未实现）
+
+**目标**：补充拍板 #25（2026-09-02 identity-binding grilling 拍板）——规则
+**可选**绑定程序指纹（canonical 路径 + SHA-256），授权目标从「目录 + 命令
+形态 / 条目名」升级到「目录 + 具体可执行文件」：PATH 前置假程序、同名假
+程序、复现命令形态的冒充路径被闭合。实现规格唯一出处
+[identity-binding.md](identity-binding.md)。
+
+范围（按 identity-binding.md §11 的 PR 序列）：
+
+- lk-core：`ProgramFingerprint` + `Rule.fingerprint`（serde 缺省 None，旧规则
+  零迁移）+ 比对序（路径 → size → SHA-256）+ PATH 解析纯函数 + 流式哈希 +
+  单测。
+- lk-daemon：对端 env PATH 读取（Linux `/proc/<pid>/environ`、Windows PEB
+  Environment 复用 starter.rs 基建、macOS `KERN_PROCARGS2` 失败 fail-closed）
+  + **内存指纹缓存/元信息失效**（stat 一致复用，O(stat)；缓存不落盘防投毒；
+  64 MiB 阈值决定预计算时机）+ 审批 finalize 侧指纹计算 + 失配路径/弹窗主题
+  + 集成测试（tests/identity_binding.rs）。
+- lk-cli + E2E：`rule add --fingerprint` 形态（与 `--read`/`--write` 同款省略
+  command）+ 失配语境文案（-32017 复用）；E2E **不扩展** auto-approve 到
+  指纹通道（沿用写门口径）。
+- 前端：弹窗「指纹已更新」提示 +「以新指纹重新授权」按钮（仅绑定规则失配
+  的审批帧）+ 未知字段防御渲染 + vitest。
+
+**出口**：`cargo test` + vitest 全绿；写门（M2.97）回归 + 指纹集成测试通过；
+clippy/fmt 全绿；文档同步（identity-binding.md、authorization-gate §11、
+data-model、milestones、decisions #25 状态翻转、AGENTS.md、CONTEXT.md 程序
+指纹词条）；issue 立项并关闭。
+
+> 本里程碑为 identity-binding grilling 会话拍板（补充拍板 #25）新增（插入
+> M2.97 之后、M3 之前）；现状未实现。
+
 ## M3 —— 浏览器填充（V1 之后）
 
 **目标**：浏览器扩展按 [browser-fill.md](browser-fill.md) 协议实现。

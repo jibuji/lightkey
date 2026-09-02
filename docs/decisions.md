@@ -487,4 +487,52 @@ needs-decision，不得自行变更。
     写规则/恒弹窗词条）；**已立项并按 PR 序列落地**（epic #111，issues
     #112-#115，实现走 PR CI 门禁序列，write-gate.md §11）。
 
+25. **规则程序指纹绑定（identity binding）：授权目标是程序而非命令形态
+    （2026-09-02 · 来源：identity-binding grilling-with-docs 会话收敛，船长
+    拍板，**待实现**）**：规则（inject/read/write）授权的是「项目目录 +
+    命令形态 / 条目名」，**不含"哪个可执行文件"维度**——任何同用户进程在
+    授权目录内**复现授权命令形态**即可命中（PATH 前置同名假程序截获注入
+    env、目录内任意进程按写规则条目名静默覆盖等）。基线事实：规则里不存在
+    身份可供"伪造"，攻击者是复现形态。裁定：
+    - **结构**：`Rule.fingerprint: Option<ProgramFingerprint>`（serde
+      default = `None`，旧规则零迁移、密文反序列化不受影响；未绑定 = 现状
+      语义，如实降级）；`ProgramFingerprint { exe_path, sha256, size }`
+      （canonical 路径 + SHA-256 + 固化时大小）。
+    - **绑定对象**：注入规则绑定**被注入命令的可执行文件**（`command[0]`）
+      ——本项主线，闭合"命令形态冒充"；读/写规则**可选**绑定调用方链（仅
+      显式启用、限独立工具二进制场景——终端/IDE/脚本的 starter 不稳定，
+      升级即失配，文档明示局限）。
+    - **失配 = 未命中**：**不新增错误码**（防探测——不给"规则存在但指纹
+      不符"的枚举信号）；GUI 弹窗明示「程序指纹与规则不符（可能已更新）」
+      +「**以新指纹重新授权**」（复用规则管理审批门，daemon finalize 侧
+      重算指纹落盘）；headless 统一 `authz.denied`。
+    - **解析认证在 daemon 侧**（信 daemon 不信客户端，与 starter/cwd 同
+      原则）：对端**真实 env** 的 PATH——Linux `/proc/<pid>/environ`、
+      Windows PEB `ProcessParameters.Environment`（复用 starter.rs 基建）、
+      macOS `KERN_PROCARGS2`（实现期验证，失败 fail-closed）；比对序 =
+      路径 → size → SHA-256（前两关免哈希快速失配）。
+    - **大文件性能**：**内存指纹缓存 + 元信息失效**（先 stat，size/mtime/
+      inode 一致即复用缓存哈希，成本 = O(stat) 与文件大小无关）；缓存**不
+      落盘**（落盘缓存可被同用户进程投毒成"自己二进制"的哈希——正是要防
+      的冒充）；阈值 **64 MiB**（默认，可配置）只决定预计算时机，不改安全
+      语义；SHA-256 全量读一次是底线成本，方案只降频率不降单次。
+    - **威胁边界**：防「**冒充**」——PATH 前置假程序 / 同名假程序 / 复现
+      命令形态；攻击者能**就地改写授权二进制本身**（含恢复 mtime/内容）＝
+      她就是这个程序，指纹无能为力——与同用户原生攻击同属 #15/#20 边界外
+      （文档明示）；校验与 spawn 之间换文件竞态同理接受 + 声明，不做
+      "daemon 返回指纹由 CLI 复核"的伪强加固（CLI 不可信，复核无意义）。
+    - 被否选项：
+      | 选项 | 否因 |
+      |------|------|
+      | 代码签名验证（Authenticode/notary） | 跨平台无统一方案；升级换代/供应链复杂度高 |
+      | 失配新增专用错误码 | 泄漏"规则存在但指纹不符"的枚举信号，反助攻击者；与"未命中"同路径即可 |
+      | 指纹缓存落盘 | 同用户进程可投毒缓存放行自己的二进制——正是防冒充的反向；内存缓存足够 |
+      | daemon 下发指纹由 CLI spawn 前复核 | CLI 是同用户不可信方，复核无意义；换文件竞态已归入边界外 |
+    - 留档（后续可选，不进 MVP）：代码签名验证；阈值数值可配置；macOS
+      env 读取实现期验证（不可行则该平台指纹规则 fail-closed）。
+    实现规格：[identity-binding.md](identity-binding.md)（**唯一出处**）；落点：
+    authorization-gate.md §11（摘要）、data-model.md（标注）、milestones.md
+    M2.98、CONTEXT.md（程序指纹词条）；**issue 待立项**（实现走 PR CI 门禁
+    序列，identity-binding.md §11）。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
