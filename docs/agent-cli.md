@@ -120,7 +120,7 @@ stdout 直接是数组（不包对象），元素为条目摘要：
 | error | code | 来源 | 建议动作 |
 |-------|------|------|---------|
 | `session.invalid` | -32002 | 守护进程 | 提示用户**解锁桌面端**（或 `lk unlock`）后重试 |
-| `authz.denied` | -32017 | 值披露裁决 | 提示用户在弹窗中批准；或经用户同意后 `lk rule add <projectDir> --read --name <规则名> --keys <条目名>` 预授权 |
+| `authz.denied` | -32017 | 值披露 / 写门裁决 | 提示用户在弹窗中批准；或经用户同意后 `lk rule add <projectDir> --read --name <规则名> --keys <条目名>`（读） / `lk rule add <projectDir> --write --name <规则名> --keys <条目名>`（写）预授权 |
 | `vault.invalid` | -32001 | 守护进程 | 主密码错误或库未初始化（文案统一防探测）；提示用户核对 |
 | `item.not_found` | -32004 | 守护进程 / `--name` 无命中 | 用 `item list --name <子串>` 查正确名 |
 | `item.name_ambiguous` | 0（exit 2） | CLI 本地 | `--name` 重名歧义；message 含候选 id，向用户澄清或改用 id |
@@ -151,13 +151,16 @@ stdout 直接是数组（不包对象），元素为条目摘要：
 
 ## 6. 锁定 / 无 UI 行为表
 
-当前实现（M2.95，补充拍板 #22/#23：规则管理审批门 + 读通道一体化解锁已落地）：
+当前实现（M2.97，补充拍板 #22/#23/#24：规则管理审批门 + 读通道一体化解锁 +
+写入门已落地）：
 
 | 命令 | 解锁态 + 桌面 UI 在场 | 解锁态 headless（无 UI） | 锁定态 + 桌面 UI 在场 | 锁定态 headless |
 |------|----------------------|--------------------------|----------------------|-----------------|
 | `lk inject` | 无规则 → 审批弹窗（30s，默认拒绝） | 无规则 → `{"allowed":false,"reason":"no_ui"}` | **一体化弹窗**（主密码 + Allow/Deny 一次交互，#67/M2.8） | `session.invalid` 错误对象 |
 | `lk item get`（id 或 --name） | 无读规则 → 读值弹窗 | `authz.denied` | **一体化弹窗**（主密码 + 解锁并允许一次交互，#23/M2.95） | `session.invalid` |
 | `lk item export` | **恒弹窗**（读规则也不豁免） | `authz.denied` | **一体化弹窗**（主密码 + 解锁并允许一次交互，#23/M2.95） | `session.invalid` |
+| `lk item add` / `lk item edit` | 写规则命中 → 静默放行；未命中 → 写审批弹窗（30s，默认拒绝；update 双向名称约束） | `authz.denied` | `session.invalid`（写门不弹解锁窗） | `session.invalid` |
+| `lk item delete` | **恒弹窗**（写规则也不豁免；无用户级恢复路径） | `authz.denied` | `session.invalid`（写门不弹解锁窗） | `session.invalid` |
 | `lk item list` | 正常（令牌门，元数据不裁决） | 正常 | `session.invalid` | `session.invalid` |
 | `lk rule add` / `lk rule remove` | **审批弹窗**（规则的建立与撤销都是授权事件，#22/M2.95；30s 超时默认拒绝；desktop 直调豁免） | `authz.denied`（headless 无 UI，除非 daemon 以 `LIGHTKEY_E2E_AUTO_APPROVE=rule` 启动；测试专用） | `session.invalid` | `session.invalid` |
 | `lk rule list` | 正常（令牌门，只读元数据） | 正常 | `session.invalid` | `session.invalid` |
@@ -166,12 +169,13 @@ stdout 直接是数组（不包对象），元素为条目摘要：
 - 解锁态的判定前提：守护进程持有有效会话令牌（`lk unlock` 或桌面端解锁后
   自动落盘）。
 - 锁定态下**一切值披露都要先解锁**（inject 的一体化弹窗除外）；
-  `session.invalid` 的建议动作固定为「解锁桌面端后重试」。
-- **写门（M2.97 规划中，未上线）**：`lk item add / edit / delete` 当前仍为
-  令牌门；落地后按 [write-gate.md](write-gate.md) 判定矩阵执行——
-  create/update 命中写规则静默、未命中弹窗、headless `authz.denied`；
-  delete 恒弹窗任何规则不豁免；锁态 `session.invalid`。
-  本表其余行不受写门影响。
+  `session.invalid` 的建议动作固定为「解锁桌面端后重试」。写门无一体化
+  解锁窗（与 inject/#23 不同）：锁定态写一律 `session.invalid` 先行
+  （write-gate.md §3/§12——锁态写一体化为留档可选项）。
+- **写门（M2.97 已上线）**：`lk item add / edit / delete` 按
+  [write-gate.md](write-gate.md) 判定矩阵执行——create/update 命中写规则
+  静默、未命中弹窗、headless `authz.denied`；delete 恒弹窗任何规则不豁免；
+  锁态 `session.invalid`。本表其余行不受写门影响。
 
 ## 7. 值披露与 inject 的裁决语义（速查）
 
@@ -181,10 +185,10 @@ stdout 直接是数组（不包对象），元素为条目摘要：
 - `inject`：注入规则白名单（projectDir + command + keys）→ 静默放行；
   否则弹窗；拒绝以 `{"allowed":false,"reason":…}` 呈现（§4.3）。
 - 读规则与注入规则**能力不互授**（read 规则不授权 inject，反之亦然；
-  M2.97 写门规划再扩 write——三能力两两不互授）。
-- 写命令（M2.97 规划中）：`item add/edit` 走写规则/弹窗/拒绝三层（update
-  双向名称约束），`item delete` **恒弹窗**任何规则不豁免；拒绝统一复用
-  `authz.denied`（-32017，CLI 按命令语境渲染文案）。
+  M2.97 起扩 write——三能力两两不互授）。
+- 写命令（M2.97 已实现）：`item add/edit` 走写规则（`rule add --write`）/
+  弹窗/拒绝三层（update 双向名称约束），`item delete` **恒弹窗**任何规则
+  不豁免；拒绝统一复用 `authz.denied`（-32017，CLI 按命令语境渲染文案）。
 
 ## 8. 平台注记
 

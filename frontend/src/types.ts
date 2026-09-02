@@ -73,12 +73,17 @@ export interface AuthRule {
   /** 规范化绝对路径（守护进程侧 canonicalize）。 */
   projectDir: string;
   name: string;
-  /** 具名命令（可 glob）；read 规则（M2.9 值披露）为空串。 */
+  /** 具名命令（可 glob）；read/write 规则（M2.9 值披露 / M2.97 写门）为空串。 */
   command: string;
-  /** 授权注入的 key 名（最小集合）；read 规则语义为可读条目名。 */
+  /** 授权注入的 key 名（最小集合）；read/write 规则语义为条目名。 */
   keys: string[];
-  /** 规则能力类型（M2.9 值披露）：inject | read；旧守护进程缺省。 */
+  /** 规则能力类型（M2.9 值披露）：inject | read | write（M2.97 写门）；
+   *  旧守护进程缺省。 */
   capability?: string;
+  /** write 能力下的写动作子集（M2.97 写门，write-gate.md §4）：create /
+   *  update 子集，Rust serde 缺省 ["create","update"]；delete 恒弹窗、
+   *  不存在于 actions。capability != write 时忽略；旧守护进程可能不返回。 */
+  actions?: string[];
   /** 创建时间（ISO-8601 UTC）。 */
   created: string;
 }
@@ -90,8 +95,12 @@ export interface RuleInput {
   command: string;
   keys: string[];
   /** 规则能力类型（M2.9 值披露）：inject（注入，缺省）| read（读值，
-   *  read 规则 command 恒为空串、keys=可读条目名）。 */
-  capability?: "inject" | "read";
+   *  read 规则 command 恒为空串、keys=可读条目名）| write（写入，M2.97
+   *  写门：command 恒为空串、keys=可写条目名）。 */
+  capability?: "inject" | "read" | "write";
+  /** write 能力下的写动作子集（缺省 create+update，Rust serde 缺省同口径；
+   *  delete 恒弹窗、规则写不进去）。 */
+  actions?: string[];
 }
 
 export type AuditResult = "allowed" | "denied" | "timeout";

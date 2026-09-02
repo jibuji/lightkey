@@ -3,12 +3,13 @@
  * TypeScript 镜像。
  *
  * 本文件是 D 层唯一承认的线协议事实来源：RPC 方法名 / 通知帧名 / 字符串
- * 错误码 / 审计通道值。所有适配器（tauriAdapter / mockAdapter / ipc-bridge）
- * 一律从这里取常量，不再手写字面量。
+ * 错误码 / 审计通道值 / 审批类型。所有适配器（tauriAdapter / mockAdapter /
+ * ipc-bridge）一律从这里取常量，不再手写字面量。
  *
  * 双向对齐由 `src/__tests__/protocolContract.test.ts` 钉死（解析 ipc.rs 的
- * `pub const *: &str` 常量，断言与本文件逐值相等、无缺无多）——协议漂移在
- * CI 失败，而不是在用户端显示空列表或错配（issue #85 / #86 类事故）。
+ * `pub const *: &str` 常量与 authz.rs 的 `ApprovalKind` 枚举，断言与本文件
+ * 逐值相等、无缺无多）——协议漂移在 CI 失败，而不是在用户端显示空列表或
+ * 错配（issue #85 / #86 类事故）。
  *
  * 键名与 Rust 常量名一一镜像（`M_VAULT_STATUS` → `METHODS.VAULT_STATUS`、
  * `MSG_ITEM_CONFLICT` → `ERROR_CODES.ITEM_CONFLICT` …），便于核对。
@@ -72,6 +73,23 @@ export const CHANNELS = {
   CLI: "cli",
   WSL_BRIDGE: "wsl-bridge",
   DESKTOP: "desktop",
+} as const;
+
+/**
+ * 审批类型（`lk_core::authz::ApprovalKind` serde `rename_all = "lowercase"`
+ * 序列化值；`authz.request` 帧的 `kind` 字段）。值披露（M2.9，`read` /
+ * `export`）+ 规则管理门（补充拍板 #22，`rule`）+ 写入门（补充拍板 #24 /
+ * M2.97，`write`——单一 kind + `command` 字段承载动作
+ * `item.put <name>` / `item.delete <name>`，keys = 单元素 [目标条目名]，
+ * write-gate.md §6）。加性演进不升协议版本；双向对齐由
+ * `protocolContract.test.ts` 解析 authz.rs 枚举钉死。
+ */
+export const APPROVAL_KINDS = {
+  INJECT: "inject",
+  READ: "read",
+  EXPORT: "export",
+  RULE: "rule",
+  WRITE: "write",
 } as const;
 
 /**

@@ -1,10 +1,12 @@
 /**
  * ui-rules 插件（M2；spec §6.4 / authorization-gate.md §4）。
  *
- * 规则列表（项目目录 + 命令 + key 名 Tag 集合 + 删除）；新建：项目目录
- * 选择器（tauri 原生目录对话框 + 手动输入） + 命令 + **key 名多选**（仅
- * 显示保险库内已有密钥条目名——「已授权 key 名」，authorization-gate.md
- * §2 最小授权）。提示条「规则保存在加密库内，随库同步」。
+ * 规则列表（项目目录 + 命令 + key 名 Tag 集合 + 删除；M2.9 起 read 规则、
+ * M2.97 起 write 规则无命令绑定，按 capability 区分展示并附 actions Tag
+ * ——write-gate.md §6）；新建：项目目录选择器（tauri 原生目录对话框 +
+ * 手动输入） + 命令 + **key 名多选**（仅显示保险库内已有密钥条目名——
+ * 「已授权 key 名」，authorization-gate.md §2 最小授权）。提示条「规则
+ * 保存在加密库内，随库同步」。
  *
  * 写入唯一合法路径之二（CLI `lk rule add` + 本页）；变更写审计（守护进程
  * 侧）；`item.changed(kind="rule")` 推送 → 列表刷新（跨端同步可见）。
@@ -77,8 +79,14 @@ export function RulesPage({ ctx }: { ctx: Context }) {
               <div className="rule-head">
                 <div>
                   <div className="rule-cmd">
-                    {/* M2.9 值披露：read 规则无命令绑定，按 capability 区分展示 */}
-                    {r.capability === "read" ? "读值规则（按条目名授权读取）" : r.command}
+                    {/* M2.9 值披露：read 规则无命令绑定；M2.97 写门：write
+                        规则同款（按条目名授权写入）。capability 缺省（旧
+                        守护进程）= inject，按命令展示（Rust serde 缺省口径）。 */}
+                    {r.capability === "read"
+                      ? "读值规则（按条目名授权读取）"
+                      : r.capability === "write"
+                        ? "写入规则（按条目名授权写入）"
+                        : r.command}
                     {r.capability === "read" ? (
                       <span
                         className="key-tag"
@@ -86,6 +94,29 @@ export function RulesPage({ ctx }: { ctx: Context }) {
                       >
                         read
                       </span>
+                    ) : null}
+                    {r.capability === "write" ? (
+                      <>
+                        <span
+                          className="key-tag"
+                          style={{ marginLeft: 8, verticalAlign: "middle" }}
+                        >
+                          write
+                        </span>
+                        {/* 写动作子集（write-gate.md §4）：Rust serde 缺省
+                            ["create","update"]（旧守护进程可能缺字段，同口径
+                            兜底）；delete 恒弹窗、不存在于 actions。
+                            capability != write 时 actions 被忽略、不展示。 */}
+                        {(r.actions ?? ["create", "update"]).map((a) => (
+                          <span
+                            className="key-tag"
+                            key={a}
+                            style={{ verticalAlign: "middle" }}
+                          >
+                            {a}
+                          </span>
+                        ))}
+                      </>
                     ) : null}
                   </div>
                   <div className="rule-dir">

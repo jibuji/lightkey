@@ -30,9 +30,12 @@ import {
 
 /** Rust 权威源文件（相对本测试文件的仓库根路径）。 */
 import ipcRs from "../../../crates/lk-core/src/ipc.rs?raw";
+import authzRs from "../../../crates/lk-core/src/authz.rs?raw";
 
 /** D 层事件总线契约源（events.ts 的类型级字面量键）。 */
 import eventsTs from "../events.ts?raw";
+
+import { APPROVAL_KINDS } from "../ipc/protocol";
 
 /** 解析全部 `pub const NAME: &str = "VALUE";` 常量。 */
 function parseStrConsts(src: string): Map<string, string> {
@@ -55,6 +58,14 @@ function parseEventBusKeys(src: string): string[] {
   const m = src.match(/interface Events \{([\s\S]*?)\n  \}/);
   const body = m?.[1] ?? "";
   return [...body.matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+}
+
+/** 解析 authz.rs `ApprovalKind` 枚举变体 → serde 小写序列化值
+ *  （`#[serde(rename_all = "lowercase")]`）。 */
+function parseApprovalKindVariants(src: string): string[] {
+  const m = src.match(/pub enum ApprovalKind \{([\s\S]*?)\n\}/);
+  const body = m?.[1] ?? "";
+  return [...body.matchAll(/^\s{4}([A-Z][A-Za-z]*),$/gm)].map((x) => x[1].toLowerCase());
 }
 
 const sorted = (xs: readonly string[]) => [...xs].sort();
@@ -103,6 +114,16 @@ describe("protocol contract (协议契约)", () => {
     expect(
       CHANNEL_BEARING_METHODS.every((v) => (Object.values(METHODS) as readonly string[]).includes(v)),
     ).toBe(true);
+  });
+
+  it("APPROVAL_KINDS mirrors the ApprovalKind serde enum (authz.rs) bidirectionally", () => {
+    // M2.9 值披露（read/export）+ 补充拍板 #22（rule）+ M2.97 写门（write，
+    // 补充拍板 #24）：authz.request 帧 kind 字段的合法值三处镜像——Rust
+    // 枚举 ↔ protocol.ts ↔ 本测试。加性演进（不升协议版本）必须三处同步。
+    expect(sorted(parseApprovalKindVariants(authzRs))).toEqual(sorted(Object.values(APPROVAL_KINDS)));
+    expect(Object.keys(APPROVAL_KINDS).length).toBe(parseApprovalKindVariants(authzRs).length);
+    // 写门（M2.97）钉死：serde "write" 在契约内（弹窗 kind=write 分支依赖）
+    expect(APPROVAL_KINDS.WRITE).toBe("write");
   });
 
   it("events.ts wire-backed event keys mirror NOTIFICATIONS", () => {

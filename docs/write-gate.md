@@ -1,7 +1,7 @@
 # 写入授权门规格（write-gate，M2.97）
 
-- 状态：**已设计定稿**（2026-09-02 write-gate grilling 会话收敛拍板；**待实现**——
-  按交付纪律登记 decisions #24 后走 PR CI 门禁落地）
+- 状态：**已实现**（2026-09-02 拍板；M2.97 PR A-D 序列经 PR CI 门禁落地——
+  #112 core / #113 daemon / #114 cli+E2E / #115 前端+文档收口）
 - 关联：[authorization-gate.md](authorization-gate.md)（三层模型 / 审批通道 /
   §10 摘要）· [value-disclosure.md](value-disclosure.md)（读/导出裁决，本规格的
   对称扩展）· [ipc.md](ipc.md)（令牌 = 认证 ≠ 授权）·

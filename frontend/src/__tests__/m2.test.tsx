@@ -14,9 +14,11 @@ import { Context } from "@cordisjs/core";
 import { createRoot, type Root } from "react-dom/client";
 import { act } from "react";
 import { approval } from "../plugins/approval";
+import { AuditPage } from "../plugins/ui-audit";
 import { desktopShell } from "../plugins/desktop-shell";
 import { ipcBridge } from "../plugins/ipc-bridge";
 import { preferenceStore } from "../plugins/preference-store";
+import { RulesPage } from "../plugins/ui-rules";
 import { toast } from "../plugins/toast";
 import { theme } from "../plugins/theme";
 import { MockAdapter } from "../ipc/mockAdapter";
@@ -743,8 +745,9 @@ describe("M2.9 值披露弹窗（kind=read/export；docs/value-disclosure.md §6
 });
 
 describe("读通道一体化解锁弹窗（kind=read/export + needsUnlock；补充拍板 #23 / issue #105）", () => {
-  // 钉住：记住按钮渲染条件 = `isRead && !needsUnlock`（真实代码变更——
-  // 锁态 read 弹窗不再渲染「允许并为此项目记住」，remember 不被静默丢弃）
+  // 钉住：记住按钮渲染条件 = `(isRead || (isWrite && !isWriteDelete)) &&
+  // !needsUnlock`（M2.97 写门扩面后锁态一律无「允许并为此项目记住」——
+  // remember 不被静默丢弃）。
   it("锁态 read 弹窗：无「记住」按钮（真正变更断言）、主密码栏在场；解锁并允许携带 masterPassword 且不追加 rule.add", async () => {
     const { ctx, mock } = await mountHost(); // 不解锁（锁态一体化流程）
     const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
@@ -950,5 +953,234 @@ describe("规则管理审批弹窗（kind=rule；补充拍板 #22 / issue #104�
     await flushApproval();
     const dialog2 = document.body.querySelectorAll(".approval-dialog");
     expect(dialog2.length).toBeGreaterThan(0);
+  });
+});
+
+describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", () => {
+  it("write put 帧：动作/目标条目名/projectDir/倒计时渲染，不展示值", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-write-put",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.put API_TOKEN",
+        keys: ["API_TOKEN"],
+        kind: "write",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const text = dialog.textContent ?? "";
+    // 动作类 + RPC 摘要（含目标条目名）+ projectDir
+    expect(text).toContain("写入条目（create/update）");
+    expect(text).toContain("item.put API_TOKEN");
+    expect(text).toContain("/work/proj-a");
+    // 30s 倒计时照常
+    expect(dialog.querySelector(".ring-num")!.textContent).toBe("30");
+    // 不展示值：条目名 Tag 之外无任何值载荷；非 needsUnlock 无主密码栏
+    expect(dialog.querySelector('input[type="password"]')).toBeNull();
+    expect(text).toContain("条目值不会显示");
+    // 命令框非 shell 形态：无 $ 前缀（同规则门先例）
+    expect(dialog.querySelector(".approval-cmd-box")!.textContent).not.toContain("$");
+  });
+
+  it("write put 帧：记住按钮 → 生成最小写规则（capability=write、keys=[条目名]、actions=[create,update]）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-write-remember",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.put API_TOKEN",
+        keys: ["API_TOKEN"],
+        kind: "write",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const rememberBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许并为此项目记住"),
+    );
+    expect(rememberBtn).toBeDefined();
+    act(() => {
+      rememberBtn!.click();
+    });
+    await act(async () => {
+      // approvalResult 与 ruleAdd 各有 300ms 模拟延迟
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(resultSpy).toHaveBeenCalledWith("req-write-remember", "allowed", "mock-challenge");
+    expect(ruleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectDir: "/work/proj-a",
+        name: "write-API_TOKEN",
+        command: "",
+        keys: ["API_TOKEN"],
+        capability: "write",
+        // 帧面不可分 create/update（§5.2 RPC 不拆）→ 记住授予 put 全类；
+        // delete 不在其中（协议恒弹窗，规则写不进去）
+        actions: ["create", "update"],
+      }),
+    );
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+
+  it("write delete 帧：恒弹窗语义——无记住按钮；允许路径不追加规则", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-write-delete",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.delete API_TOKEN",
+        keys: ["API_TOKEN"],
+        kind: "write",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const text = dialog.textContent ?? "";
+    expect(text).toContain("删除条目（delete）");
+    expect(text).toContain("item.delete API_TOKEN");
+    // 恒弹窗语义明示（任何规则不豁免）
+    expect(text).toContain("任何规则不豁免");
+    // delete 无记住按钮（对齐 export 恒弹窗先例）
+    expect(
+      Array.from(dialog.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("允许并为此项目记住"),
+      ),
+    ).toBeUndefined();
+    // 允许本次照常；不追加规则
+    const allowBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许本次"),
+    )!;
+    act(() => {
+      allowBtn.click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(resultSpy).toHaveBeenCalledWith("req-write-delete", "allowed", "mock-challenge");
+    expect(ruleSpy).not.toHaveBeenCalled();
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+});
+
+describe("M2.97 规则页 / 审计页展示（write-gate.md §6/§8）", () => {
+  it("规则列表：write 规则展示 capability + actions Tag；read 规则同现状；旧 inject 规则（capability 缺省）按命令展示", async () => {
+    const { ctx } = await mountHost();
+    await unlock(ctx);
+    vi.spyOn(ctx.ipc, "ruleList").mockResolvedValue([
+      {
+        id: "r-w",
+        projectDir: "/work/proj-a",
+        name: "写规则",
+        command: "",
+        keys: ["API_TOKEN"],
+        capability: "write",
+        actions: ["create", "update"],
+        created: "2026-09-02T00:00:00Z",
+      },
+      {
+        id: "r-r",
+        projectDir: "/work/proj-a",
+        name: "读规则",
+        command: "",
+        keys: ["API_KEY"],
+        capability: "read",
+        created: "2026-09-01T00:00:00Z",
+      },
+      {
+        id: "r-i",
+        projectDir: "/work/proj-b",
+        name: "旧注入规则",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+        created: "2026-08-14T10:00:00Z",
+      },
+    ]);
+    await act(async () => {
+      root.render(<RulesPage ctx={ctx} />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const cards = Array.from(container.querySelectorAll("#page-rules .rule-card"));
+    expect(cards).toHaveLength(3);
+    const writeCard = cards.find((c) => c.textContent?.includes("写规则"))!;
+    expect(writeCard.textContent).toContain("写入规则（按条目名授权写入）");
+    expect(writeCard.textContent).toContain("write");
+    expect(writeCard.textContent).toContain("create");
+    expect(writeCard.textContent).toContain("update");
+    const readCard = cards.find((c) => c.textContent?.includes("读规则"))!;
+    expect(readCard.textContent).toContain("读值规则（按条目名授权读取）");
+    expect(readCard.textContent).toContain("read");
+    // capability != write 时 actions 被忽略、不展示（Rust serde 口径）
+    expect(readCard.textContent).not.toContain("create");
+    const injectCard = cards.find((c) => c.textContent?.includes("旧注入规则"))!;
+    expect(injectCard.textContent).toContain("npm publish");
+    // capability 缺省（旧规则）无 write/read 形态标注
+    expect(injectCard.textContent).not.toContain("写入规则");
+    expect(injectCard.textContent).not.toContain("读值规则");
+  });
+
+  it("审计页：写门事件按 §8 字段落表（command=派生动作+条目名、result、channel）", async () => {
+    const { ctx } = await mountHost();
+    await unlock(ctx);
+    vi.spyOn(ctx.ipc, "auditList").mockResolvedValue([
+      {
+        eventId: "w1",
+        ts: "2026-09-02T10:00:00Z",
+        starter: "zsh",
+        target: "API_TOKEN",
+        command: "item.update API_TOKEN",
+        result: "allowed",
+        channel: "approval",
+      },
+      {
+        eventId: "w2",
+        ts: "2026-09-02T10:01:00Z",
+        starter: "claude",
+        target: "deploy-notes",
+        command: "item.create deploy-notes",
+        result: "allowed",
+        channel: "cli",
+      },
+      {
+        eventId: "w3",
+        ts: "2026-09-02T10:02:00Z",
+        starter: "claude",
+        target: "release-notes",
+        command: "item.delete release-notes",
+        result: "denied",
+        channel: "wsl-bridge",
+      },
+    ]);
+    await act(async () => {
+      root.render(<AuditPage ctx={ctx} />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const page = container.querySelector("#page-audit")!;
+    // §8 口径：command=动作派生 + 条目名（值不明文），风格与既有审计行一致
+    expect(page.textContent).toContain("item.update API_TOKEN");
+    expect(page.textContent).toContain("item.create deploy-notes");
+    expect(page.textContent).toContain("item.delete release-notes");
+    // 结果 Tag（allowed/denied）与来源通道
+    expect(page.textContent).toContain("允许");
+    expect(page.textContent).toContain("拒绝");
+    expect(page.textContent).toContain("审批");
+    expect(page.textContent).toContain("CLI");
+    expect(page.textContent).toContain("WSL 桥接");
+    expect(page.querySelectorAll(".audit-row")).toHaveLength(3);
   });
 });
