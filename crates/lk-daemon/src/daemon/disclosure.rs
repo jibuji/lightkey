@@ -149,6 +149,7 @@ impl Daemon {
                 needs_unlock: true,
                 kind,
                 export_meta: None,
+                fingerprint_mismatch: None,
             };
             self.gate.approval().open(&areq, expires_at);
             self.pending_disclosure.lock().unwrap().insert(
@@ -270,6 +271,7 @@ impl Daemon {
             } else {
                 None
             },
+            fingerprint_mismatch: None,
         };
         self.gate.approval().open(&areq, expires_at);
         self.pending_disclosure.lock().unwrap().insert(

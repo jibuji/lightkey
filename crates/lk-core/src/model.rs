@@ -504,6 +504,13 @@ pub struct RuleDraft {
     /// write 能力下的写动作子集（缺省 create+update，见 [`Rule::actions`]）。
     #[serde(default = "default_rule_actions")]
     pub actions: Vec<String>,
+    /// 程序指纹（M2.98，identity-binding.md §4）：`None` = 未绑定（现状语义）；
+    /// `Some` = 严格绑定可执行文件身份。serde(default) = None → 既有草稿/参数
+    /// 反序列化零迁移。**值不由客户端信任携带**——指纹始终由 daemon 在审批
+    /// finalize 侧重算/固化（identity-binding.md §5.3：以新指纹重新授权时
+    /// daemon 重算后在此落库，客户端上报的路径/哈希不作安全依据）。
+    #[serde(default)]
+    pub fingerprint: Option<ProgramFingerprint>,
 }
 
 /// 程序指纹（M2.98 规则程序指纹绑定，identity-binding.md §4）：规则**可选**
@@ -542,9 +549,8 @@ impl Rule {
             keys: draft.keys,
             capability: draft.capability,
             actions: draft.actions,
-            // RuleDraft 暂不携带指纹（M2.98 T1；T2/T3 `rule.add --fingerprint`
-            // 落地时扩展草稿字段）。T1 阶段规则经草稿创建 = 未绑定（None）。
-            fingerprint: None,
+            // 指纹由 daemon 侧重算后落库（M2.98 T2）；未绑定 = None。
+            fingerprint: draft.fingerprint,
             created,
         }
     }

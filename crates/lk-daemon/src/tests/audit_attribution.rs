@@ -61,6 +61,7 @@ fn socket_peer_item_reads_audit_real_starter() {
                     keys: vec!["k1".into()],
                     capability: lk_core::model::RULE_CAPABILITY_WRITE.into(),
                     actions: vec![lk_core::model::RULE_ACTION_CREATE.into()],
+                    fingerprint: None,
                 },
                 None,
             )

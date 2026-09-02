@@ -27,6 +27,10 @@ pub mod audit_anchor;
 pub mod config;
 mod daemon;
 pub mod dirs;
+/// 程序指纹（M2.98，identity-binding.md §5/§6）：对端真实 env PATH 读取 +
+/// 内存指纹缓存 + `command[0]` → canonical 候选解析。跨平台读取按 cfg 隔离；
+/// 解析/缓存为可注入 trait / 纯函数（单测）。
+pub mod identity;
 pub mod notifier;
 pub mod router;
 pub mod sync;

@@ -236,6 +236,7 @@ mod audit_anchor;
 mod audit_attribution;
 mod authz;
 mod disclosure;
+mod identity_binding;
 mod rule_gate;
 mod rules;
 mod session_token;

@@ -213,6 +213,7 @@ impl Daemon {
             needs_unlock: false,
             kind: lk_core::authz::ApprovalKind::Write,
             export_meta: None,
+            fingerprint_mismatch: None,
         };
         self.gate.approval().open(&areq, expires_at);
         self.pending_write.lock().unwrap().insert(

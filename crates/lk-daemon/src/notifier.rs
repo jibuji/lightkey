@@ -45,6 +45,7 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
             needs_unlock,
             kind,
             export_meta,
+            fingerprint_mismatch,
         } => json!({
             "requestId": request_id,
             "starter": starter,
@@ -58,6 +59,14 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
             "kind": serde_json::to_value(kind).unwrap_or(serde_json::json!("inject")),
             "exportMeta": export_meta.as_ref().map(|m| json!({
                 "name": m.name, "mime": m.mime, "size": m.size,
+            })),
+            // M2.98 程序指纹失配（identity-binding.md §7）：绑定注入规则命中
+            // 命令形态但指纹不符时携带——弹窗明示「程序指纹与规则不符（可能已
+            // 更新）」+ 当前解析路径 + 8 位哈希摘要 + 「以新指纹重新授权」；
+            // 失配视同未命中（headless 统一 authz.denied，不在此暴露错误码）。
+            "fingerprintMismatch": fingerprint_mismatch.as_ref().map(|m| json!({
+                "resolvedExePath": m.resolved_exe_path,
+                "sha256Short": m.sha256_short,
             })),
         }),
     };
@@ -141,6 +150,7 @@ mod tests {
             needs_unlock: true,
             kind: lk_core::authz::ApprovalKind::Inject,
             export_meta: None,
+            fingerprint_mismatch: None,
         });
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["method"], "authz.request");
@@ -171,6 +181,7 @@ mod tests {
                 mime: "application/pdf".into(),
                 size: 1024,
             }),
+            fingerprint_mismatch: None,
         });
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["params"]["kind"], "export");
@@ -187,6 +198,7 @@ mod tests {
             needs_unlock: false,
             kind: lk_core::authz::ApprovalKind::Inject,
             export_meta: None,
+            fingerprint_mismatch: None,
         }));
         assert!(!desktop_only(&VaultEvent::ItemChanged {
             item_id: uuid::Uuid::nil(),

@@ -471,6 +471,13 @@ pub struct RuleAddParams {
     /// 时忽略）。加性字段，协议零新增（write-gate.md §7）。
     #[serde(default)]
     pub actions: Option<Vec<String>>,
+    /// 程序指纹绑定请求（M2.98，identity-binding.md §4/§5.3）：`Some` 时
+    /// 规则**绑定**该可执行文件。`exe_path` 为要绑定的 canonical 绝对路径；
+    /// **daemon 不信任客户端上报的 size/sha256**——审批 finalize 侧重算
+    /// （identity-binding.md §5.3），此处仅声明「绑哪个可执行文件」。
+    /// serde(default)=None → 既有 rule.add（未绑定）零迁移。
+    #[serde(default)]
+    pub fingerprint: Option<crate::model::ProgramFingerprint>,
     /// 审计来源标注（`cli` | `desktop` | `wsl-bridge`；缺省 = cli）。
     #[serde(default)]
     pub channel: Option<String>,

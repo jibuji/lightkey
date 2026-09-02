@@ -2,6 +2,17 @@
 
 use super::rules::VaultRuleView;
 use super::*;
+use lk_core::authz::FingerprintMismatch;
+
+/// M2.98 绑定规则指纹裁决结果（§5.2）：`authz_begin` 第 2 层命中后追加判定。
+enum FingerprintVerdict {
+    /// 无绑定规则命中（沿现状语义放行）。
+    NotApplicable,
+    /// 绑定规则且指纹匹配 → 静默放行。
+    Allowed,
+    /// 绑定规则指纹失配/候选不可解析 → 视同未命中 → 转审批（携带失配展示）。
+    NeedsApproval(Option<FingerprintMismatch>),
+}
 
 impl Daemon {
     /// 阶段①（命令锁内）：会话预检 + 启动者判定 + 第 1/2 层短路；需要审批
@@ -97,6 +108,9 @@ impl Daemon {
                 needs_unlock: true,
                 kind: lk_core::authz::ApprovalKind::Inject,
                 export_meta: None,
+                // 锁态：规则在加密 vault 内无指纹可比（须待解锁后 finalize），
+                // 审批帧不携带失配信息。
+                fingerprint_mismatch: None,
             };
             self.gate.approval().open(&areq, expires_at);
             self.pending_authz.lock().unwrap().insert(
@@ -114,10 +128,18 @@ impl Daemon {
         let result = self
             .gate
             .evaluate_layers(&req, &VaultRuleView { vault: v, secrets });
+        // M2.98 程序指纹绑定：第 2 层命中但绑定规则指纹失配 → 视同未命中
+        // （identity-binding.md §3/§5）。需在 vault 读锁内判定（规则在库内）。
+        let fp_verdict = self.fingerprint_adjudicate(&req, peer, v);
         drop(vault);
         match result {
             LayerResult::Allowed { keys } => {
-                // 第 2 层命中：解密注入值 + 审计 allowed（caller channel）
+                // 绑定规则指纹失配 → 折叠为 NeedsApproval（弹窗「指纹不符」/headless
+                // 统一 authz.denied，与未命中同码、防探测）。
+                if let FingerprintVerdict::NeedsApproval(mismatch) = fp_verdict {
+                    return self.open_inject_approval(id, req, channel, false, mismatch);
+                }
+                // 第 2 层命中（且无绑定失配）：解密注入值 + 审计 allowed
                 match self.resolve_env(&keys) {
                     Ok(env) => {
                         self.audit_authz(&req, channel, AuditResult::Allowed);
@@ -147,49 +169,115 @@ impl Daemon {
                     .unwrap_or(Value::Null),
                 )))
             }
-            LayerResult::NeedsApproval => {
-                // 第 3 层：无审批界面 → fail-closed 立即拒绝（不阻塞）
-                if !self.gate.approval().available() {
-                    self.audit_authz(&req, channel, AuditResult::Denied);
-                    return AuthzBegin::Final(rpc_string(RpcResponse::ok(
-                        id,
-                        serde_json::to_value(AuthzEvaluateResult {
-                            allowed: false,
-                            reason: Some(DenyReason::NoUi.as_str().to_string()),
-                            env: None,
-                        })
-                        .unwrap_or(Value::Null),
-                    )));
-                }
-                // 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）。
-                // challenge：一次性审批应答值（#78 方案 B），仅经通知桥投给
-                // 桌面订阅者；回传必须原样带回（resolve 逐一比对）
-                let request_id = lk_core::crypto::random_uuid();
-                let challenge = hex::encode(lk_core::crypto::random_array::<16>());
-                let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
-                let areq = ApprovalRequest {
-                    request_id,
-                    starter: req.starter.clone(),
-                    project_dir: req.cwd.clone(),
-                    command: req.command.clone(),
-                    keys: req.keys.clone(),
-                    challenge: challenge.clone(),
-                    needs_unlock: false,
-                    kind: lk_core::authz::ApprovalKind::Inject,
-                    export_meta: None,
-                };
-                self.gate.approval().open(&areq, expires_at);
-                self.pending_authz.lock().unwrap().insert(
-                    request_id,
-                    PendingAuthz {
-                        request: req,
-                        needs_unlock: false,
-                        temp_vault: None,
-                    },
-                );
-                AuthzBegin::Pending { request_id }
+            LayerResult::NeedsApproval =>
+            // 第 3 层：登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）；
+            // 无审批界面 → fail-closed 立即拒绝（不阻塞）。
+            {
+                self.open_inject_approval(id, req, channel, false, None)
             }
         }
+    }
+
+    /// M2.98 程序指纹裁决（绑定规则命中命令形态但指纹不符 → 视同未命中，
+    /// identity-binding.md §3/§5.2）。在 vault 读锁内调用（规则在库内）。
+    ///
+    /// - **desktop 内嵌直调受信豁免**（§3：`pid=0` → 不查指纹）；
+    /// - 无绑定规则命中 → NotApplicable（沿现状语义放行）；
+    /// - 候选解析失败（对端 env 不可读 / PATH+cwd 未命中 / stat/hash 失败）→
+    ///   NeedsApproval(None)（视同未命中 + 无可解析路径展示）。
+    fn fingerprint_adjudicate(
+        &mut self,
+        req: &AuthzRequest,
+        peer: &PeerInfo,
+        v: &UnlockedVault,
+    ) -> FingerprintVerdict {
+        // desktop 内嵌直调：pid=0，无对端 env 可读 → 受信豁免不查指纹。
+        if peer.pid == 0 {
+            return FingerprintVerdict::NotApplicable;
+        }
+        // 命中命令形态的绑定 inject 规则（capability=inject + 项目祖先 + command 形态）。
+        let bound: Vec<lk_core::model::ProgramFingerprint> = match v.list_rules() {
+            Ok(rules) => rules
+                .into_iter()
+                .filter(|r| {
+                    r.fingerprint.is_some()
+                        && lk_core::authz::rule_matches(r, &req.cwd, &req.command)
+                })
+                .map(|r| r.fingerprint.unwrap())
+                .collect(),
+            Err(_) => return FingerprintVerdict::NotApplicable, // 规则库损坏由第 1 层已拒
+        };
+        if bound.is_empty() {
+            return FingerprintVerdict::NotApplicable;
+        }
+        // 对端真实 cwd 兜底（peer.cwd 已是真实值；绝对命令免 PATH 解析）。
+        let cwd = peer.cwd.clone().unwrap_or_else(|| req.cwd.clone());
+        match crate::identity::adjudicate_binding(
+            self.peer_env.as_ref(),
+            peer.pid,
+            &cwd,
+            &req.command,
+            &bound,
+            &mut self.fingerprint_cache,
+        ) {
+            crate::identity::BindingOutcome::Allowed => FingerprintVerdict::Allowed,
+            crate::identity::BindingOutcome::Mismatch(m) => {
+                FingerprintVerdict::NeedsApproval(Some(m))
+            }
+            crate::identity::BindingOutcome::Unresolved => FingerprintVerdict::NeedsApproval(None),
+        }
+    }
+
+    /// 注入审批的统一入口（解锁态 NeedsApproval 与指纹失配折叠共用）：登记
+    /// 待审批 + 广播 `authz.request`（命令锁内、非阻塞）。无审批界面 → 审计
+    /// 拒绝 + fail-closed 立即拒绝（与未命中同码、防探测）。
+    fn open_inject_approval(
+        &mut self,
+        id: Value,
+        req: AuthzRequest,
+        channel: AuditChannel,
+        needs_unlock: bool,
+        fingerprint_mismatch: Option<FingerprintMismatch>,
+    ) -> AuthzBegin {
+        if !self.gate.approval().available() {
+            self.audit_authz(&req, channel, AuditResult::Denied);
+            return AuthzBegin::Final(rpc_string(RpcResponse::ok(
+                id,
+                serde_json::to_value(AuthzEvaluateResult {
+                    allowed: false,
+                    reason: Some(DenyReason::NoUi.as_str().to_string()),
+                    env: None,
+                })
+                .unwrap_or(Value::Null),
+            )));
+        }
+        // challenge：一次性审批应答值（#78 方案 B），仅经通知桥投给桌面订阅者；
+        // 回传必须原样带回（resolve 逐一比对）。
+        let request_id = lk_core::crypto::random_uuid();
+        let challenge = hex::encode(lk_core::crypto::random_array::<16>());
+        let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
+        let areq = ApprovalRequest {
+            request_id,
+            starter: req.starter.clone(),
+            project_dir: req.cwd.clone(),
+            command: req.command.clone(),
+            keys: req.keys.clone(),
+            challenge: challenge.clone(),
+            needs_unlock,
+            kind: lk_core::authz::ApprovalKind::Inject,
+            export_meta: None,
+            fingerprint_mismatch,
+        };
+        self.gate.approval().open(&areq, expires_at);
+        self.pending_authz.lock().unwrap().insert(
+            request_id,
+            PendingAuthz {
+                request: req,
+                needs_unlock,
+                temp_vault: None,
+            },
+        );
+        AuthzBegin::Pending { request_id }
     }
 
     /// 阶段③（重取命令锁）：收决策 → 解密 key 值 → 审计（channel=Approval）
