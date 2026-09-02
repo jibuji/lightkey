@@ -345,6 +345,23 @@ impl Daemon {
         self.core.bus()
     }
 
+    /// M2.98 对端 env 读取注入缝（身份绑定测试/嵌入环境用；生产 = 平台真实
+    /// 读取）。替换后指纹裁决走注入的对端 env PATH（信 daemon 不信客户端）。
+    pub fn set_peer_env(&mut self, peer_env: Arc<dyn crate::identity::PeerEnv>) {
+        self.peer_env = peer_env;
+    }
+
+    /// M2.98 诊断：指纹缓存 stat 取样次数（测试断言「元信息一致复用 → 只
+    /// stat 不重算」用语）。
+    pub fn fingerprint_stat_calls(&self) -> u64 {
+        self.fingerprint_cache.stat_calls()
+    }
+
+    /// M2.98 诊断：指纹缓存哈希重算次数（测试断言「内容改 → 重算 → 失配」）。
+    pub fn fingerprint_hash_calls(&self) -> u64 {
+        self.fingerprint_cache.hash_calls()
+    }
+
     /// 处理一行 JSON-RPC 请求，返回一行响应（永不 panic）。
     /// `peer` 为 IPC 对端身份（PID/cwd，由传输层派生——授权路径不信任客户端）。
     pub fn handle(&mut self, line: &str, peer: &PeerInfo) -> String {
