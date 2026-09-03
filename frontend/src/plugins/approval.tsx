@@ -24,6 +24,19 @@
  * `keys=[条目名] + actions=[create,update]`），**delete 无记住按钮**
  * （恒弹窗语义，任何规则不豁免——对齐 export）。
  *
+ * **程序指纹失配（M2.98，补充拍板 #25；identity-binding.md §7）**：
+ * 绑定注入规则命中命令形态但可执行文件指纹不符时，`authz.request` 帧带
+ * 可选 `fingerprintMismatch`（`resolvedExePath` 当前解析路径 + `sha256Short`
+ * 8 位 SHA-256 前缀摘要，**不含完整哈希/任何值/错误码差异化**）。弹窗据此
+ * 渲染失配主题「程序指纹与规则不符（可能已更新）」+ 路径 + 摘要 + 三按钮：
+ * 「拒绝」/「本次允许」（一次性放行，与普通审批一致）/「**以新指纹重新
+ * 授权**」（= 允许本次 + `rule.add` 携带 `fingerprint{exePath}` → 规则管理
+ * 审批门 → daemon finalize 侧重算指纹并落盘；桌面直调 channel=desktop
+ * 受信豁免直执行）。**未知字段防御**：畸形 `fingerprintMismatch`
+ * （缺字段/非字符串/null/类型不符）→ [`parseFingerprintMismatch`] 返回
+ * null，弹窗按普通 inject 审批渲染（不 crash、不渲染失配主题）；sha256Short
+ * 超长（协议外完整哈希）→ 截断到 8 位——UI 硬保证不展示完整哈希值。
+ *
  * 决策权始终在 Rust 侧（plugin-architecture.md §5.3）：本插件只把用户
  * 选择经 `approval.result` 回传，不持有裁决权；伪造/已超时 requestId →
  * 守护进程忽略（accepted=false）。
@@ -82,6 +95,41 @@ function parseApprovalKind(raw: unknown): ParsedKind {
     : "unknown";
 }
 
+/** 程序指纹失配展示信息（M2.98，identity-binding.md §7）。 */
+export interface FingerprintMismatchInfo {
+  /** 当前解析到的 canonical 绝对路径（daemon 侧重算；展示用，非安全依据）。 */
+  resolvedExePath: string;
+  /** 8 位 SHA-256 前缀摘要（hex 小写；不展示完整值）。 */
+  sha256Short: string;
+}
+
+/** 防御解析 `authz.request` 帧的可选 `fingerprintMismatch` 字段（未知字段
+ *  防御渲染，AC「未知 kind/字段防御」）：只接受 shape 为
+ *  `{resolvedExePath: 非空字符串, sha256Short: string}` 的值；畸形/缺字段/
+ *  类型不符 → null（弹窗按普通 inject 审批渲染，不 crash、不渲染失配主题，
+ *  无重新授权按钮）。`sha256Short` 超长（协议外完整哈希）→ **截断到 8 位**
+ *  ——UI 硬保证绝不展示完整哈希值（identity-binding.md §7「不展示完整值」）。 */
+export function parseFingerprintMismatch(
+  raw: AuthzRequestPayload["fingerprintMismatch"],
+): FingerprintMismatchInfo | null {
+  if (!raw || typeof raw !== "object") return null;
+  const rec = raw as Record<string, unknown>;
+  if (typeof rec.resolvedExePath !== "string" || rec.resolvedExePath.length === 0) return null;
+  if (typeof rec.sha256Short !== "string" || rec.sha256Short.length === 0) return null;
+  return {
+    resolvedExePath: rec.resolvedExePath,
+    sha256Short: rec.sha256Short.slice(0, 8),
+  };
+}
+
+/** 可执行文件 basename（跨 Windows/Linux 分隔符）；「以新指纹重新授权」
+ *  生成规则名用（`fp-<basename>`，如 `fp-npm.cmd`）。 */
+function exeBasename(p: string): string {
+  const parts = p.split(/[\\/]/);
+  const last = parts[parts.length - 1];
+  return last.length > 0 ? last : p;
+}
+
 interface ApprovalItem {
   request: AuthzRequestPayload;
   /** 剩余秒数（倒计时环形）。 */
@@ -104,8 +152,11 @@ interface ApprovalItem {
  *  动作（item.put=create/update / item.delete=delete）+ 目标条目名 Tag +
  *  projectDir + 30s 倒计时，**不展示值**；「允许并为此项目记住」仅
  *  put（create/update）提供（= allow + 写规则），**delete 无记住按钮**
- *  （恒弹窗语义，对齐 export）。未知 kind **防御性渲染**：明确提示未知，
- *  不回退按 inject 渲染（协议演进时旧 UI 不误导）。 */
+ *  （恒弹窗语义，对齐 export）。M2.98 程序指纹失配：`inject` 帧带
+ *  `fingerprintMismatch` 时渲染失配主题 + 路径 + 8 位摘要 + 「以新指纹
+ *  重新授权」（= 本次允许 + 更新规则绑定），详见 [`parseFingerprintMismatch`]
+ *  与模块注释。未知 kind **防御性渲染**：明确提示未知，不回退按 inject
+ *  渲染（协议演进时旧 UI 不误导）。 */
 export function ApprovalDialog({
   item,
   onResolve,
@@ -117,6 +168,7 @@ export function ApprovalDialog({
     challenge: string,
     masterPassword?: string,
     remember?: boolean,
+    reauthorize?: boolean,
   ) => Promise<void>;
 }) {
   const req = item.request;
@@ -133,6 +185,9 @@ export function ApprovalDialog({
   // 由 daemon 从 id 有无权威派生、不进帧——§5.2 RPC 不拆）。既有先例同
   // isRuleRemove：`command.startsWith` 判定动作。
   const isWriteDelete = isWrite && req.command.startsWith("item.delete");
+  // M2.98 程序指纹失配：防御解析（畸形 → null → 普通 inject 审批渲染）
+  const mm = parseFingerprintMismatch(req.fingerprintMismatch);
+  const isMismatch = mm !== null;
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -142,16 +197,23 @@ export function ApprovalDialog({
   }, [onResolve, req.requestId, req.challenge]);
 
   const allow = useCallback(
-    async (remember = false) => {
+    async (remember = false, reauthorize = false) => {
       if (submitting) return;
       // 解锁弹窗必须提供主密码（守护进程侧校验，错误不 resolve）
       if (needsUnlock && !password) return;
       setSubmitting(true);
       // 解锁结果由插件的 onResolve 决定弹窗去留（失败停留显示 item.error）
       if (needsUnlock) {
-        await onResolve(req.requestId, "allowed", req.challenge, password);
+        await onResolve(req.requestId, "allowed", req.challenge, password, false, reauthorize);
       } else {
-        await onResolve(req.requestId, "allowed", req.challenge, undefined, remember);
+        await onResolve(
+          req.requestId,
+          "allowed",
+          req.challenge,
+          undefined,
+          remember,
+          reauthorize,
+        );
       }
       setSubmitting(false);
     },
@@ -190,6 +252,8 @@ export function ApprovalDialog({
                   ? isWriteDelete
                     ? "Agent 请求删除该项目目录下的条目（破坏性操作；任何规则不豁免，恒需本次审批）"
                     : "Agent 请求写入该项目目录下的条目（新建或整条替换；条目值不会显示）"
+                  : isMismatch
+                    ? "该程序曾获注入授权，但当前可执行文件的程序指纹与规则不符（可能已更新）——批准前请确认这是你期望的程序；「以新指纹重新授权」会用当前程序更新规则绑定"
                   : isUnknown
                     ? `未知审批类型（kind=${String(req.kind ?? "缺失")}）：当前界面版本不认识该请求，请升级应用后处理；无法确认内容前建议拒绝`
                     : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
@@ -235,6 +299,23 @@ export function ApprovalDialog({
             </span>
           ))}
         </div>
+        {mm ? (
+          // M2.98 程序指纹失配主题（identity-binding.md §7）：明示「指纹与规则
+          // 不符（可能已更新）」+ 当前解析路径 + 8 位 SHA-256 前缀摘要（**不
+          // 展示完整哈希值**——parseFingerprintMismatch 已做超长截断兜底）。
+          <div className="approval-fp-mismatch" role="alert">
+            <div className="approval-fp-mismatch-title">
+              <Icon name="shield" size={15} /> 程序指纹与规则不符（可能已更新）
+            </div>
+            <div>
+              当前解析到：<code>{mm.resolvedExePath}</code>
+            </div>
+            <div>
+              SHA-256 摘要：<code>{mm.sha256Short}</code>
+              <span className="limit-hint">（8 位前缀，不显示完整哈希）</span>
+            </div>
+          </div>
+        ) : null}
         {needsUnlock ? (
           <label className="field approval-unlock-field">
             <span className="field-label">主密码（临时解锁 · 仅本次注入）</span>
@@ -297,12 +378,27 @@ export function ApprovalDialog({
             </button>
           ) : null}
           <button
-            className="btn btn-primary"
+            className={mm ? "btn" : "btn btn-primary"}
             onClick={() => void allow()}
             disabled={submitting || (needsUnlock && !password)}
           >
             {needsUnlock ? "解锁并允许" : "允许本次"}
           </button>
+          {/* M2.98 程序指纹失配：「以新指纹重新授权」= 允许本次 + 更新规则
+              绑定（rule.add 携带 fingerprint{exePath} → 规则管理审批门 →
+              daemon finalize 侧重算指纹并落盘，identity-binding.md §7）。
+              仅绑定规则命中失配的审批帧提供；needsUnlock 防御（失配帧守护
+              进程恒 needs_unlock=false，但临时 vault 无法持久化规则——与
+              「记住」按钮同一防御条件）。 */}
+          {mm && !needsUnlock ? (
+            <button
+              className="btn btn-primary"
+              onClick={() => void allow(false, true)}
+              disabled={submitting}
+            >
+              以新指纹重新授权
+            </button>
+          ) : null}
         </div>
       </div>
     </div>
@@ -323,6 +419,7 @@ function ApprovalHost({
     challenge: string,
     masterPassword?: string,
     remember?: boolean,
+    reauthorize?: boolean,
   ) => Promise<void>;
   onExpire: () => void;
 }) {
@@ -375,7 +472,7 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     root.render(
       <ApprovalHost
         current={queue[0] ?? null}
-        onResolve={async (requestId, decision, challenge, masterPassword, remember) => {
+        onResolve={async (requestId, decision, challenge, masterPassword, remember, reauthorize) => {
           try {
             const { accepted } =
               masterPassword === undefined
@@ -411,6 +508,32 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
                   });
                 } catch {
                   ctx.toast.show("记住规则写入失败（可稍后在规则页手动添加）");
+                }
+              }
+              // M2.98 程序指纹失配「以新指纹重新授权」（identity-binding.md
+              // §7）：= 允许本次 + 更新规则绑定——rule.add 携带
+              // fingerprint{exePath}（仅声明「绑哪个 exe」，daemon finalize
+              // 侧重算 sha/size 固化，不信任客户端上报）。name 由 exe
+              // basename 派生（`fp-<basename>`）；capability=inject（指纹只
+              // 随注入规则绑定，read/write 调用方链按 spec §12 仅字段预留）。
+              // 仅失配帧（parseFingerprintMismatch 非空）触发；失败不阻塞
+              // 弹窗关闭，仅提示。
+              if (reauthorize && accepted && r) {
+                const mm = parseFingerprintMismatch(r.fingerprintMismatch);
+                if (mm) {
+                  try {
+                    await ctx.ipc.ruleAdd({
+                      projectDir: r.projectDir,
+                      name: `fp-${exeBasename(mm.resolvedExePath)}`,
+                      command: r.command,
+                      keys: r.keys,
+                      capability: "inject",
+                      fingerprint: { exePath: mm.resolvedExePath },
+                    });
+                    ctx.toast.show("已以新指纹重新授权（规则指纹已更新）");
+                  } catch {
+                    ctx.toast.show("重新授权失败：规则未更新（可稍后在规则页处理）");
+                  }
                 }
               }
             } else {

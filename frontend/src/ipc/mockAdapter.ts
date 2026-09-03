@@ -71,6 +71,23 @@ function newId(): string {
   return "it" + Math.random().toString(36).slice(2, 8);
 }
 
+/** M2.98 QA 确定性伪摘要（8 位 hex）：exe 路径 → 定长前缀，供失配帧
+ *  `sha256Short` 使用（真实 daemon 为 SHA-256 前缀；mock 只求确定性）。 */
+function pseudoSha8(path: string): string {
+  let h = 7;
+  for (let i = 0; i < path.length; i += 1) {
+    h = (h * 31 + path.charCodeAt(i)) & 0xffffffff;
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/** M2.98 QA 确定性伪摘要（64 位 hex）：规则固化指纹的 sha256 占位（8 × 8 位
+ *  前缀拼接；真实 daemon finalize 侧重算 SHA-256。UI 只展示前 8 位，mock
+ *  无真实哈希不影响展示路径）。 */
+function pseudoSha256(path: string): string {
+  return pseudoSha8(path).repeat(8);
+}
+
 /**
  * mock 首启标志（localStorage；仅 QA/dev）：`simulateFreshInstall` 写入，
  * MockAdapter 构造时读取——浏览器 E2E 可「重载后仍为首启」，真实走
@@ -270,9 +287,22 @@ export class MockAdapter implements LightKeyIpc {
     ) {
       return delayReject(new Error("invalid params"));
     }
+    const { fingerprint: fpInput, ...rest } = input;
     const rule: AuthRule = {
       id: "r" + Math.random().toString(36).slice(2, 6),
-      ...input,
+      ...rest,
+      // M2.98：mock 不重算指纹（真实 daemon finalize 侧重算 sha/size）；
+      // 归一化承载 exePath（`fingerprint` 存在性即「绑定」，sha/size 空值
+      // 占位），供规则列表展示与 simulateFingerprintInject 的 E2E 判定。
+      ...(fpInput
+        ? {
+            fingerprint: {
+              exePath: fpInput.exePath,
+              sha256: fpInput.sha256 ?? pseudoSha256(fpInput.exePath),
+              size: fpInput.size ?? 0,
+            },
+          }
+        : {}),
       created: nowStamp(),
     };
     this.rules.unshift(rule);
@@ -364,6 +394,10 @@ export class MockAdapter implements LightKeyIpc {
     needsUnlock?: boolean;
     kind?: "inject" | "read" | "export" | "rule" | "write";
     exportMeta?: { name: string; mime: string; size: number } | null;
+    /** M2.98 程序指纹失配（identity-binding.md §7）：绑定注入规则命中命令
+     *  形态但指纹不符时携带——弹窗渲染「指纹不符」主题 + 路径 + 8 位摘要 +
+     *  「以新指纹重新授权」。 */
+    fingerprintMismatch?: { resolvedExePath: string; sha256Short: string } | null;
   }): void {
     this.pendingApprovals.add(params.requestId);
     if (params.needsUnlock) {
@@ -405,6 +439,62 @@ export class MockAdapter implements LightKeyIpc {
   /** QA 只读检查 */
   readItem(id: string): Item | null {
     return this.items.find((x) => x.id === id) ?? null;
+  }
+
+  /**
+   * M2.98 浏览器 E2E：模拟守护进程对「绑定注入规则」的指纹裁决
+   * （identity-binding.md §3/§5 的 mock 等价物）。按 projectDir + command +
+   * keys 查 mock 规则（只认注入规则绑定，`fingerprint` 存在即绑定）：
+   * - 命中绑定规则且 `fingerprint.exePath === exePath` → `"matched"`（静默
+   *   放行、**不弹窗**——「规则指纹更新后可再命中」语义，配套重新授权流）；
+   * - 命中绑定规则但 path 不符 → 广播失配 `authz.request`（弹窗「指纹不符」）
+   *   → `"mismatch"`；
+   * - 无绑定规则命中 → `"unbound"`（不弹窗；调用方自持——mock 不模拟
+   *   未命中弹窗，避免与 `simulateAuthzRequest` 职责重叠）。
+   */
+  simulateFingerprintInject(params: {
+    projectDir: string;
+    command: string;
+    keys: string[];
+    exePath: string;
+  }): "matched" | "mismatch" | "unbound" {
+    const bound = this.rules.filter(
+      (r) =>
+        r.projectDir === params.projectDir &&
+        r.command === params.command &&
+        params.keys.every((k) => r.keys.includes(k)) &&
+        r.fingerprint,
+    );
+    if (bound.length === 0) return "unbound";
+    if (bound.some((r) => r.fingerprint!.exePath === params.exePath)) return "matched";
+    const requestId = `fp-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    this.pendingApprovals.add(requestId);
+    this.onFrame?.({
+      jsonrpc: "2.0",
+      method: NOTIFICATIONS.AUTHZ_REQUEST,
+      params: {
+        requestId,
+        starter: "claude",
+        projectDir: params.projectDir,
+        command: params.command,
+        keys: params.keys,
+        challenge: "mock-challenge",
+        needsUnlock: false,
+        kind: "inject",
+        // 8 位伪摘要（确定性；真实 daemon 为 SHA-256 前缀，mock 不引入
+        // 完整哈希——QA 面保持一致的不展示完整值口径）
+        fingerprintMismatch: {
+          resolvedExePath: params.exePath,
+          sha256Short: pseudoSha8(params.exePath),
+        },
+      },
+    });
+    return "mismatch";
+  }
+
+  /** QA 只读检查：当前 mock 规则列表（含 M2.98 fingerprint 绑定状态）。 */
+  readRules(): AuthRule[] {
+    return structuredClone(this.rules);
   }
 
   /** 模拟未初始化环境（全新安装首启）：清空库 + 回默认主密码；
@@ -451,6 +541,9 @@ export function installMockQaHooks(adapter: MockAdapter) {
     simulateExternalEdit: (id: string) => adapter.simulateExternalEdit(id),
     simulateAuthzRequest: (params: Parameters<MockAdapter["simulateAuthzRequest"]>[0]) =>
       adapter.simulateAuthzRequest(params),
+    simulateFingerprintInject: (
+      params: Parameters<MockAdapter["simulateFingerprintInject"]>[0],
+    ) => adapter.simulateFingerprintInject(params),
     simulateItemChanged: (params: Parameters<MockAdapter["simulateItemChanged"]>[0]) =>
       adapter.simulateItemChanged(params),
     setPickDirResult: (path: string | null) => {
@@ -459,6 +552,7 @@ export function installMockQaHooks(adapter: MockAdapter) {
     simulateFreshInstall: () => adapter.simulateFreshInstall(),
     simulateInstalled: () => adapter.simulateInstalled(),
     readItem: (id: string) => adapter.readItem(id),
+    readRules: () => adapter.readRules(),
     isUnlocked: () => adapter.isUnlocked(),
     isInitialized: () => adapter.isInitialized(),
   };

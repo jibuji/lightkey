@@ -140,6 +140,18 @@ export function RulesPage({ ctx }: { ctx: Context }) {
                   </span>
                 ))}
               </div>
+              {/* M2.98 程序指纹绑定（identity-binding.md §4）：绑定规则展示
+                  exe basename + 8 位 SHA-256 前缀（title 带完整路径，便于
+                  悬停核对；**不展示完整哈希**——与弹窗同口径）。未绑定零
+                  展示（旧规则/普通规则形态不变）。 */}
+              {r.fingerprint ? (
+                <div className="rule-fp" title={r.fingerprint.exePath}>
+                  <Icon name="shield" size={12} /> 指纹绑定：
+                  {(r.fingerprint.exePath.split(/[\\/]/).pop() || r.fingerprint.exePath)} ·{" "}
+                  {(r.fingerprint.sha256 ?? "").slice(0, 8)}
+                  <span className="limit-hint">（8 位前缀）</span>
+                </div>
+              ) : null}
             </div>
           ))
         )}
