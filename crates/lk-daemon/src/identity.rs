@@ -71,6 +71,9 @@ pub fn parse_path_from_environ(bytes: &[u8]) -> Option<String> {
 /// PATH 存为 `Path=`/`path=` 等混合大小写；CRT 的 `getenv("PATH")` 也是大小写
 /// 无关），须按 `=` 前段 `eq_ignore_ascii_case` 匹配，否则漏掉真实变量 →
 /// fail-closed 误判不可读。无 PATH / 空 → `None`。
+/// 仅 Windows PEB 路径使用（`read_peer_path_peb`），其它平台不编译（避免
+/// Linux/macOS 构建 dead-code 告警——CI `-D warnings`）。
+#[cfg(windows)]
 fn extract_path_from_env_block_utf16(block: &str) -> Option<String> {
     block.split('\0').find_map(|e| {
         let mut it = e.splitn(2, '=');
@@ -718,6 +721,7 @@ mod tests {
     /// Windows 环境块常把 PATH 存为 `Path=`（实测），严格 `PATH=` 前缀会漏掉
     /// 致 fail-closed 误判不可读。覆盖 `PATH=`/`Path=`/`path=` 与首尾无关的空段、
     /// 驱动隐藏变量（`=C:=C:\...`）、无 PATH / 空值 → None。
+    #[cfg(windows)]
     #[test]
     fn env_block_path_extraction_case_insensitive() {
         use crate::identity::extract_path_from_env_block_utf16;
