@@ -435,8 +435,14 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
     /// `capability`：`Some("read")` = 读值规则（M2.9，`--read`）、
     /// `Some("write")` = 写规则（M2.97，`--write`）；`None` = 注入规则
     /// （不带 capability 字段，老守护进程兼容）。`actions` 仅写规则携带
-    /// （write-gate.md §7 加性字段）；daemon 返回的 rule 体无法解析时兜底
-    /// 合成（nil id + 请求参数回填），与重构前行为逐字一致。
+    /// （write-gate.md §7 加性字段）；`fingerprint` 为程序指纹绑定请求
+    /// （M2.98，identity-binding.md §4/§5.3：**daemon 不信任客户端上报的
+    /// sha256/size**——审批 finalize 侧重算固化，此处仅声明「绑哪个 exe」）。
+    /// 读/写规则（`capability`）加性字段；指纹形态经 [`rule_add`] 的
+    /// `fingerprint` 参数（request 侧仅声明「绑哪个 exe」，daemon 固化）。
+    /// 参数面按命令形态/能力/指纹三轴展开达 8 参（clippy 阈值 7）——
+    /// 命名单一、类型各砖，聚集为 `RuleAddParams` 纯搬运、无收敛收益，放行。
+    #[allow(clippy::too_many_arguments)]
     pub fn rule_add(
         &mut self,
         project_dir: &str,
@@ -445,6 +451,7 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
         keys: &[String],
         capability: Option<&str>,
         actions: Option<&[String]>,
+        fingerprint: Option<lk_core::model::ProgramFingerprint>,
     ) -> Result<Rule, RpcError> {
         let mut params = json!({
             "projectDir": project_dir,
@@ -458,6 +465,14 @@ impl<F: FnMut(&str, Value) -> Result<Value, RpcError>> RpcClient<F> {
         }
         if let Some(actions) = actions {
             params["actions"] = json!(actions);
+        }
+        if let Some(fp) = fingerprint {
+            params["fingerprint"] = json!({
+                "exePath": fp.exe_path,
+                // daemon 侧重算；请求侧断言字段恒为空（不携带客户端自报值）
+                "sha256": "",
+                "size": 0,
+            });
         }
         let res = self.call(M_RULE_ADD, params)?;
         let fallback = Rule {
@@ -777,6 +792,7 @@ mod tests {
                 &["T".to_string()],
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(got.id.to_string(), "00000000-0000-0000-0000-000000000002");
@@ -789,6 +805,7 @@ mod tests {
                 "publish",
                 "npm publish",
                 &["T".to_string()],
+                None,
                 None,
                 None,
             )
@@ -812,6 +829,7 @@ mod tests {
             &["APIKey".to_string()],
             Some("read"),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(rec.last().0, "rule.add");
@@ -823,8 +841,16 @@ mod tests {
         // 注入规则：无 capability 字段（缺省 inject，向后兼容）
         let rec = Recorder::default();
         let mut c = ok_client(&rec, json!({ "rule": {} }));
-        c.rule_add("/p", "publish", "npm *", &["T".to_string()], None, None)
-            .unwrap();
+        c.rule_add(
+            "/p",
+            "publish",
+            "npm *",
+            &["T".to_string()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             rec.last().1.get("capability").is_none(),
             "inject 规则不携带 capability 字段"
@@ -845,6 +871,7 @@ mod tests {
             &["NPM_TOKEN".to_string()],
             Some("write"),
             Some(&["create".to_string(), "update".to_string()]),
+            None,
         )
         .unwrap();
         assert_eq!(rec.last().0, "rule.add");
@@ -857,7 +884,7 @@ mod tests {
         // read 规则不带 actions 字段
         let rec = Recorder::default();
         let mut c = ok_client(&rec, json!({ "rule": {} }));
-        c.rule_add("/p", "r", "", &["K".to_string()], Some("read"), None)
+        c.rule_add("/p", "r", "", &["K".to_string()], Some("read"), None, None)
             .unwrap();
         assert!(
             rec.last().1.get("actions").is_none(),
@@ -866,11 +893,56 @@ mod tests {
         // inject 规则不带 capability + actions 字段
         let rec = Recorder::default();
         let mut c = ok_client(&rec, json!({ "rule": {} }));
-        c.rule_add("/p", "pub", "npm *", &["T".to_string()], None, None)
+        c.rule_add("/p", "pub", "npm *", &["T".to_string()], None, None, None)
             .unwrap();
         assert!(
             rec.last().1.get("actions").is_none(),
             "inject 规则不携带 actions"
+        );
+    }
+
+    /// rule.add 参数形状（M2.98 指纹绑定，identity-binding.md §4/§5.3）：
+    /// 指纹仅携带 exePath（sha256/size 恒空——daemon 审批 finalize 侧重算
+    /// 固化，不信任客户端上报）；无指纹 → 不携带 fingerprint 字段。
+    #[test]
+    fn rule_add_fingerprint_params_shape() {
+        use lk_core::model::ProgramFingerprint;
+        // 带指纹：capability 省略（inject 缺省），fingerprint 结构仅 exePath 有效
+        let rec = Recorder::default();
+        let mut c = ok_client(&rec, json!({ "rule": {} }));
+        c.rule_add(
+            "/p",
+            "pub-bound",
+            "npm",
+            &["T".to_string()],
+            None,
+            None,
+            Some(ProgramFingerprint {
+                exe_path: "/usr/bin/npm".into(),
+                sha256: String::new(),
+                size: 0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(rec.last().0, "rule.add");
+        assert_eq!(
+            rec.last().1,
+            json!({ "projectDir": "/p", "name": "pub-bound", "command": "npm",
+                    "keys": ["T"], "fingerprint": { "exePath": "/usr/bin/npm",
+                    "sha256": "", "size": 0 }, "channel": "cli" })
+        );
+        let fp = &rec.last().1["fingerprint"];
+        assert_eq!(fp["exePath"], "/usr/bin/npm");
+        assert_eq!(fp["sha256"], "", "请求侧不携带客户端自报哈希");
+        assert_eq!(fp["size"], 0, "请求侧不携带客户端自报 size");
+        // 无指纹 → 不携带 fingerprint 字段（零迁移）
+        let rec = Recorder::default();
+        let mut c = ok_client(&rec, json!({ "rule": {} }));
+        c.rule_add("/p", "pub", "npm *", &["T".to_string()], None, None, None)
+            .unwrap();
+        assert!(
+            rec.last().1.get("fingerprint").is_none(),
+            "未绑定规则不携带 fingerprint 字段"
         );
     }
 

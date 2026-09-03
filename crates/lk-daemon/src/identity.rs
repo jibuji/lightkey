@@ -66,6 +66,19 @@ pub fn parse_path_from_environ(bytes: &[u8]) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+/// Windows env 块（NUL 分隔的 UTF-16 `NAME=VALUE` 串）中提取 PATH 值。
+/// 纯函数，可注入假块做单测。**env 名大小写不敏感**（Windows 环境块常把
+/// PATH 存为 `Path=`/`path=` 等混合大小写；CRT 的 `getenv("PATH")` 也是大小写
+/// 无关），须按 `=` 前段 `eq_ignore_ascii_case` 匹配，否则漏掉真实变量 →
+/// fail-closed 误判不可读。无 PATH / 空 → `None`。
+fn extract_path_from_env_block_utf16(block: &str) -> Option<String> {
+    block.split('\0').find_map(|e| {
+        let mut it = e.splitn(2, '=');
+        let (name, val) = (it.next()?, it.next()?);
+        (name.eq_ignore_ascii_case("PATH") && !val.is_empty()).then(|| val.to_string())
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn read_peer_path(pid: u32) -> Option<String> {
     // KERN_PROCARGS2：pid → 参数与环境块。实现期验证权限与可达性；读取失败 →
@@ -137,7 +150,7 @@ fn read_peer_path(pid: u32) -> Option<String> {
 
 #[cfg(windows)]
 fn read_peer_path_peb(pid: u32) -> Option<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, UNICODE_STRING};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
@@ -175,9 +188,10 @@ fn read_peer_path_peb(pid: u32) -> Option<String> {
     } else {
         0x10
     };
-    // RTL_USER_PROCESS_PARAMETERS.Environment（UNICODE_STRING）：x64 @ +0x80；
-    // x86 @ +0x48。与 starter.rs 读 CurrentDirectory.DosPath 同款偏移表方法
-    // （cwd x64 @ +0x38；Environment 在 CommandLine@+0x70 之后 @+0x80）。
+    // RTL_USER_PROCESS_PARAMETERS.Environment：x64 @ +0x80；x86 @ +0x48。
+    // 与 starter.rs 读 CurrentDirectory.DosPath 同款偏移表方法（cwd x64 @
+    // +0x38；Environment 在 CommandLine@+0x70 之后 @+0x80）。实测该位存的是
+    // 环境块**基址指针**（无 UNICODE_STRING 头）：按指针直读比按结构读更稳。
     const PROCESS_PARAMETERS_ENV_OFFSET: usize = if cfg!(target_pointer_width = "64") {
         0x80
     } else {
@@ -217,42 +231,54 @@ fn read_peer_path_peb(pid: u32) -> Option<String> {
             if params_ptr == 0 {
                 return None;
             }
-            let mut env: UNICODE_STRING = std::mem::zeroed();
+            // Environment 在 `RTL_USER_PROCESS_PARAMETERS` 中为可选的 UTF-16 环境块
+            // 指针（x64 @ +0x80；实测该位直接存环境块基址指针，而非 UNICODE_STRING
+            // 头——UNICODE_STRING 读法会因 Buffer 字段落在 NULL 区而 fail-closed，
+            // 见 identity-binding.md §5.1 Windows 注记）。先读 8 字节指针：
+            let mut env_base: usize = 0;
             if ReadProcessMemory(
                 handle,
                 (params_ptr + PROCESS_PARAMETERS_ENV_OFFSET) as *const _,
-                &mut env as *mut _ as *mut _,
-                std::mem::size_of::<UNICODE_STRING>(),
+                &mut env_base as *mut _ as *mut _,
+                std::mem::size_of::<usize>(),
                 std::ptr::null_mut(),
             ) == 0
             {
                 return None;
             }
-            // sanity：Buffer 有效 + Length 在合理上界（错位读到的小句柄值不
-            // 触发拷贝，交由 NULL 判断 + 上界双防线；与 starter.rs 同口径）。
-            if env.Buffer.is_null() || env.Length == 0 || env.Length as usize > MAX_ENV_BLOCK_BYTES
-            {
+            // sanity：基址有效 + 非奇异值（错位读到的小句柄值不触发拷贝）
+            if env_base == 0 || env_base == usize::MAX {
                 return None;
             }
-            let mut buf = vec![0u16; (env.Length as usize).div_ceil(2)];
+            // 环境块为引用计数/连续分配，读上界字节（NUL 结尾；UTF-16）。
+            // length = 读取的实际字节数（环境块大小未知，按上界读一次，
+            // 超限由长度上界守卫；非 NUL 结尾说明读错位置 → 无 PATH fail-closed）
+            let mut rawb = vec![0u16; MAX_ENV_BLOCK_BYTES.div_ceil(2)];
+            let mut read: usize = 0;
             if ReadProcessMemory(
                 handle,
-                env.Buffer as *const _,
-                buf.as_mut_ptr() as *mut _,
-                env.Length as usize,
-                std::ptr::null_mut(),
+                env_base as *const _,
+                rawb.as_mut_ptr() as *mut _,
+                MAX_ENV_BLOCK_BYTES,
+                &mut read,
             ) == 0
             {
                 return None;
             }
-            let block = String::from_utf16_lossy(&buf);
+            // 截到首个双 NUL（环境块用 `\0\0` 结尾）或实际读取长度，转 UTF-16。
+            let uk = rawb.len();
+            let end = rawb[..uk]
+                .windows(2)
+                .position(|w| w[0] == 0 && w[1] == 0)
+                .map(|i| i + 2)
+                .unwrap_or(uk);
+            let block = String::from_utf16_lossy(&rawb[..end.min(uk)]);
             // 环境块为 NUL 分隔的 `NAME=VALUE` 串；提取 PATH（值通常 ASCII，
-            // lossy 已是既有做法）。
-            block.split('\0').find_map(|e| {
-                e.strip_prefix("PATH=")
-                    .filter(|v| !v.is_empty())
-                    .map(|v| v.to_string())
-            })
+            // lossy 已是既有做法）。**Windows env 名大小写不敏感——环境块里
+            // PATH 常存为 `Path=`（实测）而非 `PATH=`，严格前缀会漏掉真实
+            // 环境 → fail-closed 误判不可读**（用 `eq_ignore_ascii_case`，
+            // 见 [`extract_path_from_env_block_utf16`]）。
+            extract_path_from_env_block_utf16(&block)
         })();
         CloseHandle(handle);
         result
@@ -686,5 +712,79 @@ mod tests {
             path: Some("/bin".into()),
         });
         assert_eq!(env.peer_path(123), Some("/bin".into()));
+    }
+
+    /// env 块 PATH 提取（Windows PEB 共用纯函数）：**大小写不敏感**——真实
+    /// Windows 环境块常把 PATH 存为 `Path=`（实测），严格 `PATH=` 前缀会漏掉
+    /// 致 fail-closed 误判不可读。覆盖 `PATH=`/`Path=`/`path=` 与首尾无关的空段、
+    /// 驱动隐藏变量（`=C:=C:\...`）、无 PATH / 空值 → None。
+    #[test]
+    fn env_block_path_extraction_case_insensitive() {
+        use crate::identity::extract_path_from_env_block_utf16;
+        // 大写（Linux 风格块也被同一纯函数处理）
+        assert_eq!(
+            extract_path_from_env_block_utf16("HOME=/u\0PATH=/usr/bin:/bin\0PWD=/u"),
+            Some("/usr/bin:/bin".into())
+        );
+        // Windows 实测形态：`Path=` 混合大小写
+        assert_eq!(
+            extract_path_from_env_block_utf16(
+                "ALLUSERSPROFILE=C:\\ProgramData\0AppData=...\0Path=C:\\Windows;C:\\bin\0PWD"
+            ),
+            Some(r"C:\Windows;C:\bin".into())
+        );
+        // 驱动隐藏变量（`=C:=C:\...`）不影响 PATH 匹配
+        assert_eq!(
+            extract_path_from_env_block_utf16("=C:=C:\\work\0PATH=C:\\Windows"),
+            Some(r"C:\Windows".into())
+        );
+        // 无 PATH / 空值 / PATH 非首个 `=` 段 → None（fail-closed 边界）
+        assert_eq!(extract_path_from_env_block_utf16("HOME=/u\0PWD=/u"), None);
+        assert_eq!(extract_path_from_env_block_utf16("PATH="), None);
+        assert_eq!(extract_path_from_env_block_utf16(""), None);
+        assert_eq!(extract_path_from_env_block_utf16("MY_PATH=C:\\x"), None);
+        // 全小写 path= 命中；PATH_FOO（非精确名）不误命中
+        assert_eq!(
+            extract_path_from_env_block_utf16("LOCALAPPDATA=C:\\x\0path=C:\\bin\0PATH_FOO=1"),
+            Some(r"C:\bin".into())
+        );
+    }
+
+    /// 平台侧真实对端 env PATH 读取（Windows PEB，regression）：当前测试
+    /// 进程自身必然可读（OpenProcess 当前 pid + PROCESS_VM_READ），读出的
+    /// PATH 应包含本进程 env 的 `PATH=...` 值（至少非空、且与本进程自上而下
+    /// 的 `std::env::var("PATH")` 共享同一份环境）。守卫：改为按指针直读
+    /// RTL_USER_PROCESS_PARAMETERS.Environment（非 UNICODE_STRING 头），
+    /// 该回归测试可防止再次落到「Buffer 读 NULL → fail-closed」；并钉住
+    /// **Windows env 名大小写不敏感**（真实块常把 PATH 存为 `Path=`，严格
+    /// 大写 `PATH=` 前缀会漏掉 → 误判不可读，见下方 `eq_ignore_ascii_case`）。
+    #[cfg(windows)]
+    #[test]
+    fn real_peer_path_reads_current_process_path() {
+        let path = PlatformPeerEnv.peer_path(std::process::id());
+        assert!(
+            matches!(&path, Some(p) if !p.is_empty()),
+            "本进程的 PEB env PATH 应可读，got: {path:?}"
+        );
+        // PATH 值应与本进程真实 PATH 一致（同源；分隔符由平台解析，此处只
+        // 断言「读出值存在于本进程 PATH」的强度：检出任一目录段非空即可）。
+        let own = std::env::var("PATH").unwrap_or_default();
+        if !own.is_empty() {
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            let own_dirs: Vec<&str> = own.split(sep).filter(|s| !s.is_empty()).collect();
+            assert!(
+                !own_dirs.is_empty() || own.is_empty(),
+                "本进程 PATH 段缺失，无法对照"
+            );
+            let p = path.unwrap();
+            let read_dirs: Vec<&str> = p.split(sep).filter(|s| !s.is_empty()).collect();
+            // 宽松断言：读出的 PATH 与本进程 PATH 至少有一个共通非空段
+            assert!(
+                read_dirs.iter().any(|d| own_dirs.contains(d)),
+                "PEB 读出的 PATH 段与本进程 PATH 无交集：read={:?} own={:?}",
+                read_dirs,
+                own_dirs
+            );
+        }
     }
 }

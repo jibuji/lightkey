@@ -12,7 +12,13 @@
 #       docs/value-disclosure.md）：无规则 item get → authz.denied 拒绝、
 #       rule add --read 后静默放行、item export 恒弹窗（headless 拒绝）→
 #       item edit 静默放行（update 命中）+ item delete headless 恒弹窗拒绝
-#       （delete 不参与规则匹配）→ rule remove → 删除生效 + 审计。
+#       （delete 不参与规则匹配）→ rule remove → 删除生效 + 审计 →
+#       指纹绑定（M2.98，docs/identity-binding.md §10.3）：rule add --inject
+#       --fingerprint（走规则门，daemon finalize 侧重算固化哈希）→ rule list
+#       展示指纹 → 把被绑定 exe 前置到 PATH 后 inject 命中 → 静默放行（exit 0
+#       + 子进程跑起来）+ 审计 allowed → 就地改写 exe（内容变 → hash 变）再
+#       inject → 失配视同未命中 → headless 拒绝（exit 1，同码）+ 审计 denied，
+#       **指纹通道不扩展 auto-approve**（沿用写门口径）。
 #
 # 用法：bash scripts/e2e_m2.sh [lk-binary-path]
 set -u
@@ -229,6 +235,75 @@ AUTO_EV=$("$LK" audit --json | jq -r '[.[] | select(.channel == "auto-approve")]
 [ "${AUTO_EV:-0}" -ge 1 ] && ok "审计含 channel=auto-approve 事件" || bad "审计缺 auto-approve 事件"
 AUTO_CMD=$("$LK" audit --json | jq -r '[.[] | select(.channel == "auto-approve")][0].command')
 echo "$AUTO_CMD" | grep -q "auto-approve" && ok "auto-approve 审计 command 含 requestId（$AUTO_CMD）" || bad "auto-approve 审计缺 requestId：$AUTO_CMD"
+
+echo "== 19. 指纹绑定（M2.98，identity-binding.md §10.3）：命中静默放行 + 失配拒绝 + 审计 =="
+# 被绑定 exe 须放在本脚本进程的 PATH 上（Windows）：守护进程经对端 PEB env
+# 的 PATH 解析 command[0] 校指纹，且 `lk inject` 的 CreateProcess 也按 PATH 查
+# 裸命令名 —— 双端一致才能命中后真正把子进程跑起来（薄证静默放行）。
+# 平台取一个可独立运行的裸 PE/ELF：Windows whoami.exe（打印当前用户）、
+# Linux /bin/true（无输出 exit 0），均与改名无关、各平台必有。
+FPBIN="$PROJ/.fpbin"
+mkdir -p "$FPBIN"
+FP_SRC=""
+if [ -f /c/Windows/System32/whoami.exe ]; then FP_SRC=/c/Windows/System32/whoami.exe
+elif [ -f /usr/bin/true ]; then FP_SRC=/usr/bin/true
+fi
+if [ -z "$FP_SRC" ]; then
+  bad "找不到可用作指纹绑定 exe 的原生程序（windows whoami / linux true）"
+else
+  cp "$FP_SRC" "$FPBIN/fptool.exe" 2>/dev/null || cp "$FP_SRC" "$FPBIN/fptool"
+  # cygpath 存在时给出 Windows 形态路径（供 daemon finalize 侧 recompute 用）
+  FP_BK="$FPBIN/fptool.exe"
+  [ -f "$FPBIN/fptool" ] && FP_BK="$FPBIN/fptool"
+  [ -n "$(command -v cygpath 2>/dev/null)" ] && FP_BK="$(cygpath -w "$FP_BK")"
+  # 绑定规则创建（走规则门：LIGHTKEY_E2E_AUTO_APPROVE=rule 已在脚本头设置）+
+  # 审计 command=rule.add；daemon finalize 侧重算 canonical+hash 固化
+  "$LK" rule add "$PROJ" --inject --name fp-bound --keys NPM_TOKEN --fingerprint "$FP_BK" >/dev/null 2>"$WORK/fp.err"
+  check "rule add --inject --fingerprint（规则门 auto-approve）" 0 $?
+  FP_RULE="$("$LK" rule list | grep fp-bound || true)"
+  if echo "$FP_RULE" | grep -q "sha256:"; then
+    ok "rule list 展示绑定指纹（canonical 路径 + sha256 摘要）"
+  else
+    bad "rule list 缺指纹列：$FP_RULE"
+  fi
+  # 命中：把 FPGA 所在目录前置到 PATH（对端 env PATH），在该项目内 inject →
+  # daemon 经 PATH 解析 fptool 并比对指纹 → 静默放行（无弹窗）+ 子进程跑起来
+  export PATH="$FPBIN:$PATH"
+  ( cd "$PROJ" && "$LK" inject --keys NPM_TOKEN -- fptool.exe >"$WORK/fp_hit.out" 2>"$WORK/fp_hit.err" )
+  check "指纹绑定命中 → 静默放行（exit 0）" 0 $?
+  if grep -q "已拒绝" "$WORK/fp_hit.err"; then
+    bad "绑定命中仍被拒绝：$(cat "$WORK/fp_hit.err")"
+  else
+    ok "绑定命中不弹窗（无拒绝文案）"
+  fi
+  FP_ALLOWED=$("$LK" audit --json | jq '[.[] | select(.command | startswith("lk inject")) | select(.result == "allowed")] | length')
+  [ "${FP_ALLOWED:-0}" -ge 1 ] && ok "审计含 lk inject allowed（指纹命中静默放行）" || bad "审计缺 lk inject allowed"
+  # 失配：就地改写被绑定 exe（内容变 → hash 变）→ 再 inject → 视同未命中 →
+  # headless 拒绝（无审批界面，同码）+ 审计 denied；**指纹通道不扩展 auto-approve**
+  printf '#!/bin/sh\n# MUTATED content so fingerprint mismatches\necho MUTATED\n' > "$FPBIN/fptool.exe"
+  sleep 0.1
+  ( cd "$PROJ" && "$LK" inject --keys NPM_TOKEN -- fptool.exe >/dev/null 2>"$WORK/fp_mis.err" )
+  check "指纹失配 → headless 拒绝（exit 1）" 1 $?
+  if grep -q "无审批界面" "$WORK/fp_mis.err"; then
+    ok "失配拒绝文案与未命中共用（无审批界面，不新增错误码）"
+  else
+    bad "失配拒绝文案不符：$(cat "$WORK/fp_mis.err")"
+  fi
+  FP_DENIED=$("$LK" audit --json | jq '[.[] | select(.command | startswith("lk inject")) | select(.result == "denied")] | length')
+  [ "${FP_DENIED:-0}" -ge 1 ] && ok "审计含 lk inject denied（失配拒绝记录）" || bad "审计缺 lk inject denied"
+  # 不扩展 auto-approve 到指纹通道（写门口径同源）：失配 inject 落 cli 通道的
+  # denied（而非被 auto-approve 放行）；audit 明细核验 channel != auto-approve
+  FP_DENIED_CH=$("$LK" audit --json | jq -r '[.[] | select(.command | startswith("lk inject")) | select(.result == "denied")][0].channel')
+  if [ "$FP_DENIED_CH" != "auto-approve" ]; then
+    ok "指纹失配非 auto-approve（channel=$FP_DENIED_CH，不扩展到指纹通道）"
+  else
+    bad "指纹失配被 auto-approve？（channel=$FP_DENIED_CH）"
+  fi
+  OLD_PATH="$PATH"
+  PATH="$(printf '%s\n' "$OLD_PATH" | sed "s|$FPBIN:||")"
+  export PATH
+  FP_RULE=
+fi
 
 echo
 echo "M2 E2E：$PASS 通过 / $FAIL 失败"
