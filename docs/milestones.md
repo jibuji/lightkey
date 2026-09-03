@@ -302,7 +302,7 @@ milestones、decisions #24 状态翻转、AGENTS.md、CONTEXT.md）；写门 iss
 > M2.95 之后、M3 之前）；已按 write-gate.md §11 PR A-D 序列落地
 > （issues #112-#115）。
 
-## M2.98 —— 规则程序指纹绑定（identity binding）（规划中，未实现）
+## M2.98 —— 规则程序指纹绑定（identity binding）（已完成）
 
 **目标**：补充拍板 #25（2026-09-02 identity-binding grilling 拍板）——规则
 **可选**绑定程序指纹（canonical 路径 + SHA-256），授权目标从「目录 + 命令
@@ -332,7 +332,9 @@ data-model、milestones、decisions #25 状态翻转、AGENTS.md、CONTEXT.md �
 指纹词条）；issue 立项并关闭。
 
 > 本里程碑为 identity-binding grilling 会话拍板（补充拍板 #25）新增（插入
-> M2.97 之后、M3 之前）；现状未实现。
+> M2.97 之后、M3 之前）；**已按 identity-binding.md §11 PR A-D 序列落地**
+> （issues #123-#126，父立项 #121）。**read/write 调用方链绑定按 spec §12
+> 默认仅字段预留**，不落地 CLI/UI（适用边界=独立工具二进制场景，文档明示）。
 
 ## M3 —— 浏览器填充（V1 之后）
 

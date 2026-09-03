@@ -1,7 +1,8 @@
 # 规则程序指纹绑定规格（identity-binding，M2.98）
 
-- 状态：**已设计定稿**（2026-09-02 identity-binding grilling-with-docs 会话收敛
-  拍板；**待实现**——按交付纪律登记 decisions #25 后走 PR CI 门禁落地）
+- 状态：**已实现**（2026-09-02 identity-binding grilling-with-docs 会话收敛
+  拍板；M2.98 PR A-D 序列经 PR CI 门禁落地——lk-core / lk-daemon / lk-cli+E2E /
+  前端+收尾，issues #123/#124/#125/#126，父立项 #121）
 - 关联：[authorization-gate.md](authorization-gate.md)（三层模型 / 规则 /
   §11 摘要）· [value-disclosure.md](value-disclosure.md)（读规则）·
   [write-gate.md](write-gate.md)（写规则；§9 曾把 exe+哈希留档为整体可选
@@ -225,19 +226,18 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
 
 ## 11. 交付切分
 
-建议 PR 序列（各自出口全绿，走 PR CI 门禁）：
+建议 PR 序列（各自出口全绿，走 PR CI 门禁）——**已按此序列全部落地**：
 
-1. **PR A（lk-core）**：`ProgramFingerprint` + `Rule.fingerprint`（serde
+1. **PR A（lk-core，#123）**：`ProgramFingerprint` + `Rule.fingerprint`（serde
    default）+ 比对序与匹配 + PATH 解析纯函数 + 流式哈希工具 + 单测（§10.1）；
-2. **PR B（lk-daemon）**：对端 env PATH 读取（Linux/Windows 本期，
+2. **PR B（lk-daemon，#124）**：对端 env PATH 读取（Linux/Windows 本期，
    macOS fail-closed）+ 内存指纹缓存/元信息失效 + 审批 finalize 侧指纹
    计算 + 失配路径/弹窗主题 + 集成测试（§10.2）；
-3. **PR C（lk-cli + E2E）**：`lk rule add` 指纹形态（实现注记：与
-   `--read`/`--write` 同款省略 command）如
-   `lk rule add <projectDir> --inject --name <规则名> --keys <name...> --fingerprint <exePath>`、
+3. **PR C（lk-cli + E2E，#125）**：`lk rule add --fingerprint <exePath>`（与
+   `--read`/`--write` 同款省略 command，命令由可执行文件 basename 推导）、
    失配文案、脚本扩展（§10.3）；
-4. **PR D（前端 + 收尾）**：弹窗指纹主题 + 重新授权按钮 + vitest + 文档
-   收口（authorization-gate §11 状态翻转「已实现」、ipc/cli/agent-cli/
+4. **PR D（前端 + 收尾，#126）**：弹窗指纹主题 + 重新授权按钮 + vitest +
+   文档收口（authorization-gate §11 状态翻转「已实现」、ipc/cli/agent-cli/
    data-model/milestones、decisions #25 状态翻转、issue 立项关闭）。
 
 ## 12. 开放问题（默认值已定，改动需重新拍板）
