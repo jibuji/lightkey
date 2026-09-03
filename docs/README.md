@@ -29,9 +29,10 @@
 | [audit.md](audit.md) | 审计日志格式、HMAC 防篡改、保留策略 | M0 |
 | [recovery.md](recovery.md) | 恢复码、恢复信封、已信任设备宽限 | M0 |
 | [sync.md](sync.md) | BYO 同步、变更发现（轮询）、冲突收敛 | M1 |
-| [authorization-gate.md](authorization-gate.md) | Agent 授权门三层模型、规则库、`lk inject`、读通道一体化解锁（§5.2，补充拍板 #23）、规则管理审批门（§9，补充拍板 #22）、写入授权门摘要（§10，补充拍板 #24，规划中） | M2 / M2.95 / M2.97 |
+| [authorization-gate.md](authorization-gate.md) | Agent 授权门三层模型、规则库、`lk inject`、读通道一体化解锁（§5.2，补充拍板 #23）、规则管理审批门（§9，补充拍板 #22）、写入授权门摘要（§10，补充拍板 #24）、规则程序指纹绑定摘要（§11，补充拍板 #25） | M2 / M2.95 / M2.97 / M2.98 |
 | [value-disclosure.md](value-disclosure.md) | 值披露裁决：`item.get`/`item.export` 升为裁决方法、读规则、锁态一体化弹窗（补充拍板 #20/#23，issue #65/#105） | M2.9 / M2.95 |
-| [write-gate.md](write-gate.md) | 写入授权门（唯一实现规格）：`item.put`/`item.delete` 升裁决方法、写规则（capability=write + actions）、delete 恒弹窗（补充拍板 #24，规划中） | M2.97 |
+| [write-gate.md](write-gate.md) | 写入授权门（唯一实现规格）：`item.put`/`item.delete` 升裁决方法、写规则（capability=write + actions）、delete 恒弹窗（补充拍板 #24，已实现） | M2.97 |
+| [identity-binding.md](identity-binding.md) | 规则程序指纹绑定（唯一实现规格）：可选绑定可执行文件（canonical 路径 + SHA-256）、失配视同未命中 + 弹窗「以新指纹重新授权」、内存指纹缓存（补充拍板 #25，已实现） | M2.98 |
 | [cross-subsystem.md](cross-subsystem.md) | 跨子系统 stdio 桥（WSL CLI ↔ Windows 桌面守护实例；补充拍板 #14） | M2.75 |
 | [testing-cross-subsystem.md](testing-cross-subsystem.md) | 跨子系统桥测试 Runbook：下载哪些 Release 产物、安装步骤、E2E/手动测试与排障 | M2.75 |
 | [browser-fill.md](browser-fill.md) | 浏览器填充通道协议（Native Messaging） | M3 |

@@ -155,14 +155,18 @@
   「记住」仅 put（最小写规则 keys=[条目名]+actions=[create,update]）、
   delete 无记住；规则页展示 capability+actions、审计页 §8 口径；E2E 不扩
   auto-approve；同步应用不受门、真相源投毒为已知限制。issues #112-#115。
-- [ ] M2.98 规则程序指纹绑定（补充拍板 #25 草案，2026-09-02 拍板，待实现；
-  spec 唯一出处 `docs/identity-binding.md`）：规则可选绑定可执行文件身份
-  （canonical 路径 + SHA-256；注入绑定被注入命令二进制、读/写可选绑定调用
-  方链限独立工具二进制场景）；失配视同未命中走弹窗 +「以新指纹重新授权」；
-  大文件内存指纹缓存 + 元信息失效 + 64 MiB 阈值 + size 快速失配门；解析在
-  daemon 侧（Linux procfs / Windows PEB / macOS KERN_PROCARGS2，macOS 失败
-  fail-closed）；防「冒充」而「就地改写授权二进制」仍属 #15/#20 边界外。
-  exe+哈希身份绑定由 write-gate.md §9 留档升级为正式立项。
+- [x] M2.98 规则程序指纹绑定（补充拍板 #25，2026-09-02 拍板，已实现；spec
+  唯一出处 `docs/identity-binding.md`，PR 序列 issues #123-#126，父立项 #121）：
+  规则可选绑定可执行文件身份（canonical 路径 + SHA-256 + 固化时大小；注入
+  绑定被注入命令二进制、读/写调用方链按 spec §12 仅字段预留限独立工具
+  二进制场景）；失配视同未命中走弹窗（明示「指纹不符」+ 路径 + 8 位摘要 +
+  「以新指纹重新授权」→ 规则门 finalize 侧重算指纹落盘）/ headless 统一
+  `authz.denied`；大文件内存指纹缓存 + 元信息失效 + 64 MiB 阈值 + size 快速
+  失配门；解析在 daemon 侧（Linux procfs / Windows PEB / macOS KERN_PROCARGS2，
+  macOS 失败 fail-closed）；防「冒充」而「就地改写授权二进制」仍属 #15/#20
+  边界外。前端 `authz.request` 帧带 `fingerprintMismatch`（resolvedExePath +
+  sha256Short 8 位前缀）。exe+哈希身份绑定由 write-gate.md §9 留档升级为
+  正式立项。
 - [ ] M3 浏览器填充
 
 ## Agent skills
