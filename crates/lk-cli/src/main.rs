@@ -168,8 +168,11 @@ enum RuleCommand {
     /// 注入规则：`lk rule add <projectDir> <command> --name <name> <keys...>`
     /// 读值规则（M2.9）：`lk rule add <projectDir> --read --name <name> --keys <name...>`
     /// 写规则（M2.97）：`lk rule add <projectDir> --write [--actions create,update] --name <name> --keys <name...>`
-    /// （读/写规则无 command 绑定，keys 经 `--keys` 选项给出——位置 keys 会被
-    /// 可选的 `<command>` 占位吞掉，选项形态与 `lk inject --keys` 一致）
+    /// 指纹绑定注入规则（M2.98）：`lk rule add <projectDir> --inject --name <name> --keys <name...> --fingerprint <exePath>`
+    /// （读/写/指纹规则无 command 位置绑定，keys 经 `--keys` 选项给出——位置
+    /// keys 会被可选的 `<command>` 占位吞掉，选项形态与 `lk inject --keys` 一致；
+    /// `--fingerprint <exePath>` 把规则绑定到该可执行文件的 canonical 路径 +
+    /// SHA-256，daemon 侧固化，失配视同未命中）
     Add {
         /// 项目目录（规范化绝对路径；须存在。以 / 开头且非现存本机路径时
         /// 按 WSL 默认发行版解析为 wsl://… 并回显确认）
@@ -192,11 +195,22 @@ enum RuleCommand {
         /// create,update；传 delete 被拒绝（删除恒弹窗由协议保证）
         #[arg(long, value_name = "ACTIONS", requires = "write")]
         actions: Option<String>,
-        /// 授权注入的 key 名（1~32 个；值不可见、名可指名）；--read/--write
-        /// 时语义为条目名
+        /// 注入规则（M2.98 指纹形态）：绑定被注入命令的可执行文件身份；
+        /// `<command>` 位置省略（命令由 --fingerprint 的可执行文件 basename
+        /// 推导），keys 经 `--keys` 选项给出。与 `--read`/`--write` 互斥
+        #[arg(long, conflicts_with_all = ["read", "write"])]
+        inject: bool,
+        /// 程序指纹绑定（仅 --inject）：要绑定的可执行文件绝对路径
+        /// （daemon 在审批 finalize 侧重算 canonical 路径 + SHA-256 固化；
+        /// 不信任客户端上报）。**read/write 调用方链绑定仅字段预留**（spec
+        /// §12 口径：终端/IDE/脚本的 starter 不稳定），不与 --read/--write 共用
+        #[arg(long, value_name = "EXEPATH", requires = "inject")]
+        fingerprint: Option<String>,
+        /// 授权注入的 key 名（1~32 个；值不可见、名可指名）；--read/--write/
+        /// --inject(--fingerprint) 时语义为条目名
         keys: Vec<String>,
-        /// 读/写规则的条目名列表（`--read`/`--write` 时使用，与
-        /// `lk inject --keys` 同形态；此时忽略位置 keys）
+        /// 读/写/指纹规则的条目名列表（`--read`/`--write`/`--inject` 时使用，
+        /// 与 `lk inject --keys` 同形态；此时忽略位置 keys）
         #[arg(long = "keys", num_args = 1.., value_name = "NAME")]
         opt_keys: Vec<String>,
     },
@@ -1928,6 +1942,8 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
             name,
             read,
             write,
+            inject,
+            fingerprint,
             actions,
             keys,
             opt_keys,
@@ -1939,6 +1955,56 @@ fn cmd_rule(out: &mut impl Write, dir: &std::path::Path, cmd: &RuleCommand, json
             } else {
                 None
             };
+            // 指纹形态（M2.98）：注入规则绑定被注入命令的可执行文件身份。
+            // --fingerprint 仅配合 --inject（clap requires 已钉);与
+            // --read/--write 互斥（clap conflicts_with 已在声明层拦截，这里
+            // 再显式兜底——绝不静默丢参数）。读/写调用方链绑定仅字段预留
+            // （identity-binding.md §12：终端/IDE/脚本 starter 不稳定），
+            // 用法层用 spec §12 口径明确报错。
+            if fingerprint.is_some() {
+                if *read || *write {
+                    eprintln!(
+                        "lk rule add: --fingerprint 仅配合 --inject 注入规则使用；\
+                         read/write 调用方链绑定当前仅作字段预留（identity-binding.md §12：\
+                         终端/IDE/脚本场景 starter 不稳定，升级即失配），请用 --inject --fingerprint"
+                    );
+                    return 2;
+                }
+                return rule_add_fingerprint(
+                    out,
+                    dir,
+                    project_dir,
+                    name,
+                    fingerprint.as_deref().unwrap(),
+                    opt_keys,
+                    json_out,
+                );
+            }
+            if *inject {
+                if *read || *write {
+                    eprintln!("lk rule add: --inject 与 --read/--write 互斥（fingerprint 绑定仅注入规则）");
+                    return 2;
+                }
+                if !keys.is_empty() {
+                    eprintln!("lk rule add: --inject 规则的 key 名请经 --keys <name...> 给出（位置参数留给 <command> 或省略）");
+                    return 2;
+                }
+                if opt_keys.is_empty() {
+                    eprintln!("lk rule add: --inject 需要 --keys <name...> 指名可注入 key 名");
+                    return 2;
+                }
+                return cmd_rule_add(
+                    out,
+                    dir,
+                    project_dir,
+                    name,
+                    command.clone(),
+                    opt_keys,
+                    None,
+                    None,
+                    json_out,
+                );
+            }
             // --read/--write：keys 经 --keys 选项（位置 keys 被可选 <command>
             // 占位，无 command 可省略）；注入规则：keys 位置参数
             if *read || *write {
@@ -2063,6 +2129,68 @@ fn cmd_rule_add(
     actions: Option<&[String]>,
     json_out: bool,
 ) -> i32 {
+    cmd_rule_add_inner(
+        out,
+        dir,
+        project_dir,
+        name,
+        command,
+        keys,
+        capability,
+        actions,
+        None,
+        json_out,
+    )
+}
+
+/// 指纹形态分流：`--fingerprint <exePath>` → [`cmd_rule_add_inner`]
+/// （capability=inject 缺省；command 位置省略/推导；指纹由 daemon 固化）。
+fn rule_add_fingerprint(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    project_dir: &str,
+    name: &str,
+    exe_path: &str,
+    keys: &[String],
+    json_out: bool,
+) -> i32 {
+    if keys.is_empty() {
+        eprintln!("lk rule add: --fingerprint 需要 --keys <name...> 指名可注入 key 名");
+        return 2;
+    }
+    if !std::path::Path::new(exe_path).exists() {
+        eprintln!(
+            "lk rule add: --fingerprint 的可执行文件不存在：{exe_path}（须为本机现存绝对路径）"
+        );
+        return 2;
+    }
+    cmd_rule_add_inner(
+        out,
+        dir,
+        project_dir,
+        name,
+        None,
+        keys,
+        None,
+        None,
+        Some(exe_path),
+        json_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_rule_add_inner(
+    out: &mut impl Write,
+    dir: &std::path::Path,
+    project_dir: &str,
+    name: &str,
+    command: Option<String>,
+    keys: &[String],
+    capability: Option<&str>,
+    actions: Option<&[String]>,
+    fp_exe: Option<&str>,
+    json_out: bool,
+) -> i32 {
     use std::io::IsTerminal;
     if keys.is_empty() {
         eprintln!("lk rule add: 至少需要 1 个 key 名（值不可见、名可指名）");
@@ -2070,8 +2198,21 @@ fn cmd_rule_add(
     }
     // --read（读值规则）/ --write（写规则，M2.97）：command 位置参数省略，
     // 以空串入库（write-gate.md §7）；注入规则：command 必填
+    // --fingerprint（M2.98 指纹绑定注入）：command 位置省略，命令形态由
+    // --fingerprint 的可执行文件 basename 推导（如 /usr/bin/npm → "npm"，
+    // 使 `lk inject --keys A -- npm args` 命中该规则的形式层）
     let no_command = capability == Some("read") || capability == Some("write");
-    let command_owned: String = if no_command {
+    let command_owned: String = if let Some(fp) = fp_exe {
+        if command.is_some() {
+            eprintln!("lk rule add: --inject --fingerprint 规则不绑定 <command> 位置参数（命令由可执行文件 basename 推导，请省略）");
+            return 2;
+        }
+        // basename（去目录与后缀? —— 保留可执行文件原语名，如 "npm"）
+        std::path::Path::new(fp)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else if no_command {
         if command.is_some() {
             eprintln!("lk rule add: --read/--write 规则不绑定命令，请省略 <command> 位置参数");
             return 2;
@@ -2145,7 +2286,21 @@ fn cmd_rule_add(
             },
         };
     }
-    match client_for(dir).rule_add(&canonical, name, command, keys, capability, actions) {
+    match client_for(dir).rule_add(
+        &canonical,
+        name,
+        command,
+        keys,
+        capability,
+        actions,
+        fp_exe.map(|fp| lk_core::model::ProgramFingerprint {
+            // 请求侧仅声明「绑哪个 exe」；sha256/size 由 daemon 审批 finalize
+            // 侧重算固化（identity-binding.md §5.3，不信任客户端上报）。
+            exe_path: fp.to_string(),
+            sha256: String::new(),
+            size: 0,
+        }),
+    ) {
         Ok(rule) => {
             if json_out {
                 let _ = writeln!(
@@ -2360,15 +2515,26 @@ fn cmd_rule_list(out: &mut impl Write, dir: &std::path::Path, json_out: bool) ->
                     } else {
                         "-".to_string()
                     };
+                    // 指纹绑定列（M2.98，identity-binding.md §4）：展示绑定的
+                    // 可执行文件 canonical 路径（sha256 不示全值，展示 8 位摘要）
+                    let fp_col = r
+                        .fingerprint
+                        .as_ref()
+                        .map(|fp| {
+                            let short = fp.sha256.chars().take(8).collect::<String>();
+                            format!("fp={} sha256:{}", fp.exe_path, short)
+                        })
+                        .unwrap_or_else(|| "-".to_string());
                     let _ = writeln!(
                         out,
-                        "{}\t{}\t{}\t{}\t[{}]\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t[{}]\t{}\t{}\t{}",
                         r.id,
                         r.name,
                         r.project_dir,
                         r.command,
                         r.capability,
                         actions,
+                        fp_col,
                         r.keys.join(",")
                     );
                 }
@@ -3029,6 +3195,81 @@ mod write_rule_add_tests {
     fn write_gate_denied_text_pins_hint() {
         assert!(WRITE_GATE_DENIED_TEXT.contains("写入被授权门拒绝"));
         assert!(WRITE_GATE_DENIED_TEXT.contains("rule add <projectDir> --write"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M2.98 指纹绑定（identity-binding.md §10.3，issue #125）：`rule_add_fingerprint`
+// 分流入口的校验分支（不触 daemon，纯本地）。`--inject --fingerprint <exePath>`
+// 的完整命中/失配行为由 e2e_m2.sh §19 断言（对端 env PATH + 真实 exe）。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod fingerprint_rule_add_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// 空 keys → 明确报错（--keys 必填；不能静默创建一个不指名任何 key 的规则）。
+    #[test]
+    fn fingerprint_requires_keys() {
+        let mut out = Vec::new();
+        let code = rule_add_fingerprint(
+            &mut out,
+            Path::new("."),
+            "/tmp/proj",
+            "fp",
+            "/usr/bin/npm",
+            &[],
+            false,
+        );
+        assert_eq!(code, 2, "无 --keys 应拒绝");
+        assert!(out.is_empty(), "校验失败不写 stdout");
+    }
+
+    /// 被绑定 exe 不存在 → 明确报错（须为本机现存绝对路径；避免 daemon finalize
+    /// 重算才暴露、造成「规则建成功但无指纹」的困惑）。
+    #[test]
+    fn fingerprint_rejects_nonexistent_exe() {
+        let mut out = Vec::new();
+        // 确定不存在的路径
+        #[cfg(windows)]
+        let exe = r"C:\definitely_not_present_xxxx\npm.exe";
+        #[cfg(not(windows))]
+        let exe = "/definitely_not_present_xxxx/npm";
+        let code = rule_add_fingerprint(
+            &mut out,
+            Path::new("."),
+            "/tmp/proj",
+            "fp",
+            exe,
+            &["TOKEN".to_string()],
+            false,
+        );
+        assert_eq!(code, 2, "被绑定 exe 不存在应拒绝");
+    }
+
+    /// 存在的 exe → 通过本地校验（不误拒现存路径），随后进入 `cmd_rule_add_inner`
+    /// 尝试连接守护实例（本项目内无 daemon）→ 返回非零（传输/连接失败），即
+    /// 验证本地校验层不卡在「存在性检查」而先放行。
+    #[test]
+    fn fingerprint_accepts_existing_exe_then_reaches_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("tool.exe");
+        std::fs::write(&exe, b"MZ fake").unwrap();
+        let mut out = Vec::new();
+        let code = rule_add_fingerprint(
+            &mut out,
+            tmp.path(),
+            &tmp.path().to_string_lossy(),
+            "fp",
+            &exe.to_string_lossy(),
+            &["TOKEN".to_string()],
+            false,
+        );
+        assert!(
+            code != 0,
+            "进入 cmd_rule_add_inner 后（本环境无守护实例）应非零失败，实测 {code}"
+        );
     }
 }
 
