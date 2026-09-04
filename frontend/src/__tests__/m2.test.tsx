@@ -1074,6 +1074,199 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
   });
 });
 
+describe("M2.98 程序指纹失配审批弹窗（kind=inject + fingerprintMismatch；identity-binding.md §7）", () => {
+  /** 失配帧参数（绑定注入规则命中命令形态但指纹不符）。 */
+  const mismatchParams = {
+    requestId: "req-fp-1",
+    starter: "claude",
+    projectDir: "/work/proj-a",
+    command: "npm publish",
+    keys: ["NPM_TOKEN"],
+    kind: "inject" as const,
+    fingerprintMismatch: {
+      resolvedExePath: "C:\\Program Files\\nodejs\\npm.cmd",
+      sha256Short: "a1b2c3d4",
+    },
+  };
+
+  it("失配帧：主题明示「指纹不符/可能已更新」+ 路径 + 8 位摘要 + 三按钮，不渲染完整哈希", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    act(() => {
+      mock.simulateAuthzRequest(mismatchParams);
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const text = dialog.textContent ?? "";
+    // 主题：程序指纹与规则不符（可能已更新）
+    expect(text).toContain("程序指纹与规则不符");
+    expect(text).toContain("可能已更新");
+    // 展示当前解析路径（不改写为 basename 之外的形式——原样展示）
+    expect(text).toContain("C:\\Program Files\\nodejs\\npm.cmd");
+    // 8 位 SHA-256 前缀摘要（不展示完整值）
+    expect(text).toContain("a1b2c3d4");
+    // 三按钮：拒绝 / 本次允许 / 以新指纹重新授权
+    const btns = Array.from(dialog.querySelectorAll("button")).map((b) =>
+      b.textContent!.trim(),
+    );
+    expect(btns.some((t) => t.includes("拒绝"))).toBe(true);
+    expect(btns.some((t) => t.includes("允许本次"))).toBe(true);
+    expect(btns.some((t) => t.includes("以新指纹重新授权"))).toBe(true);
+    // kind 仍为 inject：渲染 $ 命令框（失配 = 视同未命中的 inject 审批）
+    expect(dialog.querySelector(".approval-cmd-box")!.textContent).toContain("npm publish");
+    // 未操作：不回传、不触发 ruleAdd
+    expect(resultSpy).not.toHaveBeenCalled();
+    expect(ruleSpy).not.toHaveBeenCalled();
+  });
+
+  it("sha256Short 为 64 位完整哈希（协议外防御）→ UI 只展示前 8 位", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    // 直接经订阅发帧（绕开 simulateAuthzRequest 的类型面，模拟恶意/未来帧）
+    act(() => {
+      mock.simulateAuthzRequest({
+        ...mismatchParams,
+        requestId: "req-fp-fullhash",
+        fingerprintMismatch: {
+          resolvedExePath: "/usr/bin/npm",
+          sha256Short: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        },
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const text = dialog.textContent ?? "";
+    // 只显示 8 位前缀；完整 64 位值绝不出现在 DOM
+    expect(text).toContain("abcdef01");
+    expect(text).not.toContain("abcdef0123456789abcdef0123456789");
+  });
+
+  it("「以新指纹重新授权」→ 允许当前审批 + ruleAdd（fingerprint 仅 exePath，capability=inject）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    act(() => {
+      mock.simulateAuthzRequest(mismatchParams);
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const reauthBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("以新指纹重新授权"),
+    )!;
+    act(() => {
+      reauthBtn.click();
+    });
+    await act(async () => {
+      // approvalResult 与 ruleAdd 各有 300ms 模拟延迟
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    // 本次允许（失配帧走普通 allowed 回传）
+    expect(resultSpy).toHaveBeenCalledWith("req-fp-1", "allowed", "mock-challenge");
+    // 重新授权追加规则更新请求（仅绑定规则命中失配的审批帧）：capability=inject、
+    // 绑定当前解析路径（daemon finalize 侧重算 sha/size，前端只声明 exePath）
+    expect(ruleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectDir: "/work/proj-a",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+        capability: "inject",
+        fingerprint: { exePath: "C:\\Program Files\\nodejs\\npm.cmd" },
+      }),
+    );
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+
+  it("「本次允许」（失配帧）→ 仅回传 allowed，不追加 ruleAdd（一次性放行）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    act(() => {
+      mock.simulateAuthzRequest(mismatchParams);
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    const allowBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许本次"),
+    )!;
+    act(() => {
+      allowBtn.click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(resultSpy).toHaveBeenCalledTimes(1);
+    expect(resultSpy).toHaveBeenCalledWith("req-fp-1", "allowed", "mock-challenge");
+    expect(ruleSpy).not.toHaveBeenCalled();
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+
+  it("非失配 inject 帧：无「以新指纹重新授权」按钮（仅绑定规则失配帧提供）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-fp-none",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "npm publish",
+        keys: ["NPM_TOKEN"],
+        kind: "inject",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    expect(
+      Array.from(dialog.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("以新指纹重新授权"),
+      ),
+    ).toBe(false);
+  });
+
+  it("畸形 fingerprintMismatch（缺 resolvedExePath / 非字符串）→ 防御：不 crash、按普通 inject 渲染、无重新授权按钮", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    for (const bad of [
+      { resolvedExePath: "", sha256Short: "a1b2c3d4" },
+      { resolvedExePath: 42, sha256Short: "a1b2c3d4" },
+      { resolvedExePath: "/usr/bin/npm", sha256Short: "" },
+      null,
+      "oops",
+    ]) {
+      act(() => {
+        mock.simulateAuthzRequest({
+          requestId: `req-fp-bad-${Math.random()}`,
+          starter: "claude",
+          projectDir: "/work/proj-a",
+          command: "npm publish",
+          keys: ["NPM_TOKEN"],
+          kind: "inject",
+          fingerprintMismatch: bad as never,
+        });
+      });
+      await flushApproval();
+      // 不 crash，弹窗在场；无失配主题/路径/摘要与重新授权按钮（防御渲染）
+      const dialog = document.body.querySelector(".approval-dialog")!;
+      expect(dialog).not.toBeNull();
+      expect(dialog.textContent).not.toContain("程序指纹与规则不符");
+      expect(
+        Array.from(dialog.querySelectorAll("button")).some((b) =>
+          b.textContent?.includes("以新指纹重新授权"),
+        ),
+      ).toBe(false);
+      act(() => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+    }
+  });
+});
+
 describe("M2.97 规则页 / 审计页展示（write-gate.md §6/§8）", () => {
   it("规则列表：write 规则展示 capability + actions Tag；read 规则同现状；旧 inject 规则（capability 缺省）按命令展示", async () => {
     const { ctx } = await mountHost();

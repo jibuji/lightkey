@@ -40,7 +40,7 @@
 | `lk item get <id> --json` | 条目对象（含值，按类型分形） | 错误对象（`authz.denied` 见 §6） |
 | `lk item get --name <名> --json` | 同上（先经 item.list 解析 id，裁决路径与 id 版完全一致） | 错误对象；重名 → `item.name_ambiguous` exit 2 |
 | `lk item export <id> --output <p> --json` | 人类文案（附件写文件，不 JSON 化） | 错误对象（export 恒弹窗，headless 必拒） |
-| `lk rule add … --json` | 规则对象 | 错误对象 |
+| `lk rule add … --json` | 规则对象 | 错误对象（M2.98 `--fingerprint` 形态：`lk rule add <projectDir> --inject --name <规则名> --keys <名...> --fingerprint <exePath>`，省略 command） |
 | `lk rule list --json` | 规则数组 | 错误对象 |
 | `lk rule remove <id> --json` | 人类文案 | 错误对象 |
 | `lk inject --keys … -- <cmd> --json` | **零输出**（退出码 = 子进程退出码） | 裁决拒绝 → `{"allowed":false,"reason":…}`（§4.3）；RPC 失败 → 错误对象 |
@@ -156,7 +156,7 @@ stdout 直接是数组（不包对象），元素为条目摘要：
 
 | 命令 | 解锁态 + 桌面 UI 在场 | 解锁态 headless（无 UI） | 锁定态 + 桌面 UI 在场 | 锁定态 headless |
 |------|----------------------|--------------------------|----------------------|-----------------|
-| `lk inject` | 无规则 → 审批弹窗（30s，默认拒绝） | 无规则 → `{"allowed":false,"reason":"no_ui"}` | **一体化弹窗**（主密码 + Allow/Deny 一次交互，#67/M2.8） | `session.invalid` 错误对象 |
+| `lk inject` | 无规则 → 审批弹窗（30s，默认拒绝）；**绑定注入规则命中命令形态但指纹不符 → 同审批弹窗但明示「指纹不符」主题**（M2.98，identity-binding.md §7；视同未命中、不新增错误码） | 无规则 → `{"allowed":false,"reason":"no_ui"}`（指纹失配同口径） | **一体化弹窗**（主密码 + Allow/Deny 一次交互，#67/M2.8） | `session.invalid` 错误对象 |
 | `lk item get`（id 或 --name） | 无读规则 → 读值弹窗 | `authz.denied` | **一体化弹窗**（主密码 + 解锁并允许一次交互，#23/M2.95） | `session.invalid` |
 | `lk item export` | **恒弹窗**（读规则也不豁免） | `authz.denied` | **一体化弹窗**（主密码 + 解锁并允许一次交互，#23/M2.95） | `session.invalid` |
 | `lk item add` / `lk item edit` | 写规则命中 → 静默放行；未命中 → 写审批弹窗（30s，默认拒绝；update 双向名称约束） | `authz.denied` | `session.invalid`（写门不弹解锁窗） | `session.invalid` |
@@ -184,6 +184,12 @@ stdout 直接是数组（不包对象），元素为条目摘要：
 - `item export`：恒弹窗，无规则豁免路径。
 - `inject`：注入规则白名单（projectDir + command + keys）→ 静默放行；
   否则弹窗；拒绝以 `{"allowed":false,"reason":…}` 呈现（§4.3）。
+- **程序指纹（M2.98，identity-binding.md §7）**：绑定注入规则命中命令形态
+  但可执行文件指纹不符 → **视同未命中**——GUI 在场走弹窗（「指纹不符」主题
+  + 路径 + 8 位摘要 +「以新指纹重新授权」= `rule add --fingerprint <exePath>`
+  重新授权），headless 统一 `authz.denied` / `{"allowed":false,"reason":"no_ui"}`
+  （与未命中同码，防探测，不给「规则存在但指纹不符」的枚举信号）。read/write
+  调用方链绑定按 spec §12 仅字段预留（独立工具二进制场景），不落地 CLI。
 - 读规则与注入规则**能力不互授**（read 规则不授权 inject，反之亦然；
   M2.97 起扩 write——三能力两两不互授）。
 - 写命令（M2.97 已实现）：`item add/edit` 走写规则（`rule add --write`）/

@@ -339,6 +339,16 @@ mark.hl { background: rgba(240, 138, 60, 0.28); color: var(--fg-0); border-radiu
 
 /* ---------- 规则页 ---------- */
 .rule-card { background: var(--bg-1); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-3); }
+/* M2.98 规则页程序指纹绑定行（basename + 8 位前缀，完整路径在 title）。 */
+.rule-fp {
+  margin-top: 8px;
+  font-size: var(--fs-xs);
+  color: var(--fg-2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
 .rule-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); }
 .rule-dir { display: flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--fg-2); }
 .rule-cmd { font-family: var(--font-mono); font-weight: 600; font-size: var(--fs-md); }
@@ -652,6 +662,34 @@ mark.hl { background: rgba(240, 138, 60, 0.28); color: var(--fg-0); border-radiu
   margin-bottom: var(--sp-3); word-break: break-all;
 }
 .approval-keys { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+/* M2.98 程序指纹失配主题（identity-binding.md §7）：明示「指纹与规则不符
+   （可能已更新）」+ 当前解析路径 + 8 位 SHA-256 前缀摘要（不展示完整哈希）。 */
+.approval-fp-mismatch {
+  margin-top: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid rgba(224, 122, 95, 0.5);
+  border-radius: var(--r-sm);
+  background: rgba(224, 122, 95, 0.08);
+  font-size: var(--fs-sm);
+  display: grid;
+  gap: 4px;
+  color: var(--fg-1);
+}
+.approval-fp-mismatch-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  color: var(--danger);
+}
+.approval-fp-mismatch code {
+  font-family: var(--font-mono);
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  padding: 1px 5px;
+  border-radius: 4px;
+  word-break: break-all;
+}
 .approval-timer {
   display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-4);
   color: var(--fg-1); font-size: var(--fs-sm);

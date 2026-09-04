@@ -489,7 +489,7 @@ needs-decision，不得自行变更。
 
 25. **规则程序指纹绑定（identity binding）：授权目标是程序而非命令形态
     （2026-09-02 · 来源：identity-binding grilling-with-docs 会话收敛，船长
-    拍板，**待实现**）**：规则（inject/read/write）授权的是「项目目录 +
+    拍板，**已实现**）**：规则（inject/read/write）授权的是「项目目录 +
     命令形态 / 条目名」，**不含"哪个可执行文件"维度**——任何同用户进程在
     授权目录内**复现授权命令形态**即可命中（PATH 前置同名假程序截获注入
     env、目录内任意进程按写规则条目名静默覆盖等）。基线事实：规则里不存在
@@ -532,7 +532,9 @@ needs-decision，不得自行变更。
       env 读取实现期验证（不可行则该平台指纹规则 fail-closed）。
     实现规格：[identity-binding.md](identity-binding.md)（**唯一出处**）；落点：
     authorization-gate.md §11（摘要）、data-model.md（标注）、milestones.md
-    M2.98、CONTEXT.md（程序指纹词条）；**issue 待立项**（实现走 PR CI 门禁
-    序列，identity-binding.md §11）。
+    M2.98、CONTEXT.md（程序指纹词条）；**已立项并按 PR 序列落地**（父立项
+    #121，issues #123-#126，实现走 PR CI 门禁序列，identity-binding.md §11）。
+    **read/write 调用方链绑定按 spec §12 默认仅字段预留**（适用边界=独立
+    工具二进制场景，文档明示），不落地 CLI/UI。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

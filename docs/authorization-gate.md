@@ -362,10 +362,15 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   （写规则静默改写 secret 值 → 后续合法读/注入拿污染值）= 已知限制（文档
   明示）；exe+哈希身份绑定为整体可选加固，不随本规格。
 
-## 11. 规则程序指纹绑定（identity binding，M2.98，规划中）
+## 11. 规则程序指纹绑定（identity binding，M2.98，已实现）
 
 > 完整实现规格见 [identity-binding.md](identity-binding.md)（**唯一出处**）；
-> 本节只留边界摘要（补充拍板 #25，2026-09-02 拍板，待实现）。
+> 本节只留边界摘要（补充拍板 #25，2026-09-02 拍板，已实现——lk-core /
+> lk-daemon / lk-cli+E2E / 前端+收尾 PR 序列落地，issues #123-#126，父立项
+> #121）。**read/write 调用方链绑定按 spec §12 默认仅字段预留**——本期只随
+> 注入路径落地完整 CLI/UI；读/写规则的调用方链绑定仅文档明示适用边界
+> （独立工具二进制场景，终端/IDE/脚本的 starter 不稳定、升级即失配），
+> 不落地 CLI/UI（spec §12）。
 
 - **授权目标是程序而非命令形态**：规则**可选**绑定程序指纹（canonical 路径
   + SHA-256 + 固化时大小）——注入规则绑定被注入命令二进制（`command[0]`）、
@@ -373,7 +378,12 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   （目录 + 命令形态/条目名，零迁移）。
 - **失配 = 未命中**：**不新增错误码**（防探测）；GUI 弹窗明示「程序指纹与
   规则不符（可能已更新）」+「**以新指纹重新授权**」（复用规则管理审批门）；
-  headless 统一 `authz.denied`。
+  headless 统一 `authz.denied`。**前端帧面（M2.98，已实现）**：
+  `authz.request` 帧新增可选 `fingerprintMismatch`（`resolvedExePath` 当前
+  解析路径 + `sha256Short` 8 位 SHA-256 前缀摘要，**不含完整哈希、任何值或
+  错误码差异化**）；弹窗据此渲染失配主题 + 路径 + 摘要 +「本次允许 / 以新
+  指纹重新授权 / 拒绝」三按钮 + 30s 超时默认拒绝；未知 kind/字段防御渲染
+  （畸形 `fingerprintMismatch` 不 crash，回退普通 inject 审批）。
 - **解析在 daemon 侧**（信 daemon 不信客户端）：对端真实 env PATH——
   Linux `/proc/<pid>/environ` / Windows PEB `ProcessParameters.Environment`
   / macOS `KERN_PROCARGS2`（验证后落地，失败 fail-closed）；比对序 = 路径

@@ -86,6 +86,13 @@ export interface AuthzRequestPayload {
   kind?: "inject" | "read" | "export" | "rule" | "write";
   /** export 审批的数据包规模元信息（仅 kind=export；不含数据本身）。 */
   exportMeta?: { name: string; mime: string; size: number } | null;
+  /** M2.98 程序指纹失配（identity-binding.md §7）：绑定注入规则命中命令形态
+   *  但可执行文件指纹不符时携带（弹窗据此渲染「指纹不符」主题 + 当前解析
+   *  路径 + 8 位 SHA-256 前缀摘要 +「以新指纹重新授权」；失配视同未命中、
+   *  不含完整哈希/任何值/错误码差异化）；未失配为缺省（常规审批帧）。
+   *  协议演进防御：畸形值（缺字段/非字符串）由 approval 插件防御解析
+   *  （parseFingerprintMismatch）按普通 inject 审批渲染，不 crash。 */
+  fingerprintMismatch?: { resolvedExePath: string; sha256Short: string } | null;
 }
 
 /** `vault.search` 负载（topbar 搜索框 → ui-vault；300ms 防抖）。 */

@@ -84,6 +84,10 @@ export interface AuthRule {
    *  update 子集，Rust serde 缺省 ["create","update"]；delete 恒弹窗、
    *  不存在于 actions。capability != write 时忽略；旧守护进程可能不返回。 */
   actions?: string[];
+  /** 程序指纹绑定（M2.98，identity-binding.md §4）：canonical 路径 + SHA-256 +
+   *  固化时大小；注入规则可选绑定（读/写调用方链按 spec §12 仅字段预留，
+   *  不落地 CLI/UI）。旧守护进程不返回。 */
+  fingerprint?: { exePath: string; sha256: string; size: number };
   /** 创建时间（ISO-8601 UTC）。 */
   created: string;
 }
@@ -101,6 +105,10 @@ export interface RuleInput {
   /** write 能力下的写动作子集（缺省 create+update，Rust serde 缺省同口径；
    *  delete 恒弹窗、规则写不进去）。 */
   actions?: string[];
+  /** 程序指纹绑定请求（M2.98，identity-binding.md §5.3）：请求侧只声明
+   *  「绑哪个 exe」（`exePath`）——**daemon 不信任客户端上报的 sha/size**，
+   *  审批 finalize 侧重算固化；仅注入规则（capability=inject）使用。 */
+  fingerprint?: { exePath: string; sha256?: string; size?: number };
 }
 
 export type AuditResult = "allowed" | "denied" | "timeout";

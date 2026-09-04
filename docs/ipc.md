@@ -80,7 +80,7 @@
 | `sync.trigger` / `sync.poll` | 同步控制 | 变更摘要（不返回内容） |
 | `authz.evaluate` | 授权门判定（M2）；`channel` 枚举 `cli` \| `desktop` \| `wsl-bridge`（跨子系统桥，补充拍板 #14，审计如实记录）。锁定态一体化（#67/补充拍板 #19）：库锁态 + 桌面审批界面在场 → 走临时解锁+本次授权一次交互（§4.1 锁定态）；headless 锁态 → fail-closed `session.invalid` | 允许/拒绝 + 最小 env 集 |
 | `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 `ApprovalChannel::open`）。**仅桌面内嵌直调可提交**——socket/pipe 连接 → `channel.forbidden`（-32014）；params 含 `challenge`（`authz.request` 帧下发的一次性应答值，错值 → `accepted=false` 且条目保留；#72/#78 / 补充拍板 #16）；锁定态一体化待审+allowed 时含可选 `masterPassword`（守护进程临时解锁，§4.1） | accepted（是否接受） |
-| `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6；M2.9 起规则含 `capability`：`inject`（注入，缺省）\|`read`（读值，command 恒空串、keys=可读条目名）；M2.97 增 `write`（写规则，command 恒空串、keys=可写条目名、`actions`=create/update 子集且**缺省 create+update**——传 `delete` 校验拒绝，恒弹窗由协议保证；schema 见 [write-gate.md](write-gate.md) §4），能力两两不互授）。**M2.95（#104）**：socket/pipe 通道的 `rule.add` / `rule.remove` 升为桌面审批门（制定/撤销授权都是授权事件；desktop 直调豁免、headless fail-closed 复用 `authz.denied`，见 [authorization-gate.md](authorization-gate.md) §9）；`rule.list` 维持令牌门 | 规则 / 规则列表 / 无 |
+| `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6；M2.9 起规则含 `capability`：`inject`（注入，缺省）\|`read`（读值，command 恒空串、keys=可读条目名）；M2.97 增 `write`（写规则，command 恒空串、keys=可写条目名、`actions`=create/update 子集且**缺省 create+update**——传 `delete` 校验拒绝，恒弹窗由协议保证；schema 见 [write-gate.md](write-gate.md) §4），能力两两不互授）。**M2.95（#104）**：socket/pipe 通道的 `rule.add` / `rule.remove` 升为桌面审批门（制定/撤销授权都是授权事件；desktop 直调豁免、headless fail-closed 复用 `authz.denied`，见 [authorization-gate.md](authorization-gate.md) §9）；`rule.list` 维持令牌门。**M2.98 程序指纹（已实现）**：注入规则可带 `fingerprint`（`exePath`/`sha256`/`size`——**daemon 不信任客户端上报的 sha/size**，审批 finalize 侧重算固化；请求侧只声明「绑哪个 exe」，`sha256`/`size` 传空/0，schema 见 [identity-binding.md](identity-binding.md) §4/§5.3）。read/write 的调用方链绑定按 spec §12 仅字段预留、不落地 CLI/UI | 规则 / 规则列表 / 无 |
 | `audit.list` | 审计查询 | 事件（无密钥值） |
 | `audit.verify` | 校验审计 HMAC 链 | 已验证事件数 |
 | `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A）。来源标签：桌面壳为进程内直调订阅，socket 流连接为普通订阅——后者**不计入审批界面判定、也收不到 `authz.request` 帧**（#72/#78：帧内 challenge 是审批应答凭据，只走桌面通道）。**锁定态订阅**（#67）：desktop 来源允许锁态订阅（推送目标注册，桌面直调无需会话令牌；socket 订阅照旧要求有效会话），使锁态 `authz.request` 帧到达 GUI；帧无密钥值，不泄露明文 | 无 |
@@ -105,7 +105,13 @@
   标注审批类型（弹窗按形态渲染），缺省 `inject`；锁态读/导出统一走 `kind`=
   `read`/`export` 且 `needsUnlock=true` 的窗口；`kind=export` 时带
   `exportMeta`（`name`/`mime`/`size`，数据包规模，不含数据本身——锁态无法
-  解密故缺省）。
+  解密故缺省）。**M2.98 程序指纹失配（已实现）**：绑定注入规则命中命令形态
+   但指纹不符时带可选 `fingerprintMismatch`（`resolvedExePath` 当前解析路径 +
+   `sha256Short` 8 位 SHA-256 前缀摘要——**不含完整哈希、任何值或错误码差异
+   化**，identity-binding.md §7）；未失配为缺省（常规审批帧）。失配视同未命中
+   （headless 统一 `authz.denied`），弹窗据字段渲染「指纹不符」主题 + 路径 +
+   摘要 +「以新指纹重新授权」按钮（触发 `rule.add` 携带 `fingerprint` → 规则
+   管理审批门 → finalize 侧重算指纹落盘）。
 - **`approval.result` 扩展**：可选 `masterPassword`——仅 `needs_unlock` 待审
   条目 + `allowed` 决策时使用并校验；守护进程以其做**临时解锁**（AuthGuard
   限流照常），错误主密码计失败计数并以错误响应退回弹窗（条目保留可重试）。
