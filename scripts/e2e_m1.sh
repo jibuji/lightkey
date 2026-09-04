@@ -200,9 +200,11 @@ for d in "$A" "$B"; do
   fi
 done
 sleep 1
-# 7a. 只允许已知密文文件名（index.lk / {uuid}.{item,tomb,attach}.lk / {uuid}.{i}.chunk.lk）
+# 7a. 只允许已知密文文件名（index.lk / {uuid}.{item,rule,tomb,attach}.lk / {uuid}.{i}.chunk.lk）
+#     （M2.95 起规则与条目同路径同步——`{uuid}.rule.lk` 与条目同级落在远端，
+#     同为 LKC1 密文容器；缺失白名单会误报「意外文件」）
 BAD=$(find "$REMOTE" -type f | sed "s|$REMOTE/||" | \
-  grep -vE '^(index\.lk|[0-9a-f-]{36}\.(item|tomb|attach)\.lk|[0-9a-f-]{36}\.[0-9]+\.chunk\.lk)$' | head -1)
+  grep -vE '^(index\.lk|[0-9a-f-]{36}\.(item|rule|tomb|attach)\.lk|[0-9a-f-]{36}\.[0-9]+\.chunk\.lk)$' | head -1)
 [ -z "$BAD" ] && ok "远端只含已知密文文件名" || bad "意外文件: $BAD"
 # 7b. 全部文件以 LKC1 magic 开头
 NONLKC=0

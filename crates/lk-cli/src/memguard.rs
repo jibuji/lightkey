@@ -5,28 +5,44 @@
 //!   路径关掉，使崩溃时内存里的 secret 明文不落下磁盘；
 //! - `zeroize_env()`：secret env 值在写入子进程 env 后立即清零。
 //!
-//! 威胁模型边界（诚实声明）：这些加固**降低**同用户调试器/tracer 读取内存的
-//! 成功面，但**不防**持有同用户身份的调试器直接 ptrace/inject 本进程（进程
-//! 内存仍可被读取）；同用户进程互信被划在防护边界之外，见 docs/decisions.md
-//! 补充拍板 #15 与本条目 decisions.md 补充拍板 #17。
+//! 实现注记（issue #119 / decisions.md 补充拍板 #26）：Linux 分支**不用**
+//! `prctl(PR_SET_DUMPABLE, 0)`——非 dumpable 进程的 `/proc/<pid>/cwd` /
+//! `environ` / `exe` 对同用户守护进程返回 EACCES（`ptrace_may_access` 门），
+//! 启动者归因（#66）取不到对端 cwd → 授权门第 1 层 fail-closed，Linux 上
+//! inject / 读 / 写全拒。改为 `setrlimit(RLIMIT_CORE, {0, 0})`：禁 core dump
+//! 落盘的承诺保留；且 rlimit 可被 fork/exec 继承——`lk inject` 注入的整棵
+//! 命令子树同样禁 core，比原实现覆盖更广（子进程 exec 后 dumpable 会复位，
+//! 原 `PR_SET_DUMPABLE` 只护住 CLI 自身）。代价：失去「限制非相关进程
+//! ptrace」的副产品——该能力本就在 #15/#17 声明边界外（不防同用户调试器），
+//! 且 Debian/Ubuntu 默认 `kernel.yama.ptrace_scope=1` 已限制非父子进程
+//! ptrace。威胁模型其余边界不变：这些加固**降低**同用户调试器/tracer 读取
+//! 内存的成功面，但**不防**持有同用户身份的调试器直接 ptrace/inject 本进程
+//! （进程内存仍可被读取）；同用户进程互信被划在防护边界之外，见
+//! docs/decisions.md 补充拍板 #15 与本条目 decisions.md 补充拍板 #17/#26。
 
 use std::collections::BTreeMap;
 use zeroize::Zeroize;
 
 /// 应用进程级加固（各平台尽力实现）。
 ///
-/// - Linux：`prctl(PR_SET_DUMPABLE, 0)`，禁用 core dump（同时限制非相关进程
-///   直接 ptrace 本进程；同用户父进程/调试器边界外，见模块级文档与
-///   decisions.md 补充拍板 #17）。
+/// - Linux：`setrlimit(RLIMIT_CORE, {0, 0})`，禁用 core dump（软/硬限都置 0，
+///   子进程继承；**不再清 PR_SET_DUMPABLE**——非 dumpable 会令同用户守护进程
+///   读 `/proc/<pid>/{cwd,environ,exe}` 得 EACCES，启动者归因 fail-closed 致
+///   授权门全拒，见 issue #119 与 decisions.md 补充拍板 #26）。
 /// - Windows：`SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)`，
 ///   尽力抑制 WER 错误框，减少崩溃时被采样的窗口（尽力实现，验收以 Linux 主；
 ///   见 decisions.md 补充拍板 #17）。
 pub fn harden_process() {
     #[cfg(target_os = "linux")]
     {
-        // 失败不致命：加固是尽力而为，任何 prctl 返回 -1 都保持进程可继续运行。
+        // 失败不致命：加固是尽力而为，任何 setrlimit 返回 -1 都保持进程可继续运行。
+        // 软/硬限都置 0 是合法降级（降低硬限不需要特权），子进程继承后无法再抬高。
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         unsafe {
-            let _ = libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+            let _ = libc::setrlimit(libc::RLIMIT_CORE, &zero);
         }
     }
     #[cfg(windows)]
@@ -102,30 +118,79 @@ mod tests {
         assert_eq!(bytes.len(), 0);
     }
 
-    /// Linux：`prctl(PR_SET_DUMPABLE, 0)` 后 `/proc/self/status` 的
-    /// `Dumpable:` 字段为 0（0 = 禁止 dump）。设置后恢复原值，避免影响同进程
-    /// 其他测试/环境。
+    /// issue #119 回归：`harden_process()` 不得破坏 daemon 侧启动者归因。
+    ///
+    /// 根因：旧实现 Linux 分支 `prctl(PR_SET_DUMPABLE, 0)` 使本进程非
+    /// dumpable——同用户守护进程跨进程读 `/proc/<pid>/{cwd,environ,exe}` 走
+    /// `ptrace_may_access` 门返回 EACCES，`starter::resolve_peer_cwd` 取不到
+    /// 对端 cwd → 授权门第 1 层 fail-closed，Linux 上 inject/读/写全拒
+    /// （issue #119，探针实证见 PR #118 与本测试）。
+    ///
+    /// 本测试 fork 一个子进程执行 `harden_process()` 后挂起（模拟已加固的
+    /// CLI 对端），父进程（模拟 daemon）以真实跨进程身份断言：
+    ///   1. `lk_core::starter::resolve_peer_cwd(pid)` 仍可读（授权门第 1 层
+    ///      数据源不 fail-closed）；
+    ///   2. `lk_daemon::identity::PlatformPeerEnv::peer_path(pid)`（对端
+    ///      `/proc/<pid>/environ` 的 PATH）仍可读（M2.98 指纹绑定 Linux 面，
+    ///      identity-binding.md §5.1）；
+    ///   3. 子进程保持 dumpable（`PR_GET_DUMPABLE` 自报 1，经退出码回传）——
+    ///      `/proc` 可视性的开关；
+    ///   4. 子进程 `RLIMIT_CORE` 为 0（自报，经退出码回传）——#76「core dump
+    ///      不落明文」的目标由 rlimit 承接。
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_dumpable_becomes_zero_and_restores() {
-        let original = read_dumpable();
-        harden_process();
-        assert_eq!(
-            read_dumpable(),
-            0,
-            "prctl(PR_SET_DUMPABLE, 0) 后 Dumpable 应为 0"
-        );
-        unsafe {
-            libc::prctl(libc::PR_SET_DUMPABLE, original, 0, 0, 0);
+    fn hardening_keeps_peer_attribution_readable() {
+        use lk_daemon::identity::PeerEnv;
+        let rc = unsafe { libc::fork() };
+        assert!(rc >= 0, "fork 失败");
+        let pid = rc as u32;
+        if rc == 0 {
+            // 子进程：与 lk CLI 启动同款加固，然后自检两项安全性质并挂起，
+            // 让父进程以真实跨进程身份读 /proc。
+            harden_process();
+            let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let gr = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) };
+            // 退出码比特位：1 = RLIMIT_CORE 非 0，2 = 非 dumpable（0 = 全好）。
+            let code = (gr != 0 || lim.rlim_cur != 0) as i32 | ((dumpable != 1) as i32) << 1;
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                libc::_exit(code);
+            }
         }
-        assert_eq!(read_dumpable(), original, "恢复原 dumpable 值");
-    }
-
-    /// 取当前 dumpable 值：`prctl(PR_GET_DUMPABLE)`（不依赖 procfs——部分
-    /// 内核/WSL2 的 `/proc/self/status` 不暴露 `Dumpable:` 字段，但 prctl
-    /// 本身生效，见 issue #76 验证记录）。
-    #[cfg(target_os = "linux")]
-    fn read_dumpable() -> i32 {
-        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }
+        // 父进程：等待子进程 SIGSTOP（加固已完成、进程存续）→ 读对端 /proc。
+        let mut status: libc::c_int = 0;
+        unsafe {
+            libc::waitpid(pid as libc::pid_t, &mut status, libc::WUNTRACED);
+        }
+        // 1) cwd 归因（daemon 授权门第 1 层数据源；issue #119 的直接断点）
+        let cwd = lk_core::starter::resolve_peer_cwd(pid);
+        assert!(
+            cwd.is_some(),
+            "harden 后对端 cwd 必须仍可读——非 dumpable 致 /proc EACCES 时授权门全拒（issue #119）：{cwd:?}"
+        );
+        // 2) 对端 environ PATH（M2.98 指纹绑定数据源；与 cwd 同门）
+        let path = lk_daemon::identity::PlatformPeerEnv.peer_path(pid);
+        assert!(
+            path.is_some(),
+            "harden 后对端 environ PATH 必须仍可读（issue #119 / identity-binding.md §5.1）：{path:?}"
+        );
+        // 收尾：恢复子进程并回收，核对子进程自报的 dumpable / RLIMIT_CORE。
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGCONT);
+            libc::waitpid(pid as libc::pid_t, &mut status, 0);
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "子进程自检失败：应保持 dumpable（1）且 RLIMIT_CORE=0（#76），退出码 = {}",
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            }
+        );
     }
 }

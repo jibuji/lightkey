@@ -537,4 +537,40 @@ needs-decision，不得自行变更。
     **read/write 调用方链绑定按 spec §12 默认仅字段预留**（适用边界=独立
     工具二进制场景，文档明示），不落地 CLI/UI。
 
+26. **Linux memguard 机制修订：`RLIMIT_CORE=0` 替代 `PR_SET_DUMPABLE=0`
+    （2026-09-04 · 来源：issue #119（#76 加固与 #66 归因互斥——M2.97 T3 发现，
+    PR #118 探针实证 `readlink /proc/<pid>/cwd` EACCES），船长拍板）**：
+    修订决策 #17 的 Linux 子句——`lk` CLI 启动加固改为
+    `setrlimit(RLIMIT_CORE, {0,0})`，**不再** `prctl(PR_SET_DUMPABLE, 0)`。
+    - **根因（探针实证，WSL2 Debian 6.18 内核 fork 探针）**：非 dumpable 进程
+      的 `/proc/<pid>/{cwd,environ,exe}` 对同用户守护进程走 `ptrace_may_access`
+      门返回 EACCES（同进程自读不受门，须跨进程复现）；`comm/stat/cmdline`
+      仍可读。结果 `starter::resolve_peer_cwd`（#66）取不到对端 cwd →
+      授权门第 1 层 fail-closed → **Linux 上 inject / 读 / 写全部拒绝**
+      （`e2e_m1.sh` 阻塞）；同一机制还阻断 M2.98 指纹绑定的对端
+      `environ` PATH 读取（#121 Linux 面，identity-binding.md §5.1）。
+    - **裁定方向 2**（issue 候选 2）：换不影响 `/proc` 可见性的机制。
+      `RLIMIT_CORE=0` 完整保留 #76 核心承诺（core dump 不落下明文），且
+      rlimit 可被 fork/exec 继承——注入命令**子树**同样禁 core，覆盖比原实现
+      更广（原 `PR_SET_DUMPABLE` 在子进程 exec 时复位，只护 CLI 自身）。
+    - **被放弃的副产品重评**：「限制非相关进程直接 ptrace」。(a) #15/#17 已
+      声明同用户调试器在防护边界外，该限制属边界内的额外摩擦；(b)
+      Debian/Ubuntu 默认 `kernel.yama.ptrace_scope=1` 已限制非父子进程
+      ptrace，收益与系统默认重叠；(c) Linux 无「禁 core 但保留 /proc」的
+      独立开关——不放弃则归因无解。
+    - **被否选项**（issue 候选 1/3）：对端主动上报 + 校验（需协议面新字段，
+      违背 D8「不信客户端自报」第一原则；且只修 cwd 不修 environ）；netlink/
+      audit（需特权/内核特性，cwd 无现成事件源）；Linux 上声明 memguard 与
+      授权门互斥（E2E SKIP）——与 M2.98/M3 Linux 推进方向冲突，`e2e_m1.sh`
+      永久不能跑绿。
+    - **实现**：`crates/lk-cli/src/memguard.rs`（Linux 分支 setrlimit +
+      模块文档修订）+ Linux 回归测试（fork 子进程 `harden_process()` 挂起 →
+      父进程断言 `lk_core::starter::resolve_peer_cwd` 与对端
+      `lk_daemon::identity::PlatformPeerEnv::peer_path` 仍可读 + 子进程自检
+      `PR_GET_DUMPABLE`=1 / `RLIMIT_CORE`=0 经退出码回传）+ `docs/cli.md`
+      引用更新。**Windows/macOS 路径零改动**；fail-closed 语义不变（归因
+      真实不可得仍拒绝）。
+    - **验收**：Linux headless 规则命中 `lk inject` / `item.get` / `item.put`
+      放行；`scripts/e2e_m1.sh` / `e2e_m2.sh`（Linux）恢复跑绿。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
