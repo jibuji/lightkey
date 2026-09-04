@@ -15,7 +15,8 @@
 #       （delete 不参与规则匹配）→ rule remove → 删除生效 + 审计 →
 #       指纹绑定（M2.98，docs/identity-binding.md §10.3）：rule add --inject
 #       --fingerprint（走规则门，daemon finalize 侧重算固化哈希）→ rule list
-#       展示指纹 → 把被绑定 exe 前置到 PATH 后 inject 命中 → 静默放行（exit 0
+#       展示指纹 → 把被绑定 exe 前置到 PATH 后 带参 inject 命中（bug #132：
+#       匹配按 command[0] 可执行名）→ 静默放行（exit 0
 #       + 子进程跑起来）+ 审计 allowed → 就地改写 exe（内容变 → hash 变）再
 #       inject → 失配视同未命中 → headless 拒绝（exit 1，同码）+ 审计 denied，
 #       **指纹通道不扩展 auto-approve**（沿用写门口径）。
@@ -267,10 +268,14 @@ else
     bad "rule list 缺指纹列：$FP_RULE"
   fi
   # 命中：把 FPGA 所在目录前置到 PATH（对端 env PATH），在该项目内 inject →
-  # daemon 经 PATH 解析 fptool 并比对指纹 → 静默放行（无弹窗）+ 子进程跑起来
+  # daemon 经 PATH 解析 fptool 并比对指纹 → 静默放行（无弹窗）+ 子进程跑起来。
+  # 注入命令**带参数**（`fptool.exe /user`，Windows whoami / Linux true 均
+  # 接受并 exit 0）——bug #132：CLI 落库的命令是 basename「fptool.exe」，若
+  # 匹配层按整串 glob 比对「fptool.exe /user」必失配、绑定规则永不命中；裸
+  # 命令因 basename == 完整命令串恒成立，覆盖不了该失配。
   export PATH="$FPBIN:$PATH"
-  ( cd "$PROJ" && "$LK" inject --keys NPM_TOKEN -- fptool.exe >"$WORK/fp_hit.out" 2>"$WORK/fp_hit.err" )
-  check "指纹绑定命中 → 静默放行（exit 0）" 0 $?
+  ( cd "$PROJ" && "$LK" inject --keys NPM_TOKEN -- fptool.exe /user >"$WORK/fp_hit.out" 2>"$WORK/fp_hit.err" )
+  check "指纹绑定命中（带参命令）→ 静默放行（exit 0）" 0 $?
   if grep -q "已拒绝" "$WORK/fp_hit.err"; then
     bad "绑定命中仍被拒绝：$(cat "$WORK/fp_hit.err")"
   else

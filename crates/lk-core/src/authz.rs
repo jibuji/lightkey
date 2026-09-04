@@ -578,11 +578,41 @@ impl AuthzGate {
 
 /// 规则是否匹配 `(cwd, command)`（注入路径）：**capability=inject**（能力
 /// 不互授，read 规则不授权注入）+ projectDir 祖先匹配（canonical 形态，
-/// 相等或为前缀 + `/`）+ command glob（`*`/`?`，大小写敏感）。
+/// 相等或为前缀 + `/`）+ command 形态（`*`/`?`，大小写敏感）：
+///
+/// - **未绑定指纹（None）**：`glob_match(rule.command, command)` 整串匹配
+///   （现状语义零变化，identity-binding.md §4）；
+/// - **指纹绑定（Some）**：按 `command[0]` 的**可执行名**（basename，去
+///   目录）与 `rule.command` glob 匹配（identity-binding.md §2 目标 2：
+///   注入规则绑定被注入命令的可执行文件）——CLI 以 exe basename 落库
+///   （`/usr/bin/npm` → `"npm"`），注入请求 command 是完整命令串
+///   （`lk inject -- npm publish` → `"npm publish"`），整串匹配必失配
+///   （issue #132）。命令为空/纯空白 → 形式不成立（fail-closed）。
 pub fn rule_matches(rule: &Rule, canonical_cwd: &str, command: &str) -> bool {
     rule.capability == crate::model::RULE_CAPABILITY_INJECT
         && project_dir_matches(&rule.project_dir, canonical_cwd)
-        && glob_match(&rule.command, command)
+        && inject_command_form_matches(rule, command)
+}
+
+/// 注入命令形态匹配：绑定规则按 `command[0]` 的可执行名（basename）比较，
+/// 未绑定规则维持整串 glob（issue #132 契约，见 [`rule_matches`]）。
+fn inject_command_form_matches(rule: &Rule, command: &str) -> bool {
+    match &rule.fingerprint {
+        None => glob_match(&rule.command, command),
+        Some(_) => command0_exe_name(command).is_some_and(|name| glob_match(&rule.command, &name)),
+    }
+}
+
+/// `command[0]` 的可执行名（basename，去目录）：「npm publish」→「npm」；
+/// 「/usr/bin/npm publish」→「npm」；空/纯空白 → `None`。
+fn command0_exe_name(command: &str) -> Option<String> {
+    let c0 = crate::fingerprint::command0(command)?;
+    Some(
+        std::path::Path::new(c0)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| c0.to_string()),
+    )
 }
 
 /// 读规则是否匹配 `(cwd, 条目名)`（值披露读路径，value-disclosure.md §4）：
@@ -1647,27 +1677,31 @@ mod tests {
 
     // -- M2.98 规则程序指纹（补充拍板 #25）：未绑定匹配路径零变化回归 ---------
 
-    /// 给规则绑定一个任意指纹，`rule_matches` / `read_rule_matches` /
-    /// `write_rule_matches` 的结果必须与未绑定（None）完全一致——指纹是
-    /// **正交追加门**，不在三条匹配路径上内联；T2 daemon 装配 `fingerprint_matches`
-    /// 作为追加裁决。fingerprint=None = 现状语义（identity-binding.md §4「匹配
-    /// 函数行为零变化」）。
+    /// 指纹不改变 **read/write** 匹配路径，且**未绑定（None）**的注入规则
+    /// 保持与绑定前完全一致的整串 glob 语义——fingerprint=None = 现状语义
+    /// （identity-binding.md §4「匹配函数行为零变化」）。绑定**注入**规则
+    /// 的命令形态按 `command[0]` 可执行名匹配（issue #132，见
+    /// [`fingerprint_bound_inject_rule_matches_command0`]）；本测试的注入分支
+    /// 用 glob 形态 `"npm*"`（绑定按可执行名 `"npm"`、未绑定按整串
+    /// `"npm publish"` 都命中），两端结果一致，钉住的是「未绑定路径不因指纹
+    /// 存在与否而变化」。
     #[test]
     fn fingerprint_does_not_change_base_matcher_behavior() {
         use crate::model::ProgramFingerprint;
 
-        // 注：三分支的匹配结果与有无指纹无关，恒由 capability/cwd/keys 决定；
-        // 此处钉住「绑定 vs 未绑定」结果一致，防未来误把指纹塞进 matcher 内联
-        // 而改变未绑定路径行为。
+        // 注：read/write 分支的匹配结果与有无指纹无关，恒由 capability/cwd/keys
+        // 决定；注入分支的差异面（绑定 → command[0] 可执行名）由
+        // fingerprint_bound_inject_rule_matches_command0 单独钉住。
         let fp_some = Some(ProgramFingerprint {
             exe_path: "/usr/bin/node".into(),
             sha256: "a".repeat(64),
             size: 100,
         });
 
-        // inject 规则
-        let mut inj = rule("/proj", "npm *", &["A"]);
-        let inj_unbound = rule("/proj", "npm *", &["A"]);
+        // inject 规则（glob 形态 "npm*"：绑定按 command[0] 可执行名 "npm"、
+        // 未绑定按整串 "npm publish"，两端都命中，钉「未绑定零变化」）
+        let mut inj = rule("/proj", "npm*", &["A"]);
+        let inj_unbound = rule("/proj", "npm*", &["A"]);
         inj.fingerprint = fp_some.clone();
         assert_eq!(
             rule_matches(&inj, "/proj/sub", "npm publish"),
@@ -1700,6 +1734,49 @@ mod tests {
             None,
             "a.ini"
         ));
+    }
+
+    /// issue #132（bug 修复契约）：指纹绑定注入规则的命令形态按 `command[0]`
+    /// 的**可执行名**（basename，去目录）与规则 command 做 glob 匹配。CLI 以
+    /// exe basename 落库（`/usr/bin/npm` → `"npm"`，lk-cli `cmd_rule_add_inner`），
+    /// 而注入请求 command 是**完整命令串**（`lk inject -- npm publish` → `"npm
+    /// publish"`）——整串 glob 匹配必失配，绑定规则永不命中、指纹门不可达
+    /// （identity-binding.md §2 目标 2：注入规则绑定 `command[0]` 的可执行文件）。
+    /// 未绑定（None）规则维持整串 glob 语义（§4 零变化）。
+    #[test]
+    fn fingerprint_bound_inject_rule_matches_command0() {
+        use crate::model::ProgramFingerprint;
+
+        let fp = |exe: &str| {
+            Some(ProgramFingerprint {
+                exe_path: exe.into(),
+                sha256: "a".repeat(64),
+                size: 100,
+            })
+        };
+
+        // 绑定规则：command = CLI 推导的可执行 basename（真实产品形态）
+        let mut bound = rule("/proj", "npm", &["A"]);
+        bound.fingerprint = fp("/usr/bin/npm");
+        // 带参命令：整串 ≠ basename，但 command[0] 可执行名 = "npm" → 命中
+        assert!(rule_matches(&bound, "/proj/sub", "npm publish"));
+        assert!(rule_matches(&bound, "/proj", "npm"));
+        // 绝对路径可执行 + 参数 → 仍按可执行名 basename 命中
+        assert!(rule_matches(&bound, "/proj", "/usr/bin/npm publish"));
+        // 不同可执行名 → 不命中（fail-closed：形式不成立，指纹门不介入）
+        assert!(!rule_matches(&bound, "/proj", "npx foo"));
+        assert!(!rule_matches(&bound, "/proj", "npm-publish"));
+
+        // 绑定规则的 glob basename 形态（如按前缀命名再通配）
+        let mut glob = rule("/proj", "npm*", &["A"]);
+        glob.fingerprint = fp("/usr/bin/npm");
+        assert!(rule_matches(&glob, "/proj", "npm publish"));
+
+        // 未绑定（None）：整串 glob 语义零变化——basename 精确串不因加参命中
+        let unbound = rule("/proj", "npm", &["A"]);
+        assert!(rule_matches(&unbound, "/proj", "npm"));
+        assert!(!rule_matches(&unbound, "/proj", "npm publish"));
+        assert!(!rule_matches(&unbound, "/proj", "/usr/bin/npm publish"));
     }
 
     /// 绑定规则与未绑定规则占据同一片授权空间，指纹门不改变未命中语义：

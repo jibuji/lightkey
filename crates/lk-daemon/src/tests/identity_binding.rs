@@ -53,8 +53,10 @@ fn make_exe(dir: &Path, name: &str, content: &[u8]) -> (PathBuf, ProgramFingerpr
     (raw, fp)
 }
 
-/// 直接经 vault 写锁种一条绑定 inject 规则（command 精确 = 注入命令形态；
-/// project_dir = 注入对端 cwd 的祖先，rule_matches 才命中）。
+/// 直接经 vault 写锁种一条绑定 inject 规则。**command = CLI 推导的可执行
+/// basename**（`--fingerprint <exePath>` 落库形态，issue #132；注入请求
+/// command 是完整命令串，由匹配层按 `command[0]` 与 basename 比对命中），
+/// project_dir = 注入对端 cwd 的祖先。
 fn seed_bound_rule(
     shared: &Arc<SharedDaemon>,
     project_dir: &Path,
@@ -110,9 +112,9 @@ fn binding_hit_silently_allows() {
     let proj = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     let (_exe, fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho hi\n");
-    // 绑定 inject 规则（command 形态 = bind/dev 的前缀）
+    // 绑定 inject 规则（command = CLI 推导的 basename "pgm"，issue #132）
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-    seed_bound_rule(&shared, proj.path(), &fp, "pgm deploy", &["NPM_TOKEN"]);
+    seed_bound_rule(&shared, proj.path(), &fp, "pgm", &["NPM_TOKEN"]);
     inject_fake_env(&state, bin.path());
 
     let handler = make_handler(&state, &shared);
@@ -147,7 +149,7 @@ fn binding_mismatch_folds_to_approval() {
     let bin = tempfile::tempdir().unwrap();
     let (pgm_path, fp_v1) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-    seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm deploy", &["NPM_TOKEN"]);
+    seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm", &["NPM_TOKEN"]);
     inject_fake_env(&state, bin.path());
     // 内容被改（提升 mtime）→ 现哈希 ≠ 规则记录的 fp_v1.sha256
     std::fs::write(&pgm_path, b"#!/bin/sh\necho v2-xxxx\n").unwrap();
@@ -217,7 +219,7 @@ fn headless_mismatch_denied_same_code() {
     let bin = tempfile::tempdir().unwrap();
     let (pgm_path, fp_v1) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-    seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm deploy", &["NPM_TOKEN"]);
+    seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm", &["NPM_TOKEN"]);
     inject_fake_env(&state, bin.path());
     // 制造失配：改内容（mtime 变）→ 现哈希 ≠ 规则记录
     std::fs::write(&pgm_path, b"#!/bin/sh\necho v2-other\n").unwrap();
@@ -325,7 +327,7 @@ fn cache_meta_unchanged_reuses_hash() {
     let bin = tempfile::tempdir().unwrap();
     let (_exe, fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-    seed_bound_rule(&shared, proj.path(), &fp, "pgm deploy", &["NPM_TOKEN"]);
+    seed_bound_rule(&shared, proj.path(), &fp, "pgm", &["NPM_TOKEN"]);
     inject_fake_env(&state, bin.path());
     let handler = make_handler(&state, &shared);
     let peer = test_peer(Some(proj.path()));
@@ -368,7 +370,7 @@ fn content_change_recomputes_and_mismatches() {
         let bin = tempfile::tempdir().unwrap();
         let (pgm_path, fp_v1) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
         let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-        seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm deploy", &["NPM_TOKEN"]);
+        seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm", &["NPM_TOKEN"]);
         inject_fake_env(&state, bin.path());
         // 改内容（mtime 变）→ 重算 → 哈希失配 → 转审批
         std::fs::write(&pgm_path, content).unwrap();
@@ -417,7 +419,7 @@ fn locked_session_invalid_regression() {
         .to_string_lossy()
         .into_owned();
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-    seed_bound_rule(&shared, proj.path(), &fp, "pgm deploy", &["NPM_TOKEN"]);
+    seed_bound_rule(&shared, proj.path(), &fp, "pgm", &["NPM_TOKEN"]);
     state.lock().unwrap().handle(
         &rpc_line(M_VAULT_LOCK, None, json!({})),
         &PeerInfo::unknown(),
@@ -452,7 +454,7 @@ fn unknown_starter_denied_first() {
     let bin = tempfile::tempdir().unwrap();
     let (_exe, fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-    seed_bound_rule(&shared, proj.path(), &fp, "pgm deploy", &["NPM_TOKEN"]);
+    seed_bound_rule(&shared, proj.path(), &fp, "pgm", &["NPM_TOKEN"]);
     inject_fake_env(&state, bin.path());
     let handler = make_handler(&state, &shared);
     // 桌面订阅在场（有审批界面）——但启动者未知仍第 1 层拒绝，不进指纹/审批
