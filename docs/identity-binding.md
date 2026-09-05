@@ -125,6 +125,14 @@ pub struct ProgramFingerprint {
 - 按 PATH 序解析 `command[0]`（第一个命中项即候选）+ 对端真实 cwd 兜底
   （非绝对路径时）；结果为 canonical 绝对路径。
 - 命令为绝对路径时免 PATH 解析（直接 canonicalize）。
+- **Windows 无扩展名命令**（issue #133，主平台主线）：`command[0]` 常为
+  无扩展名的键入名（`npm`/`git`/`npx`…），真实文件是 `npm.cmd`/`node.exe`
+  等。daemon 读对端**真实 env 的 PATHEXT**（同一 env 块，与 PATH 同源），
+  按 PATH 序**逐目录**做「无扩展原名 → 逐 PATHEXT 后缀」探测（目录间仍
+  保持 PATH 序，与 cmd 行为一致）；对端未设置/不可读 → 回落 cmd 缺省表
+  `.COM;.EXE;.BAT;.CMD`。解析结果 = **带后缀的真实文件路径**（`<dir>\npm`
+  → `<dir>\npm.cmd`）再 canonicalize。Linux/macOS 无 PATHEXT 语义，不探测
+  （行为与未引入探测前完全一致）。
 - **PATH 前置假程序**（规则绑定场景）：候选路径 ≠ 规则 exePath → 直接视同
   未命中（无需哈希，见 §6-3 前先比路径）。
 
@@ -143,11 +151,19 @@ pub struct ProgramFingerprint {
 ### 5.4 命令形态匹配（绑定规则，issue #132 回归钉住）
 
 - 绑定规则的 `command` = CLI 推导的可执行 **basename**（`/usr/bin/npm` →
-  `"npm"`，§11 PR C）；注入请求 `command` 是**完整命令串**（`lk inject --
-  npm publish`）。匹配层对绑定规则按 `command[0]` 的**可执行名**（basename，
-  去目录）与 `rule.command` glob 匹配；整串 glob 必失配——绑定规则永不命中、
+  `"npm"`，§11 PR C；Windows `--fingerprint C:\...\npm.cmd` → `"npm.cmd"`）；
+  注入请求 `command` 是**完整命令串**（`lk inject -- npm publish`）。匹配层
+  对绑定规则按 `command[0]` 的**可执行名**（basename，去目录）与
+  `rule.command` glob 匹配；整串 glob 必失配——绑定规则永不命中、
   指纹门不可达（本规格 §2 目标 2 的「命中静默放行」与「失配 → 指纹不符弹窗」
   两条路径皆失效）。
+- **stem 等价**（issue #133）：Windows 落库 basename 常带可执行后缀
+  （`npm.cmd`）而键入名无扩展名（`npm`）——匹配层对绑定规则按「双方都剥离
+  常见可执行后缀（`.com/.exe/.bat/.cmd`，大小写不敏感）后 glob」的 **stem
+  等价**比较：`"npm.cmd" ↔ "npm"`、`"fptool.exe" ↔ "fptool.exe"` 均命中；
+  无可剥离后缀时退化回 #132 的 basename glob（零变化）。形式层只负责收集
+  候选规则，安全仍由 §5.1 解析 + §5.2 指纹门承载（解析到不同文件/不可解析
+  → 审批 fail-closed）。
 - **未绑定（`fingerprint=None`）规则维持整串 glob 语义**（§4 兼容性零变化）。
 
 ## 6. 大文件与性能（拍板：指纹缓存 + 元信息失效 + 阈值）

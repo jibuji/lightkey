@@ -15,6 +15,9 @@
 //! - macOS env 读取失败 → fail-closed（cfg 门）：`macos_env_read_failure_fail_closed`
 //! - 锁态 → `session.invalid`（回归）：`locked_session_invalid_regression`
 //! - 启动者未知 → 第 1 层拒绝（先于指纹比对，回归）：`unknown_starter_denied_first`
+//! - Windows 无扩展名 command[0] 经 PATHEXT 解析命中（issue #133）：
+//!   `windows_pathext_resolves_extensionless_command` / 解析不可达 fail-closed
+//!   控制组：`bound_rule_unresolvable_command_fails_closed`
 
 use super::*;
 use crate::identity::PeerEnv;
@@ -22,21 +25,27 @@ use lk_core::fingerprint;
 use lk_core::model::{ProgramFingerprint, RuleDraft, RULE_CAPABILITY_INJECT};
 use std::path::{Path, PathBuf};
 
-/// 假对端 env：返回指定 bin 目录（PATH 单目录，测试确定性解析）。
+/// 假对端 env：返回指定 bin 目录（PATH 单目录，测试确定性解析）+ 可选
+/// PATHEXT（issue #133：Windows 无扩展名命令的后缀探测表；None = 不探测）。
 #[derive(Clone)]
 struct FakePeerEnv {
     path: String,
+    pathext: Option<String>,
 }
 impl PeerEnv for FakePeerEnv {
     fn peer_path(&self, _pid: u32) -> Option<String> {
         Some(self.path.clone())
     }
+    fn peer_pathext(&self, _pid: u32) -> Option<String> {
+        self.pathext.clone()
+    }
 }
 
 /// 注入假对端 env 到守护进程（替换平台真实读取）。
-fn inject_fake_env(state: &Arc<Mutex<Daemon>>, bin_dir: &Path) {
+fn inject_fake_env(state: &Arc<Mutex<Daemon>>, bin_dir: &Path, pathext: Option<&str>) {
     state.lock().unwrap().set_peer_env(Arc::new(FakePeerEnv {
         path: bin_dir.to_string_lossy().into_owned(),
+        pathext: pathext.map(|p| p.to_string()),
     }));
 }
 
@@ -115,7 +124,7 @@ fn binding_hit_silently_allows() {
     // 绑定 inject 规则（command = CLI 推导的 basename "pgm"，issue #132）
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     seed_bound_rule(&shared, proj.path(), &fp, "pgm", &["NPM_TOKEN"]);
-    inject_fake_env(&state, bin.path());
+    inject_fake_env(&state, bin.path(), None);
 
     let handler = make_handler(&state, &shared);
     let peer = test_peer(Some(proj.path()));
@@ -140,6 +149,91 @@ fn binding_hit_silently_allows() {
     assert_eq!(evs[0].result, lk_core::audit::AuditResult::Allowed);
 }
 
+/// Windows 无扩展名 command[0]（issue #133 主线复现）：`--fingerprint
+/// ...\npm.cmd` 落库的规则 command = "npm.cmd"（含后缀 basename，#132/§5.4
+/// 形态），注入请求 "npm publish" 无扩展名 → 匹配层 stem 等价命中（#133
+/// 匹配侧）→ daemon 按对端 PATHEXT 逐后缀解析到 `<bin>\npm.cmd` → 指纹一致
+/// → **静默放行**（无审批）。假对端 env 注入 PATH+PATHEXT；真实文件
+/// "npm.cmd"（跨平台复现 Windows 形态；大小写敏感 FS 上用同形后缀等价探测）。
+#[test]
+fn windows_pathext_resolves_extensionless_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let (_exe, fp) = make_exe(bin.path(), "npm.cmd", b"@echo off\r\nset FOO=bar\r\n");
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    // CLI 落库形态（issue #132）：--fingerprint ...\npm.cmd → command = "npm.cmd"
+    seed_bound_rule(&shared, proj.path(), &fp, "npm.cmd", &["NPM_TOKEN"]);
+    inject_fake_env(&state, bin.path(), Some(".EXE;.cmd"));
+
+    let handler = make_handler(&state, &shared);
+    let peer = test_peer(Some(proj.path()));
+    let resp = handler(
+        &rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(&token),
+            json!({ "command": "npm publish", "keys": ["NPM_TOKEN"] }),
+        ),
+        &peer,
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["result"]["allowed"], true,
+        "Windows 无扩展名命令应命中绑定规则并静默放行：{resp}"
+    );
+    assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit", "放行注入值");
+    assert!(
+        shared.approvals.pending_count() == 0,
+        "绑定命中不弹窗（无审批登记）"
+    );
+    // 审计：解析 + 指纹比对全部通过 → allowed
+    let evs = inject_audit(dir.path());
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].result, lk_core::audit::AuditResult::Allowed);
+}
+
+/// issue #133 fail-closed 方向（统一跨平台）：绑定规则存在 + 命令形态命中，
+/// 但对端 PATH 无法解析出任何候选可执行文件（真实文件不在 PATH 上）→
+/// Unresolved → 视同未命中 → headless 统一拒绝（与普通未命中同码，不引入
+/// 新错误面、不泄露解析差异）。
+/// 注：Windows 无 PATHEXT 时**回落缺省后缀表**仍会命中真实文件——那是放行
+/// 方向，由 module 层 `resolve_exe_path_probes_peer_pathext_extensions`
+/// 的 cfg 分支钉住；本测试只钉「解析不可达 → fail-closed」这条链。
+#[test]
+fn bound_rule_unresolvable_command_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let (_exe, fp) = make_exe(bin.path(), "npm.cmd", b"@echo off\r\nset FOO=bar\r\n");
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    seed_bound_rule(&shared, proj.path(), &fp, "npm.cmd", &["NPM_TOKEN"]);
+    // 对端 env 的 PATH 指向**空目录**（真实文件不在 PATH 上；cwd 兜底也无）
+    // → 无扩展名/带扩展名候选全未命中 → 解析 Unresolved
+    inject_fake_env(&state, empty.path(), None);
+
+    let handler = make_handler(&state, &shared);
+    let peer = test_peer(Some(proj.path()));
+    let resp = handler(
+        &rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(&token),
+            json!({ "command": "npm publish", "keys": ["NPM_TOKEN"] }),
+        ),
+        &peer,
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["result"]["allowed"], false,
+        "解析不可达 → 视同未命中 → 拒绝：{resp}"
+    );
+    assert_eq!(
+        v["result"]["reason"].as_str(),
+        Some("no_ui"),
+        "与未命中共用 headless 拒绝路径：{resp}"
+    );
+}
+
 /// 绑定失配（改内容 → 哈希失配，同路径）→ 视同未命中 → 转审批（GUI 在场）；
 /// 审批帧携带 `fingerprintMismatch`（当前解析路径 + 8 位哈希摘要，不含完整值）。
 #[test]
@@ -150,7 +244,7 @@ fn binding_mismatch_folds_to_approval() {
     let (pgm_path, fp_v1) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm", &["NPM_TOKEN"]);
-    inject_fake_env(&state, bin.path());
+    inject_fake_env(&state, bin.path(), None);
     // 内容被改（提升 mtime）→ 现哈希 ≠ 规则记录的 fp_v1.sha256
     std::fs::write(&pgm_path, b"#!/bin/sh\necho v2-xxxx\n").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -220,7 +314,7 @@ fn headless_mismatch_denied_same_code() {
     let (pgm_path, fp_v1) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm", &["NPM_TOKEN"]);
-    inject_fake_env(&state, bin.path());
+    inject_fake_env(&state, bin.path(), None);
     // 制造失配：改内容（mtime 变）→ 现哈希 ≠ 规则记录
     std::fs::write(&pgm_path, b"#!/bin/sh\necho v2-other\n").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -262,7 +356,7 @@ fn reauthorize_via_rule_gate_persists_recomputed_fingerprint() {
     let bin = tempfile::tempdir().unwrap();
     let (pgm_path, _fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
-    inject_fake_env(&state, bin.path());
+    inject_fake_env(&state, bin.path(), None);
 
     let handler = make_handler(&state, &shared);
     let (_sid, rx) = shared.push.subscribe(true);
@@ -328,7 +422,7 @@ fn cache_meta_unchanged_reuses_hash() {
     let (_exe, fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     seed_bound_rule(&shared, proj.path(), &fp, "pgm", &["NPM_TOKEN"]);
-    inject_fake_env(&state, bin.path());
+    inject_fake_env(&state, bin.path(), None);
     let handler = make_handler(&state, &shared);
     let peer = test_peer(Some(proj.path()));
 
@@ -371,7 +465,7 @@ fn content_change_recomputes_and_mismatches() {
         let (pgm_path, fp_v1) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
         let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
         seed_bound_rule(&shared, proj.path(), &fp_v1, "pgm", &["NPM_TOKEN"]);
-        inject_fake_env(&state, bin.path());
+        inject_fake_env(&state, bin.path(), None);
         // 改内容（mtime 变）→ 重算 → 哈希失配 → 转审批
         std::fs::write(&pgm_path, content).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -424,7 +518,7 @@ fn locked_session_invalid_regression() {
         &rpc_line(M_VAULT_LOCK, None, json!({})),
         &PeerInfo::unknown(),
     );
-    inject_fake_env(&state, bin.path());
+    inject_fake_env(&state, bin.path(), None);
     let handler = make_handler(&state, &shared);
     let peer = PeerInfo {
         pid: std::process::id(),
@@ -455,7 +549,7 @@ fn unknown_starter_denied_first() {
     let (_exe, fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
     let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
     seed_bound_rule(&shared, proj.path(), &fp, "pgm", &["NPM_TOKEN"]);
-    inject_fake_env(&state, bin.path());
+    inject_fake_env(&state, bin.path(), None);
     let handler = make_handler(&state, &shared);
     // 桌面订阅在场（有审批界面）——但启动者未知仍第 1 层拒绝，不进指纹/审批
     let (_sid, _rx) = shared.push.subscribe(true);
