@@ -30,11 +30,19 @@ use lk_core::Result;
 // 1. 对端真实 env PATH 读取（§5.1）
 // ---------------------------------------------------------------------------
 
-/// 对端进程真实 env 的 PATH（守护进程侧读取；客户端自报一律视为不可信输入）。
-/// 失败（不可读/同架构不符/无 PATH）→ `None`（调用方按 fail-closed 处置）。
+/// 对端进程真实 env 的 PATH/PATHEXT（守护进程侧读取；客户端自报一律视为
+/// 不可信输入）。失败（不可读/同架构不符/无该变量）→ `None`（调用方按
+/// fail-closed 处置）。
 pub trait PeerEnv: Send + Sync {
     /// 对端真实 PATH（原始字符串，`:` / `;` 分隔；None = 无法读取 → fail-closed）。
     fn peer_path(&self, pid: u32) -> Option<String>;
+    /// 对端真实 PATHEXT（Windows；`;` 分隔的后缀表，issue #133 解析 `command[0]`
+    /// 的扩展名探测用）。默认 None：非 Windows 平台无 PATHEXT 语义；Windows
+    /// 实现读对端 env 块。None = 无法读取/未设置 → 调用方按平台缺省处理
+    /// （Windows 回落常见后缀表，其余平台不探测后缀）。
+    fn peer_pathext(&self, _pid: u32) -> Option<String> {
+        None
+    }
 }
 
 /// 平台默认对端 env 读取（Linux `/proc` / Windows PEB / macOS fail-closed）。
@@ -44,6 +52,17 @@ pub struct PlatformPeerEnv;
 impl PeerEnv for PlatformPeerEnv {
     fn peer_path(&self, pid: u32) -> Option<String> {
         read_peer_path(pid)
+    }
+    fn peer_pathext(&self, pid: u32) -> Option<String> {
+        #[cfg(windows)]
+        {
+            read_peer_pathext(pid)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
+            None
+        }
     }
 }
 
@@ -66,20 +85,50 @@ pub fn parse_path_from_environ(bytes: &[u8]) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
-/// Windows env 块（NUL 分隔的 UTF-16 `NAME=VALUE` 串）中提取 PATH 值。
+/// 解析 Windows PATHEXT（`;` 分隔，形如 `.COM;.EXE;.BAT;.CMD`）：每项规范化
+/// （去空白、补前导 `.`、去空项）后返回；输入为空/纯分隔符 → 空表。纯函数，
+/// 跨平台可测（生产仅 Windows 使用——对端 env 无 PATHEXT 时由调用方按平台
+/// 缺省处理，见 [`pathext_extensions`]）。大小写保留（Windows FS 大小写不
+/// 敏感，探测与比对不受影响）。
+pub fn parse_pathext(pathext: &str) -> Vec<String> {
+    pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.starts_with('.') {
+                s.to_string()
+            } else {
+                format!(".{s}")
+            }
+        })
+        .collect()
+}
+
+/// Windows env 块（NUL 分隔的 UTF-16 `NAME=VALUE` 串）中按名提取变量值。
 /// 纯函数，可注入假块做单测。**env 名大小写不敏感**（Windows 环境块常把
-/// PATH 存为 `Path=`/`path=` 等混合大小写；CRT 的 `getenv("PATH")` 也是大小写
-/// 无关），须按 `=` 前段 `eq_ignore_ascii_case` 匹配，否则漏掉真实变量 →
-/// fail-closed 误判不可读。无 PATH / 空 → `None`。
-/// 仅 Windows PEB 路径使用（`read_peer_path_peb`），其它平台不编译（避免
+/// PATH 存为 `Path=`/`path=` 等混合大小写；CRT 的 `getenv` 也是大小写无关），
+/// 须按 `=` 前段 `eq_ignore_ascii_case` 匹配，否则漏掉真实变量 → fail-closed
+/// 误判不可读。无该变量 / 空值 → `None`。
+/// 仅 Windows PEB 路径使用（`read_peer_env_block`），其它平台不编译（避免
 /// Linux/macOS 构建 dead-code 告警——CI `-D warnings`）。
 #[cfg(windows)]
-fn extract_path_from_env_block_utf16(block: &str) -> Option<String> {
+fn extract_var_from_env_block_utf16(block: &str, want: &str) -> Option<String> {
     block.split('\0').find_map(|e| {
         let mut it = e.splitn(2, '=');
         let (name, val) = (it.next()?, it.next()?);
-        (name.eq_ignore_ascii_case("PATH") && !val.is_empty()).then(|| val.to_string())
+        (name.eq_ignore_ascii_case(want) && !val.is_empty()).then(|| val.to_string())
     })
+}
+
+#[cfg(windows)]
+fn extract_path_from_env_block_utf16(block: &str) -> Option<String> {
+    extract_var_from_env_block_utf16(block, "PATH")
+}
+
+#[cfg(windows)]
+fn extract_pathext_from_env_block_utf16(block: &str) -> Option<String> {
+    extract_var_from_env_block_utf16(block, "PATHEXT")
 }
 
 #[cfg(target_os = "macos")]
@@ -145,14 +194,22 @@ fn read_peer_path_procargs2(pid: u32) -> Option<String> {
 
 /// Windows：PEB `ProcessParameters.Environment`（复用 starter.rs 的 PEB 读取
 /// 基建——同款 NtQueryInformationProcess + ReadProcessMemory + 偏移表 + 长度
-/// sanity check）。Environment 是 NUL 分隔的 UTF-16 键值块，取其 `PATH=...`。
+/// sanity check）。Environment 是 NUL 分隔的 UTF-16 键值块，据此取 `PATH=...`
+/// 与 `PATHEXT=...`。
 #[cfg(windows)]
 fn read_peer_path(pid: u32) -> Option<String> {
-    read_peer_path_peb(pid)
+    read_peer_env_block(pid).and_then(|b| extract_path_from_env_block_utf16(&b))
 }
 
 #[cfg(windows)]
-fn read_peer_path_peb(pid: u32) -> Option<String> {
+fn read_peer_pathext(pid: u32) -> Option<String> {
+    read_peer_env_block(pid).and_then(|b| extract_pathext_from_env_block_utf16(&b))
+}
+
+/// Windows PEB 环境块整块读取（UTF-16 → String；PATH/PATHEXT 共用一次读取
+/// 基建，两次跨进程读取各自独立）。
+#[cfg(windows)]
+fn read_peer_env_block(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
@@ -275,13 +332,13 @@ fn read_peer_path_peb(pid: u32) -> Option<String> {
                 .position(|w| w[0] == 0 && w[1] == 0)
                 .map(|i| i + 2)
                 .unwrap_or(uk);
-            let block = String::from_utf16_lossy(&rawb[..end.min(uk)]);
-            // 环境块为 NUL 分隔的 `NAME=VALUE` 串；提取 PATH（值通常 ASCII，
-            // lossy 已是既有做法）。**Windows env 名大小写不敏感——环境块里
-            // PATH 常存为 `Path=`（实测）而非 `PATH=`，严格前缀会漏掉真实
-            // 环境 → fail-closed 误判不可读**（用 `eq_ignore_ascii_case`，
-            // 见 [`extract_path_from_env_block_utf16`]）。
-            extract_path_from_env_block_utf16(&block)
+            // 环境块为 NUL 分隔的 `NAME=VALUE` 串（值通常 ASCII，lossy 已是
+            // 既有做法）。PATH/PATHEXT 提取在调用方完成——**Windows env 名
+            // 大小写不敏感**：环境块里 PATH 常存为 `Path=`（实测）而非
+            // `PATH=`，严格前缀会漏掉真实环境 → fail-closed 误判不可读
+            // （`eq_ignore_ascii_case` 处理，见
+            // [`extract_var_from_env_block_utf16`]）。
+            Some(String::from_utf16_lossy(&rawb[..end.min(uk)]))
         })();
         CloseHandle(handle);
         result
@@ -322,8 +379,40 @@ pub fn resolve_exe_path(
         .map(PathBuf::from)
         .collect();
     // resolve_exe 内置 `cwd` 兜底（PATH 全未命中时的最后一个候选）
-    let resolved = fingerprint::resolve_exe(command, &path_dirs, Path::new(cwd), |p| p.is_file())?;
+    // issue #133：Windows 无扩展名命令（`npm`/`git`/`npx`…）按对端 PATHEXT
+    // 逐后缀探测（见 [`pathext_extensions`]），解析结果 = 带后缀的真实文件；
+    // 非 Windows 无后缀表 = 探测空、行为与 #132 前完全一致。
+    let exts = pathext_extensions(peer_env, pid);
+    let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+    let resolved = fingerprint::resolve_exe(command, &path_dirs, Path::new(cwd), &ext_refs, |p| {
+        p.is_file()
+    })?;
     std::fs::canonicalize(&resolved).ok()
+}
+
+/// 本次解析用的可执行后缀表（issue #133）：对端真实 PATHEXT 解析结果；对端
+/// 未设置/读取失败 → Windows 平台缺省（cmd 缺省 PATHEXT 序，
+/// [`lk_core::fingerprint::EXEC_EXTENSIONS`]），非 Windows 为空表（不探测后缀，
+/// 行为与 #132 前完全一致）。
+fn pathext_extensions(peer_env: &dyn PeerEnv, pid: u32) -> Vec<String> {
+    match peer_env.peer_pathext(pid) {
+        Some(p) => parse_pathext(&p),
+        None => default_pathext_extensions(),
+    }
+}
+
+fn default_pathext_extensions() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        lk_core::fingerprint::EXEC_EXTENSIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
 }
 
 /// 绑定裁决结果（调用方据此决定放行 / 转审批）。
@@ -613,14 +702,18 @@ impl FingerprintCache {
 mod tests {
     use super::*;
 
-    /// 假对端 env（测试注入）。
+    /// 假对端 env（测试注入；pathext None = 平台缺省/不探测）。
     #[derive(Clone)]
     struct FakePeerEnv {
         path: Option<String>,
+        pathext: Option<String>,
     }
     impl PeerEnv for FakePeerEnv {
         fn peer_path(&self, _pid: u32) -> Option<String> {
             self.path.clone()
+        }
+        fn peer_pathext(&self, _pid: u32) -> Option<String> {
+            self.pathext.clone()
         }
     }
 
@@ -635,6 +728,69 @@ mod tests {
         assert_eq!(parse_path_from_environ(b""), None);
         // PATH 空值 → None（PATH 目录集为空 = 不可解析）
         assert_eq!(parse_path_from_environ(b"PATH=\0"), None);
+    }
+
+    /// parse_pathext（issue #133）：PATHEXT `;` 分隔后缀表的解析与规范化。
+    #[test]
+    fn parse_pathext_normalizes_extension_list() {
+        assert_eq!(
+            parse_pathext(".COM;.EXE;.BAT;.CMD"),
+            vec![".COM", ".EXE", ".BAT", ".CMD"]
+        );
+        // 去空白 / 补前导点 / 去空项；大小写保留（FS 大小写不敏感）
+        assert_eq!(
+            parse_pathext(" EXE ;cmd;;.vbs;"),
+            vec![".EXE", ".cmd", ".vbs"]
+        );
+        assert_eq!(parse_pathext("exe;.cmd"), vec![".exe", ".cmd"]);
+        // 空 / 纯分隔符 → 空表（不探测任何后缀）
+        assert_eq!(parse_pathext(""), Vec::<String>::new());
+        assert_eq!(parse_pathext(";; ;"), Vec::<String>::new());
+    }
+
+    /// resolve_exe_path 按对端 PATHEXT 逐后缀解析（issue #133 核心路径）：
+    /// 命令 "npm publish" → command[0] "npm" 无扩展名 → 无后缀字面候选不存在
+    /// → 按 PATHEXT ".EXE;.CMD" 探测到 `<bin>\npm.cmd` → canonicalize 返回
+    /// 真实文件路径（含后缀）。用真实临时文件 + 注入假对端 env（PATH+PATHEXT），
+    /// 跨平台可跑（Windows 形态在任意 OS 上由假 env 注入复现）。
+    #[test]
+    fn resolve_exe_path_probes_peer_pathext_extensions() {
+        let bin = tempfile::tempdir().unwrap();
+        let raw = bin.path().join("npm.cmd");
+        std::fs::write(&raw, b"@echo off\r\nset FOO=bar\r\n").unwrap();
+        let canonical = std::fs::canonicalize(&raw).unwrap();
+
+        // 带 PATHEXT：无扩展名命令 → 探测到 npm.cmd（大小写敏感 FS 上用同形后缀
+        // 复现顺序探测机制；真实 Windows FS 大小写不敏感，大写 `.CMD` 同样
+        // 命中小写 `npm.cmd`）
+        let env = FakePeerEnv {
+            path: Some(bin.path().to_string_lossy().into_owned()),
+            pathext: Some(".EXE;.cmd".into()),
+        };
+        let got = resolve_exe_path(&env, 1, "/proj", "npm publish")
+            .expect("PATHEXT 探测应解析出 npm.cmd");
+        assert_eq!(got, canonical, "解析结果应为带后缀的真实文件路径");
+
+        // 控制组：对端 PATHEXT 读取失败/未设置 → **平台缺省语义**（issue #133
+        // 缺省回落）：Windows 回落 cmd 缺省表（.COM;.EXE;.BAT;.CMD）→ 仍
+        // 探测到 npm.cmd；非 Windows 不探测后缀 → 无扩展名命令不可解析
+        // （fail-closed 审批）。
+        let env2 = FakePeerEnv {
+            path: Some(bin.path().to_string_lossy().into_owned()),
+            pathext: None,
+        };
+        #[cfg(windows)]
+        assert_eq!(
+            resolve_exe_path(&env2, 1, "/proj", "npm publish"),
+            Some(canonical),
+            "Windows 缺省 PATHEXT 回落应仍解析出 npm.cmd"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            resolve_exe_path(&env2, 1, "/proj", "npm publish"),
+            None,
+            "无 PATHEXT 时无扩展名命令不可解析（fail-closed 审批）"
+        );
     }
 
     /// 假文件源：元信息 + 确定性哈希（测试缓存复用/失效）。
@@ -713,8 +869,16 @@ mod tests {
         // 至少验证 trait 对象可调用（生产平台装配路径不变）。
         let env: Box<dyn PeerEnv> = Box::new(FakePeerEnv {
             path: Some("/bin".into()),
+            pathext: Some(".EXE;.CMD".into()),
         });
         assert_eq!(env.peer_path(123), Some("/bin".into()));
+        assert_eq!(env.peer_pathext(123), Some(".EXE;.CMD".into()));
+        // 缺省实现（生产非 Windows 形态）：未注入 PATHEXT → None（不探测）
+        let env2: Box<dyn PeerEnv> = Box::new(FakePeerEnv {
+            path: Some("/bin".into()),
+            pathext: None,
+        });
+        assert_eq!(env2.peer_pathext(123), None);
     }
 
     /// env 块 PATH 提取（Windows PEB 共用纯函数）：**大小写不敏感**——真实
@@ -751,6 +915,53 @@ mod tests {
         assert_eq!(
             extract_path_from_env_block_utf16("LOCALAPPDATA=C:\\x\0path=C:\\bin\0PATH_FOO=1"),
             Some(r"C:\bin".into())
+        );
+    }
+
+    /// env 块 PATHEXT 提取（issue #133）：大小写不敏感 + 与 PATH 恰为独立变量
+    /// （`PATH=` 段不误取为 PATHEXT）；无 PATHEXT / 空值 → None。
+    #[cfg(windows)]
+    #[test]
+    fn env_block_pathext_extraction_case_insensitive() {
+        use crate::identity::extract_pathext_from_env_block_utf16;
+        // 标准大写形态
+        assert_eq!(
+            extract_pathext_from_env_block_utf16("PATHEXT=.COM;.EXE;.BAT;.CMD\0HOME=/u"),
+            Some(".COM;.EXE;.BAT;.CMD".into())
+        );
+        // 混合大小写（Windows env 名大小写不敏感）
+        assert_eq!(
+            extract_pathext_from_env_block_utf16("PathExt=.EXE;.CMD\0PATH=C:\\bin"),
+            Some(".EXE;.CMD".into())
+        );
+        // 只读 PATH / PATH_FOO 不得误命中；空值 → None（fail-closed 边界）
+        assert_eq!(
+            extract_pathext_from_env_block_utf16("PATH=C:\\Windows"),
+            None
+        );
+        assert_eq!(extract_pathext_from_env_block_utf16("PATHEXT="), None);
+        assert_eq!(extract_pathext_from_env_block_utf16(""), None);
+        assert_eq!(
+            extract_pathext_from_env_block_utf16("PATHEXT_FOO=.EXE\0TMP=C:\\x"),
+            None
+        );
+    }
+
+    /// 平台侧真实对端 env PATHEXT 读取（Windows PEB，issue #133 主平台回灌）：
+    /// 本进程 PEB env 块的 PATHEXT 应可读且与本进程 env 一致（PEB 直读与
+    /// CRT `std::env` 同源）。缺失时宽松跳过（极端自定义环境并非失败）。
+    #[cfg(windows)]
+    #[test]
+    fn real_peer_pathext_reads_current_process_pathext() {
+        let got = PlatformPeerEnv.peer_pathext(std::process::id());
+        let own = std::env::var("PATHEXT").unwrap_or_default();
+        if own.is_empty() {
+            return; // 环境未设 PATHEXT（异常环境）→ 不硬性断言
+        }
+        let got = got.expect("本进程 PEB env 的 PATHEXT 应可读");
+        assert!(
+            got.eq_ignore_ascii_case(&own),
+            "PEB 读出的 PATHEXT 与本进程 env 不一致：peb={got:?} own={own:?}"
         );
     }
 

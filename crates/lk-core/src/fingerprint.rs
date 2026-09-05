@@ -24,6 +24,12 @@ use crate::Result;
 /// 读取缓冲上界，与文件大小无关——大文件不高驻全量内存。
 pub const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// 常见可执行文件后缀（Windows；决议口径 issue #133，cmd 缺省 PATHEXT
+/// `.COM;.EXE;.BAT;.CMD` 序）：绑定规则命令形态的 **stem 等价比较**
+/// （`lk-core::authz`）与守护进程 PATHEXT **缺省回落**（`lk-daemon`）共用
+/// 同一集合。统一小写；后缀检查按大小写不敏感进行（Windows FS 大小写不敏感）。
+pub const EXEC_EXTENSIONS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
+
 // ---------------------------------------------------------------------------
 // 1. 绑定规则比对序（§5.2）
 // ---------------------------------------------------------------------------
@@ -78,8 +84,20 @@ pub fn command0(command: &str) -> Option<&str> {
 /// - 否则每个 PATH 目录拼接 `command[0]`（**候选序可观测**，第一个命中项即
 ///   候选），**末尾追加 `cwd/command[0]` 兜底**（PATH 全未命中时）。
 ///
+/// `exts` 为可执行文件后缀表（Windows PATHEXT 语义，issue #133）：非绝对命令
+/// 在每个目录内按「无扩展原名 → 逐后缀」序展开——`<dir>\npm, <dir>\npm.exe,
+/// <dir>\npm.cmd, …`——**目录间仍按 PATH 序**（第一个目录内任一形态命中即
+/// 候选，与 cmd 行为一致）；Linux/macOS 传空表（不展开后缀，行为与无 `exts`
+/// 完全一致）。解析结果 = 命中项**原样路径**（含后缀——Windows 上 `npm`
+/// 解析为 `<dir>\npm.cmd`，调用方无需再自行补全后再 canonicalize）。
+///
 /// 空命令/纯空白 → 空候选集（调用方按 fail-closed 处理）。
-pub fn exe_candidates(command: &str, path_dirs: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
+pub fn exe_candidates(
+    command: &str,
+    path_dirs: &[PathBuf],
+    cwd: &Path,
+    exts: &[&str],
+) -> Vec<PathBuf> {
     let Some(cmd) = command0(command) else {
         return Vec::new();
     };
@@ -87,14 +105,34 @@ pub fn exe_candidates(command: &str, path_dirs: &[PathBuf], cwd: &Path) -> Vec<P
     if cmd_path.is_absolute() {
         return vec![cmd_path.to_path_buf()];
     }
-    let mut out: Vec<PathBuf> = path_dirs.iter().map(|d| d.join(cmd)).collect();
-    out.push(cwd.join(cmd));
+    let mut out: Vec<PathBuf> =
+        Vec::with_capacity(path_dirs.len() * (exts.len() + 1) + exts.len() + 1);
+    for d in path_dirs
+        .iter()
+        .map(|d| d.as_path())
+        .chain(std::iter::once(cwd))
+    {
+        let base = d.join(cmd);
+        out.push(base.clone());
+        for ext in exts {
+            out.push(append_suffix(&base, ext));
+        }
+    }
     out
 }
 
-/// 首个被 `exists` 判定的候选解析结果。`exists` 为可执行性判定谓词（is_file/
-/// Windows `.exe` 后缀 + Linux 可执行位的差异由调用方谓词承担），保持本函数
-/// 平台无关、纯测试可控。「第一个命中项即候选」（§5.1）。
+/// 在文件名字段后追加**无分隔符后缀**（`npm` + `.CMD` → `npm.CMD`；OsString
+/// 直拷原始字节，不引入路径分隔符——正是「后缀」而非「子目录」语义）。
+fn append_suffix(base: &Path, ext: &str) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(ext);
+    PathBuf::from(os)
+}
+
+/// 首个被 `exists` 判定的候选解析结果。`exists` 为可执行性判定谓词
+/// （is_file / Linux 可执行位）；**Windows 无扩展名命令的后缀探测由 `exts`
+/// 候选展开承担**（issue #133，见 [`exe_candidates`]），谓词无需再关心平台
+/// 后缀差异。保持本函数平台无关、纯测试可控。「第一个命中项即候选」（§5.1）。
 ///
 /// 语义：按 [`exe_candidates`] 产出的候选序，取**第一个**满足 `exists` 的候选；
 /// 全未命中 → `None`（调用方据此 fail-closed 或做 cwd 兜底裁决）。
@@ -102,9 +140,10 @@ pub fn resolve_exe(
     command: &str,
     path_dirs: &[PathBuf],
     cwd: &Path,
+    exts: &[&str],
     exists: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    let candidates = exe_candidates(command, path_dirs, cwd);
+    let candidates = exe_candidates(command, path_dirs, cwd, exts);
     candidates.into_iter().find(|c| exists(c))
 }
 
@@ -252,7 +291,7 @@ mod tests {
         let abs = r"C:\tools\node.exe";
         #[cfg(not(windows))]
         let abs = "/usr/bin/node";
-        let cands = exe_candidates(abs, &dirs, &cwd);
+        let cands = exe_candidates(abs, &dirs, &cwd, &[]);
         assert_eq!(cands, vec![PathBuf::from(abs)]);
     }
 
@@ -265,7 +304,7 @@ mod tests {
             PathBuf::from("/usr/bin"),
         ];
         let cwd = PathBuf::from("/cwd");
-        let cands = exe_candidates("npm publish", &dirs, &cwd);
+        let cands = exe_candidates("npm publish", &dirs, &cwd, &[]);
         // 候选序的父目录名 = [evil, usr, cwd]（PATH 序 + cwd 兜底；文件名全是
         // `npm`）。用父目录末分量断言，避免平台分隔符导致字面路径不等。
         let parents: Vec<String> = cands
@@ -281,7 +320,7 @@ mod tests {
         // 规则绑定的真实程序在 /usr/bin，PATH 前置假程序 /evil/npm 先命中 →
         // resolve 拿到假程序（父目录 evil）→ fingerprint 按路径不符失配（免哈希）。
         let rule = fp("/usr/bin/npm", &sha64('a'), 50);
-        let resolved = resolve_exe("npm publish", &dirs, &cwd, |p| {
+        let resolved = resolve_exe("npm publish", &dirs, &cwd, &[], |p| {
             // 候选父目录为 `evil`（前置假程序）或 `bin`（真实程序）即视为存在；
             // resolve 取第一个存在项 = 前置假程序。
             parent_name(p) == Some("evil") || parent_name(p) == Some("bin")
@@ -302,7 +341,7 @@ mod tests {
 
         // 控制组：若前置 PATH 缺假程序，则命中真实规则程序所在（bin）→ 路径
         // 一致 + size/hash 一致 → 命中。
-        let resolved2 = resolve_exe("npm publish", &dirs, &cwd, |p| {
+        let resolved2 = resolve_exe("npm publish", &dirs, &cwd, &[], |p| {
             parent_name(p) == Some("bin")
         });
         let resolved2 = resolved2.expect("真实程序应命中");
@@ -323,7 +362,7 @@ mod tests {
         ];
         let cwd = PathBuf::from("/proj");
         // PATH 目录不含 `proj`，仅 cwd 兜底候选的父目录为 `proj` → 命中 cwd 候选。
-        let resolved = resolve_exe("tool", &dirs, &cwd, |p| {
+        let resolved = resolve_exe("tool", &dirs, &cwd, &[], |p| {
             p.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("proj"))
         });
         let resolved = resolved.expect("PATH 全未命中应回退 cwd 兜底");
@@ -333,14 +372,14 @@ mod tests {
             Some(std::ffi::OsStr::new("proj")),
         );
         // PATH 全未命中 + cwd 也不存在 → None（fail-closed 边界）
-        assert_eq!(resolve_exe("tool", &dirs, &cwd, |_| false), None);
+        assert_eq!(resolve_exe("tool", &dirs, &cwd, &[], |_| false), None);
     }
 
     /// cwd 兜底追加在 PATH 候选之后（兜底语义：PATH 优先）。
     #[test]
     fn cwd_fallback_is_last_candidate() {
         let dirs = vec![PathBuf::from("/p1")];
-        let cands = exe_candidates("tool", &dirs, Path::new("/cwd"));
+        let cands = exe_candidates("tool", &dirs, Path::new("/cwd"), &[]);
         let file_names: Vec<String> = cands
             .iter()
             .map(|p| {
@@ -352,11 +391,93 @@ mod tests {
         assert_eq!(file_names, vec!["tool@p1", "tool@cwd"]);
     }
 
+    /// Windows PATHEXT 候选展开（issue #133）：非绝对命令在每个目录内按
+    /// 「无扩展原名 → 逐后缀」序展开，目录间仍按 PATH 序（+ cwd 兜底）——
+    /// `<dir>\npm, <dir>\npm.EXE, <dir>\npm.CMD, <next dir>\npm, …`。
+    #[test]
+    fn exe_candidates_interleaves_extensions_per_directory() {
+        let dirs = vec![PathBuf::from("/evil"), PathBuf::from("/bin")];
+        let cwd = PathBuf::from("/cwd");
+        let exts = [".EXE", ".CMD"];
+        let cands = exe_candidates("npm", &dirs, &cwd, &exts);
+        // 目录内：无扩展原名先于后缀形态；目录间：PATH 序（evil → bin）+ cwd 兜底
+        let names: Vec<String> = cands
+            .iter()
+            .map(|p| {
+                p.file_name().unwrap().to_str().unwrap().to_string()
+                    + "@"
+                    + p.parent().unwrap().file_name().unwrap().to_str().unwrap()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "npm@evil",
+                "npm.EXE@evil",
+                "npm.CMD@evil",
+                "npm@bin",
+                "npm.EXE@bin",
+                "npm.CMD@bin",
+                "npm@cwd",
+                "npm.EXE@cwd",
+                "npm.CMD@cwd",
+            ]
+        );
+        // 空后缀表 → 与展开前完全一致（Linux/macOS 生产形态）
+        let plain = exe_candidates("npm", &dirs, &cwd, &[]);
+        let plain_names: Vec<String> = plain
+            .iter()
+            .map(|p| {
+                p.file_name().unwrap().to_str().unwrap().to_string()
+                    + "@"
+                    + p.parent().unwrap().file_name().unwrap().to_str().unwrap()
+            })
+            .collect();
+        assert_eq!(plain_names, vec!["npm@evil", "npm@bin", "npm@cwd"]);
+    }
+
+    /// resolve 序（issue #133）：**目录间优先于后缀形态**——前置目录只有
+    /// 后缀形态命中（`/evil/npm.CMD`）也先于后置目录的无扩展原名
+    /// （`/bin/npm`）；解析结果 = 命中项**原样路径**（含后缀，
+    /// `<evil>\npm.CMD` 或平台分隔符变体），调用方直接 canonicalize 即可。
+    #[test]
+    fn resolve_exe_prefers_first_dir_with_any_extension_form() {
+        let dirs = vec![PathBuf::from("/evil"), PathBuf::from("/bin")];
+        let cwd = PathBuf::from("/cwd");
+        let exts = [".EXE", ".CMD"];
+        // 文件形态（纯谓词模拟）：/evil 只有 npm.CMD；/bin 只有 npm（无后缀）
+        let exists = |p: &Path| {
+            let parent = p
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str());
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            (parent == Some("evil") && name == "npm.CMD")
+                || (parent == Some("bin") && name == "npm")
+        };
+        // 带后缀表：前置目录的 suffix 形态先命中 → /evil/npm.CMD
+        let resolved =
+            resolve_exe("npm publish", &dirs, &cwd, &exts, exists).expect("前置目录后缀形态应命中");
+        assert_eq!(resolved.file_name(), Some(std::ffi::OsStr::new("npm.CMD")));
+        assert_eq!(
+            resolved.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("evil")),
+        );
+        // 控制组（无后缀表）：/evil/npm 不存在 → 落到 /bin/npm
+        let resolved2 =
+            resolve_exe("npm publish", &dirs, &cwd, &[], exists).expect("控制组应命中 /bin/npm");
+        assert_eq!(resolved2.file_name(), Some(std::ffi::OsStr::new("npm")));
+        assert_eq!(
+            resolved2.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("bin")),
+        );
+    }
+
     /// 空命令 → 空候选集。
     #[test]
     fn empty_command_yields_no_candidates() {
-        assert!(exe_candidates("", &[PathBuf::from("/p")], Path::new("/cwd")).is_empty());
-        assert!(exe_candidates("   ", &[PathBuf::from("/p")], Path::new("/cwd")).is_empty());
+        assert!(exe_candidates("", &[PathBuf::from("/p")], Path::new("/cwd"), &[]).is_empty());
+        assert!(exe_candidates("   ", &[PathBuf::from("/p")], Path::new("/cwd"), &[]).is_empty());
     }
 
     // -- 流式 SHA-256（§6）---------------------------------------------------

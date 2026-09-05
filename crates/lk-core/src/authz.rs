@@ -583,11 +583,13 @@ impl AuthzGate {
 /// - **未绑定指纹（None）**：`glob_match(rule.command, command)` 整串匹配
 ///   （现状语义零变化，identity-binding.md §4）；
 /// - **指纹绑定（Some）**：按 `command[0]` 的**可执行名**（basename，去
-///   目录）与 `rule.command` glob 匹配（identity-binding.md §2 目标 2：
-///   注入规则绑定被注入命令的可执行文件）——CLI 以 exe basename 落库
-///   （`/usr/bin/npm` → `"npm"`），注入请求 command 是完整命令串
+///   目录；可执行后缀剥离按 stem 等价比较，issue #133）与 `rule.command`
+///   glob 匹配（identity-binding.md §2 目标 2：注入规则绑定被注入命令的
+///   可执行文件）——CLI 以 exe basename 落库（`/usr/bin/npm` → `"npm"`，
+///   Windows `npm.cmd` → `"npm.cmd"`），注入请求 command 是完整命令串
 ///   （`lk inject -- npm publish` → `"npm publish"`），整串匹配必失配
-///   （issue #132）。命令为空/纯空白 → 形式不成立（fail-closed）。
+///   （issue #132）；Windows 无扩展名键入与带后缀落库由 stem 等价桥接
+///   （issue #133）。命令为空/纯空白 → 形式不成立（fail-closed）。
 pub fn rule_matches(rule: &Rule, canonical_cwd: &str, command: &str) -> bool {
     rule.capability == crate::model::RULE_CAPABILITY_INJECT
         && project_dir_matches(&rule.project_dir, canonical_cwd)
@@ -599,8 +601,39 @@ pub fn rule_matches(rule: &Rule, canonical_cwd: &str, command: &str) -> bool {
 fn inject_command_form_matches(rule: &Rule, command: &str) -> bool {
     match &rule.fingerprint {
         None => glob_match(&rule.command, command),
-        Some(_) => command0_exe_name(command).is_some_and(|name| glob_match(&rule.command, &name)),
+        Some(_) => command0_exe_name(command)
+            .is_some_and(|name| bound_command_matches(&rule.command, &name)),
     }
+}
+
+/// 绑定规则命令形态匹配（issue #133）：规则 `command`（CLI 由 --fingerprint
+/// 的可执行文件 basename 推导，Windows 常带 `.cmd`/`.exe`——`npm.cmd`）与
+/// 注入 `command[0]` 可执行名（Windows 用户实际输入常**无扩展名**——`npm`）
+/// 按 **stem 等价** 比较：双方都剥离可执行后缀
+/// （[`crate::fingerprint::EXEC_EXTENSIONS`]）后再 glob——`"npm.cmd" ↔
+/// "npm"`、`"fptool.exe" ↔ "fptool.exe"` 均命中；无可剥离后缀时退化回
+/// #132 的 basename glob（零变化）。形式层只负责**收集候选规则**；安全由
+/// 解析 + 指纹门承载（解析到不同文件/不可解析 → 审批 fail-closed，
+/// identity-binding.md §5）。
+fn bound_command_matches(rule_pattern: &str, typed_name: &str) -> bool {
+    glob_match(
+        strip_exec_suffix(rule_pattern),
+        strip_exec_suffix(typed_name),
+    )
+}
+
+/// 剥离可执行文件后缀（[`crate::fingerprint::EXEC_EXTENSIONS`]，大小写不
+/// 敏感；`npm.cmd` → `npm`，`NPM.CMD` → `NPM`）；无已知后缀 / 剥离后为空
+/// （`".cmd"` 自身）→ 原样返回。
+fn strip_exec_suffix(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    crate::fingerprint::EXEC_EXTENSIONS
+        .iter()
+        .find_map(|ext| {
+            (lower.ends_with(ext) && name.len() > ext.len())
+                .then(|| &name[..name.len() - ext.len()])
+        })
+        .unwrap_or(name)
 }
 
 /// `command[0]` 的可执行名（basename，去目录）：「npm publish」→「npm」；
@@ -1777,6 +1810,52 @@ mod tests {
         assert!(rule_matches(&unbound, "/proj", "npm"));
         assert!(!rule_matches(&unbound, "/proj", "npm publish"));
         assert!(!rule_matches(&unbound, "/proj", "/usr/bin/npm publish"));
+    }
+
+    /// 绑定规则命令的 **stem 等价**（issue #133）：CLI 落库 basename 带
+    /// Windows 可执行后缀（`--fingerprint C:\bin\npm.cmd` → command
+    /// `"npm.cmd"`），而注入请求 command[0] 无扩展名（`npm publish` →
+    /// `"npm"`）——两者是同一可执行文件的两种拼写，须都命中绑定规则；
+    /// 带扩展名键入（`npm.cmd`）亦须命中；无后缀规则（`pgm`）语义零变化。
+    #[test]
+    fn fingerprint_bound_rule_stem_matches_windows_extensions() {
+        use crate::model::ProgramFingerprint;
+
+        let fp = || {
+            Some(ProgramFingerprint {
+                exe_path: "C:\\bin\\npm.cmd".into(),
+                sha256: "a".repeat(64),
+                size: 100,
+            })
+        };
+
+        // CLI 落库形态：--fingerprint ...\npm.cmd → command = "npm.cmd"
+        let mut bound = rule("/proj", "npm.cmd", &["A"]);
+        bound.fingerprint = fp();
+        // Windows 用户实际输入无扩展名 → 命中（issue #133 主线）
+        assert!(rule_matches(&bound, "/proj", "npm publish"));
+        assert!(rule_matches(&bound, "/proj", "npm"));
+        // 带扩展名键入 → 同样命中（与解析层 PATHEXT 探测同向）
+        assert!(rule_matches(&bound, "/proj", "npm.cmd publish"));
+        // 不同可执行名 / 同名前缀 → 不命中（fail-closed）
+        assert!(!rule_matches(&bound, "/proj", "yarn publish"));
+        assert!(!rule_matches(&bound, "/proj", "npm-publish"));
+
+        // --fingerprint ...\fptool.exe → command = "fptool.exe"
+        let mut b2 = rule("/proj", "fptool.exe", &["A"]);
+        b2.fingerprint = fp();
+        assert!(rule_matches(&b2, "/proj", "fptool /user"));
+        assert!(rule_matches(&b2, "/proj", "fptool.exe /user"));
+
+        // 无后缀规则（Linux /usr/bin/npm 形态）：stem 等价不引入新语义
+        let mut b3 = rule("/proj", "pgm", &["A"]);
+        b3.fingerprint = fp();
+        assert!(rule_matches(&b3, "/proj", "pgm deploy"));
+        assert!(!rule_matches(&b3, "/proj", "pgm2 deploy"));
+        // 镜像对称：规则 "pgm"（无后缀）↔ 键入 "pgm.cmd"——stem 等价同样命中；
+        // 形式层只负责「收集候选规则」，安全落在解析+指纹门（解析到不同文件
+        // 或不可解析 → 审批 fail-closed，见 issue #133 集成断言）
+        assert!(rule_matches(&b3, "/proj", "pgm.cmd deploy"));
     }
 
     /// 绑定规则与未绑定规则占据同一片授权空间，指纹门不改变未命中语义：
