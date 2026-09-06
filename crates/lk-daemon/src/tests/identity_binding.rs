@@ -349,6 +349,13 @@ fn headless_mismatch_denied_same_code() {
 /// 「以新指纹重新授权」：`rule.add`（携带被要求的绑定 exe）走规则审批门 →
 /// 批准 → finalize 侧重算指纹（不信任客户端上报）落盘 + 审计 command 以
 /// `rule.add` 开头。
+///
+/// issue #136 契约：前端重新授权上报的 command 是**完整命令串**（审批帧原样
+/// 回带，如 "pgm deploy"）；daemon finalize 落库时统一规范化为 `command[0]`
+/// 的可执行名 basename（"pgm"，identity-binding.md §5.4）——否则绑定规则按
+/// 整串形态落库，匹配层按 command[0] basename 比对永不命中、规则成死规则。
+/// 落库后**同条带参注入必须命中**（静默放行，#126 AC「规则指纹更新后可再
+/// 命中」对带参命令成立）。
 #[test]
 fn reauthorize_via_rule_gate_persists_recomputed_fingerprint() {
     let dir = tempfile::tempdir().unwrap();
@@ -410,6 +417,36 @@ fn reauthorize_via_rule_gate_persists_recomputed_fingerprint() {
     assert!(
         evs.iter().any(|e| e.command.starts_with("rule.add")),
         "重新授权审计 command 以 rule.add 开头：{evs:?}"
+    );
+    // issue #136：落库 command 规范化为 command[0] 的可执行名 basename
+    // （客户端上报的是完整命令串 "pgm deploy"，原样落库即死规则）
+    assert_eq!(
+        rule["command"].as_str(),
+        Some("pgm"),
+        "绑定规则 command 落库须为 command[0] basename（非完整命令串）：{}",
+        rule["command"]
+    );
+    // 落库后同条带参注入必须命中（指纹一致 → 静默放行，#126 AC）：
+    // 无订阅（headless）下若规则未命中会走 no_ui 拒绝——正好区分两种结果。
+    let handler2 = make_handler(&state, &shared);
+    let peer2 = test_peer(Some(proj.path()));
+    let resp = handler2(
+        &rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(&token),
+            json!({ "command": "pgm deploy", "keys": ["NPM_TOKEN"] }),
+        ),
+        &peer2,
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["result"]["allowed"], true,
+        "重新授权后同条带参注入应命中绑定规则静默放行（规则不得成死规则）：{resp}"
+    );
+    assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit", "放行注入值");
+    assert!(
+        shared.approvals.pending_count() == 0,
+        "重新授权后命中不弹窗"
     );
 }
 

@@ -572,7 +572,12 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
                     await ctx.ipc.ruleAdd({
                       projectDir: r.projectDir,
                       name: `fp-${exeBasename(mm.resolvedExePath)}`,
-                      command: r.command,
+                      // 指纹绑定注入规则的 command = 被绑定 exe 的 basename
+                      // （identity-binding.md §5.4，与 CLI --fingerprint 落库
+                      // 形态一致；issue #136）——不能回带审批帧的完整命令串
+                      // （"npm publish"），否则 daemon 侧若不规范化即死规则。
+                      // daemon 落库侧仍会单点规范化（不信任生产者上报形态）。
+                      command: exeBasename(mm.resolvedExePath),
                       keys: r.keys,
                       capability: "inject",
                       fingerprint: { exePath: mm.resolvedExePath },

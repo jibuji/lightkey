@@ -1237,11 +1237,14 @@ describe("M2.98 程序指纹失配审批弹窗（kind=inject + fingerprintMismat
     // 本次允许（失配帧走普通 allowed 回传）
     expect(resultSpy).toHaveBeenCalledWith("req-fp-1", "allowed", "mock-challenge");
     // 重新授权追加规则更新请求（仅绑定规则命中失配的审批帧）：capability=inject、
-    // 绑定当前解析路径（daemon finalize 侧重算 sha/size，前端只声明 exePath）
+    // 绑定当前解析路径（daemon finalize 侧重算 sha/size，前端只声明 exePath）。
+    // command = 被绑定 exe 的 basename（issue #136 契约，identity-binding.md
+    // §5.4：绑定规则按 command[0] basename 与 rule.command 比对——完整命令串
+    // "npm publish" 落库即死规则；daemon 落库侧仍会单点规范化兜底）
     expect(ruleSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         projectDir: "/work/proj-a",
-        command: "npm publish",
+        command: "npm.cmd",
         keys: ["NPM_TOKEN"],
         capability: "inject",
         fingerprint: { exePath: "C:\\Program Files\\nodejs\\npm.cmd" },

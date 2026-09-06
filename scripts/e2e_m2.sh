@@ -304,6 +304,19 @@ else
   else
     bad "指纹失配被 auto-approve？（channel=$FP_DENIED_CH）"
   fi
+  # 重新授权（issue #136 回归）：桌面「以新指纹重新授权」的落库等价动作是
+  # 按当前 exe 重出绑定规则（daemon finalize 侧重算指纹 + command 规范化为
+  # basename）——重出后**同条带参注入必须再命中**（#126 AC：规则指纹更新后
+  # 可再命中；完整命令串落库的旧 bug 会让规则恒休眠、只弹普通审批）。
+  "$LK" rule add "$PROJ" --inject --name fp-bound --keys NPM_TOKEN --fingerprint "$FP_BK" >/dev/null 2>"$WORK/fp_reauth.err"
+  check "重新授权：按当前 exe 重出绑定规则（规则门 auto-approve）" 0 $?
+  ( cd "$PROJ" && "$LK" inject --keys NPM_TOKEN -- fptool.exe /user >"$WORK/fp_rehit.out" 2>"$WORK/fp_rehit.err" )
+  check "重新授权后带参注入再命中（静默放行，exit 0）" 0 $?
+  if grep -q "已拒绝" "$WORK/fp_rehit.err"; then
+    bad "重新授权后命中仍被拒绝：$(cat "$WORK/fp_rehit.err")"
+  else
+    ok "重新授权后命中不弹窗（无拒绝文案）"
+  fi
   OLD_PATH="$PATH"
   PATH="$(printf '%s\n' "$OLD_PATH" | sed "s|$FPBIN:||")"
   export PATH

@@ -418,10 +418,40 @@ impl Daemon {
                     }
                     None => None,
                 };
+                // 指纹绑定注入规则：command 统一规范化为 `command[0]` 的可执行
+                // 名 basename（identity-binding.md §5.4，issue #136）——匹配层
+                // 对绑定规则按 command[0] basename 与 rule.command glob 比对，
+                // 完整命令串（"npm publish"）原样落库即永不命中、规则成死规则。
+                // 前端「以新指纹重新授权」上报的正是审批帧回带的完整命令串，
+                // CLI 落库形态（exe basename）则与此幂等——daemon 落库单点
+                // 规范化（信任边界内，不信任任何生产者的上报形态）；规范化
+                // 失败（command 无可解析的可执行名）→ 判失败 fail-closed，
+                // 绝不落一条注定休眠的死规则。仅 inject 绑定规则规范化：
+                // 未绑定规则维持整串 glob 语义（§4 兼容性零变化），read/write
+                // 规则不绑定命令。
+                let command = if fingerprint.is_some()
+                    && capability == lk_core::model::RULE_CAPABILITY_INJECT
+                {
+                    match lk_core::authz::command0_exe_name(&p.command) {
+                        Some(name) => name,
+                        None => {
+                            return RpcResponse::err(
+                                id,
+                                ERR_INVALID_PARAMS,
+                                "invalid params",
+                                Some(json!({ "detail": format!(
+                                    "指纹绑定注入规则的 command 须以可执行名开头：{}", p.command
+                                ) })),
+                            )
+                        }
+                    }
+                } else {
+                    p.command.clone()
+                };
                 let draft = RuleDraft {
                     project_dir: p.project_dir.clone(),
                     name: p.name.clone(),
-                    command: p.command.clone(),
+                    command,
                     keys: p.keys.clone(),
                     capability: capability.to_string(),
                     // 校验层已归一（write=参数/缺省；capability!=write=缺省

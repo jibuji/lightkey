@@ -644,8 +644,10 @@ fn strip_exec_suffix(name: &str) -> &str {
 }
 
 /// `command[0]` 的可执行名（basename，去目录）：「npm publish」→「npm」；
-/// 「/usr/bin/npm publish」→「npm」；空/纯空白 → `None`。
-fn command0_exe_name(command: &str) -> Option<String> {
+/// 「/usr/bin/npm publish」→「npm」；空/纯空白 → `None`。daemon 规则门
+/// finalize 落库侧用同一函数做绑定规则 command 规范化（issue #136：与匹配
+/// 层共用一处契约实现，两侧永不漂移）。
+pub fn command0_exe_name(command: &str) -> Option<String> {
     let c0 = crate::fingerprint::command0(command)?;
     Some(
         std::path::Path::new(c0)
