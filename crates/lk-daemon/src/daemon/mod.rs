@@ -34,7 +34,7 @@ use crate::notifier::Notifier;
 use crate::router::{strategy_of, ExecutionStrategy};
 use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 
-use self::authz::AuthzBegin;
+use self::authz::{AuthzBegin, AuthzFinalize};
 use self::disclosure::PendingDisclosure;
 use self::lifecycle::{install_shutdown_handlers, load_config};
 use self::rules::{PendingRuleChange, RuleBegin};
@@ -137,6 +137,15 @@ pub struct Daemon {
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
 struct PendingAuthz {
     request: AuthzRequest,
+    /// IPC 对端身份（issue #140）：锁定态一体化 finalize 在临时 vault 上补
+    /// 指纹裁决时需要（对端进程在审批等待期间仍存活，env 按 pid 可重读；
+    /// desktop 直调 pid=0 → 受信豁免）。解锁态 begin 已裁决完，仅随结构
+    /// 携带不使用。
+    peer: PeerInfo,
+    /// 指纹裁决已执行（issue #140）：解锁态 begin 已裁决（或锁定态 finalize
+    /// 裁决出失配已转二次审批）→ true，finalize 不再重复裁决（防裁决 →
+    /// 审批 → 裁决死循环；二次弹窗批准即「本次允许」，identity-binding §7）。
+    fp_adjudicated: bool,
     /// 锁定态一体化（#67）：审批需先临时解锁；`temp_vault` 由
     /// `approval.result`（正确主密码 + allowed）填充，`authz_finalize`
     /// 消费后丢弃。**不签发会话令牌 / 不写 session.token / 不置 shared
@@ -400,8 +409,19 @@ impl Daemon {
                 let resp = match self.authz_begin(id.clone(), params, peer) {
                     AuthzBegin::Final(resp) => resp,
                     AuthzBegin::Pending { request_id, .. } => {
-                        let decision = self.shared.approvals.await_decision(request_id);
-                        let r = self.authz_finalize(id.clone(), request_id, decision);
+                        // #140：锁定态一体化 finalize 补指纹裁决失配 → 转二次
+                        // 审批（RePended）——循环回到锁外等待（直调单线程下
+                        // 等待持命令锁与既有 Pending 形态同窗口）。
+                        let mut request_id = request_id;
+                        let r = loop {
+                            let decision = self.shared.approvals.await_decision(request_id);
+                            match self.authz_finalize(id.clone(), request_id, decision) {
+                                AuthzFinalize::Done(r) => break r,
+                                AuthzFinalize::RePended { request_id: next } => {
+                                    request_id = next;
+                                }
+                            }
+                        };
                         self.touch_activity();
                         r
                     }

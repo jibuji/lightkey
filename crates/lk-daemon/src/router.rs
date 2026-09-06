@@ -181,14 +181,23 @@ fn authz_evaluate_deferred(
     match begin {
         crate::AuthzBegin::Final(resp) => Some(resp),
         crate::AuthzBegin::Pending { request_id, .. } => {
-            // ② 锁外等待（不持命令锁；vault/审批注册表短锁除外）
-            let decision = shared.approvals.await_decision(request_id);
-            // ③ 重取命令锁收尾
-            let resp = {
+            // ② 锁外等待（不持命令锁；vault/审批注册表短锁除外）。
+            // #140：锁定态一体化 finalize 补指纹裁决失配 → 转二次审批
+            // （RePended）——循环回到锁外等待，二次决策落地后再收尾。
+            let mut request_id = request_id;
+            let resp = loop {
+                let decision = shared.approvals.await_decision(request_id);
+                // ③ 重取命令锁收尾
                 let mut guard = state.lock().expect("daemon mutex poisoned");
-                let r = guard.authz_finalize(id, request_id, decision);
-                guard.touch_activity();
-                r
+                match guard.authz_finalize(id.clone(), request_id, decision) {
+                    crate::AuthzFinalize::Done(r) => {
+                        guard.touch_activity();
+                        break r;
+                    }
+                    crate::AuthzFinalize::RePended { request_id: next } => {
+                        request_id = next;
+                    }
+                }
             };
             Some(resp)
         }

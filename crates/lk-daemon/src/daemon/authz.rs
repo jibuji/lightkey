@@ -14,6 +14,13 @@ enum FingerprintVerdict {
     NeedsApproval(Option<FingerprintMismatch>),
 }
 
+/// 阶段③ 结果：最终响应，或锁定态一体化指纹失配转**二次审批**（issue #140）
+/// ——调用方重新进入锁外等待（G1：等待不持命令锁）。
+pub(crate) enum AuthzFinalize {
+    Done(String),
+    RePended { request_id: uuid::Uuid },
+}
+
 impl Daemon {
     /// 阶段①（命令锁内）：会话预检 + 启动者判定 + 第 1/2 层短路；需要审批
     /// 时登记待审批 + 广播 `authz.request`，返回 Pending（等待移出命令锁）。
@@ -109,7 +116,8 @@ impl Daemon {
                 kind: lk_core::authz::ApprovalKind::Inject,
                 write_action: None,
                 export_meta: None,
-                // 锁态：规则在加密 vault 内无指纹可比（须待解锁后 finalize），
+                // 锁态：规则在加密 vault 内无指纹可比（须待解锁后 finalize——
+                // issue #140：finalize 在临时 vault 上补裁决，失配转二次审批），
                 // 审批帧不携带失配信息。
                 fingerprint_mismatch: None,
             };
@@ -118,6 +126,8 @@ impl Daemon {
                 request_id,
                 PendingAuthz {
                     request: req,
+                    peer: peer.clone(),
+                    fp_adjudicated: false,
                     needs_unlock: true,
                     temp_vault: None,
                 },
@@ -138,7 +148,7 @@ impl Daemon {
                 // 绑定规则指纹失配 → 折叠为 NeedsApproval（弹窗「指纹不符」/headless
                 // 统一 authz.denied，与未命中同码、防探测）。
                 if let FingerprintVerdict::NeedsApproval(mismatch) = fp_verdict {
-                    return self.open_inject_approval(id, req, channel, false, mismatch);
+                    return self.open_inject_approval(id, req, peer, channel, false, mismatch);
                 }
                 // 第 2 层命中（且无绑定失配）：解密注入值 + 审计 allowed
                 match self.resolve_env(&keys) {
@@ -174,7 +184,7 @@ impl Daemon {
             // 第 3 层：登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）；
             // 无审批界面 → fail-closed 立即拒绝（不阻塞）。
             {
-                self.open_inject_approval(id, req, channel, false, None)
+                self.open_inject_approval(id, req, peer, channel, false, None)
             }
         }
     }
@@ -236,6 +246,7 @@ impl Daemon {
         &mut self,
         id: Value,
         req: AuthzRequest,
+        peer: &PeerInfo,
         channel: AuditChannel,
         needs_unlock: bool,
         fingerprint_mismatch: Option<FingerprintMismatch>,
@@ -275,6 +286,10 @@ impl Daemon {
             request_id,
             PendingAuthz {
                 request: req,
+                peer: peer.clone(),
+                // 解锁态 begin 已完成指纹裁决（折叠/未命中两种入口），finalize
+                // 不再重复裁决（issue #140 字段；锁态一体化 begin 未裁决 → false）。
+                fp_adjudicated: true,
                 needs_unlock,
                 temp_vault: None,
             },
@@ -291,16 +306,22 @@ impl Daemon {
     /// 加密库内）+ 解析 env + 审计（用临时 vault 的 K_audit），随后临时
     /// vault 随条目销毁——**不置 shared.vault / 不签发令牌 / 不写
     /// session.token**（#67 关键约束：本次注入不产生 item.* 全量能力，#65）。
+    ///
+    /// **锁定态补指纹裁决（issue #140，M2.8 × M2.98）**：临时 vault 上规则
+    /// 已可读、对端进程在审批等待期间仍存活（env 可重读）——begin 时无法
+    /// 执行的指纹判定在 finalize 补上：命中 → 静默放行；失配/不可解析 →
+    /// 视同未命中 → **转二次审批**（[`AuthzFinalize::RePended`]，needsUnlock
+    /// 帧携带 `fingerprintMismatch` 明示「指纹不符」，identity-binding §7）。
     pub(crate) fn authz_finalize(
         &mut self,
         id: Value,
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
-    ) -> String {
+    ) -> AuthzFinalize {
         let pending = self.pending_authz.lock().unwrap().remove(&request_id);
         let Some(pending) = pending else {
             // 条目已被消费（极端竞态）→ 保守拒绝
-            return rpc_string(RpcResponse::ok(
+            return AuthzFinalize::Done(rpc_string(RpcResponse::ok(
                 id,
                 serde_json::to_value(AuthzEvaluateResult {
                     allowed: false,
@@ -308,7 +329,7 @@ impl Daemon {
                     env: None,
                 })
                 .unwrap_or(Value::Null),
-            ));
+            )));
         };
         if pending.needs_unlock {
             return self.authz_finalize_unlock(id, pending, decision);
@@ -330,8 +351,10 @@ impl Daemon {
                     }
                     Err(_) => {
                         // 等待期间锁定/密钥不可用 → 无法满足
-                        return serde_json::to_string(&session_invalid(id))
-                            .unwrap_or_else(|_| "{}".into());
+                        return AuthzFinalize::Done(
+                            serde_json::to_string(&session_invalid(id))
+                                .unwrap_or_else(|_| "{}".into()),
+                        );
                     }
                 }
             }
@@ -360,10 +383,10 @@ impl Daemon {
                 }
             }
         };
-        rpc_string(RpcResponse::ok(
+        AuthzFinalize::Done(rpc_string(RpcResponse::ok(
             id,
             serde_json::to_value(result).unwrap_or(Value::Null),
-        ))
+        )))
     }
 
     /// 锁定态一体化 finalize（#67，见 [`Self::authz_finalize`]）。
@@ -372,14 +395,21 @@ impl Daemon {
         id: Value,
         pending: PendingAuthz,
         decision: ApprovalDecision,
-    ) -> String {
-        let req = &pending.request;
+    ) -> AuthzFinalize {
+        let PendingAuthz {
+            request: req,
+            peer,
+            fp_adjudicated,
+            needs_unlock: _,
+            temp_vault,
+        } = pending;
+        let req = &req;
         match decision {
             ApprovalDecision::Allowed => {
                 // 临时 vault 由 approval_result 以正确主密码解锁后存入；
                 // 缺失（异常路径）→ 保守拒绝
-                let Some(vault) = pending.temp_vault else {
-                    return rpc_string(RpcResponse::ok(
+                let Some(vault) = temp_vault else {
+                    return AuthzFinalize::Done(rpc_string(RpcResponse::ok(
                         id,
                         serde_json::to_value(AuthzEvaluateResult {
                             allowed: false,
@@ -387,8 +417,19 @@ impl Daemon {
                             env: None,
                         })
                         .unwrap_or(Value::Null),
-                    ));
+                    )));
                 };
+                // 锁定态补指纹裁决（issue #140，identity-binding.md §2 目标 2/
+                // §3/§7）：临时解锁后规则在临时 vault 内、对端 env 可读——
+                // 失配/不可解析 → 视同未命中 → 转二次审批（弹窗明示「指纹
+                // 不符」）；命中/未绑定 → 沿既有语义继续。二次审批条目
+                // （fp_adjudicated）不再重复裁决——弹窗批准即「本次允许」。
+                if !fp_adjudicated {
+                    let verdict = self.fingerprint_adjudicate(req, &peer, &vault);
+                    if let FingerprintVerdict::NeedsApproval(mismatch) = verdict {
+                        return self.authz_finalize_reopen(id, req, peer, vault, mismatch);
+                    }
+                }
                 // 完整三层裁决（锁态 begin 无法预载规则/解析 key；解锁后
                 // 一次性在临时 vault 上跑：第 1/2 层短路、未命中则第 3 层
                 // 已由弹窗批准视同通过）
@@ -416,8 +457,10 @@ impl Daemon {
                             }
                         }
                         Err(_) => {
-                            return serde_json::to_string(&session_invalid(id))
-                                .unwrap_or_else(|_| "{}".into())
+                            return AuthzFinalize::Done(
+                                serde_json::to_string(&session_invalid(id))
+                                    .unwrap_or_else(|_| "{}".into()),
+                            )
                         }
                     },
                     LayerResult::Denied { reason } => {
@@ -449,21 +492,23 @@ impl Daemon {
                             }
                         }
                         Err(_) => {
-                            return serde_json::to_string(&session_invalid(id))
-                                .unwrap_or_else(|_| "{}".into())
+                            return AuthzFinalize::Done(
+                                serde_json::to_string(&session_invalid(id))
+                                    .unwrap_or_else(|_| "{}".into()),
+                            )
                         }
                     },
                 };
                 // 临时 vault 随本函数结束 drop——临时解锁态销毁（未置
                 // shared.vault，vault 仍锁定；无会话令牌、无 token 文件）
-                rpc_string(RpcResponse::ok(
+                AuthzFinalize::Done(rpc_string(RpcResponse::ok(
                     id,
                     serde_json::to_value(result).unwrap_or(Value::Null),
-                ))
+                )))
             }
             // 拒绝/超时：未解锁（无临时 vault）→ 无 K_audit 可签名，审计
             // 不可写（与 v0 锁态拒绝同口径——fail-closed 不留审计内容）
-            ApprovalDecision::Denied => rpc_string(RpcResponse::ok(
+            ApprovalDecision::Denied => AuthzFinalize::Done(rpc_string(RpcResponse::ok(
                 id,
                 serde_json::to_value(AuthzEvaluateResult {
                     allowed: false,
@@ -471,8 +516,8 @@ impl Daemon {
                     env: None,
                 })
                 .unwrap_or(Value::Null),
-            )),
-            ApprovalDecision::Timeout => rpc_string(RpcResponse::ok(
+            ))),
+            ApprovalDecision::Timeout => AuthzFinalize::Done(rpc_string(RpcResponse::ok(
                 id,
                 serde_json::to_value(AuthzEvaluateResult {
                     allowed: false,
@@ -480,8 +525,68 @@ impl Daemon {
                     env: None,
                 })
                 .unwrap_or(Value::Null),
-            )),
+            ))),
         }
+    }
+
+    /// 锁定态一体化 finalize 的指纹失配转**二次审批**（issue #140）：临时
+    /// vault 随新待审条目存留（仍不置 shared.vault / 不签发令牌，#67 不变量
+    /// 不变），帧 needsUnlock=true——锁态前端门控只放行一体化帧，弹窗渲染
+    /// 失配主题「程序指纹与规则不符（可能已更新）」+ 主密码栏（identity-
+    /// binding §7；「以新指纹重新授权」按钮为失配帧解锁态形态预留，锁态
+    /// 二次批准 = 本次允许语义）。桌面审批界面不在场（审批期间断开）→ 用
+    /// 临时 vault 的 K_audit 审计拒绝 + fail-closed no_ui（与解锁态 headless
+    /// 失配同码、防探测）。
+    fn authz_finalize_reopen(
+        &mut self,
+        id: Value,
+        req: &AuthzRequest,
+        peer: PeerInfo,
+        vault: UnlockedVault,
+        mismatch: Option<FingerprintMismatch>,
+    ) -> AuthzFinalize {
+        if !self.gate.approval().available() {
+            self.audit_authz_from(&vault, req, AuditChannel::Approval, AuditResult::Denied);
+            return AuthzFinalize::Done(rpc_string(RpcResponse::ok(
+                id,
+                serde_json::to_value(AuthzEvaluateResult {
+                    allowed: false,
+                    reason: Some(DenyReason::NoUi.as_str().to_string()),
+                    env: None,
+                })
+                .unwrap_or(Value::Null),
+            )));
+        }
+        let request_id = lk_core::crypto::random_uuid();
+        let challenge = hex::encode(lk_core::crypto::random_array::<16>());
+        let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
+        let areq = ApprovalRequest {
+            request_id,
+            starter: req.starter.clone(),
+            project_dir: req.cwd.clone(),
+            command: req.command.clone(),
+            keys: req.keys.clone(),
+            challenge: challenge.clone(),
+            needs_unlock: true,
+            kind: lk_core::authz::ApprovalKind::Inject,
+            write_action: None,
+            export_meta: None,
+            fingerprint_mismatch: mismatch,
+        };
+        self.gate.approval().open(&areq, expires_at);
+        self.pending_authz.lock().unwrap().insert(
+            request_id,
+            PendingAuthz {
+                request: req.clone(),
+                peer,
+                // 二次审批不再重复指纹裁决（防裁决 → 审批 → 裁决死循环；
+                // 二次弹窗批准即本次允许，identity-binding §7 失配批准语义）
+                fp_adjudicated: true,
+                needs_unlock: true,
+                temp_vault: Some(vault),
+            },
+        );
+        AuthzFinalize::RePended { request_id }
     }
 
     /// 解析注入 env（vault 读锁内；key 名 → 值；仅被授权 key；单次扫描）。
