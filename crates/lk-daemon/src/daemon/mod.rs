@@ -4,7 +4,6 @@
 //! 子模块为命令域处理组（子模块可见父模块私有字段，无需 pub(crate) 化）；
 //! 对外路径经 [`crate`] 再导出保持不变。
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
@@ -34,11 +33,12 @@ use crate::notifier::Notifier;
 use crate::router::{strategy_of, ExecutionStrategy};
 use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 
-use self::authz::{AuthzBegin, AuthzFinalize};
-use self::disclosure::PendingDisclosure;
+use self::authz::AuthzFinalize;
+use self::gate_kit::{
+    invalid_params, parse_gate_params, ActingVault, ApprovalDraft, GateBegin, GateEntry, GateKind,
+    PendingGates,
+};
 use self::lifecycle::{install_shutdown_handlers, load_config};
-use self::rules::{PendingRuleChange, RuleBegin};
-use self::write::PendingWrite;
 
 /// 会话令牌文件名（0600；CLI 进程间传递，锁定即删除）。
 pub const SESSION_TOKEN_FILE: &str = "session.token";
@@ -118,14 +118,9 @@ pub struct Daemon {
     core: CoreServices,
     /// 授权门（第 1/2 层短路 + 第 3 层审批编排）。
     gate: AuthzGate,
-    /// 进行中的授权判定（第 3 层等待期间持有；request_id → 请求原文）。
-    pending_authz: Mutex<HashMap<uuid::Uuid, PendingAuthz>>,
-    /// 进行中的值披露审批（M2.9；request_id → 条目/方法/归因）。
-    pending_disclosure: Mutex<HashMap<uuid::Uuid, PendingDisclosure>>,
-    /// 进行中的规则管理审批（补充拍板 #22；request_id → 操作/归因）。
-    pending_rule: Mutex<HashMap<uuid::Uuid, PendingRuleChange>>,
-    /// 进行中的条目写入审批（补充拍板 #24；request_id → 操作/归因）。
-    pending_write: Mutex<HashMap<uuid::Uuid, PendingWrite>>,
+    /// 统一待审批注册表（issue #148：四张 pending 表合一；key = 请求 id，
+    /// payload = 门枚举；审批解锁辅助表无关，见 daemon/gate_kit.rs）。
+    pending_gates: Mutex<PendingGates>,
     /// 对端真实 env PATH 读取（M2.98 程序指纹，identity-binding.md §5.1；
     /// 生产 = 平台实现，测试注入假 PATH——信 daemon 不信客户端）。
     peer_env: Arc<dyn crate::identity::PeerEnv>,
@@ -135,7 +130,9 @@ pub struct Daemon {
 }
 
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
-struct PendingAuthz {
+/// needs_unlock / 临时 vault 提升到统一注册表条目级（[`gate_kit::GateEntry`]，
+/// issue #148），门负载只携带 authz 特有字段。
+pub(crate) struct PendingAuthz {
     request: AuthzRequest,
     /// IPC 对端身份（issue #140）：锁定态一体化 finalize 在临时 vault 上补
     /// 指纹裁决时需要（对端进程在审批等待期间仍存活，env 按 pid 可重读；
@@ -146,12 +143,6 @@ struct PendingAuthz {
     /// 裁决出失配已转二次审批）→ true，finalize 不再重复裁决（防裁决 →
     /// 审批 → 裁决死循环；二次弹窗批准即「本次允许」，identity-binding §7）。
     fp_adjudicated: bool,
-    /// 锁定态一体化（#67）：审批需先临时解锁；`temp_vault` 由
-    /// `approval.result`（正确主密码 + allowed）填充，`authz_finalize`
-    /// 消费后丢弃。**不签发会话令牌 / 不写 session.token / 不置 shared
-    /// vault**——临时解锁材料只服务本次注入（关键约束，见 issue #67）。
-    needs_unlock: bool,
-    temp_vault: Option<UnlockedVault>,
 }
 
 /// 信号处理标志（unix：SIGINT/SIGTERM 优雅退出）。
@@ -232,10 +223,7 @@ impl Daemon {
             shared,
             core,
             gate,
-            pending_authz: Mutex::new(HashMap::new()),
-            pending_disclosure: Mutex::new(HashMap::new()),
-            pending_rule: Mutex::new(HashMap::new()),
-            pending_write: Mutex::new(HashMap::new()),
+            pending_gates: Mutex::new(PendingGates::default()),
             // M2.98 程序指纹：生产装配平台真实对端 env 读取 + 真实文件系统缓存。
             peer_env: Arc::new(crate::identity::PlatformPeerEnv),
             fingerprint_cache: crate::identity::FingerprintCache::new(),
@@ -407,8 +395,8 @@ impl Daemon {
                     return rpc_string(session_invalid(id));
                 }
                 let resp = match self.authz_begin(id.clone(), params, peer) {
-                    AuthzBegin::Final(resp) => resp,
-                    AuthzBegin::Pending { request_id, .. } => {
+                    GateBegin::Final(resp) => resp,
+                    GateBegin::Pending { request_id, .. } => {
                         // #140：锁定态一体化 finalize 补指纹裁决失配 → 转二次
                         // 审批（RePended）——循环回到锁外等待（直调单线程下
                         // 等待持命令锁与既有 Pending 形态同窗口）。
@@ -436,8 +424,8 @@ impl Daemon {
                     return rpc_string(session_invalid(id));
                 }
                 let resp = match self.rule_begin(id.clone(), &method, params, peer) {
-                    RuleBegin::Final(resp) => resp,
-                    RuleBegin::Pending { request_id } => {
+                    GateBegin::Final(resp) => resp,
+                    GateBegin::Pending { request_id } => {
                         let decision = self.shared.approvals.await_decision(request_id);
                         let r = self.rule_finalize(id.clone(), request_id, decision);
                         self.touch_activity();
@@ -454,8 +442,8 @@ impl Daemon {
                     return rpc_string(session_invalid(id));
                 }
                 let resp = match self.write_begin(id.clone(), &method, params, peer) {
-                    write::WriteBegin::Final(resp) => resp,
-                    write::WriteBegin::Pending { request_id } => {
+                    GateBegin::Final(resp) => resp,
+                    GateBegin::Pending { request_id } => {
                         let decision = self.shared.approvals.await_decision(request_id);
                         let r = self.write_finalize(id, request_id, decision);
                         self.touch_activity();
@@ -472,8 +460,8 @@ impl Daemon {
                 return rpc_string(session_invalid(id));
             }
             let resp = match self.disclosure_begin(id.clone(), &method, params, peer) {
-                disclosure::DisclosureBegin::Final(resp) => resp,
-                disclosure::DisclosureBegin::Pending { request_id } => {
+                GateBegin::Final(resp) => resp,
+                GateBegin::Pending { request_id } => {
                     let decision = self.shared.approvals.await_decision(request_id);
                     let r = self.disclosure_finalize(id, request_id, decision);
                     self.touch_activity();
@@ -593,8 +581,8 @@ impl Daemon {
     /// `approval.result` 是否命中锁定态一体化待审条目（#67 inject /
     /// #23 读通道）：params 里的 request_id 对应一个带 `needs_unlock` 的
     /// pending → 是。锁态无会话令牌，桌面来源 + 一次性 challenge 已是双重
-    /// 绑定，故这类回传跳过 `require_session`（dispatch 用；判定查
-    /// pending_authz 与 pending_disclosure 两张表，daemon/session.rs）。
+    /// 绑定，故这类回传跳过 `require_session`（dispatch 用；判定查统一
+    /// pending 注册表，表无关，daemon/session.rs + gate_kit.rs）。
     fn approval_needs_unlock(&self, params: &Value) -> bool {
         serde_json::from_value::<ApprovalResultParams>(params.clone())
             .ok()
@@ -755,6 +743,7 @@ pub(crate) fn extract_token(params: &Value) -> Option<Vec<u8>> {
 
 pub(crate) mod authz;
 pub(crate) mod disclosure;
+pub(crate) mod gate_kit;
 mod items;
 pub(crate) mod lifecycle;
 pub(crate) mod rules;

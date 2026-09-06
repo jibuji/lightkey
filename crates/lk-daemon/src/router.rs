@@ -179,8 +179,8 @@ fn authz_evaluate_deferred(
         guard.authz_begin(id.clone(), req.params.clone(), peer)
     };
     match begin {
-        crate::AuthzBegin::Final(resp) => Some(resp),
-        crate::AuthzBegin::Pending { request_id, .. } => {
+        crate::GateBegin::Final(resp) => Some(resp),
+        crate::GateBegin::Pending { request_id, .. } => {
             // ② 锁外等待（不持命令锁；vault/审批注册表短锁除外）。
             // #140：锁定态一体化 finalize 补指纹裁决失配 → 转二次审批
             // （RePended）——循环回到锁外等待，二次决策落地后再收尾。
@@ -230,8 +230,8 @@ fn disclosure_deferred(
         guard.disclosure_begin(id.clone(), &req.method, req.params.clone(), peer)
     };
     match begin {
-        crate::DisclosureBegin::Final(resp) => Some(resp),
-        crate::DisclosureBegin::Pending { request_id } => {
+        crate::GateBegin::Final(resp) => Some(resp),
+        crate::GateBegin::Pending { request_id } => {
             // ② 锁外等待（≤超时默认拒绝；G1）
             let decision = shared.approvals.await_decision(request_id);
             // ③ 重取命令锁收尾
@@ -270,8 +270,8 @@ fn rule_deferred(
         guard.rule_begin(id.clone(), &req.method, req.params.clone(), peer)
     };
     match begin {
-        crate::RuleBegin::Final(resp) => Some(resp),
-        crate::RuleBegin::Pending { request_id } => {
+        crate::GateBegin::Final(resp) => Some(resp),
+        crate::GateBegin::Pending { request_id } => {
             // ② 锁外等待（≤超时默认拒绝；G1）
             let decision = shared.approvals.await_decision(request_id);
             // ③ 重取命令锁收尾
@@ -311,8 +311,8 @@ fn write_deferred(
         guard.write_begin(id.clone(), &req.method, req.params.clone(), peer)
     };
     match begin {
-        crate::WriteBegin::Final(resp) => Some(resp),
-        crate::WriteBegin::Pending { request_id } => {
+        crate::GateBegin::Final(resp) => Some(resp),
+        crate::GateBegin::Pending { request_id } => {
             // ② 锁外等待（≤超时默认拒绝；G1）
             let decision = shared.approvals.await_decision(request_id);
             // ③ 重取命令锁收尾

@@ -18,15 +18,11 @@
 //! target=条目名，值不明文；unknown starter / no_ui / denied / timeout
 //! 失败路径均落审计（K_audit 可用时；timeout 统一记 denied，对齐值披露
 //! §8 防探测口径）。
+//!
+//! 五件套下沉（issue #148）：begin 结果（GateBegin）/ 统一注册表（GateEntry）/
+//! 审批单点铸造 / 审计辅助（audit_gate）/ 参数解析辅助出自 daemon/gate_kit.rs。
 
 use super::*;
-
-/// 阶段① 结果：最终响应（desktop 豁免 / 写规则命中 / fail-closed 拒绝 /
-/// 参数错误）或待审批（等待移出命令锁，G1）。
-pub(crate) enum WriteBegin {
-    Final(String),
-    Pending { request_id: uuid::Uuid },
-}
 
 /// 写门第 3 层待办操作（begin 期已解析；finalize 重执行）。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -90,11 +86,11 @@ impl Daemon {
         method: &str,
         params: Value,
         peer: &PeerInfo,
-    ) -> WriteBegin {
+    ) -> GateBegin {
         // 1) 参数解析 + action 权威派生（§5.2）
         let parsed = match self.write_parse(method, &params) {
             Ok(p) => p,
-            Err(resp) => return WriteBegin::Final(rpc_string(*resp)),
+            Err(line) => return GateBegin::Final(line),
         };
         // 2) 解析目标条目名（update/delete 按 id；审计 target 与弹窗 keys 用）
         let stored_name = match parsed.op {
@@ -105,7 +101,7 @@ impl Daemon {
                 let me = guard.as_ref().unwrap();
                 match me.get(item_id) {
                     Ok(item) => Some(item.name().to_string()),
-                    Err(e) => return WriteBegin::Final(rpc_string(self.err_response(id, &e))),
+                    Err(e) => return GateBegin::Final(rpc_string(self.err_response(id, &e))),
                 }
             }
         };
@@ -129,7 +125,7 @@ impl Daemon {
                 "desktop",
                 AuditChannel::Desktop,
             );
-            return WriteBegin::Final(rpc_string(resp));
+            return GateBegin::Final(rpc_string(resp));
         }
         // 4) socket 通道：真实 starter + cwd（#66 归因链路复用；客户端自报
         //    字段不信任）；未知 → 第 1 层 fail-closed 拒绝（不弹窗、不留内容）
@@ -138,14 +134,15 @@ impl Daemon {
         let channel = peer_channel(peer);
         let command_summary = write_command_summary(&parsed.op, &target);
         if starter == UNKNOWN_STARTER || cwd.is_empty() {
-            self.audit_write_gate(
-                &command_summary,
-                &target,
+            self.audit_gate(
+                ActingVault::Shared,
                 &starter,
+                &target,
+                &command_summary,
                 channel,
                 AuditResult::Denied,
             );
-            return WriteBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
+            return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
         }
         // 5) 写规则匹配（§4 双向名约束；delete 跳过——恒弹窗）
         if let Some(action) = write_action(&parsed.op) {
@@ -172,20 +169,21 @@ impl Daemon {
                     &starter,
                     channel,
                 );
-                return WriteBegin::Final(rpc_string(resp));
+                return GateBegin::Final(rpc_string(resp));
             }
         }
         // 6) 无审批界面（headless）→ fail-closed 立即拒绝（不登记、不阻塞；
         //    E2E 自动批准不扩到写门——弹窗路径由集成测试覆盖，拍板 #24）
         if !self.gate.approval().available() {
-            self.audit_write_gate(
-                &command_summary,
-                &target,
+            self.audit_gate(
+                ActingVault::Shared,
                 &starter,
+                &target,
+                &command_summary,
                 channel,
                 AuditResult::Denied,
             );
-            return WriteBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
+            return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
         }
         // 7) 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）：kind=
         //    write、command=`item.put/delete <name>`（展示用）、keys=单元素
@@ -194,9 +192,6 @@ impl Daemon {
         //    桌面订阅者，回传必须原样带回（#78）。write_action=begin 期
         //    权威派生的动作，随帧回带 `writeAction`——前端「记住」据此生成
         //    `actions=[当前动作]` 最小写规则（§6 / #137，RPC 仍不拆）。
-        let request_id = lk_core::crypto::random_uuid();
-        let challenge = hex::encode(lk_core::crypto::random_array::<16>());
-        let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
         let display_command = format!(
             "{} {}",
             match parsed.op {
@@ -205,38 +200,37 @@ impl Daemon {
             },
             target
         );
-        let areq = ApprovalRequest {
-            request_id,
-            starter: starter.clone(),
-            project_dir: cwd,
-            command: display_command,
-            keys: vec![target.clone()],
-            challenge,
-            needs_unlock: false,
-            kind: lk_core::authz::ApprovalKind::Write,
-            write_action: write_action(&parsed.op),
-            export_meta: None,
-            fingerprint_mismatch: None,
-            // #147：审批帧携带门事实——写门子类型随帧回带 subKind
-            //（item.put / item.delete；取代前端 command 前缀匹配启发式）
-            sub_kind: Some(match parsed.op {
-                PendingWriteOp::Delete(_) => lk_core::authz::ApprovalSubKind::ItemDelete,
-                _ => lk_core::authz::ApprovalSubKind::ItemPut,
-            }),
-        };
-        self.gate.approval().open(&areq, expires_at);
-        self.pending_write.lock().unwrap().insert(
-            request_id,
-            PendingWrite {
-                op: parsed.op,
-                draft: parsed.draft,
-                expected_revision: parsed.expected_revision,
-                command_summary,
-                target,
-                starter,
+        let request_id = self.open_gate_approval(
+            ApprovalDraft {
+                starter: starter.clone(),
+                project_dir: cwd,
+                command: display_command,
+                keys: vec![target.clone()],
+                kind: lk_core::authz::ApprovalKind::Write,
+                // #147：审批帧携带门事实——写门子类型随帧回带 subKind
+                //（item.put / item.delete；取代前端 command 前缀匹配启发式）
+                sub_kind: Some(match parsed.op {
+                    PendingWriteOp::Delete(_) => lk_core::authz::ApprovalSubKind::ItemDelete,
+                    _ => lk_core::authz::ApprovalSubKind::ItemPut,
+                }),
+                write_action: write_action(&parsed.op),
+                export_meta: None,
+                fingerprint_mismatch: None,
+            },
+            GateEntry {
+                needs_unlock: false,
+                temp_vault: None,
+                kind: GateKind::Write(PendingWrite {
+                    op: parsed.op,
+                    draft: parsed.draft,
+                    expected_revision: parsed.expected_revision,
+                    command_summary,
+                    target,
+                    starter,
+                }),
             },
         );
-        WriteBegin::Pending { request_id }
+        GateBegin::Pending { request_id }
     }
 
     /// 阶段③（重取命令锁；write-gate.md §5.4）：Allowed → **锁内 TOCTOU
@@ -249,9 +243,13 @@ impl Daemon {
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
     ) -> String {
-        let pending = self.pending_write.lock().unwrap().remove(&request_id);
-        let Some(p) = pending else {
-            // 条目已被消费（极端竞态）→ 保守拒绝
+        let removed = self.pending_gates.lock().unwrap().remove(&request_id);
+        // 条目已被消费（极端竞态）→ 保守拒绝
+        let Some(GateEntry {
+            kind: GateKind::Write(p),
+            ..
+        }) = removed
+        else {
             return rpc_string(super::disclosure::authz_denied(id));
         };
         match decision {
@@ -274,10 +272,11 @@ impl Daemon {
                             .unwrap_or(false)
                     };
                     if !still_present {
-                        self.audit_write_gate(
-                            &p.command_summary,
-                            &p.target,
+                        self.audit_gate(
+                            ActingVault::Shared,
                             &p.starter,
+                            &p.target,
+                            &p.command_summary,
                             AuditChannel::Approval,
                             AuditResult::Denied,
                         );
@@ -297,10 +296,11 @@ impl Daemon {
             }
             ApprovalDecision::Denied | ApprovalDecision::Timeout => {
                 // 拒绝/超时统一 denied（§8：不区分原因防探测，与值披露同口径）
-                self.audit_write_gate(
-                    &p.command_summary,
-                    &p.target,
+                self.audit_gate(
+                    ActingVault::Shared,
                     &p.starter,
+                    &p.target,
+                    &p.command_summary,
                     AuditChannel::Approval,
                     AuditResult::Denied,
                 );
@@ -310,25 +310,16 @@ impl Daemon {
     }
 
     /// 参数解析 + action 权威派生（`ItemPutParams.id` None=create /
-    /// Some=update，§5.2——不信任客户端自报；协议结构零变更）。
+    /// Some=update，§5.2——不信任客户端自报；协议结构零变更）。解析错误
+    /// 现状为 null id（零行为变更，gate-kit 辅助照传）。
     fn write_parse(
         &self,
         method: &str,
         params: &Value,
-    ) -> std::result::Result<ParsedWrite, Box<RpcResponse>> {
+    ) -> std::result::Result<ParsedWrite, String> {
         match method {
             M_ITEM_PUT => {
-                let p: ItemPutParams = match serde_json::from_value(params.clone()) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return Err(Box::new(RpcResponse::err(
-                            Value::Null,
-                            ERR_INVALID_PARAMS,
-                            "invalid params",
-                            None,
-                        )))
-                    }
-                };
+                let p: ItemPutParams = parse_gate_params(&Value::Null, params.clone())?;
                 let (op, draft, expected_revision) = match p.id {
                     None => (PendingWriteOp::Create, Some(p.item), None),
                     Some(item_id) => (
@@ -344,24 +335,14 @@ impl Daemon {
                 })
             }
             M_ITEM_DELETE => {
-                let p: ItemDeleteParams = match serde_json::from_value(params.clone()) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return Err(Box::new(RpcResponse::err(
-                            Value::Null,
-                            ERR_INVALID_PARAMS,
-                            "invalid params",
-                            None,
-                        )))
-                    }
-                };
+                let p: ItemDeleteParams = parse_gate_params(&Value::Null, params.clone())?;
                 Ok(ParsedWrite {
                     op: PendingWriteOp::Delete(p.id),
                     draft: None,
                     expected_revision: None,
                 })
             }
-            _ => Err(Box::new(RpcResponse::err(
+            _ => Err(rpc_string(RpcResponse::err(
                 Value::Null,
                 ERR_METHOD_NOT_FOUND,
                 MSG_METHOD_NOT_FOUND,
@@ -393,35 +374,6 @@ impl Daemon {
             }
             PendingWriteOp::Delete(item_id) => self.item_delete_exec(id, item_id, starter, channel),
         }
-    }
-
-    /// 写门拒绝/超时审计（失败路径全落审计，§8；补充拍板 #22 规则门同款）：
-    /// command 按 action 派生、target=条目名、starter/channel=真实归因。
-    /// K_audit 签名；已锁定（K_audit 擦除）→ 跳过（与授权路径审计同口径）。
-    fn audit_write_gate(
-        &self,
-        command: &str,
-        target: &str,
-        starter: &str,
-        channel: AuditChannel,
-        result: AuditResult,
-    ) {
-        let vault = self.shared.vault.read().unwrap();
-        let Some(v) = vault.as_ref() else {
-            return;
-        };
-        let _ = self.audit.append(
-            v.keys(),
-            &EventInput {
-                starter: starter.to_string(),
-                target: target.to_string(),
-                command: command.to_string(),
-                result,
-                channel,
-                old_key_id: None,
-                new_key_id: None,
-            },
-        );
     }
 }
 

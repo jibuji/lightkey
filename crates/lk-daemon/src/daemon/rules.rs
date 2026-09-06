@@ -9,19 +9,15 @@
 //! 受门；`rule.list` 维持令牌门（只读元数据，M2.9「值是边界」同口径）。
 //! 错误码复用 -32017 `authz.denied`（协议零新增）；锁态 `session.invalid`
 //! 先行（规则在加密库内，锁定态无从谈起）。
+//!
+//! 五件套下沉（issue #148）：begin 结果（GateBegin）/ 统一注册表（GateEntry）/
+//! 审批单点铸造 / 审计辅助（audit_gate）/ 参数解析辅助出自 daemon/gate_kit.rs。
 
 use super::*;
 
 // ---------------------------------------------------------------------------
 // begin / finalize（规则管理审批门三阶段的锁内两段）
 // ---------------------------------------------------------------------------
-
-/// 规则门 begin 结果：最终响应（desktop 豁免 / 参数错误 / fail-closed 拒绝）
-/// 或待审批（等待移出命令锁，G1）。
-pub(crate) enum RuleBegin {
-    Final(String),
-    Pending { request_id: uuid::Uuid },
-}
 
 /// 规则门待办操作（begin 期已校验/归一化；finalize 重执行）。
 pub(crate) enum PendingRuleOp {
@@ -72,11 +68,11 @@ impl Daemon {
         method: &str,
         params: Value,
         peer: &PeerInfo,
-    ) -> RuleBegin {
+    ) -> GateBegin {
         // 1) 参数解析 + 校验 + 归一化（remove 顺带解析 id→规则，供弹窗展示）
         let parsed = match self.rule_parse_and_validate(method, &params) {
             Ok(p) => p,
-            Err(resp) => return RuleBegin::Final(rpc_string(*resp)),
+            Err(line) => return GateBegin::Final(line),
         };
         // 客户端自报 channel 标注（审计来源；缺省按对端来源回退）
         let channel_param = params
@@ -90,7 +86,7 @@ impl Daemon {
             let command = parsed.command_summary();
             let starter = "desktop".to_string();
             let resp = self.rule_op_exec(id, &parsed.op, &starter, channel, &command);
-            return RuleBegin::Final(rpc_string(resp));
+            return GateBegin::Final(rpc_string(resp));
         }
         // 3) socket 通道：真实 starter（#66 进程链回溯；客户端自报不信任）；
         //    未知 → fail-closed 拒绝（不弹窗，与 inject/披露同口径）
@@ -98,8 +94,15 @@ impl Daemon {
         let channel = client_channel(channel_param.as_deref(), peer_channel(peer));
         let command = parsed.command_summary();
         if starter == UNKNOWN_STARTER {
-            self.audit_rule_gate(&command, &starter, channel, AuditResult::Denied);
-            return RuleBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
+            self.audit_gate(
+                ActingVault::Shared,
+                &starter,
+                "daemon",
+                &command,
+                channel,
+                AuditResult::Denied,
+            );
+            return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
         }
         // 4) 无审批界面（headless）且无 E2E 自动批准 → fail-closed 立即拒绝
         //    （不登记、不阻塞；仅规则审批可走 auto 通道，补充拍板 #22）
@@ -108,46 +111,49 @@ impl Daemon {
             .approval()
             .auto_approves(lk_core::authz::ApprovalKind::Rule);
         if !via_auto && !self.gate.approval().available() {
-            self.audit_rule_gate(&command, &starter, channel, AuditResult::Denied);
-            return RuleBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
+            self.audit_gate(
+                ActingVault::Shared,
+                &starter,
+                "daemon",
+                &command,
+                channel,
+                AuditResult::Denied,
+            );
+            return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
         }
         // 5) 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞；单一 kind
         //    + command 字段承载操作：`rule.add <name>` / `rule.remove <name>`，
         //    补充拍板 #22——E2E 自动批准分支不广播，无 UI 参与）
-        let request_id = lk_core::crypto::random_uuid();
-        let challenge = hex::encode(lk_core::crypto::random_array::<16>());
-        let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
-        let areq = ApprovalRequest {
-            request_id,
-            starter: starter.clone(),
-            project_dir: parsed.display_project_dir.clone(),
-            command: format!("{} {}", method, parsed.display_name),
-            keys: parsed.display_keys.clone(),
-            challenge,
-            needs_unlock: false,
-            kind: lk_core::authz::ApprovalKind::Rule,
-            write_action: None,
-            export_meta: None,
-            fingerprint_mismatch: None,
-            // #147：审批帧携带门事实——规则门子类型随帧回带 subKind
-            //（取代前端 command 前缀匹配启发式）
-            sub_kind: Some(if method == lk_core::ipc::M_RULE_ADD {
-                lk_core::authz::ApprovalSubKind::RuleAdd
-            } else {
-                lk_core::authz::ApprovalSubKind::RuleRemove
-            }),
-        };
-        self.gate.approval().open(&areq, expires_at);
-        self.pending_rule.lock().unwrap().insert(
-            request_id,
-            PendingRuleChange {
-                op: parsed.op,
-                command_summary: command,
-                starter,
-                via_auto,
+        let request_id = self.open_gate_approval(
+            ApprovalDraft {
+                starter: starter.clone(),
+                project_dir: parsed.display_project_dir.clone(),
+                command: format!("{} {}", method, parsed.display_name),
+                keys: parsed.display_keys.clone(),
+                kind: lk_core::authz::ApprovalKind::Rule,
+                // #147：审批帧携带门事实——规则门子类型随帧回带 subKind
+                //（取代前端 command 前缀匹配启发式）
+                sub_kind: Some(if method == lk_core::ipc::M_RULE_ADD {
+                    lk_core::authz::ApprovalSubKind::RuleAdd
+                } else {
+                    lk_core::authz::ApprovalSubKind::RuleRemove
+                }),
+                write_action: None,
+                export_meta: None,
+                fingerprint_mismatch: None,
+            },
+            GateEntry {
+                needs_unlock: false,
+                temp_vault: None,
+                kind: GateKind::Rule(PendingRuleChange {
+                    op: parsed.op,
+                    command_summary: command,
+                    starter,
+                    via_auto,
+                }),
             },
         );
-        RuleBegin::Pending { request_id }
+        GateBegin::Pending { request_id }
     }
 
     /// 阶段③（重取命令锁）：Allowed → **锁内重校验（TOCTOU）**——30s 等待
@@ -160,9 +166,13 @@ impl Daemon {
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
     ) -> String {
-        let pending = self.pending_rule.lock().unwrap().remove(&request_id);
-        let Some(p) = pending else {
-            // 条目已被消费（极端竞态）→ 保守拒绝
+        let removed = self.pending_gates.lock().unwrap().remove(&request_id);
+        // 条目已被消费（极端竞态）→ 保守拒绝
+        let Some(GateEntry {
+            kind: GateKind::Rule(p),
+            ..
+        }) = removed
+        else {
             return rpc_string(super::disclosure::authz_denied(id));
         };
         match decision {
@@ -190,9 +200,11 @@ impl Daemon {
                             .unwrap_or(false)
                     };
                     if !still_exists {
-                        self.audit_rule_gate(
-                            &p.command_summary,
+                        self.audit_gate(
+                            ActingVault::Shared,
                             &p.starter,
+                            "daemon",
+                            &p.command_summary,
                             AuditChannel::Approval,
                             AuditResult::Denied,
                         );
@@ -219,9 +231,11 @@ impl Daemon {
                     ApprovalDecision::Denied => AuditResult::Denied,
                     ApprovalDecision::Allowed => unreachable!("上方已分派"),
                 };
-                self.audit_rule_gate(
-                    &p.command_summary,
+                self.audit_gate(
+                    ActingVault::Shared,
                     &p.starter,
+                    "daemon",
+                    &p.command_summary,
                     AuditChannel::Approval,
                     result,
                 );
@@ -237,20 +251,11 @@ impl Daemon {
         &self,
         method: &str,
         params: &Value,
-    ) -> std::result::Result<ParsedRuleOp, Box<RpcResponse>> {
+    ) -> std::result::Result<ParsedRuleOp, String> {
         match method {
             M_RULE_ADD => {
-                let p: RuleAddParams = match serde_json::from_value(params.clone()) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return Err(Box::new(RpcResponse::err(
-                            Value::Null,
-                            ERR_INVALID_PARAMS,
-                            "invalid params",
-                            None,
-                        )))
-                    }
-                };
+                // 解析错误现状为 null id（零行为变更，gate-kit 辅助照传）
+                let p: RuleAddParams = parse_gate_params(&Value::Null, params.clone())?;
                 // projectDir 入库基准（cross-subsystem.md §7.4，两侧同函数）：
                 // 先过跨命名空间归一化——UNC / verbatim 包裹的 WSL 路径折算为
                 // `wsl://<distro>/<rest>` 规范形；常规路径维持原语义。
@@ -277,12 +282,7 @@ impl Daemon {
                     &p.keys,
                     &actions,
                 ) {
-                    return Err(Box::new(RpcResponse::err(
-                        Value::Null,
-                        ERR_INVALID_PARAMS,
-                        "invalid params",
-                        Some(json!({ "detail": e })),
-                    )));
+                    return Err(invalid_params(Value::Null, Some(e)));
                 }
                 // wsl:// 规范形直接入库（非本机 fs 路径）；常规路径仍以
                 // canonical 形态入库（解析符号链接），并经与运行时 cwd 判定
@@ -294,14 +294,10 @@ impl Daemon {
                     match std::fs::canonicalize(&project_dir_input) {
                         Ok(c) => lk_core::path_ns::canonical_project_dir(&c.to_string_lossy()),
                         Err(_) => {
-                            return Err(Box::new(RpcResponse::err(
+                            return Err(invalid_params(
                                 Value::Null,
-                                ERR_INVALID_PARAMS,
-                                "invalid params",
-                                Some(json!({ "detail": format!(
-                                    "projectDir 无法解析：{}", p.project_dir
-                                ) })),
-                            )))
+                                Some(format!("projectDir 无法解析：{}", p.project_dir)),
+                            ))
                         }
                     }
                 };
@@ -325,17 +321,7 @@ impl Daemon {
                 })
             }
             M_RULE_REMOVE => {
-                let p: RuleRemoveParams = match serde_json::from_value(params.clone()) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return Err(Box::new(RpcResponse::err(
-                            Value::Null,
-                            ERR_INVALID_PARAMS,
-                            "invalid params",
-                            None,
-                        )))
-                    }
-                };
+                let p: RuleRemoveParams = parse_gate_params(&Value::Null, params.clone())?;
                 // id→规则解析（弹窗展示既有规则的名称/keys/项目目录，
                 // value-disclosure 同款「daemon 侧补全」）
                 let rule = {
@@ -353,10 +339,10 @@ impl Daemon {
                         display_keys: r.keys.clone(),
                         display_project_dir: r.project_dir.clone(),
                     }),
-                    Err(e) => Err(Box::new(self.err_response(Value::Null, &e))),
+                    Err(e) => Err(rpc_string(self.err_response(Value::Null, &e))),
                 }
             }
-            _ => Err(Box::new(RpcResponse::err(
+            _ => Err(rpc_string(RpcResponse::err(
                 Value::Null,
                 ERR_METHOD_NOT_FOUND,
                 MSG_METHOD_NOT_FOUND,
@@ -509,34 +495,6 @@ impl Daemon {
                 Err(e) => self.err_response(id, &e),
             },
         }
-    }
-
-    /// 规则门拒绝/超时审计（失败路径，现状仅成功路径写；补充拍板 #22）：
-    /// command=`rule.add <name>` / `rule.remove <id>`，starter/channel=真实
-    /// 归因。K_audit 签名；已锁定（K_audit 擦除）→ 跳过（与授权路径同口径）。
-    fn audit_rule_gate(
-        &self,
-        command: &str,
-        starter: &str,
-        channel: AuditChannel,
-        result: AuditResult,
-    ) {
-        let vault = self.shared.vault.read().unwrap();
-        let Some(v) = vault.as_ref() else {
-            return;
-        };
-        let _ = self.audit.append(
-            v.keys(),
-            &EventInput {
-                starter: starter.to_string(),
-                target: "daemon".into(),
-                command: command.to_string(),
-                result,
-                channel,
-                old_key_id: None,
-                new_key_id: None,
-            },
-        );
     }
 
     /// `rule.list`：解密态规则（规则库损坏 → fail-closed 报错）。
