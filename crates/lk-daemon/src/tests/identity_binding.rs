@@ -584,6 +584,300 @@ fn unknown_starter_denied_first() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 锁定态一体化注入的指纹裁决（issue #140，M2.8 × M2.98 交汇路径）：锁态
+// begin 无法预载规则（加密库内）——指纹裁决在 finalize（临时 vault）补执行。
+// 命中 → 静默放行；失配/不可解析 → 视同未命中 → 二次审批（needsUnlock 帧
+// 携带 fingerprintMismatch 明示「指纹不符」，identity-binding.md §7）。
+// ---------------------------------------------------------------------------
+
+/// 锁定态 + 绑定 inject 规则夹具（issue #140）：初始化 + 种 secret + 种绑定
+/// 规则（vault 写锁直落，解锁态完成）+ 锁定。桌面订阅由用例自行建立。
+fn locked_daemon_with_bound_rule(
+    dir: &std::path::Path,
+    secret: (&str, &str),
+    proj: &std::path::Path,
+    exe_fp: &ProgramFingerprint,
+    command: &str,
+    keys: &[&str],
+) -> (Arc<Mutex<Daemon>>, Arc<SharedDaemon>) {
+    {
+        let mut audit = AuditLog::open(dir).unwrap();
+        init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
+    }
+    let mut daemon = Daemon::start(dir).unwrap();
+    let unlock = rpc_result(&daemon.handle(
+        &rpc_line(
+            M_VAULT_UNLOCK,
+            None,
+            json!({ "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::unknown(),
+    ));
+    let token = unlock["token"].as_str().unwrap().to_string();
+    // M2.97 写门：种子走 desktop 直调豁免（GUI 同路径）
+    daemon.handle(
+        &rpc_line(
+            M_ITEM_PUT,
+            Some(&token),
+            json!({ "item": {
+                "type": "secret", "name": secret.0, "value": secret.1,
+                "purpose": "", "expiresAt": null
+            } }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let shared = daemon.shared();
+    seed_bound_rule(&shared, proj, exe_fp, command, keys);
+    daemon.handle(
+        &rpc_line(M_VAULT_LOCK, None, json!({})),
+        &PeerInfo::unknown(),
+    );
+    let state = Arc::new(Mutex::new(daemon));
+    (state, shared)
+}
+
+/// #140 命中方向：锁定态一体化 + 绑定规则指纹**匹配** → finalize 在临时
+/// vault 上补指纹裁决后静默放行（单次弹窗、无二次审批帧）+ #67 不变量保持
+/// （不置 shared.vault / 不写 session.token）。
+#[test]
+fn locked_inject_binding_hit_silently_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let (_exe, fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
+    let (state, shared) = locked_daemon_with_bound_rule(
+        dir.path(),
+        ("NPM_TOKEN", "sekrit"),
+        proj.path(),
+        &fp,
+        "pgm",
+        &["NPM_TOKEN"],
+    );
+    inject_fake_env(&state, bin.path(), None);
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        None,
+        json!({ "command": "pgm deploy", "keys": ["NPM_TOKEN"] }),
+    );
+    let h = std::thread::spawn({
+        let handler = handler.clone();
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    // 第一次弹窗：锁态一体化帧（begin 无法预知指纹结果，无失配信息）
+    let fv = next_authz_frame(&rx);
+    assert_eq!(fv["params"]["needsUnlock"], true, "锁态一体化帧须标注");
+    assert!(
+        fv["params"]["fingerprintMismatch"].is_null(),
+        "begin 无法预载规则，首帧不带失配信息：{fv}"
+    );
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    // finalize 补指纹裁决（匹配）→ 静默放行，不再弹第二次
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["allowed"], true, "指纹匹配应静默放行：{resp}");
+    assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit");
+    // 指纹裁决确实执行了（临时 vault 上补跑：哈希至少现算一次）
+    assert!(
+        state.lock().unwrap().fingerprint_hash_calls() >= 1,
+        "锁定态一体化 finalize 必须执行指纹裁决（#140）"
+    );
+    // 无二次审批登记 + #67 不变量
+    assert_eq!(shared.approvals.pending_count(), 0, "命中不转二次审批");
+    assert!(
+        shared.vault.read().unwrap().is_none(),
+        "临时解锁不得改写共享 vault（须保持锁定）"
+    );
+    assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
+    // 审计：inject allowed（channel=Approval）
+    let evs = inject_audit(dir.path());
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].result, lk_core::audit::AuditResult::Allowed);
+}
+
+/// #140 失配方向：锁定态一体化 + 绑定规则指纹**失配** → 第一次弹窗（
+/// needsUnlock，begin 无法预知）批准后，finalize 在临时 vault 上裁决出失配
+/// → **二次审批帧携带 fingerprintMismatch**（needsUnlock=true：锁态前端
+/// 门控只放行一体化帧；弹窗渲染「指纹不符」主题）→ 批准后放行。
+#[test]
+fn locked_inject_binding_mismatch_fingerprint_frame_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let (pgm_path, fp_v1) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
+    let (state, shared) = locked_daemon_with_bound_rule(
+        dir.path(),
+        ("NPM_TOKEN", "sekrit"),
+        proj.path(),
+        &fp_v1,
+        "pgm",
+        &["NPM_TOKEN"],
+    );
+    inject_fake_env(&state, bin.path(), None);
+    // 内容被改（mtime 变）→ finalize 裁决失配
+    std::fs::write(&pgm_path, b"#!/bin/sh\necho v2-xxxx\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        None,
+        json!({ "command": "pgm deploy", "keys": ["NPM_TOKEN"] }),
+    );
+    let h = std::thread::spawn({
+        let handler = handler.clone();
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    // 第一次弹窗：锁态一体化帧，无失配信息（begin 成立）
+    let fv = next_authz_frame(&rx);
+    assert_eq!(fv["params"]["needsUnlock"], true);
+    assert!(fv["params"]["fingerprintMismatch"].is_null(), "{fv}");
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    // 第二次弹窗：finalize 裁决失配 → 转二次审批，帧明示「指纹不符」
+    let fv2 = next_authz_frame(&rx);
+    assert_eq!(
+        fv2["params"]["needsUnlock"], true,
+        "锁态二次审批帧须仍标 needsUnlock（前端门控只放行一体化帧）：{fv2}"
+    );
+    let mm = &fv2["params"]["fingerprintMismatch"];
+    assert!(
+        mm.is_object(),
+        "失配二次审批帧须携带 fingerprintMismatch（明示指纹不符）：{fv2}"
+    );
+    let resolved = PathBuf::from(mm["resolvedExePath"].as_str().unwrap());
+    assert_eq!(std::fs::canonicalize(&pgm_path).unwrap(), resolved);
+    let short = mm["sha256Short"].as_str().unwrap();
+    assert_eq!(short.len(), 8, "仅展示 8 位哈希摘要");
+    assert!(
+        !serde_json::to_string(&fv2).unwrap().contains(&fp_v1.sha256),
+        "审批帧不得携带完整哈希"
+    );
+    // 二次批准 → 放行
+    let request_id = fv2["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv2["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["allowed"], true, "二次批准后放行：{resp}");
+    assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit");
+    // #67 不变量：不置 shared.vault / 不写 session.token
+    assert!(shared.vault.read().unwrap().is_none());
+    assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
+    // 审计：inject allowed（channel=Approval）
+    let evs = inject_audit(dir.path());
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].result, lk_core::audit::AuditResult::Allowed);
+}
+
+/// #140 失配二次审批**拒绝** → 最终拒绝；vault 保持锁定（临时 vault 随
+/// 条目销毁，不产生会话能力）。
+#[test]
+fn locked_inject_binding_mismatch_round2_denied_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let (pgm_path, fp_v1) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
+    let (state, shared) = locked_daemon_with_bound_rule(
+        dir.path(),
+        ("NPM_TOKEN", "sekrit"),
+        proj.path(),
+        &fp_v1,
+        "pgm",
+        &["NPM_TOKEN"],
+    );
+    inject_fake_env(&state, bin.path(), None);
+    std::fs::write(&pgm_path, b"#!/bin/sh\necho v2-xxxx\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let handler = make_handler(&state, &shared);
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    let line = rpc_line(
+        M_AUTHZ_EVALUATE,
+        None,
+        json!({ "command": "pgm deploy", "keys": ["NPM_TOKEN"] }),
+    );
+    let h = std::thread::spawn({
+        let handler = handler.clone();
+        let peer = peer.clone();
+        move || handler(&line, &peer)
+    });
+    // 第一次弹窗批准（临时解锁）
+    let fv = next_authz_frame(&rx);
+    let request_id = fv["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "allowed",
+                    "challenge": challenge, "masterPassword": "pw123456" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    // 第二次弹窗（失配主题）→ 拒绝
+    let fv2 = next_authz_frame(&rx);
+    assert!(fv2["params"]["fingerprintMismatch"].is_object(), "{fv2}");
+    let request_id = fv2["params"]["requestId"].as_str().unwrap().to_string();
+    let challenge = fv2["params"]["challenge"].as_str().unwrap().to_string();
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            None,
+            json!({ "requestId": request_id, "decision": "denied", "challenge": challenge }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["accepted"], true);
+    let resp = h.join().unwrap();
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["result"]["allowed"], false, "二次拒绝应最终拒绝：{resp}");
+    assert_eq!(v["result"]["reason"], "rejected");
+    assert!(shared.vault.read().unwrap().is_none(), "拒绝不触发解锁");
+}
+
 /// macOS：对端 env 读取失败 → fail-closed（None）——与 resolve_peer_cwd 同
 /// 口径（不可行则该平台绑定规则按未命中处理）。cfg 门：仅 macOS 编译运行。
 #[cfg(target_os = "macos")]

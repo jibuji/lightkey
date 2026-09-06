@@ -60,7 +60,7 @@ canonical 路径 + 内容哈希。
 | socket（持令牌，解锁态） | `inject`（绑定规则命中） | 路径 == exePath **且** SHA-256 == exeSha256 | 静默放行 + 审计 |
 | socket | `inject` | 路径 ≠ exePath，或 size 不符，或哈希不符 | **视同未命中** → 弹窗（GUI 在场）→ allow/deny·timeout；headless → `authz.denied` |
 | socket | `inject` | 失配且弹窗批准 | 本次放行；「以新指纹重新授权」→ 规则指纹更新（走规则门） |
-| socket（**锁定态**） | — | — | `session.invalid` 先行（规则在加密库内；与 inject/读/写门同口径） |
+| socket（**锁定态**） | — | — | `session.invalid` 先行（规则在加密库内；与 inject/读/写门同口径）。**桌面 GUI 在场**走锁定态一体化（#67）：解锁后 finalize 在临时 vault 上**补指纹裁决**（issue #140，对端 env 随 `PendingAuthz` 存留）——命中 → 静默放行；失配/不可解析 → 视同未命中 → 转二次审批（needsUnlock 帧携带 `fingerprintMismatch`，弹窗明示「指纹不符」）；二次批准 = 本次允许 |
 | desktop（内嵌直调） | — | 不查（受信豁免；注入通道桌面直调也无豁免——指纹随注入路径整体裁决，不单独豁免） | 放行 |
 
 - 启动者未知 / cwd 不可得 → 第 1 层 fail-closed 拒绝（与 inject 同口径，
