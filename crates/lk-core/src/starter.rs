@@ -344,6 +344,10 @@ fn process_entry(
 /// fail-closed）。步骤：OpenProcess → NtQueryInformationProcess(PEB 地址)
 /// → ReadProcessMemory(ProcessParameters → CurrentDirectory.DosPath)。
 ///
+/// PEB 原语（NtQueryInformationProcess + ReadProcessMemory + 偏移表）唯一
+/// 一份在 [`crate::peb`]（与 daemon 对端 env 块读取共享，issue #151）；本函数
+/// 只保留 cwd 专属步骤：DosPath sanity check + `\\?\` 前缀剥离 + canonicalize。
+///
 /// 偏移（同架构）：x64 `PEB+0x20` → `RTL_USER_PROCESS_PARAMETERS+0x38`
 /// CurrentDirectory.DosPath；x86 `PEB+0x10` → `+0x24`。x64 布局中
 /// `+0x30` 是 StandardError 句柄而非 CurrentDirectory——若读错位置，
@@ -356,134 +360,38 @@ fn process_entry(
 /// 参考 Geoff Chappell 结构研究 / MS Learn winternl.h。）
 #[cfg(windows)]
 pub fn resolve_peer_cwd(pid: u32) -> Option<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, UNICODE_STRING};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
-    };
+    use crate::peb::{RemoteProcess, PROCESS_PARAMETERS_CWD_OFFSET};
+    use windows_sys::Win32::Foundation::UNICODE_STRING;
 
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtQueryInformationProcess(
-            process_handle: HANDLE,
-            process_information_class: u32, // ProcessBasicInformation = 0
-            process_information: *mut core::ffi::c_void,
-            process_information_length: u32,
-            return_length: *mut u32,
-        ) -> i32;
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn ReadProcessMemory(
-            process: HANDLE,
-            base_address: *const core::ffi::c_void,
-            buffer: *mut core::ffi::c_void,
-            size: usize,
-            number_of_bytes_read: *mut usize,
-        ) -> i32;
-    }
-
-    #[repr(C)]
-    struct BasicInfo {
-        exit_status: i32,
-        peb_base: *mut core::ffi::c_void,
-        affinity_mask: usize,
-        base_priority: i32,
-        unique_process_id: usize,
-        inherited_from: usize,
-    }
-
-    const PEB_PROCESS_PARAMETERS_OFFSET: usize = if cfg!(target_pointer_width = "64") {
-        0x20
-    } else {
-        0x10
-    };
-    // CurrentDirectory.DosPath（UNICODE_STRING）：x64 @ +0x38（+0x30 是
-    // StandardError 句柄）；x86 @ +0x24。
-    const PROCESS_PARAMETERS_CWD_OFFSET: usize = if cfg!(target_pointer_width = "64") {
-        0x38
-    } else {
-        0x24
-    };
     // DosPath 长度上限（字节）：Windows 路径硬上限 32767 个 UTF-16 码元
     // （长路径形态的极限），×2 得字节数——合法 cwd 不可能超限，超出即视为
     // 读到错误位置 → fail-closed，不拿垃圾长度做第二次跨进程读取。
-    // （注意：错位读到的小句柄值不会触发此上限，由下方 ReadProcessMemory
+    // （注意：错位读到的小句柄值不会触发此上限，由 ReadProcessMemory
     // 对垃圾指针必然失败而兜底。）
     const MAX_CWD_DOS_PATH_BYTES: u16 = 32767 * 2;
 
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
-        if handle.is_null() {
-            return None;
-        }
-        let result = (|| {
-            let mut basic: BasicInfo = std::mem::zeroed();
-            if NtQueryInformationProcess(
-                handle,
-                0,
-                &mut basic as *mut _ as *mut core::ffi::c_void,
-                std::mem::size_of::<BasicInfo>() as u32,
-                std::ptr::null_mut(),
-            ) < 0
-            {
-                return None;
-            }
-            // PEB → ProcessParameters 指针
-            let mut params_ptr: usize = 0;
-            if ReadProcessMemory(
-                handle,
-                (basic.peb_base as usize + PEB_PROCESS_PARAMETERS_OFFSET) as *const _,
-                &mut params_ptr as *mut _ as *mut _,
-                std::mem::size_of::<usize>(),
-                std::ptr::null_mut(),
-            ) == 0
-            {
-                return None;
-            }
-            if params_ptr == 0 {
-                return None;
-            }
-            // ProcessParameters → CurrentDirectory（CURDIR = UNICODE_STRING + HANDLE）
-            let mut cwd: UNICODE_STRING = std::mem::zeroed();
-            if ReadProcessMemory(
-                handle,
-                (params_ptr + PROCESS_PARAMETERS_CWD_OFFSET) as *const _,
-                &mut cwd as *mut _ as *mut _,
-                std::mem::size_of::<UNICODE_STRING>(),
-                std::ptr::null_mut(),
-            ) == 0
-            {
-                return None;
-            }
-            // Sanity check：Length 为 0 或超出 Windows 路径硬上限都视为读到
-            // 错误位置 → fail-closed。
-            if cwd.Buffer.is_null() || cwd.Length == 0 || cwd.Length > MAX_CWD_DOS_PATH_BYTES {
-                return None;
-            }
-            let mut buf = vec![0u16; (cwd.Length as usize).div_ceil(2)];
-            if ReadProcessMemory(
-                handle,
-                cwd.Buffer as *const _,
-                buf.as_mut_ptr() as *mut _,
-                cwd.Length as usize,
-                std::ptr::null_mut(),
-            ) == 0
-            {
-                return None;
-            }
-            let path = String::from_utf16_lossy(&buf);
-            // 去除 \\?\ 前缀（长路径形态）并规范化
-            let path = path
-                .strip_prefix(r"\\?\")
-                .unwrap_or(path.as_str())
-                .to_string();
-            std::fs::canonicalize(&path)
-                .ok()
-                .map(|p| p.to_string_lossy().to_string())
-        })();
-        CloseHandle(handle);
-        result
+    let proc = RemoteProcess::open(pid)?;
+    let params_ptr = proc.process_parameters()?;
+    // ProcessParameters → CurrentDirectory（CURDIR = UNICODE_STRING + HANDLE）
+    let cwd: UNICODE_STRING = proc.read_value(params_ptr + PROCESS_PARAMETERS_CWD_OFFSET)?;
+    // Sanity check：Length 为 0 或超出 Windows 路径硬上限都视为读到
+    // 错误位置 → fail-closed。
+    if cwd.Buffer.is_null() || cwd.Length == 0 || cwd.Length > MAX_CWD_DOS_PATH_BYTES {
+        return None;
     }
+    let mut buf = vec![0u16; (cwd.Length as usize).div_ceil(2)];
+    proc.read_bytes(cwd.Buffer as usize, unsafe {
+        std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, cwd.Length as usize)
+    })?;
+    let path = String::from_utf16_lossy(&buf);
+    // 去除 \\?\ 前缀（长路径形态）并规范化
+    let path = path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(path.as_str())
+        .to_string();
+    std::fs::canonicalize(&path)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// 跨会话先验：对端与守护进程必须同会话，否则视为不可信 → fail-closed。

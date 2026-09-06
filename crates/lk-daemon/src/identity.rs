@@ -2,8 +2,8 @@
 //!
 //! 1. **对端真实 env PATH 读取**（[`PeerEnv`]，§5.1「信 daemon 不信客户端」）：
 //!    - Linux：`/proc/<pid>/environ`（同用户可读）；
-//!    - Windows：PEB `ProcessParameters.Environment`（复用 `lk_core::starter`
-//!      的 PEB 读取基建——同款偏移表 + 长度 sanity check，读 `PATH=...`）；
+//!    - Windows：PEB `ProcessParameters.Environment`（复用 `lk_core::peb`
+//!      的 PEB 读取原语——唯一一份偏移表 + 长度 sanity check，读 `PATH=...`）；
 //!    - macOS：`sysctl KERN_PROCARGS2`（§12：实现期验证权限与可达性；**失败
 //!      → fail-closed**，机制与 `resolve_peer_cwd` 现状同口径）；
 //! 2. **`command[0]` → canonical 候选**（[`resolve_exe_path`]，§5.1）：按 PATH
@@ -192,10 +192,10 @@ fn read_peer_path_procargs2(pid: u32) -> Option<String> {
     None
 }
 
-/// Windows：PEB `ProcessParameters.Environment`（复用 starter.rs 的 PEB 读取
-/// 基建——同款 NtQueryInformationProcess + ReadProcessMemory + 偏移表 + 长度
-/// sanity check）。Environment 是 NUL 分隔的 UTF-16 键值块，据此取 `PATH=...`
-/// 与 `PATHEXT=...`。
+/// Windows：PEB `ProcessParameters.Environment`（复用 `lk_core::peb` 的 PEB
+/// 读取原语——唯一一份 NtQueryInformationProcess + ReadProcessMemory 与偏移表
+/// 及长度 sanity check）。Environment 是 NUL 分隔的 UTF-16 键值块，据此取
+/// PATH 与 PATHEXT。
 #[cfg(windows)]
 fn read_peer_path(pid: u32) -> Option<String> {
     read_peer_env_block(pid).and_then(|b| extract_path_from_env_block_utf16(&b))
@@ -207,142 +207,48 @@ fn read_peer_pathext(pid: u32) -> Option<String> {
 }
 
 /// Windows PEB 环境块整块读取（UTF-16 → String；PATH/PATHEXT 共用一次读取
-/// 基建，两次跨进程读取各自独立）。
+/// 基建，两次跨进程读取各自独立）。PEB 原语（NtQueryInformationProcess +
+/// ReadProcessMemory + 偏移表）唯一一份在 `lk_core::peb`（与 starter 的
+/// 启动者 cwd 读取共享，issue #151）；本函数只保留 env 块专属步骤：
+/// `Environment` 基址 sanity + 整块按上界读取 + 双 NUL 截断。
 #[cfg(windows)]
 fn read_peer_env_block(pid: u32) -> Option<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
-    };
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtQueryInformationProcess(
-            process_handle: HANDLE,
-            process_information_class: u32, // ProcessBasicInformation = 0
-            process_information: *mut core::ffi::c_void,
-            process_information_length: u32,
-            return_length: *mut u32,
-        ) -> i32;
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn ReadProcessMemory(
-            process: HANDLE,
-            base_address: *const core::ffi::c_void,
-            buffer: *mut core::ffi::c_void,
-            size: usize,
-            number_of_bytes_read: *mut usize,
-        ) -> i32;
-    }
-    #[repr(C)]
-    struct BasicInfo {
-        exit_status: i32,
-        peb_base: *mut core::ffi::c_void,
-        affinity_mask: usize,
-        base_priority: i32,
-        unique_process_id: usize,
-        inherited_from: usize,
-    }
-    const PEB_PROCESS_PARAMETERS_OFFSET: usize = if cfg!(target_pointer_width = "64") {
-        0x20
-    } else {
-        0x10
-    };
-    // RTL_USER_PROCESS_PARAMETERS.Environment：x64 @ +0x80；x86 @ +0x48。
-    // 与 starter.rs 读 CurrentDirectory.DosPath 同款偏移表方法（cwd x64 @
-    // +0x38；Environment 在 CommandLine@+0x70 之后 @+0x80）。实测该位存的是
-    // 环境块**基址指针**（无 UNICODE_STRING 头）：按指针直读比按结构读更稳。
-    const PROCESS_PARAMETERS_ENV_OFFSET: usize = if cfg!(target_pointer_width = "64") {
-        0x80
-    } else {
-        0x48
-    };
+    use lk_core::peb::{RemoteProcess, PROCESS_PARAMETERS_ENV_OFFSET};
     // env 块字节长度上限（sanity）：环境块一般 <64 KiB；长度超限或读错位置 →
     // fail-closed，不拿垃圾长度做第二次跨进程读取（与 starter.rs cwd 同防线）。
     const MAX_ENV_BLOCK_BYTES: usize = 32767 * 2;
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
-        if handle.is_null() {
-            return None;
-        }
-        let result = (|| {
-            let mut basic: BasicInfo = std::mem::zeroed();
-            if NtQueryInformationProcess(
-                handle,
-                0,
-                &mut basic as *mut _ as *mut core::ffi::c_void,
-                std::mem::size_of::<BasicInfo>() as u32,
-                std::ptr::null_mut(),
-            ) < 0
-            {
-                return None;
-            }
-            let mut params_ptr: usize = 0;
-            if ReadProcessMemory(
-                handle,
-                (basic.peb_base as usize + PEB_PROCESS_PARAMETERS_OFFSET) as *const _,
-                &mut params_ptr as *mut _ as *mut _,
-                std::mem::size_of::<usize>(),
-                std::ptr::null_mut(),
-            ) == 0
-            {
-                return None;
-            }
-            if params_ptr == 0 {
-                return None;
-            }
-            // Environment 在 `RTL_USER_PROCESS_PARAMETERS` 中为可选的 UTF-16 环境块
-            // 指针（x64 @ +0x80；实测该位直接存环境块基址指针，而非 UNICODE_STRING
-            // 头——UNICODE_STRING 读法会因 Buffer 字段落在 NULL 区而 fail-closed，
-            // 见 identity-binding.md §5.1 Windows 注记）。先读 8 字节指针：
-            let mut env_base: usize = 0;
-            if ReadProcessMemory(
-                handle,
-                (params_ptr + PROCESS_PARAMETERS_ENV_OFFSET) as *const _,
-                &mut env_base as *mut _ as *mut _,
-                std::mem::size_of::<usize>(),
-                std::ptr::null_mut(),
-            ) == 0
-            {
-                return None;
-            }
-            // sanity：基址有效 + 非奇异值（错位读到的小句柄值不触发拷贝）
-            if env_base == 0 || env_base == usize::MAX {
-                return None;
-            }
-            // 环境块为引用计数/连续分配，读上界字节（NUL 结尾；UTF-16）。
-            // length = 读取的实际字节数（环境块大小未知，按上界读一次，
-            // 超限由长度上界守卫；非 NUL 结尾说明读错位置 → 无 PATH fail-closed）
-            let mut rawb = vec![0u16; MAX_ENV_BLOCK_BYTES.div_ceil(2)];
-            let mut read: usize = 0;
-            if ReadProcessMemory(
-                handle,
-                env_base as *const _,
-                rawb.as_mut_ptr() as *mut _,
-                MAX_ENV_BLOCK_BYTES,
-                &mut read,
-            ) == 0
-            {
-                return None;
-            }
-            // 截到首个双 NUL（环境块用 `\0\0` 结尾）或实际读取长度，转 UTF-16。
-            let uk = rawb.len();
-            let end = rawb[..uk]
-                .windows(2)
-                .position(|w| w[0] == 0 && w[1] == 0)
-                .map(|i| i + 2)
-                .unwrap_or(uk);
-            // 环境块为 NUL 分隔的 `NAME=VALUE` 串（值通常 ASCII，lossy 已是
-            // 既有做法）。PATH/PATHEXT 提取在调用方完成——**Windows env 名
-            // 大小写不敏感**：环境块里 PATH 常存为 `Path=`（实测）而非
-            // `PATH=`，严格前缀会漏掉真实环境 → fail-closed 误判不可读
-            // （`eq_ignore_ascii_case` 处理，见
-            // [`extract_var_from_env_block_utf16`]）。
-            Some(String::from_utf16_lossy(&rawb[..end.min(uk)]))
-        })();
-        CloseHandle(handle);
-        result
+    let proc = RemoteProcess::open(pid)?;
+    let params_ptr = proc.process_parameters()?;
+    // Environment 在 `RTL_USER_PROCESS_PARAMETERS` 中为可选的 UTF-16 环境块
+    // 指针（x64 @ +0x80；实测该位直接存环境块基址指针，而非 UNICODE_STRING
+    // 头——UNICODE_STRING 读法会因 Buffer 字段落在 NULL 区而 fail-closed，
+    // 见 identity-binding.md §5.1 Windows 注记）。先读 8 字节指针：
+    let env_base: usize = proc.read_value(params_ptr + PROCESS_PARAMETERS_ENV_OFFSET)?;
+    // sanity：基址有效 + 非奇异值（错位读到的小句柄值不触发拷贝）
+    if env_base == 0 || env_base == usize::MAX {
+        return None;
     }
+    // 环境块为引用计数/连续分配，读上界字节（NUL 结尾；UTF-16）。
+    // length = 读取的实际字节数（环境块大小未知，按上界读一次，
+    // 超限由长度上界守卫；非 NUL 结尾说明读错位置 → 无 PATH fail-closed）
+    let mut rawb = vec![0u16; MAX_ENV_BLOCK_BYTES.div_ceil(2)];
+    proc.read_bytes(env_base, unsafe {
+        std::slice::from_raw_parts_mut(rawb.as_mut_ptr() as *mut u8, MAX_ENV_BLOCK_BYTES)
+    })?;
+    // 截到首个双 NUL（环境块用 `\0\0` 结尾）或实际读取长度，转 UTF-16。
+    let uk = rawb.len();
+    let end = rawb[..uk]
+        .windows(2)
+        .position(|w| w[0] == 0 && w[1] == 0)
+        .map(|i| i + 2)
+        .unwrap_or(uk);
+    // 环境块为 NUL 分隔的 `NAME=VALUE` 串（值通常 ASCII，lossy 已是
+    // 既有做法）。PATH/PATHEXT 提取在调用方完成——**Windows env 名
+    // 大小写不敏感**：环境块里 PATH 常存为 `Path=`（实测）而非
+    // `PATH=`，严格前缀会漏掉真实环境 → fail-closed 误判不可读
+    // （`eq_ignore_ascii_case` 处理，见
+    // [`extract_var_from_env_block_utf16`]）。
+    Some(String::from_utf16_lossy(&rawb[..end.min(uk)]))
 }
 
 // ---------------------------------------------------------------------------
