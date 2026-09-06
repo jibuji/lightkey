@@ -349,11 +349,35 @@ fn read_peer_env_block(pid: u32) -> Option<String> {
 // 2. `command[0]` → canonical 候选路径（§5.1；只解析路径，不触碰文件内容）
 // ---------------------------------------------------------------------------
 
+/// PATH 字符串 → 目录序列（issue #139）：**空元素按 POSIX `execvp` 语义原位
+/// 映射为对端 cwd**（不过滤、不丢序）——POSIX `execvp`（Rust `Command::new`
+/// 对裸命令名的 Unix 语义）把空 PATH 元素视为当前位置 cwd，且位于其所在位置。
+/// 解析序必须与子进程实际 exec 序一致：此前实现过滤空元素，导致
+/// `PATH=":/usr/bin"`（空首元素，POSIX 惯例写法）+ cwd 同名假程序场景下，
+/// daemon 解析到 `/usr/bin` 真程序（指纹命中 → Allowed），而子进程实际执行
+/// cwd 假程序——指纹门被「PATH 前置假程序」绕过。Windows 上裸名解析语义
+/// 不同（CreateProcess 搜索序），按 spec 权威（identity-binding.md §5.1）
+/// 统一实现 POSIX 语义——空元素 → cwd 候选在解析序中前移只会更 fail-closed。
+/// 纯函数，跨平台可测。
+pub fn parse_path_dirs(path_str: &str, sep: char, cwd: &Path) -> Vec<PathBuf> {
+    path_str
+        .split(sep)
+        .map(|s| {
+            if s.is_empty() {
+                cwd.to_path_buf()
+            } else {
+                PathBuf::from(s)
+            }
+        })
+        .collect()
+}
+
 /// 解析 `command[0]` → canonical 绝对候选路径：
 ///
 /// - 从对端真实 env 取 PATH（不可读 → fail-closed）；绝对命令免 PATH 解析；
 /// - 按 PATH 序 `resolve_exe`（第一个命中即是候选，入参可执行性谓词 =
 ///   is_file，见 [`resolve_exe_path`] 的调用处）+ 对端真实 cwd 兜底；
+///   空元素原位映射为 cwd（POSIX execvp 语义，[`parse_path_dirs`]，issue #139）；
 /// - canonicalize 得绝对路径（相对候选解析符号链接）。
 ///
 /// 返回 `None` 表示无法解析（env/cwd 缺失、候选不存在、canonical 失败）→
@@ -373,11 +397,10 @@ pub fn resolve_exe_path(
     let sep = ';';
     #[cfg(not(windows))]
     let sep = ':';
-    let path_dirs: Vec<PathBuf> = path_str
-        .split(sep)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect();
+    // 空元素原位映射 cwd（POSIX execvp 语义，issue #139）：解析序与子进程
+    // 实际 exec 序一致；cwd 兜底候选仍由 resolve_exe 追加在末尾（PATH 全
+    // 未命中时的既有 fail-closed 行为零变化；重复候选无害——取首个命中）。
+    let path_dirs: Vec<PathBuf> = parse_path_dirs(&path_str, sep, Path::new(cwd));
     // resolve_exe 内置 `cwd` 兜底（PATH 全未命中时的最后一个候选）
     // issue #133：Windows 无扩展名命令（`npm`/`git`/`npx`…）按对端 PATHEXT
     // 逐后缀探测（见 [`pathext_extensions`]），解析结果 = 带后缀的真实文件；
@@ -814,6 +837,126 @@ mod tests {
             None,
             "无 PATHEXT 时无扩展名命令不可解析（fail-closed 审批）"
         );
+    }
+
+    /// PATH 解析（issue #139）：空 PATH 元素按 POSIX `execvp` 语义**原位映射
+    /// 为对端 cwd**（不过滤、不丢序）——`PATH=":/usr/bin"` → `[cwd, /usr/bin]`；
+    /// 中部/末尾空元素同理。解析序必须与子进程实际 exec 序一致，否则「指纹
+    /// 比对命中的程序」与「实际被执行的程序」可分叉（PATH 前置假程序绕过）。
+    #[test]
+    fn parse_path_dirs_maps_empty_elements_to_cwd_in_place() {
+        let cwd = Path::new("/proj");
+        // 首位空元素（POSIX 惯例 `PATH=":/usr/bin"`）→ cwd 原位在前
+        let got = parse_path_dirs(":/usr/bin", ':', cwd);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["/proj".to_string(), "/usr/bin".to_string()]);
+        // 中部空元素 → cwd 原位居中
+        let got = parse_path_dirs("/a::/b", ':', cwd);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["/a".to_string(), "/proj".to_string(), "/b".to_string()]
+        );
+        // 末尾空元素 → cwd 原位在后
+        let got = parse_path_dirs("/a:", ':', cwd);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["/a".to_string(), "/proj".to_string()]);
+        // 多重空元素 → 每个空位各自映射 cwd（`"::"` 切出 3 个空段）
+        let got = parse_path_dirs("::", ':', cwd);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "/proj".to_string(),
+                "/proj".to_string(),
+                "/proj".to_string()
+            ]
+        );
+        // 无空元素 → 原样（零变化）
+        let got = parse_path_dirs("/a:/b", ':', cwd);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["/a".to_string(), "/b".to_string()]);
+    }
+
+    /// issue #139 主场景（fail-closed 语义钉死）：`PATH=":<真实程序目录>"` +
+    /// cwd 含同名假程序 + 另一目录含真实程序。解析必须**先命中 cwd 假程序**
+    /// （与 execvp 实际执行序一致）→ 与绑定 `/…real…` 的规则路径不符 → 失配；
+    /// 修复前空元素被过滤 → 解析到真实程序 → 指纹命中 → Allowed（绕过）。
+    #[test]
+    fn resolve_exe_path_empty_leading_element_resolves_cwd_fake_first() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let real_dir = tempfile::tempdir().unwrap();
+        let fake = cwd_dir.path().join("npm");
+        let real = real_dir.path().join("npm");
+        std::fs::write(&fake, b"fake").unwrap();
+        std::fs::write(&real, b"real binary").unwrap();
+        let fake_canonical = std::fs::canonicalize(&fake).unwrap();
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let env = FakePeerEnv {
+            path: Some(format!(
+                "{}{}{}",
+                "",
+                sep,
+                real_dir.path().to_string_lossy()
+            )),
+            pathext: None,
+        };
+        let got = resolve_exe_path(
+            &env,
+            1,
+            cwd_dir.path().to_string_lossy().as_ref(),
+            "npm publish",
+        )
+        .expect("cwd 假程序应被解析为候选（与 execvp 序一致）");
+        assert_eq!(
+            got, fake_canonical,
+            "空首元素必须原位映射 cwd：解析序 = 实际 exec 序"
+        );
+    }
+
+    /// issue #139 控制组：空**尾**元素（`PATH="<真实目录>:"`）时真实程序在
+    /// cwd 之前，仍解析到真实程序（序不变）；真实目录未命中才轮到 cwd。
+    #[test]
+    fn resolve_exe_path_trailing_empty_element_keeps_path_order() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let real_dir = tempfile::tempdir().unwrap();
+        std::fs::write(cwd_dir.path().join("npm"), b"fake").unwrap();
+        let real = real_dir.path().join("npm");
+        std::fs::write(&real, b"real binary").unwrap();
+        let real_canonical = std::fs::canonicalize(&real).unwrap();
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let env = FakePeerEnv {
+            path: Some(format!(
+                "{}{}{}",
+                real_dir.path().to_string_lossy(),
+                sep,
+                ""
+            )),
+            pathext: None,
+        };
+        let got = resolve_exe_path(
+            &env,
+            1,
+            cwd_dir.path().to_string_lossy().as_ref(),
+            "npm publish",
+        )
+        .expect("真实程序应命中");
+        assert_eq!(got, real_canonical, "PATH 序不被空尾元素打乱");
     }
 
     /// 假文件源：元信息 + 确定性哈希（测试缓存复用/失效）。

@@ -124,6 +124,13 @@ pub struct ProgramFingerprint {
     fail-closed，机制与 `resolve_peer_cwd` 现状同口径）。
 - 按 PATH 序解析 `command[0]`（第一个命中项即候选）+ 对端真实 cwd 兜底
   （非绝对路径时）；结果为 canonical 绝对路径。
+- **空 PATH 元素**（issue #139）：按 POSIX `execvp` 语义（Rust `Command::new`
+  对裸命令名的 Unix 语义）**原位映射为对端 cwd**——不过滤、不丢序
+  （`PATH=":/usr/bin"` → 候选序 `[cwd, /usr/bin, …]`）。解析序必须与子进程
+  实际 exec 序一致，否则 cwd 同名假程序可造成「指纹比对命中的程序」与
+  「实际被执行（注入 env 的）程序」分叉，绕过指纹门。Windows 裸名解析语义
+  不同（CreateProcess 搜索序），解析层按本规格统一实现 POSIX 语义——空元素
+  → cwd 候选前移只会更 fail-closed。
 - 命令为绝对路径时免 PATH 解析（直接 canonicalize）。
 - **Windows 无扩展名命令**（issue #133，主平台主线）：`command[0]` 常为
   无扩展名的键入名（`npm`/`git`/`npx`…），真实文件是 `npm.cmd`/`node.exe`
