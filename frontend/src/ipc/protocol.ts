@@ -93,6 +93,21 @@ export const APPROVAL_KINDS = {
 } as const;
 
 /**
+ * 审批子类型（issue #147：审批帧携带门事实；`authz.request` 帧 `subKind`
+ * 字段）。daemon 权威派生并随 kind=rule/write 帧回带，serde 值 = RPC 方法
+ * 名（`lk_core::authz::ApprovalSubKind`，常量 `crate::ipc::SUB_KIND_*`）：
+ * read/export/inject 审批**不带**该字段（缺字段即旧帧信号）。前端解析器
+ * 纯派生「记住」可记性（rememberable 不进协议），command 前缀匹配启发式
+ * 由本字段取代。双向对齐由 `protocolContract.test.ts` 钉死。
+ */
+export const APPROVAL_SUB_KINDS = {
+  RULE_ADD: "rule.add",
+  RULE_REMOVE: "rule.remove",
+  ITEM_PUT: "item.put",
+  ITEM_DELETE: "item.delete",
+} as const;
+
+/**
  * 携带 `channel` 参数的方法（`lk_core::ipc::CHANNEL_BEARING_METHODS`）：
  * 授权门 + 规则 + 值披露裁决。CLI（钉 "cli" / 桥覆写 "wsl-bridge"）与
  * 桌面（钉 "desktop"）据此标注来源，清单在此与 Rust 侧共享。

@@ -126,6 +126,38 @@ pub enum ApprovalKind {
     Write,
 }
 
+/// 审批子类型（issue #147：审批帧携带门事实）。规则门/写门的子类型事实
+/// ——daemon 权威派生并随 `authz.request` 帧回带 `subKind`（serde 值 =
+/// RPC 方法名 `rule.add` / `rule.remove` / `item.put` / `item.delete`，
+/// 常量在 [`crate::ipc::SUB_KIND_*`]）；read/export/inject 审批不带
+/// （`None`）。前端据此渲染门语义并纯派生「记住」可记性
+/// （rememberable 不进协议——派生值进帧即同一真相存两处），取代弹窗的
+/// command 前缀匹配启发式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ApprovalSubKind {
+    #[serde(rename = "rule.add")]
+    RuleAdd,
+    #[serde(rename = "rule.remove")]
+    RuleRemove,
+    #[serde(rename = "item.put")]
+    ItemPut,
+    #[serde(rename = "item.delete")]
+    ItemDelete,
+}
+
+impl ApprovalSubKind {
+    /// 协议面字符串（`authz.request` 帧 `subKind` 字段；常量单一来源
+    /// `crate::ipc::SUB_KIND_*`，TS 镜像 `APPROVAL_SUB_KINDS`）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ApprovalSubKind::RuleAdd => crate::ipc::SUB_KIND_RULE_ADD,
+            ApprovalSubKind::RuleRemove => crate::ipc::SUB_KIND_RULE_REMOVE,
+            ApprovalSubKind::ItemPut => crate::ipc::SUB_KIND_ITEM_PUT,
+            ApprovalSubKind::ItemDelete => crate::ipc::SUB_KIND_ITEM_DELETE,
+        }
+    }
+}
+
 /// export 审批的数据包元信息（弹窗展示规模用；不含数据本身）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportMeta {
@@ -185,6 +217,10 @@ pub struct ApprovalRequest {
     /// 命令形态但指纹不符时携带（弹窗据此显示「指纹不符」主题 + 当前路径 +
     /// 8 位哈希摘要 + 「以新指纹重新授权」）；未失配为 `None`。
     pub fingerprint_mismatch: Option<FingerprintMismatch>,
+    /// 审批子类型（issue #147）：kind=Rule/Write 时 daemon 权威派生并随帧
+    /// 回带 `subKind`（取代前端 command 前缀匹配启发式）；read/export/inject
+    /// 恒 `None`（帧不携带该字段）。
+    pub sub_kind: Option<ApprovalSubKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +433,7 @@ impl ApprovalChannel for LocalApprovalChannel {
             write_action: req.write_action,
             export_meta: req.export_meta.clone(),
             fingerprint_mismatch: req.fingerprint_mismatch.clone(),
+            sub_kind: req.sub_kind,
         });
     }
 
@@ -1107,6 +1144,7 @@ mod tests {
             write_action: None,
             export_meta: None,
             fingerprint_mismatch: None,
+            sub_kind: None,
         };
         // open：登记 + 广播（非阻塞）
         ch.open(&req, Instant::now() + Duration::from_secs(10));
@@ -1125,6 +1163,7 @@ mod tests {
                 write_action,
                 export_meta,
                 fingerprint_mismatch,
+                sub_kind,
             } => {
                 assert_eq!(*request_id, req.request_id);
                 assert_eq!(starter, "/bin/zsh");
@@ -1142,6 +1181,8 @@ mod tests {
                 assert!(export_meta.is_none());
                 // M2.98：非失配注入审批不带指纹失配信息
                 assert!(fingerprint_mismatch.is_none());
+                // #147：inject 审批不带审批子类型
+                assert!(sub_kind.is_none());
             }
             other => panic!("应广播 authz.request：{other:?}"),
         }
@@ -1247,6 +1288,7 @@ mod tests {
                 write_action: None,
                 export_meta: None,
                 fingerprint_mismatch: None,
+                sub_kind: None,
             },
             Instant::now() + Duration::from_secs(10),
         );
@@ -1630,6 +1672,7 @@ mod tests {
             write_action: None,
             export_meta: None,
             fingerprint_mismatch: None,
+            sub_kind: None,
         }
     }
 
@@ -1723,9 +1766,12 @@ mod tests {
                 size: 1024,
             }),
             fingerprint_mismatch: None,
+            sub_kind: None,
         };
         assert_eq!(areq.kind, ApprovalKind::Export);
         assert_eq!(areq.export_meta.as_ref().unwrap().size, 1024);
+        // #147：read/export/inject 审批不带审批子类型
+        assert!(areq.sub_kind.is_none());
         // 常规注入审批不带 export 元信息
         let inject_req = ApprovalRequest {
             kind: ApprovalKind::Inject,
@@ -1743,6 +1789,32 @@ mod tests {
         assert_eq!(write_req.write_action, Some(WriteAction::Update));
         assert_eq!(WriteAction::Create.as_str(), "create");
         assert_eq!(WriteAction::Update.as_str(), "update");
+        // #147：写审批携带审批子类型（daemon 权威派生随帧回带 subKind）
+        write_req.sub_kind = Some(ApprovalSubKind::ItemPut);
+        assert_eq!(write_req.sub_kind, Some(ApprovalSubKind::ItemPut));
+    }
+
+    /// ApprovalSubKind 协议面序列化（serde rename = RPC 方法名字符串；
+    /// 常量单一来源 `crate::ipc::SUB_KIND_*`，TS 镜像 `APPROVAL_SUB_KINDS`）。
+    #[test]
+    fn approval_sub_kind_serde_contract() {
+        for (v, s) in [
+            (ApprovalSubKind::RuleAdd, crate::ipc::SUB_KIND_RULE_ADD),
+            (
+                ApprovalSubKind::RuleRemove,
+                crate::ipc::SUB_KIND_RULE_REMOVE,
+            ),
+            (ApprovalSubKind::ItemPut, crate::ipc::SUB_KIND_ITEM_PUT),
+            (
+                ApprovalSubKind::ItemDelete,
+                crate::ipc::SUB_KIND_ITEM_DELETE,
+            ),
+        ] {
+            assert_eq!(v.as_str(), s);
+            assert_eq!(serde_json::to_value(v).unwrap(), serde_json::json!(s));
+            let back: ApprovalSubKind = serde_json::from_value(serde_json::json!(s)).unwrap();
+            assert_eq!(back, v);
+        }
     }
 
     // -- M2.98 规则程序指纹（补充拍板 #25）：未绑定匹配路径零变化回归 ---------

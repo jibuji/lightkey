@@ -855,6 +855,7 @@ describe("规则管理审批弹窗（kind=rule；补充拍板 #22 / issue #104�
         command: "rule.add publish",
         keys: ["NPM_TOKEN", "GH_TOKEN"],
         kind: "rule",
+        subKind: "rule.add",
       });
     });
     await flushApproval();
@@ -901,6 +902,7 @@ describe("规则管理审批弹窗（kind=rule；补充拍板 #22 / issue #104�
         command: "rule.remove publish",
         keys: ["NPM_TOKEN"],
         kind: "rule",
+        subKind: "rule.remove",
       });
     });
     await flushApproval();
@@ -969,6 +971,7 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         keys: ["API_TOKEN"],
         kind: "write",
         writeAction: "create",
+        subKind: "item.put",
       });
     });
     await flushApproval();
@@ -1001,6 +1004,7 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         keys: ["API_TOKEN"],
         kind: "write",
         writeAction: "create",
+        subKind: "item.put",
       });
     });
     await flushApproval();
@@ -1045,6 +1049,7 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         keys: ["API_TOKEN"],
         kind: "write",
         writeAction: "update",
+        subKind: "item.put",
       });
     });
     await flushApproval();
@@ -1068,10 +1073,11 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
     );
   });
 
-  it("write put 帧缺 writeAction（旧守护进程帧）：展示回退动作类；记住点击不生成规则（宁可不记不超发）", async () => {
+  it("write put 旧帧（缺 subKind，issue #147）：「记住」按钮不渲染（spec 唯一行为修正——原为可点但每次点击提示失败）", async () => {
     const { ctx, mock } = await mountHost();
     await unlock(ctx);
     const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    const resultSpy = vi.spyOn(ctx.ipc, "approvalResult");
     act(() => {
       mock.simulateAuthzRequest({
         requestId: "req-write-remember-no-action",
@@ -1080,22 +1086,34 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         command: "item.put API_TOKEN",
         keys: ["API_TOKEN"],
         kind: "write",
+        // 旧守护进程帧：writeAction 在场但缺 subKind（缺字段 = 旧帧信号）
+        writeAction: "create",
       });
     });
     await flushApproval();
     const dialog = document.body.querySelector(".approval-dialog")!;
-    // 防御回退：动作类并列展示
-    expect(dialog.textContent).toContain("写入条目（create/update）");
-    const rememberBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("允许并为此项目记住"),
+    // 写门形态照常渲染（writeAction 在场 → 按动作精确展示），但「记住」按钮不再出现
+    expect(dialog.textContent).toContain("新建条目（create）");
+    expect(
+      Array.from(dialog.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("允许并为此项目记住"),
+      ),
+    ).toBeUndefined();
+    // 允许本次照常可用；不追加规则
+    const allowBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许本次"),
     )!;
     act(() => {
-      rememberBtn.click();
+      allowBtn.click();
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(300);
     });
-    // writeAction 缺失 → 不生成规则（不允许回退到 put 全类授权）
+    expect(resultSpy).toHaveBeenCalledWith(
+      "req-write-remember-no-action",
+      "allowed",
+      "mock-challenge",
+    );
     expect(ruleSpy).not.toHaveBeenCalled();
     expect(document.body.querySelector(".approval-dialog")).toBeNull();
   });
@@ -1114,6 +1132,7 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         keys: ["API_TOKEN"],
         kind: "write",
         writeAction: null,
+        subKind: "item.delete",
       });
     });
     await flushApproval();

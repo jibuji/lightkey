@@ -21,6 +21,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  APPROVAL_KINDS,
+  APPROVAL_SUB_KINDS,
   CHANNELS,
   CHANNEL_BEARING_METHODS,
   ERROR_CODES,
@@ -34,8 +36,6 @@ import authzRs from "../../../crates/lk-core/src/authz.rs?raw";
 
 /** D 层事件总线契约源（events.ts 的类型级字面量键）。 */
 import eventsTs from "../events.ts?raw";
-
-import { APPROVAL_KINDS } from "../ipc/protocol";
 
 /** 解析全部 `pub const NAME: &str = "VALUE";` 常量。 */
 function parseStrConsts(src: string): Map<string, string> {
@@ -77,13 +77,15 @@ describe("protocol contract (协议契约)", () => {
   const rustMsg = new Map([...consts].filter(([k]) => /^MSG_/.test(k)));
   const rustNotify = new Map([...consts].filter(([k]) => /^NOTIFY_/.test(k)));
   const rustChannels = new Map([...consts].filter(([k]) => /^CHANNEL_/.test(k)));
+  const rustSubKinds = new Map([...consts].filter(([k]) => /^SUB_KIND_/.test(k)));
 
-  it("every &str const in ipc.rs is classified (methods / notify / msg / channel)", () => {
+  it("every &str const in ipc.rs is classified (methods / notify / msg / channel / subKind)", () => {
     const classified = new Set([
       ...rustMethods.keys(),
       ...rustMsg.keys(),
       ...rustNotify.keys(),
       ...rustChannels.keys(),
+      ...rustSubKinds.keys(),
     ]);
     expect(classified).toEqual(new Set(consts.keys()));
   });
@@ -124,6 +126,18 @@ describe("protocol contract (协议契约)", () => {
     expect(Object.keys(APPROVAL_KINDS).length).toBe(parseApprovalKindVariants(authzRs).length);
     // 写门（M2.97）钉死：serde "write" 在契约内（弹窗 kind=write 分支依赖）
     expect(APPROVAL_KINDS.WRITE).toBe("write");
+  });
+
+  it("APPROVAL_SUB_KINDS mirrors the SUB_KIND_* consts (ipc.rs) bidirectionally", () => {
+    // #147 审批帧携带门事实：authz.request 帧 subKind 字段的合法值三处镜像
+    // ——ipc.rs 常量 ↔ protocol.ts ↔ 本测试。加性演进必须三处同步。
+    expect(sorted([...rustSubKinds.values()])).toEqual(sorted(Object.values(APPROVAL_SUB_KINDS)));
+    expect(Object.keys(APPROVAL_SUB_KINDS).length).toBe(rustSubKinds.size);
+    // 钉死语义值：规则门/写门各两个子类型（取代前端 command 前缀匹配）
+    expect(APPROVAL_SUB_KINDS.RULE_ADD).toBe("rule.add");
+    expect(APPROVAL_SUB_KINDS.RULE_REMOVE).toBe("rule.remove");
+    expect(APPROVAL_SUB_KINDS.ITEM_PUT).toBe("item.put");
+    expect(APPROVAL_SUB_KINDS.ITEM_DELETE).toBe("item.delete");
   });
 
   it("events.ts wire-backed event keys mirror NOTIFICATIONS", () => {

@@ -111,7 +111,15 @@
    化**，identity-binding.md §7）；未失配为缺省（常规审批帧）。失配视同未命中
    （headless 统一 `authz.denied`），弹窗据字段渲染「指纹不符」主题 + 路径 +
    摘要 +「以新指纹重新授权」按钮（触发 `rule.add` 携带 `fingerprint` → 规则
-   管理审批门 → finalize 侧重算指纹落盘）。
+   管理审批门 → finalize 侧重算指纹落盘）。**审批帧携带门事实（#147，已实现）**：
+   `kind=rule`/`write` 帧恒带 `subKind`（`rule.add`\|`rule.remove`\|`item.put`\|
+   `item.delete`，daemon 权威派生，serde 值 = RPC 方法名，常量 `SUB_KIND_*` /
+   TS 镜像 `APPROVAL_SUB_KINDS`，契约测试钉死）；`read`/`export`/`inject` 帧
+   **不带**该字段（缺字段 = 旧帧信号）。前端单一解析器据帧产出唯一事实对象
+   ApprovalContext——「记住」可记性（rememberable）由 `subKind + writeAction +
+   needsUnlock` 纯派生、**不进协议**，command 前缀匹配启发式全删；旧帧（缺
+   `subKind`）下「记住」按钮不渲染（spec 唯一行为修正）；决策回调收结构化
+   ApprovalResolution。
 - **`approval.result` 扩展**：可选 `masterPassword`——仅 `needs_unlock` 待审
   条目 + `allowed` 决策时使用并校验；守护进程以其做**临时解锁**（AuthGuard
   限流照常），错误主密码计失败计数并以错误响应退回弹窗（条目保留可重试）。

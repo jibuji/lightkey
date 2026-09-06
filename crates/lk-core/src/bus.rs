@@ -111,6 +111,10 @@ pub enum VaultEvent {
         /// 携带（弹窗「指纹不符」主题 + 当前路径 + 8 位哈希摘要）；None = 常规
         /// 审批（未失配 / 非绑定规则）。
         fingerprint_mismatch: Option<crate::authz::FingerprintMismatch>,
+        /// 审批子类型（issue #147）：kind=Rule/Write 时 daemon 权威派生并随
+        /// 帧回带 `subKind`（取代前端 command 前缀匹配启发式）；read/export/
+        /// inject 恒 None（帧不携带该字段）。
+        sub_kind: Option<crate::authz::ApprovalSubKind>,
     },
 }
 
@@ -281,6 +285,7 @@ mod tests {
                 write_action: None,
                 export_meta: None,
                 fingerprint_mismatch: None,
+                sub_kind: None,
             }
             .name(),
             "authz.request"

@@ -402,6 +402,11 @@ export class MockAdapter implements LightKeyIpc {
      *  形态但指纹不符时携带——弹窗渲染「指纹不符」主题 + 路径 + 8 位摘要 +
      *  「以新指纹重新授权」。 */
     fingerprintMismatch?: { resolvedExePath: string; sha256Short: string } | null;
+    /** 审批子类型（issue #147：审批帧携带门事实）：daemon 权威派生并随
+     *  kind=rule/write 帧回带（rule.add / rule.remove / item.put /
+     *  item.delete）；read/export/inject 帧不携带（缺省 undefined = 旧帧
+     *  信号——「记住」按钮不渲染）。 */
+    subKind?: "rule.add" | "rule.remove" | "item.put" | "item.delete" | null;
   }): void {
     this.pendingApprovals.add(params.requestId);
     if (params.needsUnlock) {

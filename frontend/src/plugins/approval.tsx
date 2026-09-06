@@ -1,11 +1,15 @@
 /**
  * approval 插件（M2；spec §6.5 + authorization-gate.md §6）。
  *
- * 订阅 `authz.request`（Rust authz-gate → 通知桥 → 帧 → 本层事件）→ 渲染
- * 审批弹窗：启动者 · 项目目录 · 命令（等宽）· 请求 key 名 Tag 集 ·
- * **倒计时环形（默认拒绝；时长取自 config `approvalTimeoutSecs`，缺省 30s）**
- * · 「允许本次」「拒绝」；Esc = 拒绝；超时自动关闭（守护进程侧超时审计
- * `timeout`，弹窗本地倒计时到期即关闭，不重复回传）。
+ * 订阅 `authz.request`（Rust authz-gate → 通知桥 → 帧 → 本层事件）→
+ * 经**单一解析器**（`approvalContext.ts`）把帧解析成唯一事实对象
+ * ApprovalContext → 渲染审批弹窗：启动者 · 项目目录 · 命令（等宽）· 请求
+ * key 名 Tag 集 · **倒计时环形（默认拒绝；时长取自 config
+ * `approvalTimeoutSecs`，缺省 30s）** · 「允许本次」「拒绝」；Esc = 拒绝；
+ * 超时自动关闭（守护进程侧超时审计 `timeout`，弹窗本地倒计时到期即关闭，
+ * 不重复回传）。弹窗渲染、「记住 / 以新指纹重新授权」按钮与决策回调全部
+ * 消费 ApprovalContext——**不再用 command 前缀匹配推断门语义**（启发式
+ * 全删，issue #147）。
  *
  * **锁定态一体化（#67 注入 / #23 读通道）**：帧携带 `needsUnlock=true` 时
  * （守护进程锁态收到 `authz.evaluate` / 锁态 `item.get` / `item.export` 且
@@ -18,13 +22,12 @@
  * 无「允许并为此项目记住」（临时 vault 无法持久化规则，补充拍板 #23）。
  *
  * **写入门（M2.97，补充拍板 #24；write-gate.md §6）**：kind=write 帧
- * （command=`item.put/delete <name>`，keys=单元素[目标条目名]）渲染动作 +
- * 目标条目名 + projectDir + 30s 倒计时，**不展示值**；「允许并为此项目
- * 记住」仅 put（create/update）提供（= allow + 最小写规则
- * `keys=[条目名] + actions=[帧内 writeAction 当前动作]`——daemon 从
- * `ItemPutParams.id` 权威派生随帧回带，#137 最小授权修复；writeAction
- * 畸形/缺失不生成规则，宁可不记不超发），**delete 无记住按钮**
- * （恒弹窗语义，任何规则不豁免——对齐 export）。
+ * （subKind=item.put / item.delete）渲染动作 + 目标条目名 + projectDir +
+ * 30s 倒计时，**不展示值**；「允许并为此项目记住」仅 put（create/update）
+ * 提供（= allow + 最小写规则 `keys=[条目名] + actions=[帧内 writeAction
+ * 当前动作]`——daemon 从 `ItemPutParams.id` 权威派生随帧回带，#137 最小
+ * 授权修复；writeAction 畸形/缺失不生成规则，宁可不记不超发），**delete
+ * 无记住按钮**（恒弹窗语义，任何规则不豁免——对齐 export）。
  *
  * **程序指纹失配（M2.98，补充拍板 #25；identity-binding.md §7）**：
  * 绑定注入规则命中命令形态但可执行文件指纹不符时，`authz.request` 帧带
@@ -34,13 +37,18 @@
  * 「拒绝」/「本次允许」（一次性放行，与普通审批一致）/「**以新指纹重新
  * 授权**」（= 允许本次 + `rule.add` 携带 `fingerprint{exePath}` → 规则管理
  * 审批门 → daemon finalize 侧重算指纹并落盘；桌面直调 channel=desktop
- * 受信豁免直执行）。**未知字段防御**：畸形 `fingerprintMismatch`
- * （缺字段/非字符串/null/类型不符）→ [`parseFingerprintMismatch`] 返回
- * null，弹窗按普通 inject 审批渲染（不 crash、不渲染失配主题）；sha256Short
- * 超长（协议外完整哈希）→ 截断到 8 位——UI 硬保证不展示完整哈希值。
+ * 受信豁免直执行）。**未知字段防御**：畸形 `fingerprintMismatch` →
+ * parseFingerprintMismatch 返回 null，弹窗按普通 inject 审批渲染。
+ *
+ * **审批帧携带门事实（issue #147）**：kind=rule/write 帧自带 `subKind`
+ * （daemon 权威派生）；旧帧（缺 subKind）下「记住」按钮**不再渲染**
+ * （rememberable 纯派生恒 false）——spec 唯一行为修正，与「未知 kind
+ * 防御渲染」先例一致。
  *
  * 决策权始终在 Rust 侧（plugin-architecture.md §5.3）：本插件只把用户
- * 选择经 `approval.result` 回传，不持有裁决权；伪造/已超时 requestId →
+ * 选择以**结构化决策对象**（ApprovalResolution：allow/deny + 主密码 +
+ * remember/reauthorize 意图）回传，host 只做意图→RPC 翻译（规则负载由
+ * 解析器旁纯函数构造），不持有裁决权；伪造/已超时 requestId →
  * 守护进程忽略（accepted=false）。
  *
  * 无槽位服务插件：自挂 React root 渲染弹窗层（portal 语义）。
@@ -55,6 +63,13 @@ import { Icon } from "../components/Icons";
 import { VaultInvalidError } from "../ipc";
 import { APPROVAL_KINDS } from "../ipc/protocol";
 import { formatProjectDir } from "../utils/projectDir";
+import {
+  buildReauthorizeRule,
+  buildRememberRule,
+  parseApprovalContext,
+  type ApprovalContext,
+  type ApprovalResolution,
+} from "./approvalContext";
 
 /** 审批超时默认值（秒；与守护进程 `approval_timeout_secs` 默认值对齐）。
  *  仅作缺省兜底——实际倒计时取自 config `approvalTimeoutSecs`（#50）。 */
@@ -82,68 +97,11 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** 解析后的审批类型（补充拍板 #22 增 `rule`；M2.97 写门 #24 增 `write`）。
- *  白名单单一来源 = `ipc/protocol.ts` 的 `APPROVAL_KINDS`（镜像 Rust
- *  `ApprovalKind` serde 值）。未知/缺失 → `"unknown"` **防御性渲染**（明确
- *  提示，不回退按 inject 渲染——协议演进时旧 UI 不误导，规格 #102 故事 25）。 */
-type ApprovalKindValue = (typeof APPROVAL_KINDS)[keyof typeof APPROVAL_KINDS];
-type ParsedKind = ApprovalKindValue | "unknown";
-
-const KIND_WHITELIST: readonly string[] = Object.values(APPROVAL_KINDS);
-
-function parseApprovalKind(raw: unknown): ParsedKind {
-  return typeof raw === "string" && KIND_WHITELIST.includes(raw)
-    ? (raw as ParsedKind)
-    : "unknown";
-}
-
-/** 程序指纹失配展示信息（M2.98，identity-binding.md §7）。 */
-export interface FingerprintMismatchInfo {
-  /** 当前解析到的 canonical 绝对路径（daemon 侧重算；展示用，非安全依据）。 */
-  resolvedExePath: string;
-  /** 8 位 SHA-256 前缀摘要（hex 小写；不展示完整值）。 */
-  sha256Short: string;
-}
-
-/** 防御解析 `authz.request` 帧的可选 `fingerprintMismatch` 字段（未知字段
- *  防御渲染，AC「未知 kind/字段防御」）：只接受 shape 为
- *  `{resolvedExePath: 非空字符串, sha256Short: string}` 的值；畸形/缺字段/
- *  类型不符 → null（弹窗按普通 inject 审批渲染，不 crash、不渲染失配主题，
- *  无重新授权按钮）。`sha256Short` 超长（协议外完整哈希）→ **截断到 8 位**
- *  ——UI 硬保证绝不展示完整哈希值（identity-binding.md §7「不展示完整值」）。 */
-export function parseFingerprintMismatch(
-  raw: AuthzRequestPayload["fingerprintMismatch"],
-): FingerprintMismatchInfo | null {
-  if (!raw || typeof raw !== "object") return null;
-  const rec = raw as Record<string, unknown>;
-  if (typeof rec.resolvedExePath !== "string" || rec.resolvedExePath.length === 0) return null;
-  if (typeof rec.sha256Short !== "string" || rec.sha256Short.length === 0) return null;
-  return {
-    resolvedExePath: rec.resolvedExePath,
-    sha256Short: rec.sha256Short.slice(0, 8),
-  };
-}
-
-/** 可执行文件 basename（跨 Windows/Linux 分隔符）；「以新指纹重新授权」
- *  生成规则名用（`fp-<basename>`，如 `fp-npm.cmd`）。 */
-function exeBasename(p: string): string {
-  const parts = p.split(/[\\/]/);
-  const last = parts[parts.length - 1];
-  return last.length > 0 ? last : p;
-}
-
-/** 防御解析写帧的 `writeAction`（#137 最小授权修复）：daemon 从
- *  `ItemPutParams.id` 有无权威派生并随 kind=write 帧回带（RPC 不拆）。
- *  只接受 `"create"` / `"update"`；缺失/畸形（旧守护进程帧、类型不符）→
- *  null——**不生成记住规则**（宁可不记，不超发 `actions` 授权）。 */
-export function parseWriteAction(
-  raw: AuthzRequestPayload["writeAction"],
-): "create" | "update" | null {
-  return raw === "create" || raw === "update" ? raw : null;
-}
-
 interface ApprovalItem {
   request: AuthzRequestPayload;
+  /** 单一事实对象（issue #147）：入队时解析一次，渲染与决策回调全程复用
+   *  ——按钮渲染条件与规则负载构造消费同一解析产物。 */
+  ctx: ApprovalContext;
   /** 剩余秒数（倒计时环形）。 */
   remain: number;
   /** 倒计时总秒数（config `approvalTimeoutSecs`，入队时读取）。 */
@@ -153,87 +111,51 @@ interface ApprovalItem {
 }
 
 /** 弹窗本体（手写 React：倒计时环形为原子组件，不拆内部结构）。
- *  `needsUnlock`（#67）：展示主密码输入栏；「解锁并允许」携带
- *  masterPassword 回传。
- *  M2.9 值披露：按 `kind` 选形态——`read`（条目名 Tag、无命令框、
- *  「允许并为此项目记住」= allow + rule.add）；`export`（额外展示数据包
- *  规模，无记住按钮——导出恒弹窗，规则不豁免）；`inject` 为既有形态。
- *  规则管理审批门（补充拍板 #22）：`rule` 展示命令框（`rule.add <name>` /
- *  `rule.remove <name>`）+ keys Tag + 30s 倒计时，**无「记住」按钮**（规则
- *  操作本身就是持久动作）。写入门（补充拍板 #24，M2.97）：`write` 展示
- *  动作（按帧内 `writeAction` 精确展示 create/update；delete 帧恒弹窗）+
- *  目标条目名 Tag + projectDir + 30s 倒计时，**不展示值**；「允许并为此项目
- *  记住」仅 put（create/update）提供（= allow + 写规则
- *  `actions=[当前动作]`，#137），**delete 无记住按钮**（恒弹窗语义，
- *  对齐 export）。M2.98 程序指纹失配：`inject` 帧带
- *  `fingerprintMismatch` 时渲染失配主题 + 路径 + 8 位摘要 + 「以新指纹
- *  重新授权」（= 本次允许 + 更新规则绑定），详见 [`parseFingerprintMismatch`]
- *  与模块注释。未知 kind **防御性渲染**：明确提示未知，不回退按 inject
- *  渲染（协议演进时旧 UI 不误导）。 */
+ *  渲染分支只看 ApprovalContext（issue #147）：kind 选形态（M2.9 值披露：
+ *  read/export/inject；补充拍板 #22 规则门；#24 写门）；isRuleRemove /
+ *  isWriteDelete / rememberable / reauthorizable 全部来自解析器纯派生。
+ *  决策回调收**单个结构化对象** ApprovalResolution（无尾随位置可选参）。
+ *  未知 kind 防御性渲染：明确提示未知，不回退按 inject 渲染（协议演进时
+ *  旧 UI 不误导）。 */
 export function ApprovalDialog({
   item,
   onResolve,
 }: {
   item: ApprovalItem;
-  onResolve: (
-    requestId: string,
-    decision: "allowed" | "denied",
-    challenge: string,
-    masterPassword?: string,
-    remember?: boolean,
-    reauthorize?: boolean,
-  ) => Promise<void>;
+  onResolve: (requestId: string, resolution: ApprovalResolution) => Promise<void>;
 }) {
   const req = item.request;
-  const needsUnlock = req.needsUnlock;
-  const kind = parseApprovalKind(req.kind);
-  const isRead = kind === "read";
-  const isExport = kind === "export";
-  const isRule = kind === "rule";
-  const isWrite = kind === "write";
-  const isUnknown = kind === "unknown";
-  const isRuleRemove = isRule && req.command.startsWith("rule.remove");
-  // 写门动作派生（M2.97，write-gate.md §6）：帧 command 恒为
-  // `item.put <name>` / `item.delete <name>`（§5.3 展示用；create/update
-  // 由 daemon 从 id 有无权威派生、随帧 `writeAction` 回带——§5.2 RPC 不拆
-  // + #137 最小授权修复）。既有先例同 isRuleRemove：`command.startsWith`
-  // 判定 delete；create/update 按帧内 writeAction 精确展示（畸形/缺失
-  // 防御回退「create/update」并列展示，不影响记住路径的独立防御）。
-  const isWriteDelete = isWrite && req.command.startsWith("item.delete");
-  const writeAction = parseWriteAction(req.writeAction);
-  // M2.98 程序指纹失配：防御解析（畸形 → null → 普通 inject 审批渲染）
-  const mm = parseFingerprintMismatch(req.fingerprintMismatch);
-  const isMismatch = mm !== null;
+  const ctx = item.ctx;
+  const needsUnlock = ctx.needsUnlock;
+  const isRead = ctx.kind === APPROVAL_KINDS.READ;
+  const isExport = ctx.kind === APPROVAL_KINDS.EXPORT;
+  const isRule = ctx.kind === APPROVAL_KINDS.RULE;
+  const isWrite = ctx.kind === APPROVAL_KINDS.WRITE;
+  const isUnknown = ctx.kind === "unknown";
+  const mm = ctx.fingerprintMismatch;
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const deny = useCallback(() => {
-    void onResolve(req.requestId, "denied", req.challenge);
-  }, [onResolve, req.requestId, req.challenge]);
+    void onResolve(req.requestId, { decision: "denied" });
+  }, [onResolve, req.requestId]);
 
   const allow = useCallback(
-    async (remember = false, reauthorize = false) => {
+    async (resolution: Omit<ApprovalResolution, "decision"> = {}) => {
       if (submitting) return;
       // 解锁弹窗必须提供主密码（守护进程侧校验，错误不 resolve）
       if (needsUnlock && !password) return;
       setSubmitting(true);
       // 解锁结果由插件的 onResolve 决定弹窗去留（失败停留显示 item.error）
-      if (needsUnlock) {
-        await onResolve(req.requestId, "allowed", req.challenge, password, false, reauthorize);
-      } else {
-        await onResolve(
-          req.requestId,
-          "allowed",
-          req.challenge,
-          undefined,
-          remember,
-          reauthorize,
-        );
-      }
+      await onResolve(req.requestId, {
+        decision: "allowed",
+        ...resolution,
+        masterPassword: needsUnlock ? password : undefined,
+      });
       setSubmitting(false);
     },
-    [submitting, needsUnlock, password, onResolve, req.requestId, req.challenge],
+    [submitting, needsUnlock, password, onResolve, req.requestId],
   );
 
   // Esc = 拒绝（spec §6.5；弹窗存在期间生效）
@@ -260,19 +182,19 @@ export function ApprovalDialog({
               ? "Agent 请求读取该项目目录下条目的值（值不会显示，批准后仅返回给发起程序）"
               : isExport
                 ? "Agent 请求导出条目数据包（附件明文将离开守护进程，请确认）"
-              : isRule
-                ? isRuleRemove
-                  ? "Agent 请求删除既有授权规则（撤销已授予的读取/注入能力；批准后立即生效并随同步传播）"
-                  : "Agent 请求建立持久化授权规则（批准后写入规则库；此为持久授权，请确认范围）"
-                : isWrite
-                  ? isWriteDelete
-                    ? "Agent 请求删除该项目目录下的条目（破坏性操作；任何规则不豁免，恒需本次审批）"
-                    : "Agent 请求写入该项目目录下的条目（新建或整条替换；条目值不会显示）"
-                  : isMismatch
-                    ? "该程序曾获注入授权，但当前可执行文件的程序指纹与规则不符（可能已更新）——批准前请确认这是你期望的程序；「以新指纹重新授权」会用当前程序更新规则绑定"
-                  : isUnknown
-                    ? `未知审批类型（kind=${String(req.kind ?? "缺失")}）：当前界面版本不认识该请求，请升级应用后处理；无法确认内容前建议拒绝`
-                    : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
+                : isRule
+                  ? ctx.isRuleRemove
+                    ? "Agent 请求删除既有授权规则（撤销已授予的读取/注入能力；批准后立即生效并随同步传播）"
+                    : "Agent 请求建立持久化授权规则（批准后写入规则库；此为持久授权，请确认范围）"
+                  : isWrite
+                    ? ctx.isWriteDelete
+                      ? "Agent 请求删除该项目目录下的条目（破坏性操作；任何规则不豁免，恒需本次审批）"
+                      : "Agent 请求写入该项目目录下的条目（新建或整条替换；条目值不会显示）"
+                    : mm
+                      ? "该程序曾获注入授权，但当前可执行文件的程序指纹与规则不符（可能已更新）——批准前请确认这是你期望的程序；「以新指纹重新授权」会用当前程序更新规则绑定"
+                      : isUnknown
+                        ? `未知审批类型（kind=${String(req.kind ?? "缺失")}）：当前界面版本不认识该请求，请升级应用后处理；无法确认内容前建议拒绝`
+                        : "Agent 请求在项目目录中执行命令并注入密钥（密钥值不会显示）"}
         </p>
         <div className="approval-source">
           <span className="approval-avatar">
@@ -294,7 +216,7 @@ export function ApprovalDialog({
         {isRule ? (
           // 规则门（补充拍板 #22）：命令框承载操作（非 shell 命令，无 $ 前缀）
           <div className="approval-cmd-box">
-            {isRuleRemove ? "移除规则：" : "新建规则："}
+            {ctx.isRuleRemove ? "移除规则：" : "新建规则："}
             {req.command}
           </div>
         ) : isWrite ? (
@@ -302,11 +224,11 @@ export function ApprovalDialog({
           // <name>` 是 RPC 摘要而非 shell 命令，无 $ 前缀——同规则门先例）。
           // 动作按帧内 writeAction 精确展示（#137）；畸形/缺失回退动作类。
           <div className="approval-cmd-box">
-            {isWriteDelete
+            {ctx.isWriteDelete
               ? "删除条目（delete）："
-              : writeAction === "create"
+              : ctx.writeAction === "create"
                 ? "新建条目（create）："
-                : writeAction === "update"
+                : ctx.writeAction === "update"
                   ? "替换条目（update）："
                   : "写入条目（create/update）："}
             {req.command}
@@ -382,18 +304,17 @@ export function ApprovalDialog({
           <button className="btn btn-ghost" onClick={deny} disabled={submitting}>
             拒绝
           </button>
-          {/* 「允许并为此项目记住」：allow 决策 + 追加一条最小授权规则（默认
-              不持久化，用户显式选择）。适用面 = read（追加 read 规则，M2.9）
-              + write 的 put（追加写规则，M2.97）；export 恒弹窗语义 → 不提供
-              记住；delete 同为恒弹窗（任何规则不豁免）→ 亦不提供。锁态一体化
-              （#23，补充拍板 #23）：临时 vault 无法持久化规则——记住按钮
-              渲染条件 = `(isRead || (isWrite && !isWriteDelete)) &&
-              !needsUnlock`（write 帧守护进程恒 needs_unlock=false，防御保持
-              同一条件），锁态弹窗不承诺做不到的事。 */}
-          {(isRead || (isWrite && !isWriteDelete)) && !needsUnlock ? (
+          {/* 「允许并为此项目记住」：渲染条件 = 解析器纯派生的 rememberable
+              （issue #147；与 buildRememberRule 规则构造消费同一 ApprovalContext
+              ——渲染与规则负载永不分歧）。适用面 = read（追加 read 规则，M2.9）
+              + write 的 put（追加写规则且帧内 writeAction 在场，M2.97/#137）；
+              export / delete 恒弹窗语义 → 不提供；锁态一体化（#23）临时 vault
+              无法持久化规则 → 不提供；**旧帧（缺 subKind）恒不渲染**——原为
+              可点但每次点击提示失败，spec 唯一行为修正（宁可不承诺）。 */}
+          {ctx.rememberable ? (
             <button
               className="btn"
-              onClick={() => void allow(true)}
+              onClick={() => void allow({ remember: true })}
               disabled={submitting}
             >
               允许并为此项目记住
@@ -409,13 +330,12 @@ export function ApprovalDialog({
           {/* M2.98 程序指纹失配：「以新指纹重新授权」= 允许本次 + 更新规则
               绑定（rule.add 携带 fingerprint{exePath} → 规则管理审批门 →
               daemon finalize 侧重算指纹并落盘，identity-binding.md §7）。
-              仅绑定规则命中失配的审批帧提供；needsUnlock 防御（失配帧守护
-              进程恒 needs_unlock=false，但临时 vault 无法持久化规则——与
-              「记住」按钮同一防御条件）。 */}
-          {mm && !needsUnlock ? (
+              渲染条件 = 解析器纯派生的 reauthorizable（失配帧且非一体化解锁
+              ——临时 vault 无法持久化规则，与「记住」按钮同一防御口径）。 */}
+          {ctx.reauthorizable ? (
             <button
               className="btn btn-primary"
-              onClick={() => void allow(false, true)}
+              onClick={() => void allow({ reauthorize: true })}
               disabled={submitting}
             >
               以新指纹重新授权
@@ -428,21 +348,16 @@ export function ApprovalDialog({
 }
 
 /** 弹窗宿主：队列消费 + 倒计时（每秒 tick；到期自动关闭不回传——守护进程
- * 侧超时审计 timeout）。 */
+ * 侧超时审计 timeout）。决策回调收结构化 ApprovalResolution（issue #147），
+ * 宿主只做**意图→RPC 翻译**：approval.result 回传 + 记住/重新授权规则
+ * 负载（解析器旁纯函数构造）经 rule.add 落库。 */
 function ApprovalHost({
   current,
   onResolve,
   onExpire,
 }: {
   current: ApprovalItem | null;
-  onResolve: (
-    requestId: string,
-    decision: "allowed" | "denied",
-    challenge: string,
-    masterPassword?: string,
-    remember?: boolean,
-    reauthorize?: boolean,
-  ) => Promise<void>;
+  onResolve: (requestId: string, resolution: ApprovalResolution) => Promise<void>;
   onExpire: () => void;
 }) {
   // 回调经 ref 持有：插件每次 render() 会新建闭包，但倒计时只随 current 重启
@@ -472,7 +387,7 @@ function ApprovalHost({
   ) : null;
 }
 
-/** 插件工厂：无槽位服务；订阅 authz.request → 弹窗队列。 */
+/** 插件工厂：无槽位服务；订阅 authz.request → 解析入队 → 弹窗队列。 */
 export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) => {
   let rootEl: HTMLDivElement | null = null;
   let root: Root | null = null;
@@ -494,57 +409,34 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     root.render(
       <ApprovalHost
         current={queue[0] ?? null}
-        onResolve={async (requestId, decision, challenge, masterPassword, remember, reauthorize) => {
+        onResolve={async (requestId, resolution) => {
+          // 宿主 = 意图→RPC 翻译（issue #147）：决策回传 approval.result；
+          // remember / reauthorize 意图经解析器旁纯函数构造规则负载后
+          // rule.add 落库。弹窗恒为队首（requestId 冗余校验防御乱序）。
+          const item = queue[0];
+          const r = item?.request;
+          const ictx = item?.ctx;
           try {
             const { accepted } =
-              masterPassword === undefined
-                ? await ctx.ipc.approvalResult(requestId, decision, challenge)
+              resolution.masterPassword === undefined
+                ? await ctx.ipc.approvalResult(requestId, resolution.decision, r?.challenge ?? "")
                 : await ctx.ipc.approvalResult(
                     requestId,
-                    decision,
-                    challenge,
-                    masterPassword,
+                    resolution.decision,
+                    r?.challenge ?? "",
+                    resolution.masterPassword,
                   );
-            if (decision === "allowed") {
+            if (resolution.decision === "allowed") {
               ctx.toast.show(accepted ? "已允许本次（env 仅注入被批准 key）" : "请求已超时，未生效");
-              // 审批的「允许并为此项目记住」：allow 后追加一条最小授权规则。
-              // read（M2.9 值披露 §6）：channel=desktop、capability=read、
-              // keys=[条目名]。write put（M2.97 写门 §6）：capability=write、
-              // keys=[条目名] + actions=[当前动作]——动作取帧内 writeAction
-              // （daemon 从 id 有无权威派生随帧回带，RPC 不拆；#137 最小授权
-              // 修复：批准一次 create 只授 create，不再顺带 update）。
-              // delete 无记住入口（恒弹窗）。writeAction 畸形/缺失（旧守护
-              // 进程帧）→ 不生成规则（宁可不记，不超发全类授权），提示与
-              // 写入失败同一口径。projectDir=弹窗展示的 cwd。仅 accepted 时
-              // 写（超时/伪造回传不预授权）；失败不阻塞弹窗关闭，仅提示。
-              const r = queue[0]?.request;
-              const isReadFrame = r?.kind === "read";
-              const isWritePutFrame = r?.kind === "write" && r.command.startsWith("item.put");
-              const writeFrameAction = r ? parseWriteAction(r.writeAction) : null;
-              // 记住规则负载：read → capability=read；write put →
-              // actions=[帧内 writeAction 当前动作]（最小授权，#137）。
-              // writeAction 畸形/缺失（旧守护进程帧）→ 规则负载为 null →
-              // 不生成规则（宁可不记，不超发 put 全类授权）。
+              // 「允许并为此项目记住」（#147 结构化意图）：allow 后追加一条
+              // 最小授权规则。规则负载由解析器旁纯函数 buildRememberRule
+              // 构造——与按钮渲染消费同一 ApprovalContext（rememberable
+              // 单点派生），不再各自判断。仅 accepted 时写（超时/伪造回传
+              // 不预授权）；负载 null（旧帧/动作缺失等防御）→ 不生成规则，
+              // 用户意图未达成按失败同口径提示；失败不阻塞弹窗关闭。
               const rememberRule =
-                remember && accepted && r && (isReadFrame || isWritePutFrame)
-                  ? isReadFrame
-                    ? {
-                        projectDir: r.projectDir,
-                        name: `read-${r.keys[0] ?? "item"}`,
-                        command: "",
-                        keys: r.keys,
-                        capability: "read" as const,
-                      }
-                    : writeFrameAction
-                      ? {
-                          projectDir: r.projectDir,
-                          name: `write-${r.keys[0] ?? "item"}`,
-                          command: "",
-                          keys: r.keys,
-                          capability: "write" as const,
-                          actions: [writeFrameAction],
-                        }
-                      : null
+                resolution.remember === true && accepted && r && ictx
+                  ? buildRememberRule(r, ictx)
                   : null;
               if (rememberRule) {
                 try {
@@ -552,40 +444,24 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
                 } catch {
                   ctx.toast.show("记住规则写入失败（可稍后在规则页手动添加）");
                 }
-              } else if (remember && accepted && r && isWritePutFrame && !writeFrameAction) {
-                // writeAction 缺失/畸形：无法生成最小授权规则（宁可不记，
-                // 不超发 put 全类授权）——用户意图未达成，按失败同口径提示。
+              } else if (resolution.remember === true && accepted && rememberRule === null) {
                 ctx.toast.show("记住规则写入失败（可稍后在规则页手动添加）");
               }
-              // M2.98 程序指纹失配「以新指纹重新授权」（identity-binding.md
-              // §7）：= 允许本次 + 更新规则绑定——rule.add 携带
-              // fingerprint{exePath}（仅声明「绑哪个 exe」，daemon finalize
-              // 侧重算 sha/size 固化，不信任客户端上报）。name 由 exe
-              // basename 派生（`fp-<basename>`）；capability=inject（指纹只
-              // 随注入规则绑定，read/write 调用方链按 spec §12 仅字段预留）。
-              // 仅失配帧（parseFingerprintMismatch 非空）触发；失败不阻塞
-              // 弹窗关闭，仅提示。
-              if (reauthorize && accepted && r) {
-                const mm = parseFingerprintMismatch(r.fingerprintMismatch);
-                if (mm) {
-                  try {
-                    await ctx.ipc.ruleAdd({
-                      projectDir: r.projectDir,
-                      name: `fp-${exeBasename(mm.resolvedExePath)}`,
-                      // 指纹绑定注入规则的 command = 被绑定 exe 的 basename
-                      // （identity-binding.md §5.4，与 CLI --fingerprint 落库
-                      // 形态一致；issue #136）——不能回带审批帧的完整命令串
-                      // （"npm publish"），否则 daemon 侧若不规范化即死规则。
-                      // daemon 落库侧仍会单点规范化（不信任生产者上报形态）。
-                      command: exeBasename(mm.resolvedExePath),
-                      keys: r.keys,
-                      capability: "inject",
-                      fingerprint: { exePath: mm.resolvedExePath },
-                    });
-                    ctx.toast.show("已以新指纹重新授权（规则指纹已更新）");
-                  } catch {
-                    ctx.toast.show("重新授权失败：规则未更新（可稍后在规则页处理）");
-                  }
+              // 「以新指纹重新授权」（M2.98 identity-binding.md §7，#147 结构
+              // 化意图）：= 允许本次 + 更新规则绑定——buildReauthorizeRule
+              // 构造 rule.add 负载（fingerprint 仅声明 exePath，daemon
+              // finalize 侧重算 sha/size 固化，不信任客户端上报）。仅失配帧
+              // 触发；失败不阻塞弹窗关闭，仅提示。
+              const reauthRule =
+                resolution.reauthorize === true && accepted && r && ictx
+                  ? buildReauthorizeRule(r, ictx)
+                  : null;
+              if (reauthRule) {
+                try {
+                  await ctx.ipc.ruleAdd(reauthRule);
+                  ctx.toast.show("已以新指纹重新授权（规则指纹已更新）");
+                } catch {
+                  ctx.toast.show("重新授权失败：规则未更新（可稍后在规则页处理）");
                 }
               }
             } else {
@@ -616,9 +492,9 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     );
   };
 
-  // 订阅 authz.request：入队 + 弹窗（倒计时由宿主驱动，时长取自 config）。
-  // 门控：普通帧仍要求解锁态；锁定态只接受 needsUnlock 一体化帧（#67，
-  // 锁态不渲染无关请求元数据——QA P1 语义不变）。
+  // 订阅 authz.request：解析（单一事实对象）+ 入队 + 弹窗（倒计时由宿主
+  // 驱动，时长取自 config）。门控：普通帧仍要求解锁态；锁定态只接受
+  // needsUnlock 一体化帧（#67，锁态不渲染无关请求元数据——QA P1 语义不变）。
   let unlocked = ctx.session.unlocked;
   const offUnlocked = ctx.on("session.unlocked", () => {
     unlocked = true;
@@ -637,7 +513,8 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
     void (async () => {
       const total = await readApprovalTimeoutSecs(ctx);
       if (!unlocked && !payload.needsUnlock) return;
-      queue.push({ request: payload, remain: total, total });
+      // 入队时解析一次（issue #147）：渲染 / 按钮 / 决策回调全程复用
+      queue.push({ request: payload, ctx: parseApprovalContext(payload), remain: total, total });
       // 强提醒（#95）：弹窗只存在于窗口内部，窗口最小化/隐藏到托盘/被遮挡
       // 时用户零感知，必须由操作系统级提醒兜底。仅在队列从空变非空时发
       // （聚合：已在等待的请求不重复刷屏）。
