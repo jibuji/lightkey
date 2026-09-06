@@ -86,6 +86,12 @@ export interface AuthzRequestPayload {
   kind?: "inject" | "read" | "export" | "rule" | "write";
   /** export 审批的数据包规模元信息（仅 kind=export；不含数据本身）。 */
   exportMeta?: { name: string; mime: string; size: number } | null;
+  /** M2.97 写门写动作（#137 最小授权修复）：daemon 从 `ItemPutParams.id`
+   *  有无权威派生（None=create / Some=update）并随 kind=write 帧回带——
+   *  「允许并为此项目记住」据此生成 `actions=[当前动作]` 最小写规则
+   *  （write-gate.md §6；RPC 不拆，delete 帧无此字段/为 null）。畸形值由
+   *  approval 插件防御解析（parseWriteAction）按缺失处理，不生成规则。 */
+  writeAction?: "create" | "update" | null;
   /** M2.98 程序指纹失配（identity-binding.md §7）：绑定注入规则命中命令形态
    *  但可执行文件指纹不符时携带（弹窗据此渲染「指纹不符」主题 + 当前解析
    *  路径 + 8 位 SHA-256 前缀摘要 +「以新指纹重新授权」；失配视同未命中、

@@ -93,6 +93,9 @@ pub enum VaultEvent {
     /// **临时解锁**（仅本次注入可用，不签发会话令牌）。
     /// `kind` / `export_meta`（M2.9 值披露）：审批类型（弹窗按形态渲染）
     /// 与 export 数据包规模元信息（仅 export 审批有值）。
+    /// `write_action`（M2.97 #137 最小授权修复）：kind=Write 时由 daemon
+    /// 权威派生（`ItemPutParams.id` 有无）并随帧回带 `writeAction`，前端
+    /// 「记住」据此生成 `actions=[当前动作]` 最小写规则；非写审批为 None。
     AuthzRequest {
         request_id: uuid::Uuid,
         starter: String,
@@ -102,6 +105,7 @@ pub enum VaultEvent {
         challenge: String,
         needs_unlock: bool,
         kind: crate::authz::ApprovalKind,
+        write_action: Option<crate::authz::WriteAction>,
         export_meta: Option<crate::authz::ExportMeta>,
         /// 程序指纹失配信息（M2.98）：绑定注入规则命中命令形态但指纹不符时
         /// 携带（弹窗「指纹不符」主题 + 当前路径 + 8 位哈希摘要）；None = 常规
@@ -274,6 +278,7 @@ mod tests {
                 challenge: "chal".into(),
                 needs_unlock: false,
                 kind: crate::authz::ApprovalKind::Inject,
+                write_action: None,
                 export_meta: None,
                 fingerprint_mismatch: None,
             }

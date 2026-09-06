@@ -394,6 +394,10 @@ export class MockAdapter implements LightKeyIpc {
     needsUnlock?: boolean;
     kind?: "inject" | "read" | "export" | "rule" | "write";
     exportMeta?: { name: string; mime: string; size: number } | null;
+    /** M2.97 写门写动作（#137 最小授权修复）：daemon 从 `ItemPutParams.id`
+     *  有无权威派生并随 kind=write 帧回带——「记住」按当前动作生成
+     *  `actions=[当前动作]` 最小写规则（write-gate.md §6）。 */
+    writeAction?: "create" | "update" | null;
     /** M2.98 程序指纹失配（identity-binding.md §7）：绑定注入规则命中命令
      *  形态但指纹不符时携带——弹窗渲染「指纹不符」主题 + 路径 + 8 位摘要 +
      *  「以新指纹重新授权」。 */

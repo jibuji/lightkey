@@ -323,6 +323,11 @@ fn write_gate_socket_no_rule_allow_deny_timeout() {
     assert_eq!(fv["params"]["command"], "item.put cfg", "展示用 command");
     assert_eq!(fv["params"]["keys"][0], "cfg", "keys=单元素目标条目名");
     assert_eq!(fv["params"]["needsUnlock"], false);
+    // #137 最小授权修复：帧回带 daemon 权威派生动作（id=None → create）
+    assert_eq!(
+        fv["params"]["writeAction"], "create",
+        "create 审批帧 writeAction=create：{fv}"
+    );
     assert!(!fv.to_string().contains("sekrit"), "审批帧不含值：{fv}");
     let canonical_proj = lk_core::path_ns::canonical_project_dir(
         &std::fs::canonicalize(proj.path())
@@ -380,6 +385,11 @@ fn write_gate_socket_no_rule_allow_deny_timeout() {
         }),
     );
     let fv = next_authz_frame(&rx);
+    // #137：update 请求（id=Some）→ 帧回带 writeAction=update
+    assert_eq!(
+        fv["params"]["writeAction"], "update",
+        "update 审批帧 writeAction=update：{fv}"
+    );
     let (request_id, challenge) = (
         fv["params"]["requestId"].as_str().unwrap().to_string(),
         fv["params"]["challenge"].as_str().unwrap().to_string(),
@@ -512,6 +522,11 @@ fn write_gate_delete_always_prompts_despite_write_rule() {
     assert_eq!(
         fv["params"]["command"], "item.delete cfg",
         "delete 审批帧按展示形态广播"
+    );
+    // #137：delete 无写动作（恒弹窗、不参与规则匹配，WriteAction 无 Delete）
+    assert!(
+        fv["params"].get("writeAction").is_none_or(|m| m.is_null()),
+        "delete 审批帧不携带 writeAction：{fv}"
     );
     assert_eq!(fv["params"]["keys"][0], "cfg");
     let (request_id, challenge) = (

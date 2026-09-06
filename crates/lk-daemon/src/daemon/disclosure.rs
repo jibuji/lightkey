@@ -148,6 +148,7 @@ impl Daemon {
                 challenge: challenge.clone(),
                 needs_unlock: true,
                 kind,
+                write_action: None,
                 export_meta: None,
                 fingerprint_mismatch: None,
             };
@@ -266,6 +267,7 @@ impl Daemon {
             challenge: challenge.clone(),
             needs_unlock: false,
             kind,
+            write_action: None,
             export_meta: if method == M_ITEM_EXPORT {
                 export_meta
             } else {

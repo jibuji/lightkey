@@ -126,6 +126,7 @@ impl Daemon {
             challenge,
             needs_unlock: false,
             kind: lk_core::authz::ApprovalKind::Rule,
+            write_action: None,
             export_meta: None,
             fingerprint_mismatch: None,
         };

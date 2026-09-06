@@ -21,7 +21,9 @@
  * （command=`item.put/delete <name>`，keys=单元素[目标条目名]）渲染动作 +
  * 目标条目名 + projectDir + 30s 倒计时，**不展示值**；「允许并为此项目
  * 记住」仅 put（create/update）提供（= allow + 最小写规则
- * `keys=[条目名] + actions=[create,update]`），**delete 无记住按钮**
+ * `keys=[条目名] + actions=[帧内 writeAction 当前动作]`——daemon 从
+ * `ItemPutParams.id` 权威派生随帧回带，#137 最小授权修复；writeAction
+ * 畸形/缺失不生成规则，宁可不记不超发），**delete 无记住按钮**
  * （恒弹窗语义，任何规则不豁免——对齐 export）。
  *
  * **程序指纹失配（M2.98，补充拍板 #25；identity-binding.md §7）**：
@@ -130,6 +132,16 @@ function exeBasename(p: string): string {
   return last.length > 0 ? last : p;
 }
 
+/** 防御解析写帧的 `writeAction`（#137 最小授权修复）：daemon 从
+ *  `ItemPutParams.id` 有无权威派生并随 kind=write 帧回带（RPC 不拆）。
+ *  只接受 `"create"` / `"update"`；缺失/畸形（旧守护进程帧、类型不符）→
+ *  null——**不生成记住规则**（宁可不记，不超发 `actions` 授权）。 */
+export function parseWriteAction(
+  raw: AuthzRequestPayload["writeAction"],
+): "create" | "update" | null {
+  return raw === "create" || raw === "update" ? raw : null;
+}
+
 interface ApprovalItem {
   request: AuthzRequestPayload;
   /** 剩余秒数（倒计时环形）。 */
@@ -149,10 +161,11 @@ interface ApprovalItem {
  *  规则管理审批门（补充拍板 #22）：`rule` 展示命令框（`rule.add <name>` /
  *  `rule.remove <name>`）+ keys Tag + 30s 倒计时，**无「记住」按钮**（规则
  *  操作本身就是持久动作）。写入门（补充拍板 #24，M2.97）：`write` 展示
- *  动作（item.put=create/update / item.delete=delete）+ 目标条目名 Tag +
- *  projectDir + 30s 倒计时，**不展示值**；「允许并为此项目记住」仅
- *  put（create/update）提供（= allow + 写规则），**delete 无记住按钮**
- *  （恒弹窗语义，对齐 export）。M2.98 程序指纹失配：`inject` 帧带
+ *  动作（按帧内 `writeAction` 精确展示 create/update；delete 帧恒弹窗）+
+ *  目标条目名 Tag + projectDir + 30s 倒计时，**不展示值**；「允许并为此项目
+ *  记住」仅 put（create/update）提供（= allow + 写规则
+ *  `actions=[当前动作]`，#137），**delete 无记住按钮**（恒弹窗语义，
+ *  对齐 export）。M2.98 程序指纹失配：`inject` 帧带
  *  `fingerprintMismatch` 时渲染失配主题 + 路径 + 8 位摘要 + 「以新指纹
  *  重新授权」（= 本次允许 + 更新规则绑定），详见 [`parseFingerprintMismatch`]
  *  与模块注释。未知 kind **防御性渲染**：明确提示未知，不回退按 inject
@@ -182,9 +195,12 @@ export function ApprovalDialog({
   const isRuleRemove = isRule && req.command.startsWith("rule.remove");
   // 写门动作派生（M2.97，write-gate.md §6）：帧 command 恒为
   // `item.put <name>` / `item.delete <name>`（§5.3 展示用；create/update
-  // 由 daemon 从 id 有无权威派生、不进帧——§5.2 RPC 不拆）。既有先例同
-  // isRuleRemove：`command.startsWith` 判定动作。
+  // 由 daemon 从 id 有无权威派生、随帧 `writeAction` 回带——§5.2 RPC 不拆
+  // + #137 最小授权修复）。既有先例同 isRuleRemove：`command.startsWith`
+  // 判定 delete；create/update 按帧内 writeAction 精确展示（畸形/缺失
+  // 防御回退「create/update」并列展示，不影响记住路径的独立防御）。
   const isWriteDelete = isWrite && req.command.startsWith("item.delete");
+  const writeAction = parseWriteAction(req.writeAction);
   // M2.98 程序指纹失配：防御解析（畸形 → null → 普通 inject 审批渲染）
   const mm = parseFingerprintMismatch(req.fingerprintMismatch);
   const isMismatch = mm !== null;
@@ -284,9 +300,15 @@ export function ApprovalDialog({
         ) : isWrite ? (
           // 写门（M2.97）：命令框承载动作 + 目标条目名（`item.put/delete
           // <name>` 是 RPC 摘要而非 shell 命令，无 $ 前缀——同规则门先例）。
-          // put 在帧面不可分 create/update（§5.2 RPC 不拆），按动作类展示。
+          // 动作按帧内 writeAction 精确展示（#137）；畸形/缺失回退动作类。
           <div className="approval-cmd-box">
-            {isWriteDelete ? "删除条目（delete）：" : "写入条目（create/update）："}
+            {isWriteDelete
+              ? "删除条目（delete）："
+              : writeAction === "create"
+                ? "新建条目（create）："
+                : writeAction === "update"
+                  ? "替换条目（update）："
+                  : "写入条目（create/update）："}
             {req.command}
           </div>
         ) : !isRead && !isExport && !isUnknown ? (
@@ -488,27 +510,52 @@ export const approval: Plugin.Function<Context> = Object.assign((ctx: Context) =
               // 审批的「允许并为此项目记住」：allow 后追加一条最小授权规则。
               // read（M2.9 值披露 §6）：channel=desktop、capability=read、
               // keys=[条目名]。write put（M2.97 写门 §6）：capability=write、
-              // keys=[条目名] + actions=[create, update]——帧 command 恒为
-              // `item.put <name>`，create/update 由 daemon 权威派生、不进帧
-              // （§5.2 RPC 不拆），记住授予的是 put 全类；delete 无记住入口
-              // （恒弹窗）。projectDir=弹窗展示的 cwd。仅 accepted 时写
-              // （超时/伪造回传不预授权）；失败不阻塞弹窗关闭，仅提示。
+              // keys=[条目名] + actions=[当前动作]——动作取帧内 writeAction
+              // （daemon 从 id 有无权威派生随帧回带，RPC 不拆；#137 最小授权
+              // 修复：批准一次 create 只授 create，不再顺带 update）。
+              // delete 无记住入口（恒弹窗）。writeAction 畸形/缺失（旧守护
+              // 进程帧）→ 不生成规则（宁可不记，不超发全类授权），提示与
+              // 写入失败同一口径。projectDir=弹窗展示的 cwd。仅 accepted 时
+              // 写（超时/伪造回传不预授权）；失败不阻塞弹窗关闭，仅提示。
               const r = queue[0]?.request;
               const isReadFrame = r?.kind === "read";
               const isWritePutFrame = r?.kind === "write" && r.command.startsWith("item.put");
-              if (remember && accepted && r && (isReadFrame || isWritePutFrame)) {
+              const writeFrameAction = r ? parseWriteAction(r.writeAction) : null;
+              // 记住规则负载：read → capability=read；write put →
+              // actions=[帧内 writeAction 当前动作]（最小授权，#137）。
+              // writeAction 畸形/缺失（旧守护进程帧）→ 规则负载为 null →
+              // 不生成规则（宁可不记，不超发 put 全类授权）。
+              const rememberRule =
+                remember && accepted && r && (isReadFrame || isWritePutFrame)
+                  ? isReadFrame
+                    ? {
+                        projectDir: r.projectDir,
+                        name: `read-${r.keys[0] ?? "item"}`,
+                        command: "",
+                        keys: r.keys,
+                        capability: "read" as const,
+                      }
+                    : writeFrameAction
+                      ? {
+                          projectDir: r.projectDir,
+                          name: `write-${r.keys[0] ?? "item"}`,
+                          command: "",
+                          keys: r.keys,
+                          capability: "write" as const,
+                          actions: [writeFrameAction],
+                        }
+                      : null
+                  : null;
+              if (rememberRule) {
                 try {
-                  await ctx.ipc.ruleAdd({
-                    projectDir: r.projectDir,
-                    name: `${isReadFrame ? "read" : "write"}-${r.keys[0] ?? "item"}`,
-                    command: "",
-                    keys: r.keys,
-                    capability: isReadFrame ? "read" : "write",
-                    ...(isReadFrame ? {} : { actions: ["create", "update"] }),
-                  });
+                  await ctx.ipc.ruleAdd(rememberRule);
                 } catch {
                   ctx.toast.show("记住规则写入失败（可稍后在规则页手动添加）");
                 }
+              } else if (remember && accepted && r && isWritePutFrame && !writeFrameAction) {
+                // writeAction 缺失/畸形：无法生成最小授权规则（宁可不记，
+                // 不超发 put 全类授权）——用户意图未达成，按失败同口径提示。
+                ctx.toast.show("记住规则写入失败（可稍后在规则页手动添加）");
               }
               // M2.98 程序指纹失配「以新指纹重新授权」（identity-binding.md
               // §7）：= 允许本次 + 更新规则绑定——rule.add 携带

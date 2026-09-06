@@ -107,6 +107,7 @@ impl Daemon {
                 challenge: challenge.clone(),
                 needs_unlock: true,
                 kind: lk_core::authz::ApprovalKind::Inject,
+                write_action: None,
                 export_meta: None,
                 // 锁态：规则在加密 vault 内无指纹可比（须待解锁后 finalize），
                 // 审批帧不携带失配信息。
@@ -265,6 +266,7 @@ impl Daemon {
             challenge: challenge.clone(),
             needs_unlock,
             kind: lk_core::authz::ApprovalKind::Inject,
+            write_action: None,
             export_meta: None,
             fingerprint_mismatch,
         };
