@@ -129,6 +129,13 @@ impl Daemon {
             write_action: None,
             export_meta: None,
             fingerprint_mismatch: None,
+            // #147：审批帧携带门事实——规则门子类型随帧回带 subKind
+            //（取代前端 command 前缀匹配启发式）
+            sub_kind: Some(if method == lk_core::ipc::M_RULE_ADD {
+                lk_core::authz::ApprovalSubKind::RuleAdd
+            } else {
+                lk_core::authz::ApprovalSubKind::RuleRemove
+            }),
         };
         self.gate.approval().open(&areq, expires_at);
         self.pending_rule.lock().unwrap().insert(

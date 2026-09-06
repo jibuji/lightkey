@@ -217,6 +217,12 @@ impl Daemon {
             write_action: write_action(&parsed.op),
             export_meta: None,
             fingerprint_mismatch: None,
+            // #147：审批帧携带门事实——写门子类型随帧回带 subKind
+            //（item.put / item.delete；取代前端 command 前缀匹配启发式）
+            sub_kind: Some(match parsed.op {
+                PendingWriteOp::Delete(_) => lk_core::authz::ApprovalSubKind::ItemDelete,
+                _ => lk_core::authz::ApprovalSubKind::ItemPut,
+            }),
         };
         self.gate.approval().open(&areq, expires_at);
         self.pending_write.lock().unwrap().insert(

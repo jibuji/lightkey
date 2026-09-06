@@ -151,6 +151,8 @@ impl Daemon {
                 write_action: None,
                 export_meta: None,
                 fingerprint_mismatch: None,
+                // #147：read/export 审批不带审批子类型（帧不含 subKind 字段）
+                sub_kind: None,
             };
             self.gate.approval().open(&areq, expires_at);
             self.pending_disclosure.lock().unwrap().insert(
@@ -274,6 +276,8 @@ impl Daemon {
                 None
             },
             fingerprint_mismatch: None,
+            // #147：read/export 审批不带审批子类型（帧不含 subKind 字段）
+            sub_kind: None,
         };
         self.gate.approval().open(&areq, expires_at);
         self.pending_disclosure.lock().unwrap().insert(

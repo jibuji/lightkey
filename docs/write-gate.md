@@ -188,11 +188,15 @@ CLI/daemon/审计/测试表面翻倍。保留单 `M_ITEM_PUT`：
   （§5.2），帧面只补派生结果；delete 审批帧无写动作（null）；前端畸形/
   缺失防御处理（不生成记住规则，不回退全类授权）。
 - 前端 approval 插件 kind=write 分支：动作（create/update/delete）+ 目标
-  条目名 + projectDir + 30s 倒计时，**不展示值**；
+  条目名 + projectDir + 30s 倒计时，**不展示值**（#147 起语义取帧内
+  `subKind=item.put`/`item.delete`——daemon 权威派生随帧回带，前端不再用
+  command 前缀匹配推断门语义）；
 - **「允许并为此项目记住」仅 create/update 提供**（生成写规则
   `keys=[条目名] + actions=[当前动作]` 的最小授权——action 取帧内
-  `writeAction`，批准一次 create 只授 create，不超发 update）；**delete
-  无记住按钮**（恒弹窗语义，任何规则不豁免——对齐 export）；
+  `writeAction`，批准一次 create 只授 create，不超发 update；#147 起可记性
+  rememberable 由 `subKind + writeAction + needsUnlock` 纯派生，旧帧缺
+  `subKind` → 按钮不渲染）；**delete 无记住按钮**（恒弹窗语义，任何规则
+  不豁免——对齐 export）；
 - 规则管理页与审计页：规则列表展示 capability + actions；审计事件按 §8
   落表。
 

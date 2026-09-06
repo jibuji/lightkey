@@ -99,6 +99,13 @@ export interface AuthzRequestPayload {
    *  协议演进防御：畸形值（缺字段/非字符串）由 approval 插件防御解析
    *  （parseFingerprintMismatch）按普通 inject 审批渲染，不 crash。 */
   fingerprintMismatch?: { resolvedExePath: string; sha256Short: string } | null;
+  /** 审批子类型（issue #147：审批帧携带门事实）：daemon 权威派生并随
+   *  kind=rule/write 帧回带（`rule.add` / `rule.remove` / `item.put` /
+   *  `item.delete`，镜像 Rust `ApprovalSubKind` serde 值）；read/export/
+   *  inject 审批不带（缺字段/畸形 → null——旧帧信号，「记住」按钮不渲染）。
+   *  弹窗渲染与「记住」可记性纯派生（rememberable 不进协议）均消费本字段，
+   *  command 前缀匹配启发式已删除。 */
+  subKind?: "rule.add" | "rule.remove" | "item.put" | "item.delete" | null;
 }
 
 /** `vault.search` 负载（topbar 搜索框 → ui-vault；300ms 防抖）。 */

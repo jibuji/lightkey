@@ -194,6 +194,17 @@ pub const CHANNEL_BEARING_METHODS: &[&str] = &[
     M_ITEM_EXPORT,
 ];
 
+/// 审批帧 `subKind` 字段值（issue #147：审批帧携带门事实）。规则门/写门
+/// 审批的子类型事实——daemon 侧随 `authz.request` 帧回带（kind=rule/write
+/// 恒携带；read/export/inject 不带）。前端据此渲染门语义与派生「记住」
+/// 可记性（rememberable 不进协议），command 前缀匹配启发式由本字段取代。
+/// TS 镜像 = `frontend/src/ipc/protocol.ts` 的 `APPROVAL_SUB_KINDS`，
+/// 双向对齐由 `protocolContract.test.ts` 钉死。
+pub const SUB_KIND_RULE_ADD: &str = "rule.add";
+pub const SUB_KIND_RULE_REMOVE: &str = "rule.remove";
+pub const SUB_KIND_ITEM_PUT: &str = "item.put";
+pub const SUB_KIND_ITEM_DELETE: &str = "item.delete";
+
 // ---------------------------------------------------------------------------
 // 各方法参数/结果类型（最小字段）
 // ---------------------------------------------------------------------------
