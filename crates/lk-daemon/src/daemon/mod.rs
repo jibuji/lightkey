@@ -34,8 +34,8 @@ use crate::router::{run_deferred, strategy_of, ExecutionStrategy};
 use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 
 use self::gate_kit::{
-    invalid_params, parse_gate_params, ActingVault, ApprovalDraft, DeferredOutcome, GateBegin,
-    GateEntry, GateKind, PendingGates,
+    invalid_params, parse_gate_params, ActingVault, ApprovalDraft, ApprovalWorkspace,
+    DeferredOutcome, GateBegin, GateEntry, GateKind, PendingGates,
 };
 use self::lifecycle::{install_shutdown_handlers, load_config};
 
@@ -129,8 +129,10 @@ pub struct Daemon {
 }
 
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
-/// needs_unlock / 临时 vault 提升到统一注册表条目级（[`gate_kit::GateEntry`]，
-/// issue #148），门负载只携带 authz 特有字段。
+/// needs_unlock / 审批工作区承载于统一注册表条目
+/// （[`gate_kit::GateEntry`]，issue #148/#150），门负载只携带 authz 特有
+/// 字段；指纹裁决单发状态随审批工作区走（issue #140，见
+/// `gate_kit::ApprovalWorkspace`）。
 pub(crate) struct PendingAuthz {
     request: AuthzRequest,
     /// IPC 对端身份（issue #140）：锁定态一体化 finalize 在临时 vault 上补
@@ -138,10 +140,6 @@ pub(crate) struct PendingAuthz {
     /// desktop 直调 pid=0 → 受信豁免）。解锁态 begin 已裁决完，仅随结构
     /// 携带不使用。
     peer: PeerInfo,
-    /// 指纹裁决已执行（issue #140）：解锁态 begin 已裁决（或锁定态 finalize
-    /// 裁决出失配已转二次审批）→ true，finalize 不再重复裁决（防裁决 →
-    /// 审批 → 裁决死循环；二次弹窗批准即「本次允许」，identity-binding §7）。
-    fp_adjudicated: bool,
 }
 
 /// 信号处理标志（unix：SIGINT/SIGTERM 优雅退出）。

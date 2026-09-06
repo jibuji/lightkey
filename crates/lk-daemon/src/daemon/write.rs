@@ -217,18 +217,16 @@ impl Daemon {
                 export_meta: None,
                 fingerprint_mismatch: None,
             },
-            GateEntry {
-                needs_unlock: false,
-                temp_vault: None,
-                kind: GateKind::Write(PendingWrite {
-                    op: parsed.op,
-                    draft: parsed.draft,
-                    expected_revision: parsed.expected_revision,
-                    command_summary,
-                    target,
-                    starter,
-                }),
-            },
+            // 常规审批条目（issue #150：`GateEntry::approval` 显式声明写门
+            // 无需一体化解锁——写门无解锁窗，write-gate.md §5.3 拍板保留）
+            GateEntry::approval(GateKind::Write(PendingWrite {
+                op: parsed.op,
+                draft: parsed.draft,
+                expected_revision: parsed.expected_revision,
+                command_summary,
+                target,
+                starter,
+            })),
         );
         GateBegin::Pending { request_id }
     }
@@ -441,6 +439,10 @@ impl crate::router::DeferredFlow for WriteFlow {
     }
 
     fn rependable(&self) -> bool {
+        false
+    }
+
+    fn unlock_supported(&self) -> bool {
         false
     }
 }

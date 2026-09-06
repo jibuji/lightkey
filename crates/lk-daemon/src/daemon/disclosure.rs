@@ -12,8 +12,10 @@
 //! `item.get` / `item.export` 走与 #67 inject 同款的一体化弹窗——登记
 //! `Pending{needs_unlock:true}` 并广播 `authz.request(needsUnlock=true)`，
 //! `approval.result`（allowed + masterPassword）先做临时解锁，finalize 在
-//! **临时 vault** 上执行披露（单次即毁，不签发令牌 / 不写 session.token /
-//! 不置 shared.vault，#65 边界）；未初始化库 / headless 仍 fail-closed。
+//! **临时 vault**（审批工作区，issue #150；生命周期与「不签令牌 / 不置
+//! 共享 vault / 单次即毁」不变量由构造承载——gate_kit.rs
+//! `ApprovalWorkspace` 类型文档）上执行披露；未初始化库 / headless 仍
+//! fail-closed。
 //!
 //! 五件套下沉（issue #148）：begin 结果（GateBegin）/ 统一注册表（GateEntry，
 //! needs_unlock 与临时 vault 条目级承载）/ 审批单点铸造 / 审计辅助
@@ -127,16 +129,12 @@ impl Daemon {
                     export_meta: None,
                     fingerprint_mismatch: None,
                 },
-                GateEntry {
-                    needs_unlock: true,
-                    temp_vault: None,
-                    kind: GateKind::Disclosure(PendingDisclosure {
-                        method: method.to_string(),
-                        item_id,
-                        item_name: None,
-                        starter,
-                    }),
-                },
+                GateEntry::unified_unlock(GateKind::Disclosure(PendingDisclosure {
+                    method: method.to_string(),
+                    item_id,
+                    item_name: None,
+                    starter,
+                })),
             );
             return GateBegin::Pending { request_id };
         }
@@ -176,8 +174,20 @@ impl Daemon {
         //    GUI 读值体验零变化，spec §3 第 1 行）
         if peer.origin == PeerOrigin::Desktop {
             let resp = match method {
-                M_ITEM_GET => self.item_get_exec(id, item_id, "desktop", AuditChannel::Desktop),
-                _ => self.item_export_exec(id, item_id, "desktop", AuditChannel::Desktop),
+                M_ITEM_GET => self.item_get_exec(
+                    ActingVault::Shared,
+                    id,
+                    item_id,
+                    "desktop",
+                    AuditChannel::Desktop,
+                ),
+                _ => self.item_export_exec(
+                    ActingVault::Shared,
+                    id,
+                    item_id,
+                    "desktop",
+                    AuditChannel::Desktop,
+                ),
             };
             return GateBegin::Final(rpc_string(resp));
         }
@@ -212,7 +222,7 @@ impl Daemon {
                 })
             };
             if hit {
-                let resp = self.item_get_exec(id, item_id, &starter, channel);
+                let resp = self.item_get_exec(ActingVault::Shared, id, item_id, &starter, channel);
                 return GateBegin::Final(rpc_string(resp));
             }
         }
@@ -248,16 +258,12 @@ impl Daemon {
                 },
                 fingerprint_mismatch: None,
             },
-            GateEntry {
-                needs_unlock: false,
-                temp_vault: None,
-                kind: GateKind::Disclosure(PendingDisclosure {
-                    method: method.to_string(),
-                    item_id,
-                    item_name,
-                    starter,
-                }),
-            },
+            GateEntry::approval(GateKind::Disclosure(PendingDisclosure {
+                method: method.to_string(),
+                item_id,
+                item_name,
+                starter,
+            })),
         );
         GateBegin::Pending { request_id }
     }
@@ -268,12 +274,13 @@ impl Daemon {
     /// `session.invalid`（exec 内 vault 为空时保守失败，无法签名审计）。
     ///
     /// 锁定态一体化（#23）：统一注册表条目 `needs_unlock` 时（issue #148
-    /// 起 needs_unlock/temp_vault 条目级承载）——
+    /// 起 needs_unlock 条目级承载，issue #150 起解锁材料承载于审批工作区）——
     /// - **等待期整库被解锁**（用户绕开弹窗直接解锁）→ finalize 走**常态
     ///   路径**（共享 vault 披露 + 共享 K_audit 审计，与解锁态同语义）；
-    /// - 仍锁定 → 用审批回传时临时解锁的 vault（条目级 `temp_vault`）在
-    ///   临时 vault 上披露，随后即毁（不置 shared.vault / 不签发令牌）；
-    /// - deny / timeout → 无临时 vault（未解锁）→ 无 K_audit 可签名，不写
+    /// - 仍锁定 → 用审批回传时临时解锁的工作区（条目内一等对象）在临时
+    ///   vault 上披露，工作区随条目消费即毁（生命周期不变量见 gate_kit.rs
+    ///   `ApprovalWorkspace`）；
+    /// - deny / timeout → 无工作区（未解锁）→ 无 K_audit 可签名，不写
     ///   审计（与 #67 注入一体化拒绝同口径）。
     pub(crate) fn disclosure_finalize(
         &mut self,
@@ -285,7 +292,7 @@ impl Daemon {
         // 条目已被消费（极端竞态）→ 保守拒绝
         let Some(GateEntry {
             needs_unlock,
-            temp_vault,
+            workspace,
             kind: GateKind::Disclosure(p),
         }) = removed
         else {
@@ -299,7 +306,7 @@ impl Daemon {
                         self.disclosure_finalize_normal(id, p)
                     } else {
                         // 仍锁定 → 临时 vault 单次披露
-                        self.disclosure_finalize_unlock(id, p, temp_vault)
+                        self.disclosure_finalize_unlock(id, p, workspace)
                     };
                 }
                 self.disclosure_finalize_normal(id, p)
@@ -333,42 +340,58 @@ impl Daemon {
             return rpc_string(session_invalid(id));
         }
         let resp = match p.method.as_str() {
-            M_ITEM_GET => self.item_get_exec(id, p.item_id, &p.starter, AuditChannel::Approval),
-            _ => self.item_export_exec(id, p.item_id, &p.starter, AuditChannel::Approval),
-        };
-        rpc_string(resp)
-    }
-
-    /// 锁定态一体化 finalize（#23）：**临时 vault**（`approval_result_unlock`
-    /// 以正确主密码解锁后存入统一注册表条目）上执行披露——get/export exec
-    /// 支持传入外部 vault 引用（`item_get_exec_from` / `item_export_exec_from`），
-    /// 审计用临时 vault 的 K_audit 签名（channel=approval）。临时 vault 随
-    /// 本函数结束即销毁——不置 shared.vault、不签发令牌、不写 session.token
-    /// （#65 边界：本次交互不产生任何持久能力）。
-    fn disclosure_finalize_unlock(
-        &mut self,
-        id: Value,
-        p: PendingDisclosure,
-        temp_vault: Option<UnlockedVault>,
-    ) -> String {
-        // 临时 vault 由 approval_result 以正确主密码解锁后存入；
-        // 缺失（异常路径）→ 保守拒绝
-        let Some(vault) = temp_vault else {
-            return rpc_string(authz_denied(id));
-        };
-        let resp = match p.method.as_str() {
-            M_ITEM_GET => {
-                self.item_get_exec_from(&vault, id, p.item_id, &p.starter, AuditChannel::Approval)
-            }
-            _ => self.item_export_exec_from(
-                &vault,
+            M_ITEM_GET => self.item_get_exec(
+                ActingVault::Shared,
+                id,
+                p.item_id,
+                &p.starter,
+                AuditChannel::Approval,
+            ),
+            _ => self.item_export_exec(
+                ActingVault::Shared,
                 id,
                 p.item_id,
                 &p.starter,
                 AuditChannel::Approval,
             ),
         };
-        // 临时 vault 随本函数结束 drop——临时解锁材料即用即毁
+        rpc_string(resp)
+    }
+
+    /// 锁定态一体化 finalize（#23）：**临时 vault**（审批工作区，
+    /// `approval_result_unlock` 以正确主密码解锁后存入统一注册表条目）上
+    /// 执行披露——get/export exec 统一收 [`ActingVault`]（issue #150：
+    /// `_from` 变体对已消），审计用临时 vault 的 K_audit 签名
+    /// （channel=approval）。工作区随条目消费即毁——生命周期与不变量
+    /// 由构造承载（gate_kit.rs `ApprovalWorkspace` 类型文档）。
+    fn disclosure_finalize_unlock(
+        &mut self,
+        id: Value,
+        p: PendingDisclosure,
+        workspace: Option<ApprovalWorkspace>,
+    ) -> String {
+        // 工作区由 approval_result 以正确主密码解锁后存入；
+        // 缺失（异常路径）→ 保守拒绝
+        let Some(workspace) = workspace else {
+            return rpc_string(authz_denied(id));
+        };
+        let resp = match p.method.as_str() {
+            M_ITEM_GET => self.item_get_exec(
+                ActingVault::Temporary(workspace.vault()),
+                id,
+                p.item_id,
+                &p.starter,
+                AuditChannel::Approval,
+            ),
+            _ => self.item_export_exec(
+                ActingVault::Temporary(workspace.vault()),
+                id,
+                p.item_id,
+                &p.starter,
+                AuditChannel::Approval,
+            ),
+        };
+        // 工作区随本函数结束 drop——临时解锁材料即用即毁
         rpc_string(resp)
     }
 }
@@ -415,6 +438,10 @@ impl crate::router::DeferredFlow for DisclosureFlow {
 
     fn rependable(&self) -> bool {
         false
+    }
+
+    fn unlock_supported(&self) -> bool {
+        true
     }
 }
 
