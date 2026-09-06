@@ -403,3 +403,46 @@ fn write_action(op: &PendingWriteOp) -> Option<lk_core::authz::WriteAction> {
         PendingWriteOp::Delete(_) => None,
     }
 }
+
+// -------------------------------------------------------------------------
+// 流程声明（issue #149：通用 deferred 编排器的注册项）
+// -------------------------------------------------------------------------
+
+/// 写入授权门流程声明（issue #149）：预检 / begin / finalize 委托既有门
+/// 方法，锁编排由 router.rs 通用 deferred 编排器统一承担。**不可
+/// RePended**——写门 finalize 一步收尾（TOCTOU 重校验后执行），无二次
+/// 审批路径（写门无解锁窗，write-gate.md §5.3 拍板保留）。
+pub(crate) struct WriteFlow;
+
+impl crate::router::DeferredFlow for WriteFlow {
+    fn precheck(&self, daemon: &Daemon, token: Option<&[u8]>) -> bool {
+        daemon.write_precheck(token)
+    }
+
+    fn begin(
+        &self,
+        daemon: &mut Daemon,
+        method: &str,
+        id: Value,
+        params: Value,
+        peer: &PeerInfo,
+    ) -> GateBegin {
+        daemon.write_begin(id, method, params, peer)
+    }
+
+    fn finalize(
+        &self,
+        daemon: &mut Daemon,
+        id: Value,
+        request_id: uuid::Uuid,
+        decision: ApprovalDecision,
+    ) -> DeferredOutcome {
+        DeferredOutcome::Done(daemon.write_finalize(id, request_id, decision))
+    }
+
+    fn rependable(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) const WRITE_FLOW: WriteFlow = WriteFlow;

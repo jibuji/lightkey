@@ -819,72 +819,16 @@ fn authz_denies_unresolvable_requested_keys() {
     assert_eq!(v["result"]["reason"], "missing_keys");
 }
 
-/// interface 即测试面：两阶段策略（OutsideLock / ApprovalDeferred）的
-/// 直调形态与生产主缝（make_handler → route）请求/响应逐字一致。
-/// 选取无副作用场景（同步未配置 / 无审批界面 fail-closed）以便双路径对跑。
-#[test]
-fn special_strategies_direct_call_matches_production_route() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut audit = AuditLog::open(dir.path()).unwrap();
-    init_vault_with_params(
-        dir.path(),
-        "pw123456",
-        false,
-        &mut audit,
-        &test_kdf_params(),
-    )
-    .unwrap();
-    let mut daemon = Daemon::start(dir.path()).unwrap();
-    daemon
-        .shared()
-        .config
-        .write()
-        .unwrap()
-        .approval_timeout_secs = 1;
-    let unlock = rpc_result(&daemon.handle(
-        &rpc_line(
-            M_VAULT_UNLOCK,
-            None,
-            json!({ "masterPassword": "pw123456" }),
-        ),
-        &PeerInfo::unknown(),
-    ));
-    let token = unlock["token"].as_str().unwrap().to_string();
+// 等价性专项测试 `special_strategies_direct_call_matches_production_route`
+// 已随通用 deferred 编排器退役（issue #149）：route 与直调驱动**同一个**
+// 编排器（DirectSeam 持锁透传），等价由构造保证而非测试维持——替代覆盖 =
+// router.rs 编排器单测（三阶段骨架 / RePended 内建循环 / 注册表完整性）+
+// 既有集成测试（本文件与 disclosure/rule_gate/write_gate 按门分文件，两条
+// 缝各自穿唯一 JSON-RPC 入口）。
 
-    let state = Arc::new(std::sync::Mutex::new(daemon));
-    let shared = state.lock().unwrap().shared();
-    let handler = make_handler(&state, &shared);
-    let peer = test_peer(None);
-
-    for (method, params) in [
-        // OutsideLock：同步未配置 → ERR_SYNC_NOT_CONFIGURED
-        (M_SYNC_TRIGGER, json!({ "token": token })),
-        // ApprovalDeferred：无订阅者 = 无审批界面 → fail-closed 立即拒绝
-        (
-            M_AUTHZ_EVALUATE,
-            json!({
-                "token": token,
-                "command": "npm run build",
-                "keys": ["NPM_TOKEN"],
-            }),
-        ),
-    ] {
-        let line = rpc_line(method, Some(&token), params);
-        let via_handle = rpc_json(&state.lock().unwrap().handle(&line, &peer));
-        let via_route = rpc_json(&handler(&line, &peer));
-        assert_eq!(via_handle, via_route, "{method} 直调与生产主缝行为不一致");
-    }
-    // 具体语义抽查：同步未配置的错误码（错误响应走完整对象而非 result）
-    let sync_resp = rpc_json(&handler(
-        &rpc_line(M_SYNC_TRIGGER, Some(&token), json!({ "token": token })),
-        &peer,
-    ));
-    assert_eq!(sync_resp["error"]["code"], ERR_SYNC_NOT_CONFIGURED);
-}
-
-/// 跨缝等价回归：ApprovalDeferred 阶段①的会话预检在两条缝上都生效——
-/// 无效 token + 第 2 层规则可命中时，直调与生产主缝都必须 session.invalid，
-/// 绝不放行或泄露注入值。
+/// 跨缝 fail-closed 回归：ApprovalDeferred 阶段①的会话预检在两条缝上都
+/// 生效——无效 token + 第 2 层规则可命中时，直调与生产主缝都必须
+/// session.invalid，绝不放行或泄露注入值。
 #[test]
 fn authz_deferred_invalid_token_session_gated_on_both_seams() {
     let dir = tempfile::tempdir().unwrap();

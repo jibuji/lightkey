@@ -377,3 +377,45 @@ impl Daemon {
 pub(crate) fn authz_denied(id: Value) -> RpcResponse {
     RpcResponse::err(id, ERR_AUTHZ_DENIED, MSG_AUTHZ_DENIED, None)
 }
+
+// -------------------------------------------------------------------------
+// 流程声明（issue #149：通用 deferred 编排器的注册项）
+// -------------------------------------------------------------------------
+
+/// 值披露门流程声明（issue #149）：预检 / begin / finalize 委托既有门方法，
+/// 锁编排由 router.rs 通用 deferred 编排器统一承担。**不可 RePended**——
+/// 披露 finalize 一步收尾，无二次审批路径。
+pub(crate) struct DisclosureFlow;
+
+impl crate::router::DeferredFlow for DisclosureFlow {
+    fn precheck(&self, daemon: &Daemon, token: Option<&[u8]>) -> bool {
+        daemon.disclosure_precheck(token)
+    }
+
+    fn begin(
+        &self,
+        daemon: &mut Daemon,
+        method: &str,
+        id: Value,
+        params: Value,
+        peer: &PeerInfo,
+    ) -> GateBegin {
+        daemon.disclosure_begin(id, method, params, peer)
+    }
+
+    fn finalize(
+        &self,
+        daemon: &mut Daemon,
+        id: Value,
+        request_id: uuid::Uuid,
+        decision: ApprovalDecision,
+    ) -> DeferredOutcome {
+        DeferredOutcome::Done(daemon.disclosure_finalize(id, request_id, decision))
+    }
+
+    fn rependable(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) const DISCLOSURE_FLOW: DisclosureFlow = DisclosureFlow;
