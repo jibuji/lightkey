@@ -596,3 +596,192 @@ fn macos_env_read_failure_fail_closed() {
         "macOS env 读取失败须 fail-closed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 预计算阈值（identity-binding.md §6-2，issue #138）：规则创建/审批 finalize
+// 固化指纹时，绑定 exe 大小 ≤ 阈值 → 锁内立即预计算（缓存预热）；> 阈值 →
+// 惰性（固化哈希仍现算，缓存留待首次命中）。阈值经 config
+// `fingerprintPrecomputeThresholdBytes` 配置（热读，与 approvalTimeoutSecs
+// 同级）；预计算失败不影响 finalize 既有 fail-closed 语义。
+// ---------------------------------------------------------------------------
+
+/// desktop 直调 rule.add（规则创建路径；socket 审批门 finalize 走同一
+/// `rule_op_exec`，预计算行为一致）。
+fn add_bound_rule_desktop(
+    state: &Arc<Mutex<Daemon>>,
+    token: &str,
+    project_dir: &Path,
+    name: &str,
+    command: &str,
+    exe_path: &Path,
+) -> Value {
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_RULE_ADD,
+            Some(token),
+            json!({ "projectDir": project_dir, "name": name, "command": command,
+                    "capability": "inject", "keys": ["NPM_TOKEN"],
+                    "fingerprint": { "exePath": exe_path.to_string_lossy(),
+                                     "sha256": "x".repeat(64), "size": 0 },
+                    "channel": "desktop" }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    serde_json::from_str(&resp).unwrap()
+}
+
+/// 绑定注入评估（返回解析后的响应）。
+fn evaluate_inject(
+    handler: &crate::transport::Handler,
+    token: &str,
+    project_dir: &Path,
+    command: &str,
+) -> Value {
+    let peer = test_peer(Some(project_dir));
+    let resp = handler(
+        &rpc_line(
+            M_AUTHZ_EVALUATE,
+            Some(token),
+            json!({ "command": command, "keys": ["NPM_TOKEN"] }),
+        ),
+        &peer,
+    );
+    serde_json::from_str(&resp).unwrap()
+}
+
+/// ≤ 阈值（缺省 64 MiB）：规则创建 finalize 后缓存已含指纹（预计算生效）——
+/// 随后绑定命中评估只 stat 复用，不重算（hash_calls 不增）。
+#[test]
+fn rule_create_precomputes_cache_within_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let (exe, _fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    inject_fake_env(&state, bin.path(), None);
+
+    let v = add_bound_rule_desktop(&state, &token, proj.path(), "pre-warm", "pgm", &exe);
+    assert!(
+        v["result"]["rule"]["fingerprint"].is_object(),
+        "规则应入库：{v}"
+    );
+    // finalize 固化哈希现算一次并预热缓存
+    let hash_after_add = state.lock().unwrap().fingerprint_hash_calls();
+    assert_eq!(hash_after_add, 1, "规则创建现算一次固化哈希");
+
+    let handler = make_handler(&state, &shared);
+    let v = evaluate_inject(&handler, &token, proj.path(), "pgm deploy");
+    assert_eq!(v["result"]["allowed"], true, "绑定命中放行：{v}");
+    assert_eq!(
+        state.lock().unwrap().fingerprint_hash_calls(),
+        hash_after_add,
+        "≤ 阈值：finalize 已预热缓存，首次命中只 stat 复用不重算"
+    );
+}
+
+/// 超过阈值（config 自定义 `fingerprintPrecomputeThresholdBytes=1`）：惰性——
+/// 固化哈希仍现算（fail-closed 不变），但缓存不预热：首次命中重新全量哈希。
+#[test]
+fn rule_create_lazy_above_threshold_leaves_cache_cold() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let (exe, _fp) = make_exe(bin.path(), "pgm", b"#!/bin/sh\necho v1\n");
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    inject_fake_env(&state, bin.path(), None);
+    // 自定义阈值 1 字节（文件 > 1 字节 → 惰性）
+    {
+        let mut cfg = shared.config.write().unwrap();
+        cfg.fingerprint_precompute_threshold_bytes = 1;
+    }
+
+    let v = add_bound_rule_desktop(&state, &token, proj.path(), "lazy", "pgm", &exe);
+    assert!(
+        v["result"]["rule"]["fingerprint"].is_object(),
+        "规则应入库：{v}"
+    );
+    let hash_after_add = state.lock().unwrap().fingerprint_hash_calls();
+    assert_eq!(hash_after_add, 1, "> 阈值：固化哈希仍现算一次（落盘必需）");
+
+    let handler = make_handler(&state, &shared);
+    let v = evaluate_inject(&handler, &token, proj.path(), "pgm deploy");
+    assert_eq!(v["result"]["allowed"], true, "绑定命中放行：{v}");
+    assert_eq!(
+        state.lock().unwrap().fingerprint_hash_calls(),
+        hash_after_add + 1,
+        "> 阈值：缓存未预热，首次命中重新全量哈希"
+    );
+}
+
+/// 阈值配置生效：同一 daemon 内改 `fingerprintPrecomputeThresholdBytes`
+/// 翻转预计算行为（惰性 ↔ 预热）——配置面真实生效、热读。
+#[test]
+fn threshold_config_flips_precompute_behavior() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let (exe_a, _fa) = make_exe(bin.path(), "pgma", b"#!/bin/sh\necho a\n");
+    let (exe_b, _fb) = make_exe(bin.path(), "pgmb", b"#!/bin/sh\necho b\n");
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    inject_fake_env(&state, bin.path(), None);
+    let handler = make_handler(&state, &shared);
+
+    // 阈值 1（惰性）：规则 A 创建后缓存冷 → 首次命中重算
+    {
+        let mut cfg = shared.config.write().unwrap();
+        cfg.fingerprint_precompute_threshold_bytes = 1;
+    }
+    let v = add_bound_rule_desktop(&state, &token, proj.path(), "r-a", "pgma", &exe_a);
+    assert!(v["result"]["rule"]["fingerprint"].is_object(), "{v}");
+    let h = state.lock().unwrap().fingerprint_hash_calls();
+    let v = evaluate_inject(&handler, &token, proj.path(), "pgma deploy");
+    assert_eq!(v["result"]["allowed"], true, "{v}");
+    assert_eq!(
+        state.lock().unwrap().fingerprint_hash_calls(),
+        h + 1,
+        "惰性阈值：首次命中重算"
+    );
+
+    // 阈值放开（预热）：规则 B 创建即预热 → 首次命中只 stat 复用
+    {
+        let mut cfg = shared.config.write().unwrap();
+        cfg.fingerprint_precompute_threshold_bytes = u64::MAX;
+    }
+    let v = add_bound_rule_desktop(&state, &token, proj.path(), "r-b", "pgmb", &exe_b);
+    assert!(v["result"]["rule"]["fingerprint"].is_object(), "{v}");
+    let h = state.lock().unwrap().fingerprint_hash_calls();
+    let v = evaluate_inject(&handler, &token, proj.path(), "pgmb deploy");
+    assert_eq!(v["result"]["allowed"], true, "{v}");
+    assert_eq!(
+        state.lock().unwrap().fingerprint_hash_calls(),
+        h,
+        "预热阈值：finalize 已预热，首次命中复用不重算"
+    );
+}
+
+/// 预计算失败不影响 finalize 既有语义（fail-closed 保持）：绑定的 exe 不可
+/// 解析 → `rule.add` 原样判失败（invalid params），阈值两侧形态一致。
+#[test]
+fn precompute_failure_keeps_finalize_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, _shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    let ghost = proj.path().join("no-such-exe");
+
+    // 缺省阈值（预计算分支）下失败 → invalid params（既有语义）
+    let v = add_bound_rule_desktop(&state, &token, proj.path(), "f1", "pgm", &ghost);
+    assert_eq!(
+        v["error"]["code"], ERR_INVALID_PARAMS,
+        "不可解析 exe → 判失败：{v}"
+    );
+    // 阈值 0（惰性分支）下失败 → 同形态（固化哈希路径不受阈值影响）
+    {
+        let mut cfg = _shared.config.write().unwrap();
+        cfg.fingerprint_precompute_threshold_bytes = 0;
+    }
+    let v = add_bound_rule_desktop(&state, &token, proj.path(), "f2", "pgm", &ghost);
+    assert_eq!(
+        v["error"]["code"], ERR_INVALID_PARAMS,
+        "惰性分支下失败同形态（fail-closed 不变）：{v}"
+    );
+}

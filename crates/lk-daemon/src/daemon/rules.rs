@@ -367,6 +367,15 @@ impl Daemon {
         channel: AuditChannel,
         audit_command: &str,
     ) -> RpcResponse {
+        // 预计算阈值（§6-2，config 热读，与 approval_timeout 同口径）：在取
+        // vault 写锁**之前**读——避免 config 读锁嵌套在 vault 写锁内（同步
+        // 轮询器按 config → vault 顺序取锁，反序嵌套是潜在死锁面）。
+        let precompute_threshold = self
+            .shared
+            .config
+            .read()
+            .unwrap()
+            .fingerprint_precompute_threshold_bytes;
         let shared = Arc::clone(&self.shared);
         let mut guard = shared.vault.write().unwrap();
         let Some(me) = guard.as_mut() else {
@@ -384,11 +393,14 @@ impl Daemon {
                 // daemon **不信任客户端上报的 sha/size**——在批准后的 finalize
                 // 侧重算（canonicalize + stat + 流式 SHA-256，走缓存）。重算失败
                 // （exe 不可解析/不可读）→ 无法绑定 → 判失败（fail-closed）。
+                // 预计算阈值语义：≤ 阈值现算并预热缓存；> 阈值惰性（哈希仍现算，
+                // 缓存留待首次命中）——见 `identity::recompute_fingerprint`。
                 let fingerprint = match p.fingerprint.as_ref() {
                     Some(fp) => {
                         match crate::identity::recompute_fingerprint(
                             &fp.exe_path,
                             &mut self.fingerprint_cache,
+                            precompute_threshold,
                         ) {
                             Some(rf) => Some(rf),
                             None => {

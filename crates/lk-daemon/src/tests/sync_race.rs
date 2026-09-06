@@ -37,6 +37,7 @@ fn sync_round_does_not_block_commands_and_apply_respects_races() {
                 interval_secs: 60,
             }),
             approval_timeout_secs: 30,
+            ..Config::default()
         };
         *daemon.shared().config.write().unwrap() = cfg;
     }
