@@ -120,9 +120,8 @@ pub enum ApprovalKind {
     /// 不拆两个 kind——remove 由 daemon 解析 id→规则补全 name/keys/projectDir
     /// 供弹窗展示。
     Rule,
-    /// 条目写入（`item.put` / `item.delete`；M2.97 写入门，补充拍板 #24，
-    /// write-gate.md §6）。单一 kind + `command` 字段承载动作
-    /// （`item.put <name>` / `item.delete <name>`）；keys = 单元素
+    /// 写入门（补充拍板 #24，M2.97，write-gate.md §6）。单一 kind + `command`
+    /// 字段承载动作（`item.put <name>` / `item.delete <name>`）；keys = 单元素
     /// [目标条目名]；export_meta 恒 None。
     Write,
 }
@@ -174,6 +173,12 @@ pub struct ApprovalRequest {
     pub needs_unlock: bool,
     /// 审批类型（值披露读/导出弹窗按 kind 渲染；读/导出不带解锁一体化）。
     pub kind: ApprovalKind,
+    /// 派生写动作（kind=Write 时有值；#137 最小授权修复）：daemon 从
+    /// `ItemPutParams.id` 有无权威派生（None=create / Some=update，§5.2
+    /// RPC 不拆——action 不进 RPC 面，但随 `authz.request` 帧回带
+    /// `writeAction` 字段），前端「允许并为此项目记住」据此生成
+    /// `actions=[当前动作]` 最小写规则（write-gate.md §6）；非写审批恒 None。
+    pub write_action: Option<WriteAction>,
     /// export 审批的数据包规模元信息（kind=Export 时有值；读/注入为 None）。
     pub export_meta: Option<ExportMeta>,
     /// 程序指纹失配信息（M2.98，identity-binding.md §7）：绑定注入规则命中
@@ -378,7 +383,8 @@ impl ApprovalChannel for LocalApprovalChannel {
             .register(req.request_id, expires_at, req.challenge.clone());
         // 广播 `authz.request`（通知 D 层弹窗；无密钥值；challenge 仅经本
         // 事件通道下发——守护进程侧通知桥只投给桌面订阅者，#78 方案 A；
-        // kind/export_meta 供弹窗按审批类型渲染，M2.9 值披露）
+        // kind/export_meta 供弹窗按审批类型渲染，M2.9 值披露；write_action
+        // 供「记住」生成 actions=[当前动作] 最小写规则，#137）
         self.bus.emit(&VaultEvent::AuthzRequest {
             request_id: req.request_id,
             starter: req.starter.clone(),
@@ -388,6 +394,7 @@ impl ApprovalChannel for LocalApprovalChannel {
             challenge: req.challenge.clone(),
             needs_unlock: req.needs_unlock,
             kind: req.kind,
+            write_action: req.write_action,
             export_meta: req.export_meta.clone(),
             fingerprint_mismatch: req.fingerprint_mismatch.clone(),
         });
@@ -668,6 +675,17 @@ pub enum WriteAction {
     Create,
     /// 整条替换（id=Some）：keys 同时包含存储名与草稿名（双向名约束）。
     Update,
+}
+
+impl WriteAction {
+    /// 协议面字符串（`authz.request` 帧的 `writeAction` 字段；#137 最小
+    /// 授权修复——前端「记住」按帧内 action 生成 `actions=[当前动作]`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WriteAction::Create => "create",
+            WriteAction::Update => "update",
+        }
+    }
 }
 
 /// 写规则是否匹配 `(cwd, action, 存储名?, 草稿名)`（写门路径，write-gate.md
@@ -1084,6 +1102,7 @@ mod tests {
             challenge: "chal-xyz".into(),
             needs_unlock: false,
             kind: ApprovalKind::Inject,
+            write_action: None,
             export_meta: None,
             fingerprint_mismatch: None,
         };
@@ -1101,6 +1120,7 @@ mod tests {
                 challenge,
                 needs_unlock,
                 kind,
+                write_action,
                 export_meta,
                 fingerprint_mismatch,
             } => {
@@ -1115,6 +1135,8 @@ mod tests {
                 assert!(!needs_unlock);
                 // M2.9 值披露：inject 审批不带导出元信息
                 assert_eq!(*kind, ApprovalKind::Inject);
+                // #137：非写审批不携带派生写动作
+                assert!(write_action.is_none());
                 assert!(export_meta.is_none());
                 // M2.98：非失配注入审批不带指纹失配信息
                 assert!(fingerprint_mismatch.is_none());
@@ -1220,6 +1242,7 @@ mod tests {
                 challenge: String::new(),
                 needs_unlock: false,
                 kind: ApprovalKind::Inject,
+                write_action: None,
                 export_meta: None,
                 fingerprint_mismatch: None,
             },
@@ -1602,6 +1625,7 @@ mod tests {
             challenge: "chal".into(),
             needs_unlock: false,
             kind,
+            write_action: None,
             export_meta: None,
             fingerprint_mismatch: None,
         }
@@ -1690,6 +1714,7 @@ mod tests {
             challenge: "chal".into(),
             needs_unlock: false,
             kind: ApprovalKind::Export,
+            write_action: None,
             export_meta: Some(ExportMeta {
                 name: "合同.pdf".into(),
                 mime: "application/pdf".into(),
@@ -1706,6 +1731,16 @@ mod tests {
             ..areq.clone()
         };
         assert!(inject_req.export_meta.is_none());
+        // #137 最小授权修复：写审批携带 daemon 权威派生的写动作（随
+        // `authz.request` 帧回带 `writeAction`），非写审批恒 None
+        let mut write_req = areq.clone();
+        write_req.kind = ApprovalKind::Write;
+        write_req.command = "item.put 合同.pdf".into();
+        write_req.export_meta = None;
+        write_req.write_action = Some(WriteAction::Update);
+        assert_eq!(write_req.write_action, Some(WriteAction::Update));
+        assert_eq!(WriteAction::Create.as_str(), "create");
+        assert_eq!(WriteAction::Update.as_str(), "update");
     }
 
     // -- M2.98 规则程序指纹（补充拍板 #25）：未绑定匹配路径零变化回归 ---------

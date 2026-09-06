@@ -44,6 +44,7 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
             challenge,
             needs_unlock,
             kind,
+            write_action,
             export_meta,
             fingerprint_mismatch,
         } => json!({
@@ -57,6 +58,11 @@ pub fn frame_for_event(event: &VaultEvent) -> String {
             // M2.9 值披露：审批类型（弹窗按形态渲染）+ export 数据包
             // 规模元信息（仅 export 审批携带，帧不含数据本身）
             "kind": serde_json::to_value(kind).unwrap_or(serde_json::json!("inject")),
+            // M2.97 写门 #137 最小授权修复：kind=write 时回带 daemon 从
+            // `ItemPutParams.id` 有无权威派生的动作（create/update；RPC 仍
+            // 不拆）——前端「记住」据此生成 `actions=[当前动作]` 最小写规
+            // 则（write-gate.md §6）；非写审批为 null。
+            "writeAction": write_action.map(|a| a.as_str()),
             "exportMeta": export_meta.as_ref().map(|m| json!({
                 "name": m.name, "mime": m.mime, "size": m.size,
             })),
@@ -149,6 +155,7 @@ mod tests {
             challenge: "chal-1".into(),
             needs_unlock: true,
             kind: lk_core::authz::ApprovalKind::Inject,
+            write_action: None,
             export_meta: None,
             fingerprint_mismatch: None,
         });
@@ -161,6 +168,10 @@ mod tests {
         assert_eq!(v["params"]["challenge"], "chal-1");
         assert_eq!(v["params"]["needsUnlock"], true, "需解锁一体化帧须标注");
         assert_eq!(v["params"]["kind"], "inject", "审批类型帧字段（M2.9）");
+        assert!(
+            v["params"].get("writeAction").is_none_or(|m| m.is_null()),
+            "非写审批帧不携带派生写动作（#137）"
+        );
         assert!(
             v["params"].get("exportMeta").is_none_or(|m| m.is_null()),
             "inject 帧不携带导出元信息"
@@ -176,6 +187,7 @@ mod tests {
             challenge: "chal-e".into(),
             needs_unlock: false,
             kind: lk_core::authz::ApprovalKind::Export,
+            write_action: None,
             export_meta: Some(lk_core::authz::ExportMeta {
                 name: "合同.pdf".into(),
                 mime: "application/pdf".into(),
@@ -188,6 +200,35 @@ mod tests {
         assert_eq!(v["params"]["exportMeta"]["name"], "合同.pdf");
         assert_eq!(v["params"]["exportMeta"]["mime"], "application/pdf");
         assert_eq!(v["params"]["exportMeta"]["size"], 1024);
+
+        // write 审批帧（M2.97 写门；#137 最小授权修复）：kind=write + 回带
+        // daemon 权威派生动作（writeAction=create/update）——前端「记住」
+        // 据此生成 actions=[当前动作] 最小写规则（write-gate.md §6）
+        for (action, expect) in [
+            (lk_core::authz::WriteAction::Create, "create"),
+            (lk_core::authz::WriteAction::Update, "update"),
+        ] {
+            let frame = frame_for_event(&VaultEvent::AuthzRequest {
+                request_id: uuid::Uuid::nil(),
+                starter: "/bin/zsh".into(),
+                project_dir: "/proj".into(),
+                command: "item.put cfg".into(),
+                keys: vec!["cfg".into()],
+                challenge: "chal-w".into(),
+                needs_unlock: false,
+                kind: lk_core::authz::ApprovalKind::Write,
+                write_action: Some(action),
+                export_meta: None,
+                fingerprint_mismatch: None,
+            });
+            let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["params"]["kind"], "write");
+            assert_eq!(
+                v["params"]["writeAction"], expect,
+                "写审批帧回带派生动作（#137）"
+            );
+        }
+
         assert!(desktop_only(&VaultEvent::AuthzRequest {
             request_id: uuid::Uuid::nil(),
             starter: String::new(),
@@ -197,6 +238,7 @@ mod tests {
             challenge: String::new(),
             needs_unlock: false,
             kind: lk_core::authz::ApprovalKind::Inject,
+            write_action: None,
             export_meta: None,
             fingerprint_mismatch: None,
         }));

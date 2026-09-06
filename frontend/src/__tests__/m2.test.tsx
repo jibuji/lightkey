@@ -968,13 +968,14 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         command: "item.put API_TOKEN",
         keys: ["API_TOKEN"],
         kind: "write",
+        writeAction: "create",
       });
     });
     await flushApproval();
     const dialog = document.body.querySelector(".approval-dialog")!;
     const text = dialog.textContent ?? "";
-    // 动作类 + RPC 摘要（含目标条目名）+ projectDir
-    expect(text).toContain("写入条目（create/update）");
+    // 动作（按帧内 writeAction 精确展示，#137）+ RPC 摘要（含目标条目名）+ projectDir
+    expect(text).toContain("新建条目（create）");
     expect(text).toContain("item.put API_TOKEN");
     expect(text).toContain("/work/proj-a");
     // 30s 倒计时照常
@@ -986,7 +987,7 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
     expect(dialog.querySelector(".approval-cmd-box")!.textContent).not.toContain("$");
   });
 
-  it("write put 帧：记住按钮 → 生成最小写规则（capability=write、keys=[条目名]、actions=[create,update]）", async () => {
+  it("write put 帧：记住按钮 → 生成最小写规则（capability=write、keys=[条目名]、actions=[帧内 writeAction 当前动作]）", async () => {
     const { ctx, mock } = await mountHost();
     await unlock(ctx);
     const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
@@ -999,6 +1000,7 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         command: "item.put API_TOKEN",
         keys: ["API_TOKEN"],
         kind: "write",
+        writeAction: "create",
       });
     });
     await flushApproval();
@@ -1022,11 +1024,79 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         command: "",
         keys: ["API_TOKEN"],
         capability: "write",
-        // 帧面不可分 create/update（§5.2 RPC 不拆）→ 记住授予 put 全类；
-        // delete 不在其中（协议恒弹窗，规则写不进去）
-        actions: ["create", "update"],
+        // #137 最小授权：actions=[帧内 writeAction 当前动作]——批准一次
+        // create 只授 create，不超发 update；delete 不在其中（协议恒弹窗）
+        actions: ["create"],
       }),
     );
+    expect(document.body.querySelector(".approval-dialog")).toBeNull();
+  });
+
+  it("write put（update）帧：按 writeAction=update 生成 actions=[update]（最小授权，不超发 create）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-write-remember-update",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.put API_TOKEN",
+        keys: ["API_TOKEN"],
+        kind: "write",
+        writeAction: "update",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    expect(dialog.textContent).toContain("替换条目（update）");
+    const rememberBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许并为此项目记住"),
+    )!;
+    act(() => {
+      rememberBtn.click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(ruleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        capability: "write",
+        keys: ["API_TOKEN"],
+        actions: ["update"],
+      }),
+    );
+  });
+
+  it("write put 帧缺 writeAction（旧守护进程帧）：展示回退动作类；记住点击不生成规则（宁可不记不超发）", async () => {
+    const { ctx, mock } = await mountHost();
+    await unlock(ctx);
+    const ruleSpy = vi.spyOn(ctx.ipc, "ruleAdd");
+    act(() => {
+      mock.simulateAuthzRequest({
+        requestId: "req-write-remember-no-action",
+        starter: "claude",
+        projectDir: "/work/proj-a",
+        command: "item.put API_TOKEN",
+        keys: ["API_TOKEN"],
+        kind: "write",
+      });
+    });
+    await flushApproval();
+    const dialog = document.body.querySelector(".approval-dialog")!;
+    // 防御回退：动作类并列展示
+    expect(dialog.textContent).toContain("写入条目（create/update）");
+    const rememberBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("允许并为此项目记住"),
+    )!;
+    act(() => {
+      rememberBtn.click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    // writeAction 缺失 → 不生成规则（不允许回退到 put 全类授权）
+    expect(ruleSpy).not.toHaveBeenCalled();
     expect(document.body.querySelector(".approval-dialog")).toBeNull();
   });
 
@@ -1043,6 +1113,7 @@ describe("M2.97 写门审批弹窗（kind=write；docs/write-gate.md §6）", ()
         command: "item.delete API_TOKEN",
         keys: ["API_TOKEN"],
         kind: "write",
+        writeAction: null,
       });
     });
     await flushApproval();

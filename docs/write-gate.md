@@ -142,7 +142,10 @@ CLI/daemon/审计/测试表面翻倍。保留单 `M_ITEM_PUT`：
    `authz.request`；
 7. `ApprovalRequest` 填充：kind = `Write`；command = `"item.put <name>"` /
    `"item.delete <name>"`（展示用）；keys = 单元素 [目标条目名]；
-   project_dir = cwd（canonical / wsl:// 规范形）；`needs_unlock = false`。
+   project_dir = cwd（canonical / wsl:// 规范形）；`needs_unlock = false`；
+   `write_action` = 步骤 2 派生的动作（create/update）——随 `authz.request`
+   帧回带 `writeAction` 字段（**#137 最小授权修复**：RPC 仍不拆，帧面补
+   派生结果；delete 审批无写动作，字段为 null）。
 
 **锁定态**：begin 前写门预检（对齐 `rule_precheck`：vault 解锁态 + 会话有效
   才继续；锁定 → `session.invalid` 先行，不弹窗）。
@@ -179,12 +182,17 @@ CLI/daemon/审计/测试表面翻倍。保留单 `M_ITEM_PUT`：
 
 - `ApprovalKind` 新增 `Write`（serde `"write"`，加性变更不升协议版本）；
   单一 kind + `command` 字段承载动作（`item.put <name>` / `item.delete <name>`）；
-  `keys` = 单元素 [目标条目名]；`export_meta` 恒 None。
+  `keys` = 单元素 [目标条目名]；`export_meta` 恒 None；
+  **`writeAction`**（#137 最小授权修复）：daemon 从 `ItemPutParams.id`
+  有无权威派生的动作（`"create"` / `"update"`）随帧回带——RPC 仍不拆
+  （§5.2），帧面只补派生结果；delete 审批帧无写动作（null）；前端畸形/
+  缺失防御处理（不生成记住规则，不回退全类授权）。
 - 前端 approval 插件 kind=write 分支：动作（create/update/delete）+ 目标
   条目名 + projectDir + 30s 倒计时，**不展示值**；
 - **「允许并为此项目记住」仅 create/update 提供**（生成写规则
-  `keys=[条目名] + actions=[当前动作]` 的最小授权）；**delete 无记住按钮**
-  （恒弹窗语义，任何规则不豁免——对齐 export）；
+  `keys=[条目名] + actions=[当前动作]` 的最小授权——action 取帧内
+  `writeAction`，批准一次 create 只授 create，不超发 update）；**delete
+  无记住按钮**（恒弹窗语义，任何规则不豁免——对齐 export）；
 - 规则管理页与审计页：规则列表展示 capability + actions；审计事件按 §8
   落表。
 

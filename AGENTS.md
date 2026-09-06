@@ -146,13 +146,14 @@
   `docs/write-gate.md`）：`item.put`/`item.delete` 升裁决方法（写 = 授权
   事件）；写规则 `capability=write` + `actions`（serde 缺省 create+update，
   update 双向名称约束）；**delete 恒弹窗**任何规则不豁免；RPC 不拆（action
-  由 daemon 从 `ItemPutParams.id` 有无权威派生）+ `ApprovalKind::Write`
-  （serde `"write"`）；拒绝复用 -32017；desktop 直调豁免、headless
-  fail-closed、锁态 `session.invalid` 先行（写门无一体化解锁窗，留档）；
-  全路径审计 command 派生 `item.create/update/delete <name>`；
-  `lk rule add --write`（actions 校验拒绝 delete）+ 写拒绝语境文案；
-  前端 kind=write 弹窗（动作/条目名/projectDir/倒计时，不展示值）+
-  「记住」仅 put（最小写规则 keys=[条目名]+actions=[create,update]）、
+  由 daemon 从 `ItemPutParams.id` 有无权威派生；`authz.request` 帧回带
+  `writeAction`，#137）+ `ApprovalKind::Write`（serde `"write"`）；拒绝复用
+  -32017；desktop 直调豁免、headless fail-closed、锁态 `session.invalid`
+  先行（写门无一体化解锁窗，留档）；全路径审计 command 派生
+  `item.create/update/delete <name>`；`lk rule add --write`（actions 校验
+  拒绝 delete）+ 写拒绝语境文案；前端 kind=write 弹窗（动作/条目名/
+  projectDir/倒计时，不展示值）+ 「记住」仅 put（最小写规则
+  keys=[条目名]+actions=[帧内 writeAction 当前动作]，#137）、
   delete 无记住；规则页展示 capability+actions、审计页 §8 口径；E2E 不扩
   auto-approve；同步应用不受门、真相源投毒为已知限制。issues #112-#115。
 - [x] M2.98 规则程序指纹绑定（补充拍板 #25，2026-09-02 拍板，已实现；spec

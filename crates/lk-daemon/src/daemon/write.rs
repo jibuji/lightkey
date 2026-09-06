@@ -191,7 +191,9 @@ impl Daemon {
         //    write、command=`item.put/delete <name>`（展示用）、keys=单元素
         //    [目标条目名]、project_dir=cwd、needs_unlock=false、export_meta
         //    恒 None（§5.3 步骤 7 / §6）。challenge 语义同 inject——仅投递
-        //    桌面订阅者，回传必须原样带回（#78）。
+        //    桌面订阅者，回传必须原样带回（#78）。write_action=begin 期
+        //    权威派生的动作，随帧回带 `writeAction`——前端「记住」据此生成
+        //    `actions=[当前动作]` 最小写规则（§6 / #137，RPC 仍不拆）。
         let request_id = lk_core::crypto::random_uuid();
         let challenge = hex::encode(lk_core::crypto::random_array::<16>());
         let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
@@ -212,6 +214,7 @@ impl Daemon {
             challenge,
             needs_unlock: false,
             kind: lk_core::authz::ApprovalKind::Write,
+            write_action: write_action(&parsed.op),
             export_meta: None,
             fingerprint_mismatch: None,
         };
