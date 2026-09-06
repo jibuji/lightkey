@@ -21,13 +21,6 @@ enum FingerprintVerdict {
     NeedsApproval(Option<FingerprintMismatch>),
 }
 
-/// 阶段③ 结果：最终响应，或锁定态一体化指纹失配转**二次审批**（issue #140）
-/// ——调用方重新进入锁外等待（G1：等待不持命令锁）。
-pub(crate) enum AuthzFinalize {
-    Done(String),
-    RePended { request_id: uuid::Uuid },
-}
-
 impl Daemon {
     /// 阶段①（命令锁内）：会话预检 + 启动者判定 + 第 1/2 层短路；需要审批
     /// 时登记待审批 + 广播 `authz.request`，返回 Pending（等待移出命令锁）。
@@ -295,14 +288,14 @@ impl Daemon {
     /// **锁定态补指纹裁决（issue #140，M2.8 × M2.98）**：临时 vault 上规则
     /// 已可读、对端进程在审批等待期间仍存活（env 可重读）——begin 时无法
     /// 执行的指纹判定在 finalize 补上：命中 → 静默放行；失配/不可解析 →
-    /// 视同未命中 → **转二次审批**（[`AuthzFinalize::RePended`]，needsUnlock
+    /// 视同未命中 → **转二次审批**（[`DeferredOutcome::RePended`]，needsUnlock
     /// 帧携带 `fingerprintMismatch` 明示「指纹不符」，identity-binding §7）。
     pub(crate) fn authz_finalize(
         &mut self,
         id: Value,
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
-    ) -> AuthzFinalize {
+    ) -> DeferredOutcome {
         let removed = self.pending_gates.lock().unwrap().remove(&request_id);
         // 条目已被消费（极端竞态）或门不符 → 保守拒绝
         let (pending, temp_vault, needs_unlock) = match removed {
@@ -312,7 +305,7 @@ impl Daemon {
                 kind: GateKind::Authz(pending),
             }) => (pending, temp_vault, needs_unlock),
             _ => {
-                return AuthzFinalize::Done(rpc_string(RpcResponse::ok(
+                return DeferredOutcome::Done(rpc_string(RpcResponse::ok(
                     id,
                     serde_json::to_value(AuthzEvaluateResult {
                         allowed: false,
@@ -344,7 +337,7 @@ impl Daemon {
                     }
                     Err(_) => {
                         // 等待期间锁定/密钥不可用 → 无法满足
-                        return AuthzFinalize::Done(
+                        return DeferredOutcome::Done(
                             serde_json::to_string(&session_invalid(id))
                                 .unwrap_or_else(|_| "{}".into()),
                         );
@@ -378,7 +371,7 @@ impl Daemon {
                 }
             }
         };
-        AuthzFinalize::Done(rpc_string(RpcResponse::ok(
+        DeferredOutcome::Done(rpc_string(RpcResponse::ok(
             id,
             serde_json::to_value(result).unwrap_or(Value::Null),
         )))
@@ -393,7 +386,7 @@ impl Daemon {
         pending: PendingAuthz,
         temp_vault: Option<UnlockedVault>,
         decision: ApprovalDecision,
-    ) -> AuthzFinalize {
+    ) -> DeferredOutcome {
         let PendingAuthz {
             request: req,
             peer,
@@ -405,7 +398,7 @@ impl Daemon {
                 // 临时 vault 由 approval_result 以正确主密码解锁后存入；
                 // 缺失（异常路径）→ 保守拒绝
                 let Some(vault) = temp_vault else {
-                    return AuthzFinalize::Done(rpc_string(RpcResponse::ok(
+                    return DeferredOutcome::Done(rpc_string(RpcResponse::ok(
                         id,
                         serde_json::to_value(AuthzEvaluateResult {
                             allowed: false,
@@ -453,7 +446,7 @@ impl Daemon {
                             }
                         }
                         Err(_) => {
-                            return AuthzFinalize::Done(
+                            return DeferredOutcome::Done(
                                 serde_json::to_string(&session_invalid(id))
                                     .unwrap_or_else(|_| "{}".into()),
                             )
@@ -488,7 +481,7 @@ impl Daemon {
                             }
                         }
                         Err(_) => {
-                            return AuthzFinalize::Done(
+                            return DeferredOutcome::Done(
                                 serde_json::to_string(&session_invalid(id))
                                     .unwrap_or_else(|_| "{}".into()),
                             )
@@ -497,14 +490,14 @@ impl Daemon {
                 };
                 // 临时 vault 随本函数结束 drop——临时解锁态销毁（未置
                 // shared.vault，vault 仍锁定；无会话令牌、无 token 文件）
-                AuthzFinalize::Done(rpc_string(RpcResponse::ok(
+                DeferredOutcome::Done(rpc_string(RpcResponse::ok(
                     id,
                     serde_json::to_value(result).unwrap_or(Value::Null),
                 )))
             }
             // 拒绝/超时：未解锁（无临时 vault）→ 无 K_audit 可签名，审计
             // 不可写（与 v0 锁态拒绝同口径——fail-closed 不留审计内容）
-            ApprovalDecision::Denied => AuthzFinalize::Done(rpc_string(RpcResponse::ok(
+            ApprovalDecision::Denied => DeferredOutcome::Done(rpc_string(RpcResponse::ok(
                 id,
                 serde_json::to_value(AuthzEvaluateResult {
                     allowed: false,
@@ -513,7 +506,7 @@ impl Daemon {
                 })
                 .unwrap_or(Value::Null),
             ))),
-            ApprovalDecision::Timeout => AuthzFinalize::Done(rpc_string(RpcResponse::ok(
+            ApprovalDecision::Timeout => DeferredOutcome::Done(rpc_string(RpcResponse::ok(
                 id,
                 serde_json::to_value(AuthzEvaluateResult {
                     allowed: false,
@@ -540,7 +533,7 @@ impl Daemon {
         peer: PeerInfo,
         vault: UnlockedVault,
         mismatch: Option<FingerprintMismatch>,
-    ) -> AuthzFinalize {
+    ) -> DeferredOutcome {
         if !self.gate.approval().available() {
             self.audit_authz(
                 ActingVault::Temporary(&vault),
@@ -548,7 +541,7 @@ impl Daemon {
                 AuditChannel::Approval,
                 AuditResult::Denied,
             );
-            return AuthzFinalize::Done(rpc_string(RpcResponse::ok(
+            return DeferredOutcome::Done(rpc_string(RpcResponse::ok(
                 id,
                 serde_json::to_value(AuthzEvaluateResult {
                     allowed: false,
@@ -584,7 +577,7 @@ impl Daemon {
                 }),
             },
         );
-        AuthzFinalize::RePended { request_id }
+        DeferredOutcome::RePended { request_id }
     }
 
     /// 解析注入 env（vault 读锁内；key 名 → 值；仅被授权 key；单次扫描）。
@@ -643,3 +636,46 @@ impl Daemon {
         );
     }
 }
+
+// -------------------------------------------------------------------------
+// 流程声明（issue #149：通用 deferred 编排器的注册项）
+// -------------------------------------------------------------------------
+
+/// 注入门流程声明（issue #149）：预检 / begin / finalize 委托既有门方法，
+/// 锁编排由 router.rs 通用 deferred 编排器统一承担。**可 RePended**——
+/// 锁定态一体化 finalize 补指纹裁决失配转二次审批（issue #140），RePended
+/// 循环内建于编排器（注入裁决不再是编排特例）。
+pub(crate) struct AuthzFlow;
+
+impl crate::router::DeferredFlow for AuthzFlow {
+    fn precheck(&self, daemon: &Daemon, token: Option<&[u8]>) -> bool {
+        daemon.authz_evaluate_precheck(token)
+    }
+
+    fn begin(
+        &self,
+        daemon: &mut Daemon,
+        _method: &str,
+        id: Value,
+        params: Value,
+        peer: &PeerInfo,
+    ) -> GateBegin {
+        daemon.authz_begin(id, params, peer)
+    }
+
+    fn finalize(
+        &self,
+        daemon: &mut Daemon,
+        id: Value,
+        request_id: uuid::Uuid,
+        decision: ApprovalDecision,
+    ) -> DeferredOutcome {
+        daemon.authz_finalize(id, request_id, decision)
+    }
+
+    fn rependable(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) const AUTHZ_FLOW: AuthzFlow = AuthzFlow;

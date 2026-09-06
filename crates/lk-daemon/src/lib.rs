@@ -55,8 +55,6 @@ pub use daemon::lifecycle::{global_shutdown, make_handler, run, serve_embedded, 
 pub use daemon::{Daemon, SharedDaemon, SESSION_TOKEN_FILE};
 
 // —— crate 内部旧路径兼容（router.rs 等兄弟模块引用）——
-pub(crate) use daemon::authz::AuthzFinalize;
-pub(crate) use daemon::gate_kit::GateBegin;
 pub(crate) use daemon::{extract_token, rpc_string};
 
 #[cfg(test)]

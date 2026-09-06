@@ -30,13 +30,12 @@ use sha2::Digest;
 
 use crate::config::{Config, SyncRuntime};
 use crate::notifier::Notifier;
-use crate::router::{strategy_of, ExecutionStrategy};
+use crate::router::{run_deferred, strategy_of, ExecutionStrategy};
 use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 
-use self::authz::AuthzFinalize;
 use self::gate_kit::{
-    invalid_params, parse_gate_params, ActingVault, ApprovalDraft, GateBegin, GateEntry, GateKind,
-    PendingGates,
+    invalid_params, parse_gate_params, ActingVault, ApprovalDraft, DeferredOutcome, GateBegin,
+    GateEntry, GateKind, PendingGates,
 };
 use self::lifecycle::{install_shutdown_handlers, load_config};
 
@@ -383,89 +382,25 @@ impl Daemon {
         // 空闲超时自动锁定（任何请求都会触发检查）
         self.auto_lock_if_idle();
 
-        // 执行计划路由（ADR-0001）：直调形态查同一张策略表——两阶段策略在
-        // 持锁前提下顺序执行与 route() 相同的 phase 方法（单线程直调下锁
-        // 窗口不可观察，请求/响应与主缝一致）。
+        // 执行计划路由（ADR-0001）：直调形态查同一张策略表与流程注册表，
+        // 以持锁形态（DirectSeam：locked 即透传，单线程直调下锁窗口本就不
+        // 可观察）驱动与 route() 主缝**同一个**通用 deferred 编排器——
+        // route 与直调的等价由构造保证（issue #149）。
         if strategy_of(&method) == ExecutionStrategy::ApprovalDeferred {
-            if method == M_AUTHZ_EVALUATE {
-                if !self.authz_evaluate_precheck(token.as_deref()) {
-                    return rpc_string(session_invalid(id));
-                }
-                let resp = match self.authz_begin(id.clone(), params, peer) {
-                    GateBegin::Final(resp) => resp,
-                    GateBegin::Pending { request_id, .. } => {
-                        // #140：锁定态一体化 finalize 补指纹裁决失配 → 转二次
-                        // 审批（RePended）——循环回到锁外等待（直调单线程下
-                        // 等待持命令锁与既有 Pending 形态同窗口）。
-                        let mut request_id = request_id;
-                        let r = loop {
-                            let decision = self.shared.approvals.await_decision(request_id);
-                            match self.authz_finalize(id.clone(), request_id, decision) {
-                                AuthzFinalize::Done(r) => break r,
-                                AuthzFinalize::RePended { request_id: next } => {
-                                    request_id = next;
-                                }
-                            }
-                        };
-                        self.touch_activity();
-                        r
-                    }
-                };
-                return resp;
-            }
-            // 规则管理审批门（补充拍板 #22）：锁态先失败（session.invalid——
-            // 规则在加密库内）；desktop 直调豁免 / socket 审批门在 begin 内
-            // 分派（daemon/rules.rs）
-            if method == M_RULE_ADD || method == M_RULE_REMOVE {
-                if !self.rule_precheck(token.as_deref()) {
-                    return rpc_string(session_invalid(id));
-                }
-                let resp = match self.rule_begin(id.clone(), &method, params, peer) {
-                    GateBegin::Final(resp) => resp,
-                    GateBegin::Pending { request_id } => {
-                        let decision = self.shared.approvals.await_decision(request_id);
-                        let r = self.rule_finalize(id.clone(), request_id, decision);
-                        self.touch_activity();
-                        r
-                    }
-                };
-                return resp;
-            }
-            // 写入授权门（补充拍板 #24，write-gate.md §5）：锁态先失败
-            // （session.invalid——写门不弹解锁窗）；desktop 直调豁免 /
-            // socket 写规则匹配 / 审批门在 begin 内分派（daemon/write.rs）
-            if method == M_ITEM_PUT || method == M_ITEM_DELETE {
-                if !self.write_precheck(token.as_deref()) {
-                    return rpc_string(session_invalid(id));
-                }
-                let resp = match self.write_begin(id.clone(), &method, params, peer) {
-                    GateBegin::Final(resp) => resp,
-                    GateBegin::Pending { request_id } => {
-                        let decision = self.shared.approvals.await_decision(request_id);
-                        let r = self.write_finalize(id, request_id, decision);
-                        self.touch_activity();
-                        r
-                    }
-                };
-                return resp;
-            }
-            // M2.9 值披露（`item.get` / `item.export`）：锁态 + 桌面 UI 在场
-            // → 一体化解锁弹窗（补充拍板 #23，disclosure_precheck 分流）；
-            // headless / 未初始化库 → fail-closed session.invalid。desktop
-            // 直调受信豁免在 begin 内直返。
-            if !self.disclosure_precheck(token.as_deref()) {
-                return rpc_string(session_invalid(id));
-            }
-            let resp = match self.disclosure_begin(id.clone(), &method, params, peer) {
-                GateBegin::Final(resp) => resp,
-                GateBegin::Pending { request_id } => {
-                    let decision = self.shared.approvals.await_decision(request_id);
-                    let r = self.disclosure_finalize(id, request_id, decision);
-                    self.touch_activity();
-                    r
+            let flow = match crate::router::gate_flow(&method) {
+                Some(f) => f,
+                // 注册表完整性兜底（正常不可达，完整性测试钉住）
+                None => {
+                    return rpc_string(RpcResponse::err(
+                        id,
+                        ERR_METHOD_NOT_FOUND,
+                        MSG_METHOD_NOT_FOUND,
+                        None,
+                    ))
                 }
             };
-            return resp;
+            let mut seam = crate::router::DirectSeam::new(self);
+            return run_deferred(&mut seam, flow, &method, id, token, params, peer);
         }
 
         // 调用方归因（#66）：Inline 方法派生一次，供写审计的处理器复用

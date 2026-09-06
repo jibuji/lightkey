@@ -12,10 +12,12 @@
 //! - [`Daemon::audit_gate`] + [`ActingVault`]：四门合一的审计辅助——事件
 //!   字段由门提供，K_audit 按「本次执行所用 vault」签名（调用方决定共享
 //!   vault 还是临时 vault，为审批工作区衔接预留，T4）；
-//! - 参数解析辅助（[`parse_gate_params`] / [`invalid_params`]）。
+//! - 参数解析辅助（[`parse_gate_params`] / [`invalid_params`]）；
+//! - [`DeferredOutcome`]：finalize 阶段统一结果类型（RePended 由通用
+//!   deferred 编排器内建循环消费）。
 //!
-//! 预检（precheck）与 finalize 编排仍属各门 / 路由（T3 通用 deferred 编排器
-//! 在此之上收敛）。
+//! 预检（precheck）/ begin / finalize 由各门声明为流程（issue #149），锁
+//! 编排收敛于 router.rs 的通用 deferred 编排器。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -32,6 +34,16 @@ use super::*;
 pub(crate) enum GateBegin {
     Final(String),
     Pending { request_id: uuid::Uuid },
+}
+
+/// finalize 阶段统一结果类型（issue #149）：最终响应，或锁定态一体化指纹
+/// 失配转**二次审批**（issue #140）——RePended 循环内建于通用 deferred 编排器
+/// （router.rs `run_deferred`），finalize 返回 [`DeferredOutcome::RePended`]
+/// 即回到锁外等待；注入裁决不再是编排特例。取代 authz 特有的
+/// `AuthzFinalize`（已删除）。
+pub(crate) enum DeferredOutcome {
+    Done(String),
+    RePended { request_id: uuid::Uuid },
 }
 
 /// 统一待审批注册表条目（key = 请求 id，由外层 map 承担）。needs_unlock
