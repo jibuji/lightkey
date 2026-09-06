@@ -23,6 +23,11 @@ const SYNC_KEYRING_SERVICE: &str = "lightkey-sync";
 /// 审批超时默认值（第 3 层弹窗 30s 超时默认拒绝；`lk-core::authz` 常量对齐）。
 const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 30;
 
+/// 指纹预计算阈值缺省值（identity-binding.md §6-2：64 MiB，可配置）。
+fn default_fingerprint_precompute_threshold_bytes() -> u64 {
+    crate::identity::FINGERPRINT_PRECOMPUTE_THRESHOLD
+}
+
 /// 守护进程配置（`config.json`）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +41,14 @@ pub struct Config {
     /// 缺省 30；测试可调小以缩短等待。
     #[serde(default = "default_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// M2.98 指纹预计算阈值字节（identity-binding.md §6-2，可配置；缺省
+    /// 64 MiB）：规则创建/审批 finalize 固化指纹时，绑定 exe 大小 ≤ 阈值 →
+    /// 立即预计算（锁内预热指纹缓存，人在场一次性可接受）；> 阈值 → 惰性
+    /// （固化哈希仍现算——落盘 sha256 必需，fail-closed 不变——但不预热
+    /// 缓存，首次命中重新全量哈希）。只影响预计算时机，不改变安全语义；
+    /// 0 = 全部惰性。
+    #[serde(default = "default_fingerprint_precompute_threshold_bytes")]
+    pub fingerprint_precompute_threshold_bytes: u64,
 }
 
 fn default_approval_timeout_secs() -> u64 {
@@ -48,6 +61,8 @@ impl Default for Config {
             auto_lock_minutes: 5,
             sync: None,
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
+            fingerprint_precompute_threshold_bytes: default_fingerprint_precompute_threshold_bytes(
+            ),
         }
     }
 }

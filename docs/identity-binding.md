@@ -193,6 +193,19 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
    用户原生攻击同属边界外声明（decisions #15/#20）。元信息只做失效提示、
    不作安全依据，安全依据始终是 SHA-256 本身。
 
+### 6-1. 阈值实现注记（issue #138）
+
+- **配置字段**：`config.json` 的 `fingerprintPrecomputeThresholdBytes`
+  （serde 缺省 = 64 MiB，出处 `lk_daemon::identity::FINGERPRINT_PRECOMPUTE_THRESHOLD`；
+  畸形配置随整个 config.json 解析失败回退缺省——与既有字段同口径）；
+  守护进程热读（与 `approvalTimeoutSecs` 同级）。
+- **语义**：固化指纹（规则创建 / 审批 finalize，`rule_op_exec` →
+  `recompute_fingerprint`）时哈希**一律现算**——落盘 sha256 必需，
+  fail-closed 语义不变；阈值门控的是**缓存预热**：≤ 阈值 → 现算即预热
+  （finalize 后缓存已含指纹，首次命中 O(stat)）；> 阈值 → 惰性（缓存不
+  预热，首次命中重新全量哈希）。`0` = 全部惰性。阈值只影响预计算时机，
+  不改变安全语义（未命中/失配判定逻辑不变）。
+
 ## 7. 指纹失配 UX（拍板：视同未命中 + 弹窗重新授权）
 
 - **失配 = 未命中**：走与注入/读/写门一致的裁决路径——GUI 在场弹窗、

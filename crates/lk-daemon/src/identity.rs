@@ -494,13 +494,24 @@ fn mismatch_info(path: &Path, cache: &mut FingerprintCache) -> FingerprintMismat
 /// 的 sha256/size**，对请求绑定的 exe_path 重新 canonicalize + stat + 流式
 /// SHA-256（走缓存，元信息一致复用）。失败（路径不可解析 / 文件不可读）→
 /// `None`（调用方据此 fail：无法绑定到不可达的可执行文件）。
+///
+/// `precompute_threshold`（§6-2，config `fingerprintPrecomputeThresholdBytes`，
+/// 缺省 [`FINGERPRINT_PRECOMPUTE_THRESHOLD`]）：文件大小 ≤ 阈值 → 哈希现算
+/// 并**预热缓存**（= 预计算，锁内一次性、人在场可接受）；> 阈值 → **惰性**：
+/// 固化落盘所需的哈希仍现算（fail-closed 不变），但不预热缓存——首次命中
+/// 重新全量哈希。阈值只影响缓存预热时机，不改变安全语义。
 pub fn recompute_fingerprint(
     exe_path: &str,
     cache: &mut FingerprintCache,
+    precompute_threshold: u64,
 ) -> Option<ProgramFingerprint> {
     let canonical = std::fs::canonicalize(exe_path).ok()?;
     let meta = cache.stat(&canonical)?;
-    let sha256 = cache.sha256(&canonical, meta)?;
+    let sha256 = if meta.size <= precompute_threshold {
+        cache.sha256(&canonical, meta)?
+    } else {
+        cache.hash_uncached(&canonical)?
+    };
     Some(ProgramFingerprint {
         exe_path: canonical.to_string_lossy().into_owned(),
         sha256,
@@ -580,8 +591,12 @@ struct CacheEntry {
     sha256: String,
 }
 
-/// 指纹缓存配额（64 MiB 预计算阈值只决定预计算时机，不改变安全语义——缓存
-/// 本身总是按需计算；数值保留为语义文档化，见 identity-binding.md §6-2）。
+/// 指纹预计算阈值缺省值（64 MiB，identity-binding.md §6-2）：只决定**预计算
+/// （缓存预热）时机**，不改变安全语义——缓存本身总是按需计算。≤ 阈值：规则
+/// 创建/审批 finalize 时立即预热（[`recompute_fingerprint`] 走缓存写入）；
+/// 超过阈值：惰性到首次命中（固化哈希仍现算，缓存不预热）。config.json 经
+/// `fingerprintPrecomputeThresholdBytes` 覆盖（本常量为 serde 缺省出处，
+/// 见 `config.rs`）。
 pub const FINGERPRINT_PRECOMPUTE_THRESHOLD: u64 = 64 * 1024 * 1024;
 
 /// 内存指纹缓存：`exe_path → {sha256, size, mtime, file-id}`。调用方先 `stat`
@@ -655,6 +670,16 @@ impl FingerprintCache {
         Some(sha256)
     }
 
+    /// 现算哈希但**不写缓存**（§6-2 > 阈值惰性分支）：固化落盘所需的哈希
+    /// 仍现算，缓存保持冷态——首次命中重新全量哈希。读取失败 → `None`。
+    /// 重算计数 `hash_calls`。
+    fn hash_uncached(&mut self, path: &Path) -> Option<String> {
+        let sha256 = self.source.hash(path).ok()?;
+        self.hash_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(sha256)
+    }
+
     /// 取 `path` 的 8 位 SHA-256 前缀摘要（失配展示用）。内部先 stat（计
     /// `stat_calls`）再 `sha256`（元信息一致即复用）。文件不可读 → `None`。
     pub(crate) fn resolve_sha256_short(&mut self, path: &Path) -> Option<String> {
@@ -674,9 +699,7 @@ impl FingerprintCache {
     }
 
     fn rehash(&mut self, path: &Path, meta: MetaSnapshot) -> Option<String> {
-        let sha256 = self.source.hash(path).ok()?;
-        self.hash_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sha256 = self.hash_uncached(path)?;
         self.entries.insert(
             path.to_path_buf(),
             CacheEntry {
@@ -1001,5 +1024,159 @@ mod tests {
                 own_dirs
             );
         }
+    }
+
+    /// recompute_fingerprint 走真实 canonicalize——测试统一用临时文件路径
+    /// （元信息/哈希由注入的 FakeSource 决定，文件内容无关）。返回临时目录
+    /// 守卫（须同 scope 持有，防提前删除）与 canonical 路径。
+    fn fake_exe_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tool.exe");
+        std::fs::write(&p, b"fake exe").unwrap();
+        let canonical = std::fs::canonicalize(&p).unwrap();
+        (dir, canonical)
+    }
+
+    /// recompute_fingerprint 阈值语义（§6-2，issue #138）——≤ 阈值：finalize
+    /// 现算并**预热缓存**（预计算生效：同 meta 再取复用，不重算）。
+    #[test]
+    fn recompute_fingerprint_precomputes_within_threshold() {
+        let (_dir, path) = fake_exe_path();
+        let meta = MetaSnapshot {
+            size: 100,
+            mtime_nanos: 42,
+            file_id: 7,
+        };
+        let mut cache = FingerprintCache::with_source(Box::new(FakeSource {
+            meta,
+            sha: sha64('a'),
+        }));
+        let fp = recompute_fingerprint(
+            &path.to_string_lossy(),
+            &mut cache,
+            FINGERPRINT_PRECOMPUTE_THRESHOLD,
+        )
+        .expect("可读文件应固化成功");
+        assert_eq!(fp.sha256, sha64('a'));
+        assert_eq!(fp.size, 100);
+        // 预计算生效：缓存已含指纹——同 meta 再取复用，hash_calls 不增
+        assert_eq!(cache.sha256(&path, meta), Some(sha64('a')));
+        assert_eq!(cache.hash_calls(), 1, "≤ 阈值：固化现算一次，评估复用");
+    }
+
+    /// recompute_fingerprint 阈值语义（§6-2）——> 阈值：**惰性**——固化落盘
+    /// 所需哈希仍现算（fail-closed 不变），但缓存不预热：首次命中重新全量哈希。
+    #[test]
+    fn recompute_fingerprint_lazy_above_threshold() {
+        let (_dir, path) = fake_exe_path();
+        let meta = MetaSnapshot {
+            size: FINGERPRINT_PRECOMPUTE_THRESHOLD + 1,
+            mtime_nanos: 42,
+            file_id: 7,
+        };
+        let mut cache = FingerprintCache::with_source(Box::new(FakeSource {
+            meta,
+            sha: sha64('a'),
+        }));
+        let fp = recompute_fingerprint(
+            &path.to_string_lossy(),
+            &mut cache,
+            FINGERPRINT_PRECOMPUTE_THRESHOLD,
+        )
+        .expect("> 阈值固化仍现算（落盘 sha256 必需）");
+        assert_eq!(fp.sha256, sha64('a'));
+        assert_eq!(fp.size, FINGERPRINT_PRECOMPUTE_THRESHOLD + 1);
+        assert_eq!(cache.hash_calls(), 1, "固化哈希现算一次");
+        // 缓存冷态：同 meta 再取须重算（预计算未发生）
+        assert_eq!(cache.sha256(&path, meta), Some(sha64('a')));
+        assert_eq!(cache.hash_calls(), 2, "> 阈值：缓存未预热，首次命中重算");
+    }
+
+    /// 阈值边界与自定义配置语义：size == 阈值（≤ 含等于）→ 预热；阈值 0
+    /// （config 可设）→ 全部惰性。
+    #[test]
+    fn recompute_fingerprint_threshold_boundary_and_custom() {
+        let (_dir, path) = fake_exe_path();
+        let meta = MetaSnapshot {
+            size: 100,
+            mtime_nanos: 42,
+            file_id: 7,
+        };
+        // size == 阈值 → 预热（≤ 边界含等于）
+        let mut cache = FingerprintCache::with_source(Box::new(FakeSource {
+            meta,
+            sha: sha64('a'),
+        }));
+        let _ = recompute_fingerprint(&path.to_string_lossy(), &mut cache, 100).unwrap();
+        assert_eq!(cache.hash_calls(), 1);
+        assert_eq!(
+            cache.sha256(&path, meta),
+            Some(sha64('a')),
+            "size == 阈值应预热（≤ 含等于）"
+        );
+        assert_eq!(cache.hash_calls(), 1);
+        // 自定义阈值 0 → 全部惰性（缓存不预热）
+        let mut cache0 = FingerprintCache::with_source(Box::new(FakeSource {
+            meta,
+            sha: sha64('a'),
+        }));
+        let _ = recompute_fingerprint(&path.to_string_lossy(), &mut cache0, 0).unwrap();
+        assert_eq!(cache0.sha256(&path, meta), Some(sha64('a')));
+        assert_eq!(cache0.hash_calls(), 2, "阈值 0：全部惰性，首次命中重算");
+    }
+
+    /// 恒失败文件源（预计算失败路径：stat/hash 不可达）。
+    struct UnreadableSource;
+    impl FingerprintSource for UnreadableSource {
+        fn stat(&self, _path: &Path) -> Option<MetaSnapshot> {
+            None
+        }
+        fn hash(&self, _path: &Path) -> Result<String> {
+            Err(lk_core::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "unreadable",
+            )))
+        }
+    }
+
+    /// 预计算失败不影响 finalize 既有语义（fail-closed 保持）：文件不可读 →
+    /// `None`（调用方判失败），不 panic、不改变错误形态。
+    #[test]
+    fn recompute_fingerprint_failure_stays_fail_closed() {
+        // stat 失败（候选不可读）→ None
+        let mut cache = FingerprintCache::with_source(Box::new(UnreadableSource));
+        assert_eq!(
+            recompute_fingerprint("/bin/tool", &mut cache, FINGERPRINT_PRECOMPUTE_THRESHOLD),
+            None,
+            "stat 不可读 → None（fail-closed）"
+        );
+        // hash 失败 → None（阈值两侧同形态）
+        struct HashFailsSource;
+        impl FingerprintSource for HashFailsSource {
+            fn stat(&self, _path: &Path) -> Option<MetaSnapshot> {
+                Some(MetaSnapshot {
+                    size: 1,
+                    mtime_nanos: 1,
+                    file_id: 1,
+                })
+            }
+            fn hash(&self, _path: &Path) -> Result<String> {
+                Err(lk_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "unreadable",
+                )))
+            }
+        }
+        let mut cache = FingerprintCache::with_source(Box::new(HashFailsSource));
+        assert_eq!(
+            recompute_fingerprint("/bin/tool", &mut cache, FINGERPRINT_PRECOMPUTE_THRESHOLD),
+            None,
+            "≤ 阈值 hash 失败 → None"
+        );
+        assert_eq!(
+            recompute_fingerprint("/bin/tool", &mut cache, 0),
+            None,
+            "> 阈值 hash 失败 → None"
+        );
     }
 }
