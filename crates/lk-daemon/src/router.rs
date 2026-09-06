@@ -117,6 +117,12 @@ pub(crate) trait DeferredFlow {
     /// 可否 RePended（二次审批）：仅注入裁决声明 true（锁定态一体化补
     /// 指纹裁决，issue #140）；声明 false 的流程 finalize 恒 Done。
     fn rependable(&self) -> bool;
+
+    /// 是否支持锁定态一体化解锁（#67 inject / #23 读通道，issue #150 显式
+    /// 声明）：规则门 / 写门恒 false——产品决策留档（规则门锁态
+    /// `session.invalid` 先行；写门无解锁窗，write-gate.md §5.3 拍板保留），
+    /// 不被管道意外改变；注册表完整性测试钉住声明值。
+    fn unlock_supported(&self) -> bool;
 }
 
 /// 流程注册表（唯一分发依据）：method → 流程声明。与 [`strategy_of`] 的
@@ -206,7 +212,16 @@ pub(crate) fn run_deferred<S: DeferredSeam>(
         if !flow.precheck(g, token.as_deref()) {
             None
         } else {
-            Some(flow.begin(g, method, id.clone(), params, peer))
+            let begin = flow.begin(g, method, id.clone(), params, peer);
+            // 一体化解锁声明一致性（issue #150，debug 钉）：needs_unlock 条目
+            // 只能由声明支持一体化解锁的门登记（注册表完整性测试亦钉住声明）。
+            if let GateBegin::Pending { request_id } = &begin {
+                debug_assert!(
+                    !g.pending_needs_unlock(*request_id) || flow.unlock_supported(),
+                    "{method} 流程声明不支持一体化解锁却登记 needs_unlock 条目"
+                );
+            }
+            Some(begin)
         }
     });
     let Some(begin) = begin else {
@@ -408,6 +423,10 @@ mod tests {
         fn rependable(&self) -> bool {
             true
         }
+
+        fn unlock_supported(&self) -> bool {
+            true
+        }
     }
 
     /// Mock 缝：锁段计数 + 预编程决策队列（耗尽后恒 Denied）；持有一个
@@ -558,10 +577,11 @@ mod tests {
         assert_eq!(seam.lock_segments(), 3);
     }
 
-    /// 注册表完整性（issue #149 验收 1）：策略表 ApprovalDeferred 集合与
-    /// 流程注册表严格同步——每个审批延迟方法都有流程声明（可 RePended 仅
-    /// 注入门），每个有流程声明的方法都在策略表内；Inline / OutsideLock
-    /// 方法无流程声明。
+    /// 注册表完整性（issue #149 验收 1 + issue #150）：策略表
+    /// ApprovalDeferred 集合与流程注册表严格同步——每个审批延迟方法都有
+    /// 流程声明（可 RePended 仅注入门；一体化解锁支持 = 注入门 + 读通道，
+    /// 规则门/写门显式声明 false），每个有流程声明的方法都在策略表内；
+    /// Inline / OutsideLock 方法无流程声明。
     #[test]
     fn flow_registry_matches_strategy_table() {
         let deferred = [
@@ -582,6 +602,13 @@ mod tests {
             let flow = gate_flow(m).unwrap_or_else(|| panic!("{m} 缺流程声明"));
             // RePended 声明：仅注入门（锁定态一体化补指纹裁决，#140）。
             assert_eq!(flow.rependable(), m == M_AUTHZ_EVALUATE);
+            // 一体化解锁声明（issue #150）：注入门（#67）+ 读通道（#23）
+            // 支持；规则门/写门显式无需（产品决策留档）。
+            assert_eq!(
+                flow.unlock_supported(),
+                matches!(m, M_AUTHZ_EVALUATE | M_ITEM_GET | M_ITEM_EXPORT),
+                "{m} 一体化解锁声明不符"
+            );
         }
         // 策略表外的方法无流程声明（新增审批门 = 策略表一行 + 注册表一行）。
         for m in [M_SYNC_TRIGGER, M_VAULT_STATUS, M_ITEM_LIST, M_RULE_LIST] {

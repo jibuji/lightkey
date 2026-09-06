@@ -17,11 +17,11 @@ impl Daemon {
     ///
     /// **锁定态一体化（#67）**：待审条目带 `needs_unlock` 时，`allowed`
     /// 决策必须携带 `masterPassword`——先做**临时解锁**（AuthGuard 限流
-    /// 照常生效、审计 `vault.unlock`），解锁成功才把临时 vault 存入待审
-    /// 条目并 `resolve(Allowed)`（finalize 消费后即销毁临时态，不签发会话
-    /// 令牌）；主密码错误 → 错误响应退回弹窗（条目保留，倒计时内可重试）。
-    /// denied 决策无需主密码（未解锁也写不了审计——锁态无 K_audit，
-    /// 与 v0 headless 拒绝同口径不审计）。
+    /// 照常生效、审计 `vault.unlock`），解锁成功才把审批工作区存入待审
+    /// 条目并 `resolve(Allowed)`（工作区生命周期与不变量见 gate_kit.rs
+    /// `ApprovalWorkspace`）；主密码错误 → 错误响应退回弹窗（条目保留，
+    /// 倒计时内可重试）。denied 决策无需主密码（未解锁也写不了审计——
+    /// 锁态无 K_audit，与 v0 headless 拒绝同口径不审计）。
     pub(crate) fn approval_result(
         &mut self,
         id: Value,
@@ -105,21 +105,21 @@ impl Daemon {
                 self.unlock_guard.on_success();
                 // 审计 vault.unlock（via=inject-gui 一体化；channel 按桌面
                 // 直调归因 #66——starter/channel 取 desktop）。锁态无会话，
-                // 但临时临时 vault 持 K_audit 可签名。
+                // 但临时 vault 持 K_audit 可签名。
                 let _ = self.audit.append(
                     vault.keys(),
                     &caller.event(M_VAULT_UNLOCK, AuditResult::Allowed),
                 );
-                // 临时 vault 存入待审条目（finalize 消费后即销毁；不置
-                // shared.vault、不签发令牌、不写 session.token）。
-                // 统一注册表（issue #148）里任何门的 needs_unlock 条目都
-                // 可能命中——条目已被消费（超时竞态）则放弃存储，随本函数
-                // 结束 drop。
+                // 审批工作区（issue #150）存入待审条目：临时解锁材料的
+                // 生命周期与条目严格一致（finalize 消费即随条目销毁；超时
+                // 竞态则放弃存储、随本函数作用域整体 drop）——「不签令牌 /
+                // 不置共享 vault / 单次即毁」由工作区类型与生命周期承载
+                // （见 gate_kit.rs `ApprovalWorkspace` 类型文档）。
                 let _ = self
                     .pending_gates
                     .lock()
                     .unwrap()
-                    .store_temp_vault(p.request_id, vault);
+                    .store_workspace(p.request_id, ApprovalWorkspace::new(vault));
                 let accepted = self.shared.approvals.resolve(
                     p.request_id,
                     ApprovalDecision::Allowed,
@@ -142,8 +142,10 @@ impl Daemon {
     /// 注册表（四表合一，gate_kit.rs）。`approval.result` 的 allowed 决策
     /// 对这类条目要求携带 masterPassword 先做临时解锁（dispatch 会话绕过
     /// 与 [`Self::approval_result`] 共用本判定，见 daemon/mod.rs
-    /// `approval_needs_unlock`）。
-    pub(super) fn pending_needs_unlock(&self, request_id: uuid::Uuid) -> bool {
+    /// `approval_needs_unlock`；通用 deferred 编排器的 debug 一致性断言
+    /// 亦用——needs_unlock 条目只能由声明支持一体化解锁的门登记，issue
+    /// #150）。
+    pub(crate) fn pending_needs_unlock(&self, request_id: uuid::Uuid) -> bool {
         self.pending_gates.lock().unwrap().needs_unlock(request_id)
     }
 

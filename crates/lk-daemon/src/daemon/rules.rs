@@ -142,16 +142,14 @@ impl Daemon {
                 export_meta: None,
                 fingerprint_mismatch: None,
             },
-            GateEntry {
-                needs_unlock: false,
-                temp_vault: None,
-                kind: GateKind::Rule(PendingRuleChange {
-                    op: parsed.op,
-                    command_summary: command,
-                    starter,
-                    via_auto,
-                }),
-            },
+            // 常规审批条目（issue #150：`GateEntry::approval` 显式声明规则门
+            // 无需一体化解锁——锁态 `session.invalid` 先行，见 precheck）
+            GateEntry::approval(GateKind::Rule(PendingRuleChange {
+                op: parsed.op,
+                command_summary: command,
+                starter,
+                via_auto,
+            })),
         );
         GateBegin::Pending { request_id }
     }
@@ -571,7 +569,8 @@ struct RuleListParams {
 /// 规则管理审批门流程声明（issue #149）：预检 / begin / finalize 委托既有
 /// 门方法，锁编排由 router.rs 通用 deferred 编排器统一承担。**不可
 /// RePended**——规则门 finalize 一步收尾（TOCTOU 重校验后落盘），无二次
-/// 审批路径。
+/// 审批路径。**无需一体化解锁**（issue #150 显式声明，产品决策留档）：
+/// 锁态先失败（规则在加密库内，`session.invalid`），不弹解锁窗。
 pub(crate) struct RuleFlow;
 
 impl crate::router::DeferredFlow for RuleFlow {
@@ -601,6 +600,10 @@ impl crate::router::DeferredFlow for RuleFlow {
     }
 
     fn rependable(&self) -> bool {
+        false
+    }
+
+    fn unlock_supported(&self) -> bool {
         false
     }
 }

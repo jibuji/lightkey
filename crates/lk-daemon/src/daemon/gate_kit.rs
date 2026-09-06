@@ -9,9 +9,13 @@
 //! - [`Daemon::open_gate_approval`]：审批请求（id / challenge / 超时）单点
 //!   铸造并经 `ApprovalChannel::open` 登记广播（challenge 一次性等不变量
 //!   只有一处实现，#78）；
-//! - [`Daemon::audit_gate`] + [`ActingVault`]：四门合一的审计辅助——事件
-//!   字段由门提供，K_audit 按「本次执行所用 vault」签名（调用方决定共享
-//!   vault 还是临时 vault，为审批工作区衔接预留，T4）；
+//! - [`Daemon::audit_gate`] + [`ActingVault`] + [`Daemon::with_acting_vault`]：
+//!   四门合一的审计辅助——事件字段由门提供，K_audit 按「本次执行所用
+//!   vault」签名（执行/审计入口统一收 ActingVault，issue #150 起无
+//!   `_from` 变体对）；
+//! - [`ApprovalWorkspace`]：审批工作区（issue #150）——临时解锁材料与
+//!   单次裁决状态的条目内一等对象；「单次即毁 / 不签令牌 / 不置共享
+//!   vault / 指纹裁决单发」不变量的**单点出处**（类型文档即权威）；
 //! - 参数解析辅助（[`parse_gate_params`] / [`invalid_params`]）；
 //! - [`DeferredOutcome`]：finalize 阶段统一结果类型（RePended 由通用
 //!   deferred 编排器内建循环消费）。
@@ -46,20 +50,97 @@ pub(crate) enum DeferredOutcome {
     RePended { request_id: uuid::Uuid },
 }
 
-/// 统一待审批注册表条目（key = 请求 id，由外层 map 承担）。needs_unlock
-/// 与临时 vault 是条目级一等字段（issue #148）：审批解锁辅助表无关，且为
-/// 审批工作区（T4：临时解锁材料成为注册表条目内的一等对象）预留位置。
+/// 审批工作区（issue #150）：注册表条目内的**一等对象**——临时解锁材料与
+/// 单次裁决状态的唯一承载。正常路径恒不存在（条目字段恒 `None`），仅锁定态
+/// 一体化解锁路径（#67 inject / #23 读通道）由 `approval.result`（正确主
+/// 密码 + allowed）填充。
+///
+/// 生命周期与条目**严格一致**：工作区只存在于 [`GateEntry`] 内，finalize
+/// 消费即随条目销毁；超时竞态（条目已被 finalize 取走）下 `store_workspace`
+/// 失败、工作区随调用方作用域整体 drop。由此**由构造与生命周期承载**的
+/// 不变量（取代既往散布各门 finalize / 审批回传路径的注释纪律）：
+///
+/// - **单次即毁**：vault 字段私有、只出不进借用（[`Self::vault`]），
+///   所有权无法离开工作区——不存在把临时 vault 移入 `shared.vault`（共享
+///   解锁态）的代码路径；
+/// - **不签发会话令牌 / 不写 session.token**：会话签发代码对工作区无任何
+///   访问面（无持有主密码、无 vault 所有权可移交）；
+/// - **指纹裁决单发**（issue #140）：裁决一次性状态随工作区走
+///   （[`Self::fingerprint_adjudicated`] / [`Self::mark_fingerprint_adjudicated`]），
+///   二次审批条目携带已裁决工作区——防「裁决 → 审批 → 裁决」死循环由
+///   结构承载，#140 类竞态不可复发。
+pub(crate) struct ApprovalWorkspace {
+    /// 临时解锁 vault（私有：仅借出引用，无所有权出口）。
+    vault: UnlockedVault,
+    /// 指纹裁决单发状态（issue #140）：false = 本次审批尚未做过指纹裁决
+    /// （锁定态一体化 begin 无法裁决）；true = 已裁决（解锁态 begin 侧或
+    /// 二次审批条目），finalize 不得重复裁决。
+    fp_adjudicated: bool,
+}
+
+impl ApprovalWorkspace {
+    /// 由临时解锁产物构造（`approval.result` 解锁成功路径，session.rs）。
+    /// 初始未裁决（锁定态一体化 begin 无法预裁决）。
+    pub(crate) fn new(vault: UnlockedVault) -> Self {
+        Self {
+            vault,
+            fp_adjudicated: false,
+        }
+    }
+
+    /// 临时 vault 借用（K_audit / 规则 / 密文在此内存态可用；finalize 在
+    /// 其上执行裁决、读值与审计签名）。
+    pub(crate) fn vault(&self) -> &UnlockedVault {
+        &self.vault
+    }
+
+    /// 指纹裁决是否已执行（单发状态读取）。
+    pub(crate) fn fingerprint_adjudicated(&self) -> bool {
+        self.fp_adjudicated
+    }
+
+    /// 标记指纹裁决已执行（转二次审批时随工作区移入新条目——新条目的
+    /// finalize 不再裁决）。
+    pub(crate) fn mark_fingerprint_adjudicated(&mut self) {
+        self.fp_adjudicated = true;
+    }
+}
+
+/// 统一待审批注册表条目（key = 请求 id，由外层 map 承担）。needs_unlock 与
+/// 审批工作区是条目级一等字段（issue #148/#150）：审批解锁辅助表无关。
 pub(crate) struct GateEntry {
     /// 锁定态一体化标志（#67 inject / #23 读通道）：审批需先临时解锁；
     /// `authz.request` 帧的 `needsUnlock` 与本值同源（单点铸造保证）。
+    /// 规则门/写门恒 false——由 [`GateEntry::approval`] 构造器与各门流程
+    /// 声明（`DeferredFlow::unlock_supported`）显式承载（issue #150）。
     pub needs_unlock: bool,
-    /// 临时解锁 vault（审批工作区预留位）：由 `approval.result`（正确主
-    /// 密码 + allowed）填充，finalize 消费后随条目销毁——**不签发会话
-    /// 令牌 / 不写 session.token / 不置 shared vault**（#67 关键约束）。
-    /// 正常路径恒空，仅一体化解锁路径填充。
-    pub temp_vault: Option<UnlockedVault>,
+    /// 审批工作区（issue #150，见 [`ApprovalWorkspace`] 类型文档——不变量
+    /// 「单次即毁 / 不签令牌 / 不置共享 vault」的单点出处）。正常路径恒
+    /// `None`，仅一体化解锁路径由审批回传填充。
+    pub workspace: Option<ApprovalWorkspace>,
     /// 门负载（各门 begin 期已解析的产物）。
     pub kind: GateKind,
+}
+
+impl GateEntry {
+    /// 常规审批条目（解锁态；**显式声明无需一体化解锁**——规则门/写门等）。
+    pub(crate) fn approval(kind: GateKind) -> Self {
+        Self {
+            needs_unlock: false,
+            workspace: None,
+            kind,
+        }
+    }
+
+    /// 一体化解锁审批条目（锁定态 #67/#23：审批回传以主密码临时解锁后
+    /// 由 [`PendingGates::store_workspace`] 填充工作区）。
+    pub(crate) fn unified_unlock(kind: GateKind) -> Self {
+        Self {
+            needs_unlock: true,
+            workspace: None,
+            kind,
+        }
+    }
 }
 
 /// 统一注册表条目的门负载（issue #148：payload = 门枚举）。
@@ -77,7 +158,7 @@ pub(crate) enum GateKind {
 /// 统一待审批注册表（issue #148：四张 pending 表并成一张；key = 请求 id）。
 ///
 /// 命令线程登记 / finalize 消费，`approval.result` 回传线程写入（needs_unlock
-/// 判定与临时 vault 存取经 [`Self::needs_unlock`] / [`Self::store_temp_vault`]
+/// 判定与工作区存取经 [`Self::needs_unlock`] / [`Self::store_workspace`]
 /// ——表无关，不感知具体门）。
 #[derive(Default)]
 pub(crate) struct PendingGates {
@@ -106,17 +187,28 @@ impl PendingGates {
             .unwrap_or(false)
     }
 
-    /// 把临时解锁 vault 存入待审条目（`approval.result` 的 allowed 决策，
-    /// 主密码临时解锁成功后）。返回条目是否存在（true = 已存储）；条目已
-    /// 被 finalize 消费（超时竞态）→ false，vault 随调用方作用域 drop。
-    pub(crate) fn store_temp_vault(
+    /// 把审批工作区存入待审条目（`approval.result` 的 allowed 决策，主密码
+    /// 临时解锁成功后；issue #150）。返回条目是否存在（true = 已存储）；
+    /// 条目已被 finalize 消费（超时竞态）→ false，工作区随调用方作用域
+    /// 整体 drop（生命周期与条目严格一致）。
+    ///
+    /// 条目已带工作区（#140 二次审批条目）时**替换解锁材料、保留单次裁决
+    /// 状态**：指纹单发状态属于条目侧裁决流程而非某一份解锁材料——重解锁
+    /// 不得重置「已裁决」标记，否则失配二次审批将再次裁决、再次失配，形成
+    /// 裁决死循环（#140 类竞态由结构排除）。
+    pub(crate) fn store_workspace(
         &mut self,
         request_id: uuid::Uuid,
-        vault: UnlockedVault,
+        mut ws: ApprovalWorkspace,
     ) -> bool {
         match self.entries.get_mut(&request_id) {
             Some(entry) => {
-                entry.temp_vault = Some(vault);
+                if let Some(prev) = entry.workspace.take() {
+                    if prev.fingerprint_adjudicated() {
+                        ws.mark_fingerprint_adjudicated();
+                    }
+                }
+                entry.workspace = Some(ws);
                 true
             }
             None => false,
@@ -181,6 +273,26 @@ impl Daemon {
         request_id
     }
 
+    /// 「本次执行所用 vault」统一取用原语（issue #150）：执行/审计入口收
+    /// [`ActingVault`]——Shared = 共享 vault 读锁内取（`None` = 已锁定，
+    /// K_audit 已擦除，语义由调用方决定：审计跳过 / 执行保守报错）；
+    /// Temporary = 锁定态一体化的临时 vault 借用（审批工作区，见
+    /// [`ApprovalWorkspace::vault`]）。执行与审计的 `_from` 变体对由此
+    /// 全消（环境解析 / 读值执行 / 导出执行 / 审计同一入口）。
+    pub(crate) fn with_acting_vault<R>(
+        &self,
+        acting: ActingVault<'_>,
+        f: impl FnOnce(Option<&UnlockedVault>) -> R,
+    ) -> R {
+        match acting {
+            ActingVault::Shared => {
+                let guard = self.shared.vault.read().unwrap();
+                f(guard.as_ref())
+            }
+            ActingVault::Temporary(v) => f(Some(v)),
+        }
+    }
+
     /// 四门合一的审计辅助（issue #148）：事件字段（starter/target/command/
     /// channel/result）由调用方提供，K_audit 按**本次执行所用 vault**
     /// （[`ActingVault`]）签名——调用方决定传共享 vault 还是临时 vault。
@@ -195,15 +307,10 @@ impl Daemon {
         channel: AuditChannel,
         result: AuditResult,
     ) {
-        let keys = match acting {
-            ActingVault::Shared => {
-                let vault = self.shared.vault.read().unwrap();
-                let Some(v) = vault.as_ref() else {
-                    return; // 已锁定 → 无法签名（K_audit 已擦除）
-                };
-                v.keys().clone()
-            }
-            ActingVault::Temporary(v) => v.keys().clone(),
+        let keys = match self.with_acting_vault(acting, |v| v.map(|v| v.keys().clone())) {
+            // 共享 vault 已锁定 → K_audit 已擦除，跳过审计（既有口径）
+            Some(keys) => keys,
+            None => return,
         };
         let _ = self.audit.append(
             &keys,
@@ -220,13 +327,15 @@ impl Daemon {
     }
 }
 
-/// 本次执行所用 vault（acting vault；审计签名 / 执行的 K_audit 来源）。
-/// 调用方决定传共享 vault 还是临时 vault（取走即空、drop 即毁，#67）。
+/// 本次执行所用 vault（acting vault；执行与审计的 K_audit 来源）。执行/
+/// 审计入口统一收本枚举（issue #150：`with_acting_vault` 单点取用）——
+/// 调用方决定传共享 vault 还是临时 vault；临时形态的 vault 由审批工作区
+/// 持有（借用，生命周期不变量见 [`ApprovalWorkspace`]）。
 pub(crate) enum ActingVault<'a> {
-    /// 共享 vault（解锁态常态路径）；已锁定 → 审计辅助跳过（K_audit 擦除）。
+    /// 共享 vault（解锁态常态路径）；已锁定（`None`）→ 语义由调用方决定
+    /// （审计跳过 / 执行保守报错）。
     Shared,
-    /// 锁定态一体化的临时 vault（#67/#23）：单次披露/注入即毁，K_audit
-    /// 在内存可用。
+    /// 锁定态一体化的临时 vault（#67/#23；审批工作区借用）。
     Temporary(&'a UnlockedVault),
 }
 
@@ -260,28 +369,29 @@ mod tests {
     /// 构造一个 disclosure 门条目（字段全为简单值；GateKind 选哪个门不影响
     /// 条目级行为——这正是「表无关」的断言点）。
     fn disclosure_entry(needs_unlock: bool) -> GateEntry {
-        GateEntry {
-            needs_unlock,
-            temp_vault: None,
-            kind: GateKind::Disclosure(PendingDisclosure {
-                method: lk_core::ipc::M_ITEM_GET.to_string(),
-                item_id: uuid::Uuid::new_v4(),
-                item_name: Some("item".to_string()),
-                starter: "test".to_string(),
-            }),
+        let kind = GateKind::Disclosure(PendingDisclosure {
+            method: lk_core::ipc::M_ITEM_GET.to_string(),
+            item_id: uuid::Uuid::new_v4(),
+            item_name: Some("item".to_string()),
+            starter: "test".to_string(),
+        });
+        if needs_unlock {
+            GateEntry::unified_unlock(kind)
+        } else {
+            GateEntry::approval(kind)
         }
     }
 
-    /// 初始化临时 vault（审批工作区预留位需要真实的 UnlockedVault 值；
-    /// test KDF 参数下开销可忽略。UnlockedVault 不可 Clone，每次取用重新
-    /// 解锁）。
+    /// 初始化临时 vault（审批工作区需要真实的 UnlockedVault 值；test KDF
+    /// 参数下开销可忽略。UnlockedVault 不可 Clone，每次取用重新解锁）。
     fn init_vault(dir: &std::path::Path) {
         let mut audit = lk_core::audit::AuditLog::open(dir).unwrap();
         init_vault_with_params(dir, "pw123456", false, &mut audit, &test_kdf_params()).unwrap();
     }
 
-    fn unlock_vault(dir: &std::path::Path) -> UnlockedVault {
-        UnlockedVault::unlock(dir, "pw123456").unwrap()
+    /// 构造填充态审批工作区（临时解锁 vault 由测试主密码解锁）。
+    fn workspace(dir: &std::path::Path) -> ApprovalWorkspace {
+        ApprovalWorkspace::new(UnlockedVault::unlock(dir, "pw123456").unwrap())
     }
 
     #[test]
@@ -303,22 +413,78 @@ mod tests {
         assert!(!registry.needs_unlock(plain));
     }
 
-    /// 临时 vault 生命周期与条目严格一致（审批工作区衔接预留）：在册条目
-    /// 存储成功、随 remove 返回；条目已被消费（超时竞态）→ false。
+    /// 审批工作区生命周期与条目严格一致（issue #150）：在册条目存储成功、
+    /// 随 remove 返回（finalize 消费）；条目已被消费（超时竞态）→ false，
+    /// 工作区随调用方作用域整体 drop。
     #[test]
-    fn temp_vault_storage_follows_entry_lifecycle() {
+    fn workspace_storage_follows_entry_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         init_vault(dir.path());
         let mut registry = PendingGates::default();
         // 条目不在册 → 放弃存储（调用方作用域 drop）
-        assert!(!registry.store_temp_vault(uuid::Uuid::new_v4(), unlock_vault(dir.path())));
+        assert!(!registry.store_workspace(uuid::Uuid::new_v4(), workspace(dir.path())));
         let id = uuid::Uuid::new_v4();
         registry.insert(id, disclosure_entry(true));
-        assert!(registry.store_temp_vault(id, unlock_vault(dir.path())));
+        assert!(registry.store_workspace(id, workspace(dir.path())));
         let entry = registry.remove(&id).expect("条目在册");
-        assert!(entry.temp_vault.is_some());
+        assert!(entry.workspace.is_some());
         // 消费后再存 → false（一次性语义）
-        assert!(!registry.store_temp_vault(id, unlock_vault(dir.path())));
+        assert!(!registry.store_workspace(id, workspace(dir.path())));
+    }
+
+    /// 单次裁决状态属于条目而非解锁材料（issue #150，#140 回归钉）：二次
+    /// 审批条目已带「已裁决」工作区时，`approval.result` 重解锁存入**新的**
+    /// 解锁材料——替换 vault 但不得重置已裁决标记，否则失配二次审批将再次
+    /// 裁决、再次失配，形成裁决死循环。
+    #[test]
+    fn store_workspace_preserves_single_shot_state_of_repend_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        init_vault(dir.path());
+        let mut registry = PendingGates::default();
+        let id = uuid::Uuid::new_v4();
+        // 模拟二次审批条目：工作区已裁决（finalize reopen 侧标记）
+        registry.insert(id, disclosure_entry(true));
+        let mut ws = workspace(dir.path());
+        ws.mark_fingerprint_adjudicated();
+        registry.store_workspace(id, ws);
+        // 回传重解锁：全新解锁材料替换既有工作区
+        assert!(registry.store_workspace(id, workspace(dir.path())));
+        let entry = registry.remove(&id).expect("条目在册");
+        let ws = entry.workspace.expect("工作区在册");
+        assert!(
+            ws.fingerprint_adjudicated(),
+            "重解锁不得重置单次裁决状态（#140 裁决死循环由结构排除）"
+        );
+    }
+
+    /// 工作区 = 临时解锁材料 + 单次裁决状态的一等对象（issue #150）：
+    /// vault 只能借用（K_audit 在内存可用）；指纹裁决单发状态默认 false、
+    /// 标记后 true（防裁决 → 审批 → 裁决死循环由结构承载，issue #140）。
+    #[test]
+    fn workspace_borrows_vault_and_carries_single_shot_state() {
+        let dir = tempfile::tempdir().unwrap();
+        init_vault(dir.path());
+        let mut ws = workspace(dir.path());
+        // 临时 vault 可借用：K_audit 在内存（审计可签名）
+        let _ = ws.vault().keys();
+        // 单次裁决状态：默认未裁决
+        assert!(!ws.fingerprint_adjudicated());
+        ws.mark_fingerprint_adjudicated();
+        assert!(ws.fingerprint_adjudicated());
+    }
+
+    /// 条目构造器即声明（issue #150）：`GateEntry::approval` = 常规审批
+    /// （needs_unlock=false，规则门/写门显式声明无需一体化解锁）；
+    /// `GateEntry::unified_unlock` = 一体化解锁审批（needs_unlock=true，
+    /// #67/#23）；工作区在两条路径上初始恒空。
+    #[test]
+    fn entry_constructors_declare_unlock_gate() {
+        let plain = disclosure_entry(false);
+        assert!(!plain.needs_unlock);
+        assert!(plain.workspace.is_none());
+        let unified = disclosure_entry(true);
+        assert!(unified.needs_unlock);
+        assert!(unified.workspace.is_none());
     }
 
     /// 参数解析辅助：成功路径原样解析；失败路径 = `invalid params` 行
