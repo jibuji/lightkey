@@ -36,6 +36,7 @@
 //! | [`ipc`] | JSON-RPC 2.0 协议类型、会话令牌、错误码 | `docs/ipc.md` |
 //! | [`bus`] | 事件总线（模拟 Cordis `emit`：观察广播，fire-and-forget） | `docs/plugin-architecture.md` §5 |
 //! | [`service`] | A/B 层 trait 服务 + C 层装配点（[`service::CoreServices`]） | `docs/plugin-architecture.md` §3/§4 |
+//! | [`peb`]（Windows） | 远端进程 PEB 读取原语（唯一一份；进程链回溯 cwd + 对端 env 块共用） | `docs/identity-binding.md` §5.1 |
 //!
 //! ## 里程碑状态
 //!
@@ -54,6 +55,8 @@ pub mod fingerprint;
 pub mod ipc;
 pub mod model;
 pub mod path_ns;
+#[cfg(windows)]
+pub mod peb;
 pub mod recovery;
 pub mod service;
 pub mod session;
