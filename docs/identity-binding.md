@@ -150,7 +150,7 @@ pub struct ProgramFingerprint {
 
 ### 5.4 命令形态匹配（绑定规则，issue #132 回归钉住）
 
-- 绑定规则的 `command` = CLI 推导的可执行 **basename**（`/usr/bin/npm` →
+- 绑定规则的 `command` = 可执行 **basename**（`/usr/bin/npm` →
   `"npm"`，§11 PR C；Windows `--fingerprint C:\...\npm.cmd` → `"npm.cmd"`）；
   注入请求 `command` 是**完整命令串**（`lk inject -- npm publish`）。匹配层
   对绑定规则按 `command[0]` 的**可执行名**（basename，去目录）与
@@ -165,6 +165,15 @@ pub struct ProgramFingerprint {
   候选规则，安全仍由 §5.1 解析 + §5.2 指纹门承载（解析到不同文件/不可解析
   → 审批 fail-closed）。
 - **未绑定（`fingerprint=None`）规则维持整串 glob 语义**（§4 兼容性零变化）。
+- **落库单点规范化**（issue #136）：绑定规则的 basename 形态由 **daemon
+  规则门 finalize 落库侧**统一保证——`rule.add` 携带指纹且 capability=inject
+  时，daemon 把 `command` 规范化为 `command[0]` 的可执行名 basename 再落库
+  （与匹配层共用 `lk_core::authz::command0_exe_name` 一处契约实现）；规范化
+  失败（command 无可解析可执行名）→ `invalid params` 判失败（fail-closed，
+  绝不落注定休眠的死规则）。桌面「以新指纹重新授权」上报的完整命令串由该
+  点兜底；CLI `--fingerprint` 的 exe basename 形态与此幂等；前端上报亦同步
+  为被绑定 exe 的 basename。仅绑定 inject 规则规范化——未绑定规则维持整串
+  glob（兼容性零变化），read/write 规则不绑定命令。
 
 ## 6. 大文件与性能（拍板：指纹缓存 + 元信息失效 + 阈值）
 
