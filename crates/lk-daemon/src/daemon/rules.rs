@@ -388,10 +388,10 @@ impl Daemon {
                 // 侧重算（canonicalize + stat + 流式 SHA-256，走缓存）。重算失败
                 // （exe 不可解析/不可读）→ 无法绑定 → 判失败（fail-closed）。
                 // 预计算阈值语义：≤ 阈值现算并预热缓存；> 阈值惰性（哈希仍现算，
-                // 缓存留待首次命中）——见 `identity::recompute_fingerprint`。
+                // 缓存留待首次命中）——见 `binding::recompute_fingerprint`。
                 let fingerprint = match p.fingerprint.as_ref() {
                     Some(fp) => {
-                        match crate::identity::recompute_fingerprint(
+                        match crate::binding::recompute_fingerprint(
                             &fp.exe_path,
                             &mut self.fingerprint_cache,
                             precompute_threshold,

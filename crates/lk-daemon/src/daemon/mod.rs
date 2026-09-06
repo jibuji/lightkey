@@ -123,10 +123,10 @@ pub struct Daemon {
     pending_gates: Mutex<PendingGates>,
     /// 对端真实 env PATH 读取（M2.98 程序指纹，identity-binding.md §5.1；
     /// 生产 = 平台实现，测试注入假 PATH——信 daemon 不信客户端）。
-    peer_env: Arc<dyn crate::identity::PeerEnv>,
+    peer_env: Arc<dyn crate::peer_env::PeerEnv>,
     /// 内存指纹缓存（M2.98，§6）：exe_path → 元信息快照 + SHA-256；评估先
     /// stat、一致即复用（O(stat)）、不一致流式重算。**不落盘**（防同用户投毒）。
-    fingerprint_cache: crate::identity::FingerprintCache,
+    fingerprint_cache: crate::exe_resolve::FingerprintCache,
 }
 
 /// 授权判定第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
@@ -225,8 +225,8 @@ impl Daemon {
             gate,
             pending_gates: Mutex::new(PendingGates::default()),
             // M2.98 程序指纹：生产装配平台真实对端 env 读取 + 真实文件系统缓存。
-            peer_env: Arc::new(crate::identity::PlatformPeerEnv),
-            fingerprint_cache: crate::identity::FingerprintCache::new(),
+            peer_env: Arc::new(crate::peer_env::PlatformPeerEnv),
+            fingerprint_cache: crate::exe_resolve::FingerprintCache::new(),
         };
         // 启动自检：锚点 vs 链（截断检测，无需 K_audit），置 `anchor_ok`。
         daemon.anchor_selfcheck();
@@ -344,19 +344,16 @@ impl Daemon {
 
     /// M2.98 对端 env 读取注入缝（身份绑定测试/嵌入环境用；生产 = 平台真实
     /// 读取）。替换后指纹裁决走注入的对端 env PATH（信 daemon 不信客户端）。
-    pub fn set_peer_env(&mut self, peer_env: Arc<dyn crate::identity::PeerEnv>) {
+    pub fn set_peer_env(&mut self, peer_env: Arc<dyn crate::peer_env::PeerEnv>) {
         self.peer_env = peer_env;
     }
 
-    /// M2.98 诊断：指纹缓存 stat 取样次数（测试断言「元信息一致复用 → 只
-    /// stat 不重算」用语）。
-    pub fn fingerprint_stat_calls(&self) -> u64 {
-        self.fingerprint_cache.stat_calls()
-    }
-
-    /// M2.98 诊断：指纹缓存哈希重算次数（测试断言「内容改 → 重算 → 失配」）。
-    pub fn fingerprint_hash_calls(&self) -> u64 {
-        self.fingerprint_cache.hash_calls()
+    /// 指纹缓存引用（issue #152：白盒计数器移至缓存模块自身观测面——
+    /// `FingerprintCache::stat_calls`/`hash_calls` 仅测试构建可见，宿主公共面
+    /// 不再暴露计数测试钩子）。仅测试构建编译（同 `set_anchor` 先例）。
+    #[cfg(test)]
+    pub(crate) fn fingerprint_cache(&self) -> &crate::exe_resolve::FingerprintCache {
+        &self.fingerprint_cache
     }
 
     /// 处理一行 JSON-RPC 请求，返回一行响应（永不 panic）。

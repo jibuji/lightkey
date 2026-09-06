@@ -24,14 +24,21 @@
 //!   客户端自报字段一律不信任。
 
 pub mod audit_anchor;
+/// 绑定裁决（M2.98，identity-binding.md §5.2/§5.3；identity 三拆之一）：
+/// 绑定规则比对序 + finalize 侧重算指纹。daemon 侧裁决入口唯一为
+/// `Daemon::fingerprint_adjudicate`（begin 与 finalize 共用，issue #140/#152）。
+pub mod binding;
 pub mod config;
 mod daemon;
 pub mod dirs;
-/// 程序指纹（M2.98，identity-binding.md §5/§6）：对端真实 env PATH 读取 +
-/// 内存指纹缓存 + `command[0]` → canonical 候选解析。跨平台读取按 cfg 隔离；
-/// 解析/缓存为可注入 trait / 纯函数（单测）。
-pub mod identity;
+/// `command[0]` → canonical 候选解析 + 内存指纹缓存（M2.98；identity 三拆
+/// 之一）：PATH/PATHEXT 解析为纯函数，指纹缓存走可注入 [`exe_resolve::FingerprintSource`]。
+pub mod exe_resolve;
 pub mod notifier;
+/// 对端真实 env 读取（M2.98；identity 三拆之一）：Linux `/proc` /
+/// Windows PEB（`lk_core::peb` 原语）/ macOS KERN_PROCARGS2，失败 fail-closed；
+/// 可注入 [`peer_env::PeerEnv`]。
+pub mod peer_env;
 pub mod router;
 pub mod sync;
 pub mod transport;

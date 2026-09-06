@@ -130,7 +130,7 @@ mod tests {
     /// CLI 对端），父进程（模拟 daemon）以真实跨进程身份断言：
     ///   1. `lk_core::starter::resolve_peer_cwd(pid)` 仍可读（授权门第 1 层
     ///      数据源不 fail-closed）；
-    ///   2. `lk_daemon::identity::PlatformPeerEnv::peer_path(pid)`（对端
+    ///   2. `lk_daemon::peer_env::PlatformPeerEnv::peer_path(pid)`（对端
     ///      `/proc/<pid>/environ` 的 PATH）仍可读（M2.98 指纹绑定 Linux 面，
     ///      identity-binding.md §5.1）；
     ///   3. 子进程保持 dumpable（`PR_GET_DUMPABLE` 自报 1，经退出码回传）——
@@ -140,7 +140,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn hardening_keeps_peer_attribution_readable() {
-        use lk_daemon::identity::PeerEnv;
+        use lk_daemon::peer_env::PeerEnv;
         let rc = unsafe { libc::fork() };
         assert!(rc >= 0, "fork 失败");
         let pid = rc as u32;
@@ -173,7 +173,7 @@ mod tests {
             "harden 后对端 cwd 必须仍可读——非 dumpable 致 /proc EACCES 时授权门全拒（issue #119）：{cwd:?}"
         );
         // 2) 对端 environ PATH（M2.98 指纹绑定数据源；与 cwd 同门）
-        let path = lk_daemon::identity::PlatformPeerEnv.peer_path(pid);
+        let path = lk_daemon::peer_env::PlatformPeerEnv.peer_path(pid);
         assert!(
             path.is_some(),
             "harden 后对端 environ PATH 必须仍可读（issue #119 / identity-binding.md §5.1）：{path:?}"

@@ -20,7 +20,7 @@
 //!   控制组：`bound_rule_unresolvable_command_fails_closed`
 
 use super::*;
-use crate::identity::PeerEnv;
+use crate::peer_env::PeerEnv;
 use lk_core::fingerprint;
 use lk_core::model::{ProgramFingerprint, RuleDraft, RULE_CAPABILITY_INJECT};
 use std::path::{Path, PathBuf};
@@ -476,15 +476,15 @@ fn cache_meta_unchanged_reuses_hash() {
         assert_eq!(v["result"]["allowed"], true);
     };
     run(); // 冷态：stat + hash
-    let hash_after_first = state.lock().unwrap().fingerprint_hash_calls();
+    let hash_after_first = state.lock().unwrap().fingerprint_cache().hash_calls();
     run(); // 元信息一致 → 只 stat，复用缓存哈希
     assert_eq!(
-        state.lock().unwrap().fingerprint_hash_calls(),
+        state.lock().unwrap().fingerprint_cache().hash_calls(),
         hash_after_first,
         "元信息一致应复用，不重复哈希"
     );
     assert_eq!(
-        state.lock().unwrap().fingerprint_stat_calls(),
+        state.lock().unwrap().fingerprint_cache().stat_calls(),
         2, // 每次裁决先 stat 一次
     );
 }
@@ -531,7 +531,7 @@ fn content_change_recomputes_and_mismatches() {
             "失配 headless 拒绝 reason=no_ui：{resp}"
         );
         assert!(
-            state.lock().unwrap().fingerprint_hash_calls() >= 1,
+            state.lock().unwrap().fingerprint_cache().hash_calls() >= 1,
             "内容改触发重算"
         );
     }
@@ -732,7 +732,7 @@ fn locked_inject_binding_hit_silently_allows() {
     assert_eq!(v["result"]["env"]["NPM_TOKEN"], "sekrit");
     // 指纹裁决确实执行了（临时 vault 上补跑：哈希至少现算一次）
     assert!(
-        state.lock().unwrap().fingerprint_hash_calls() >= 1,
+        state.lock().unwrap().fingerprint_cache().hash_calls() >= 1,
         "锁定态一体化 finalize 必须执行指纹裁决（#140）"
     );
     // 无二次审批登记 + #67 不变量
@@ -920,7 +920,7 @@ fn locked_inject_binding_mismatch_round2_denied_rejects() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_env_read_failure_fail_closed() {
-    let env = crate::identity::PlatformPeerEnv;
+    let env = crate::peer_env::PlatformPeerEnv;
     // 不存在的 pid / 超限 pid → 读取失败 → None（fail-closed）
     assert!(
         env.peer_path(999_999).is_none(),
@@ -997,14 +997,14 @@ fn rule_create_precomputes_cache_within_threshold() {
         "规则应入库：{v}"
     );
     // finalize 固化哈希现算一次并预热缓存
-    let hash_after_add = state.lock().unwrap().fingerprint_hash_calls();
+    let hash_after_add = state.lock().unwrap().fingerprint_cache().hash_calls();
     assert_eq!(hash_after_add, 1, "规则创建现算一次固化哈希");
 
     let handler = make_handler(&state, &shared);
     let v = evaluate_inject(&handler, &token, proj.path(), "pgm deploy");
     assert_eq!(v["result"]["allowed"], true, "绑定命中放行：{v}");
     assert_eq!(
-        state.lock().unwrap().fingerprint_hash_calls(),
+        state.lock().unwrap().fingerprint_cache().hash_calls(),
         hash_after_add,
         "≤ 阈值：finalize 已预热缓存，首次命中只 stat 复用不重算"
     );
@@ -1031,14 +1031,14 @@ fn rule_create_lazy_above_threshold_leaves_cache_cold() {
         v["result"]["rule"]["fingerprint"].is_object(),
         "规则应入库：{v}"
     );
-    let hash_after_add = state.lock().unwrap().fingerprint_hash_calls();
+    let hash_after_add = state.lock().unwrap().fingerprint_cache().hash_calls();
     assert_eq!(hash_after_add, 1, "> 阈值：固化哈希仍现算一次（落盘必需）");
 
     let handler = make_handler(&state, &shared);
     let v = evaluate_inject(&handler, &token, proj.path(), "pgm deploy");
     assert_eq!(v["result"]["allowed"], true, "绑定命中放行：{v}");
     assert_eq!(
-        state.lock().unwrap().fingerprint_hash_calls(),
+        state.lock().unwrap().fingerprint_cache().hash_calls(),
         hash_after_add + 1,
         "> 阈值：缓存未预热，首次命中重新全量哈希"
     );
@@ -1064,11 +1064,11 @@ fn threshold_config_flips_precompute_behavior() {
     }
     let v = add_bound_rule_desktop(&state, &token, proj.path(), "r-a", "pgma", &exe_a);
     assert!(v["result"]["rule"]["fingerprint"].is_object(), "{v}");
-    let h = state.lock().unwrap().fingerprint_hash_calls();
+    let h = state.lock().unwrap().fingerprint_cache().hash_calls();
     let v = evaluate_inject(&handler, &token, proj.path(), "pgma deploy");
     assert_eq!(v["result"]["allowed"], true, "{v}");
     assert_eq!(
-        state.lock().unwrap().fingerprint_hash_calls(),
+        state.lock().unwrap().fingerprint_cache().hash_calls(),
         h + 1,
         "惰性阈值：首次命中重算"
     );
@@ -1080,11 +1080,11 @@ fn threshold_config_flips_precompute_behavior() {
     }
     let v = add_bound_rule_desktop(&state, &token, proj.path(), "r-b", "pgmb", &exe_b);
     assert!(v["result"]["rule"]["fingerprint"].is_object(), "{v}");
-    let h = state.lock().unwrap().fingerprint_hash_calls();
+    let h = state.lock().unwrap().fingerprint_cache().hash_calls();
     let v = evaluate_inject(&handler, &token, proj.path(), "pgmb deploy");
     assert_eq!(v["result"]["allowed"], true, "{v}");
     assert_eq!(
-        state.lock().unwrap().fingerprint_hash_calls(),
+        state.lock().unwrap().fingerprint_cache().hash_calls(),
         h,
         "预热阈值：finalize 已预热，首次命中复用不重算"
     );
