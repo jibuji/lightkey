@@ -214,7 +214,7 @@ impl Daemon {
         }
         // 对端真实 cwd 兜底（peer.cwd 已是真实值；绝对命令免 PATH 解析）。
         let cwd = peer.cwd.clone().unwrap_or_else(|| req.cwd.clone());
-        match crate::identity::adjudicate_binding(
+        match crate::binding::adjudicate_binding(
             self.peer_env.as_ref(),
             peer.pid,
             &cwd,
@@ -222,11 +222,11 @@ impl Daemon {
             &bound,
             &mut self.fingerprint_cache,
         ) {
-            crate::identity::BindingOutcome::Allowed => FingerprintVerdict::Allowed,
-            crate::identity::BindingOutcome::Mismatch(m) => {
+            crate::binding::BindingOutcome::Allowed => FingerprintVerdict::Allowed,
+            crate::binding::BindingOutcome::Mismatch(m) => {
                 FingerprintVerdict::NeedsApproval(Some(m))
             }
-            crate::identity::BindingOutcome::Unresolved => FingerprintVerdict::NeedsApproval(None),
+            crate::binding::BindingOutcome::Unresolved => FingerprintVerdict::NeedsApproval(None),
         }
     }
 

@@ -25,7 +25,7 @@ const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 30;
 
 /// 指纹预计算阈值缺省值（identity-binding.md §6-2：64 MiB，可配置）。
 fn default_fingerprint_precompute_threshold_bytes() -> u64 {
-    crate::identity::FINGERPRINT_PRECOMPUTE_THRESHOLD
+    crate::exe_resolve::FINGERPRINT_PRECOMPUTE_THRESHOLD
 }
 
 /// 守护进程配置（`config.json`）。
