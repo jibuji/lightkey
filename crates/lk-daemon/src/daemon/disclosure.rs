@@ -14,6 +14,10 @@
 //! `approval.result`（allowed + masterPassword）先做临时解锁，finalize 在
 //! **临时 vault** 上执行披露（单次即毁，不签发令牌 / 不写 session.token /
 //! 不置 shared.vault，#65 边界）；未初始化库 / headless 仍 fail-closed。
+//!
+//! 五件套下沉（issue #148）：begin 结果（GateBegin）/ 统一注册表（GateEntry，
+//! needs_unlock 与临时 vault 条目级承载）/ 审批单点铸造 / 审计辅助
+//! （audit_gate）出自 daemon/gate_kit.rs。
 
 use super::*;
 
@@ -26,14 +30,9 @@ fn disclosure_kind(method: &str) -> lk_core::authz::ApprovalKind {
     }
 }
 
-/// 阶段① 结果：最终响应（desktop 豁免 / 规则命中 / fail-closed 拒绝）或
-/// 待审批（等待移出命令锁，G1）。
-pub(crate) enum DisclosureBegin {
-    Final(String),
-    Pending { request_id: uuid::Uuid },
-}
-
 /// 值披露第 3 层的待办（等待期间由发起连接线程持有，锁外等待）。
+/// needs_unlock / 临时 vault 提升到统一注册表条目级
+/// （[`super::gate_kit::GateEntry`]，issue #148），门负载只携带披露特有字段。
 pub(crate) struct PendingDisclosure {
     /// `item.get` | `item.export`（决定 finalize 披露形态）。
     pub method: String,
@@ -44,13 +43,6 @@ pub(crate) struct PendingDisclosure {
     pub item_name: Option<String>,
     /// 真实启动者（#66 进程链回溯；finalize 审计 starter 用）。
     pub starter: String,
-    /// 锁定态一体化（补充拍板 #23）：审批需先临时解锁（主密码）；
-    /// `temp_vault` 由 `approval.result`（正确主密码 + allowed）填充，
-    /// `disclosure_finalize` 消费后丢弃。**不签发会话令牌 / 不写
-    /// session.token / 不置 shared vault**——临时解锁材料只服务本次
-    /// 披露（关键约束，与 #67/#65 同口径）。
-    pub needs_unlock: bool,
-    pub temp_vault: Option<UnlockedVault>,
 }
 
 impl Daemon {
@@ -80,34 +72,20 @@ impl Daemon {
         method: &str,
         params: Value,
         peer: &PeerInfo,
-    ) -> DisclosureBegin {
+    ) -> GateBegin {
         // 1) 参数解析（id 必填；channel 为可选审计来源标注，§8——缺省按
         //    对端来源，wsl-bridge 客户端标注优先，与 rule.* 同口径）
         let (item_id, channel_param) = match method {
-            M_ITEM_GET => match serde_json::from_value::<ItemGetParams>(params) {
+            M_ITEM_GET => match parse_gate_params::<ItemGetParams>(&id, params) {
                 Ok(p) => (p.id, p.channel),
-                Err(_) => {
-                    return DisclosureBegin::Final(rpc_string(RpcResponse::err(
-                        id,
-                        ERR_INVALID_PARAMS,
-                        "invalid params",
-                        None,
-                    )))
-                }
+                Err(line) => return GateBegin::Final(line),
             },
-            M_ITEM_EXPORT => match serde_json::from_value::<ItemExportParams>(params) {
+            M_ITEM_EXPORT => match parse_gate_params::<ItemExportParams>(&id, params) {
                 Ok(p) => (p.id, p.channel),
-                Err(_) => {
-                    return DisclosureBegin::Final(rpc_string(RpcResponse::err(
-                        id,
-                        ERR_INVALID_PARAMS,
-                        "invalid params",
-                        None,
-                    )))
-                }
+                Err(line) => return GateBegin::Final(line),
             },
             _ => {
-                return DisclosureBegin::Final(rpc_string(RpcResponse::err(
+                return GateBegin::Final(rpc_string(RpcResponse::err(
                     id,
                     ERR_METHOD_NOT_FOUND,
                     MSG_METHOD_NOT_FOUND,
@@ -125,10 +103,10 @@ impl Daemon {
             let cwd =
                 lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
             if starter == UNKNOWN_STARTER || cwd.is_empty() {
-                return DisclosureBegin::Final(rpc_string(authz_denied(id)));
+                return GateBegin::Final(rpc_string(authz_denied(id)));
             }
             if !self.gate.approval().available() {
-                return DisclosureBegin::Final(rpc_string(authz_denied(id)));
+                return GateBegin::Final(rpc_string(authz_denied(id)));
             }
             // 登记待审批（needs_unlock=true）+ 广播 authz.request
             // （needsUnlock=true，D 层弹窗同时展示主密码输入 + 授权栏）。
@@ -136,37 +114,31 @@ impl Daemon {
             // 回传必须原样带回（#78）。锁态不知道条目名，keys 空（finalize
             // 在临时 vault 上解析后写审计 target）。
             let kind = disclosure_kind(method);
-            let request_id = lk_core::crypto::random_uuid();
-            let challenge = hex::encode(lk_core::crypto::random_array::<16>());
-            let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
-            let areq = ApprovalRequest {
-                request_id,
-                starter: starter.clone(),
-                project_dir: cwd,
-                command: method.to_string(),
-                keys: vec![],
-                challenge: challenge.clone(),
-                needs_unlock: true,
-                kind,
-                write_action: None,
-                export_meta: None,
-                fingerprint_mismatch: None,
-                // #147：read/export 审批不带审批子类型（帧不含 subKind 字段）
-                sub_kind: None,
-            };
-            self.gate.approval().open(&areq, expires_at);
-            self.pending_disclosure.lock().unwrap().insert(
-                request_id,
-                PendingDisclosure {
-                    method: method.to_string(),
-                    item_id,
-                    item_name: None,
-                    starter,
+            let request_id = self.open_gate_approval(
+                ApprovalDraft {
+                    starter: starter.clone(),
+                    project_dir: cwd,
+                    command: method.to_string(),
+                    keys: vec![],
+                    kind,
+                    // #147：read/export 审批不带审批子类型（帧不含 subKind 字段）
+                    sub_kind: None,
+                    write_action: None,
+                    export_meta: None,
+                    fingerprint_mismatch: None,
+                },
+                GateEntry {
                     needs_unlock: true,
                     temp_vault: None,
+                    kind: GateKind::Disclosure(PendingDisclosure {
+                        method: method.to_string(),
+                        item_id,
+                        item_name: None,
+                        starter,
+                    }),
                 },
             );
-            return DisclosureBegin::Pending { request_id };
+            return GateBegin::Pending { request_id };
         }
         // 2) 解析条目：id → 条目名（不存在 → `item.not_found`，现状语义）；
         //    export 顺带解析数据包元信息（弹窗展示规模用，不解密附件数据）
@@ -197,7 +169,7 @@ impl Daemon {
                     };
                     (Some(item.name().to_string()), meta)
                 }
-                Err(e) => return DisclosureBegin::Final(rpc_string(self.err_response(id, &e))),
+                Err(e) => return GateBegin::Final(rpc_string(self.err_response(id, &e))),
             }
         };
         // 3) 通道判定：desktop 内嵌直调 → 受信豁免直返（不登记审批；
@@ -207,7 +179,7 @@ impl Daemon {
                 M_ITEM_GET => self.item_get_exec(id, item_id, "desktop", AuditChannel::Desktop),
                 _ => self.item_export_exec(id, item_id, "desktop", AuditChannel::Desktop),
             };
-            return DisclosureBegin::Final(rpc_string(resp));
+            return GateBegin::Final(rpc_string(resp));
         }
         // 4) socket 通道：真实 starter + cwd（#66 归因链路复用；客户端自报
         //    字段不信任）；未知 → 第 1 层 fail-closed 拒绝（不弹窗、不留内容）
@@ -215,14 +187,15 @@ impl Daemon {
         let cwd = lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
         let channel = client_channel(channel_param.as_deref(), peer_channel(peer));
         if starter == UNKNOWN_STARTER || cwd.is_empty() {
-            self.audit_disclosure(
-                method,
-                item_name.as_deref().unwrap_or(""),
+            self.audit_gate(
+                ActingVault::Shared,
                 &starter,
+                item_name.as_deref().unwrap_or(""),
+                method,
                 channel,
                 AuditResult::Denied,
             );
-            return DisclosureBegin::Final(rpc_string(authz_denied(id)));
+            return GateBegin::Final(rpc_string(authz_denied(id)));
         }
         // 5) item.get：读规则匹配（spec §4）→ 命中静默放行 + 审计 allowed
         if method == M_ITEM_GET {
@@ -240,58 +213,53 @@ impl Daemon {
             };
             if hit {
                 let resp = self.item_get_exec(id, item_id, &starter, channel);
-                return DisclosureBegin::Final(rpc_string(resp));
+                return GateBegin::Final(rpc_string(resp));
             }
         }
         // 6) get 未命中 / export 恒弹窗：无审批界面 → fail-closed 立即拒绝
         if !self.gate.approval().available() {
-            self.audit_disclosure(
-                method,
-                item_name.as_deref().unwrap_or(""),
+            self.audit_gate(
+                ActingVault::Shared,
                 &starter,
+                item_name.as_deref().unwrap_or(""),
+                method,
                 channel,
                 AuditResult::Denied,
             );
-            return DisclosureBegin::Final(rpc_string(authz_denied(id)));
+            return GateBegin::Final(rpc_string(authz_denied(id)));
         }
         // 7) 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞；challenge
         //    语义同 inject——仅投递桌面订阅者，回传必须原样带回，#78）
         let kind = disclosure_kind(method);
-        let request_id = lk_core::crypto::random_uuid();
-        let challenge = hex::encode(lk_core::crypto::random_array::<16>());
-        let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
-        let areq = ApprovalRequest {
-            request_id,
-            starter: starter.clone(),
-            project_dir: cwd,
-            command: method.to_string(),
-            keys: vec![item_name.clone().unwrap_or_default()],
-            challenge: challenge.clone(),
-            needs_unlock: false,
-            kind,
-            write_action: None,
-            export_meta: if method == M_ITEM_EXPORT {
-                export_meta
-            } else {
-                None
+        let request_id = self.open_gate_approval(
+            ApprovalDraft {
+                starter: starter.clone(),
+                project_dir: cwd,
+                command: method.to_string(),
+                keys: vec![item_name.clone().unwrap_or_default()],
+                kind,
+                // #147：read/export 审批不带审批子类型（帧不含 subKind 字段）
+                sub_kind: None,
+                write_action: None,
+                export_meta: if method == M_ITEM_EXPORT {
+                    export_meta
+                } else {
+                    None
+                },
+                fingerprint_mismatch: None,
             },
-            fingerprint_mismatch: None,
-            // #147：read/export 审批不带审批子类型（帧不含 subKind 字段）
-            sub_kind: None,
-        };
-        self.gate.approval().open(&areq, expires_at);
-        self.pending_disclosure.lock().unwrap().insert(
-            request_id,
-            PendingDisclosure {
-                method: method.to_string(),
-                item_id,
-                item_name,
-                starter,
+            GateEntry {
                 needs_unlock: false,
                 temp_vault: None,
+                kind: GateKind::Disclosure(PendingDisclosure {
+                    method: method.to_string(),
+                    item_id,
+                    item_name,
+                    starter,
+                }),
             },
         );
-        DisclosureBegin::Pending { request_id }
+        GateBegin::Pending { request_id }
     }
 
     /// 阶段③（重取命令锁；spec §5.3）：Allowed → 披露值/数据包 + 审计
@@ -299,11 +267,12 @@ impl Daemon {
     /// 被消费（极端竞态）→ `authz.denied` + 审计。等待期间锁定 →
     /// `session.invalid`（exec 内 vault 为空时保守失败，无法签名审计）。
     ///
-    /// 锁定态一体化（#23）：`pending.needs_unlock` 时——
+    /// 锁定态一体化（#23）：统一注册表条目 `needs_unlock` 时（issue #148
+    /// 起 needs_unlock/temp_vault 条目级承载）——
     /// - **等待期整库被解锁**（用户绕开弹窗直接解锁）→ finalize 走**常态
     ///   路径**（共享 vault 披露 + 共享 K_audit 审计，与解锁态同语义）；
-    /// - 仍锁定 → 用审批回传时临时解锁的 vault（`temp_vault`）在临时 vault
-    ///   上披露，随后即毁（不置 shared.vault / 不签发令牌）；
+    /// - 仍锁定 → 用审批回传时临时解锁的 vault（条目级 `temp_vault`）在
+    ///   临时 vault 上披露，随后即毁（不置 shared.vault / 不签发令牌）；
     /// - deny / timeout → 无临时 vault（未解锁）→ 无 K_audit 可签名，不写
     ///   审计（与 #67 注入一体化拒绝同口径）。
     pub(crate) fn disclosure_finalize(
@@ -312,20 +281,25 @@ impl Daemon {
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
     ) -> String {
-        let pending = self.pending_disclosure.lock().unwrap().remove(&request_id);
-        let Some(p) = pending else {
-            // 条目已被消费（极端竞态）→ 保守拒绝
+        let removed = self.pending_gates.lock().unwrap().remove(&request_id);
+        // 条目已被消费（极端竞态）→ 保守拒绝
+        let Some(GateEntry {
+            needs_unlock,
+            temp_vault,
+            kind: GateKind::Disclosure(p),
+        }) = removed
+        else {
             return rpc_string(authz_denied(id));
         };
         match decision {
             ApprovalDecision::Allowed => {
-                if p.needs_unlock {
+                if needs_unlock {
                     return if self.vault_peek() {
                         // 等待期整库被解锁 → 常态路径（共享 vault）
                         self.disclosure_finalize_normal(id, p)
                     } else {
                         // 仍锁定 → 临时 vault 单次披露
-                        self.disclosure_finalize_unlock(id, p)
+                        self.disclosure_finalize_unlock(id, p, temp_vault)
                     };
                 }
                 self.disclosure_finalize_normal(id, p)
@@ -334,11 +308,12 @@ impl Daemon {
                 // 拒绝/超时统一 denied（spec §8：不区分原因，防探测）。
                 // 锁定态一体化条目：未解锁 → 无 K_audit 不可签名，不写审计
                 // （与 #67 注入拒绝同口径）；解锁态条目照旧落审计。
-                if !p.needs_unlock {
-                    self.audit_disclosure(
-                        &p.method,
-                        p.item_name.as_deref().unwrap_or(""),
+                if !needs_unlock {
+                    self.audit_gate(
+                        ActingVault::Shared,
                         &p.starter,
+                        p.item_name.as_deref().unwrap_or(""),
+                        &p.method,
                         AuditChannel::Approval,
                         AuditResult::Denied,
                     );
@@ -365,15 +340,20 @@ impl Daemon {
     }
 
     /// 锁定态一体化 finalize（#23）：**临时 vault**（`approval_result_unlock`
-    /// 以正确主密码解锁后存入）上执行披露——get/export exec 支持传入外部
-    /// vault 引用（`item_get_exec_from` / `item_export_exec_from`），审计用
-    /// 临时 vault 的 K_audit 签名（channel=approval）。临时 vault 随本函数
-    /// 结束即销毁——不置 shared.vault、不签发令牌、不写 session.token
+    /// 以正确主密码解锁后存入统一注册表条目）上执行披露——get/export exec
+    /// 支持传入外部 vault 引用（`item_get_exec_from` / `item_export_exec_from`），
+    /// 审计用临时 vault 的 K_audit 签名（channel=approval）。临时 vault 随
+    /// 本函数结束即销毁——不置 shared.vault、不签发令牌、不写 session.token
     /// （#65 边界：本次交互不产生任何持久能力）。
-    fn disclosure_finalize_unlock(&mut self, id: Value, p: PendingDisclosure) -> String {
+    fn disclosure_finalize_unlock(
+        &mut self,
+        id: Value,
+        p: PendingDisclosure,
+        temp_vault: Option<UnlockedVault>,
+    ) -> String {
         // 临时 vault 由 approval_result 以正确主密码解锁后存入；
         // 缺失（异常路径）→ 保守拒绝
-        let Some(vault) = p.temp_vault else {
+        let Some(vault) = temp_vault else {
             return rpc_string(authz_denied(id));
         };
         let resp = match p.method.as_str() {
@@ -390,35 +370,6 @@ impl Daemon {
         };
         // 临时 vault 随本函数结束 drop——临时解锁材料即用即毁
         rpc_string(resp)
-    }
-
-    /// 值披露审计（spec §8）：command=`item.get`/`item.export`、
-    /// target=条目名、starter/channel=真实归因。K_audit 签名；已锁定
-    /// （K_audit 擦除）→ 跳过（与授权路径审计同口径）。
-    fn audit_disclosure(
-        &self,
-        command: &str,
-        target: &str,
-        starter: &str,
-        channel: AuditChannel,
-        result: AuditResult,
-    ) {
-        let vault = self.shared.vault.read().unwrap();
-        let Some(v) = vault.as_ref() else {
-            return;
-        };
-        let _ = self.audit.append(
-            v.keys(),
-            &EventInput {
-                starter: starter.to_string(),
-                target: target.to_string(),
-                command: command.to_string(),
-                result,
-                channel,
-                old_key_id: None,
-                new_key_id: None,
-            },
-        );
     }
 }
 
