@@ -336,6 +336,37 @@ data-model、milestones、decisions #25 状态翻转、AGENTS.md、CONTEXT.md �
 > （issues #123-#126，父立项 #121）。**read/write 调用方链绑定按 spec §12
 > 默认仅字段预留**，不落地 CLI/UI（适用边界=独立工具二进制场景，文档明示）。
 
+## M2.99 —— 快速保存（quick capture）（进行中）
+
+**目标**：补充拍板 #27（2026-09-07 · 来源 issue #161）——用户复制 API key /
+token 后**一键**存进 LightKey：托盘「快速保存剪贴板…」→ 值预填、命名即存
+（1 次点击 + 1 次命名）。快速保存只是**交互面**（写能力早在 M2.97 就绪），
+复用 `item.put` desktop 受信豁免，零协议变更、零新审批路径、零新第三方依赖
+（`arboard` 已在 workspace）。实现规格唯一出处 [quick-capture.md](quick-capture.md)。
+
+范围（按 quick-capture.md §10 的 PR 序列）：
+
+- **PR A（lk-app）**：托盘菜单「快速保存剪贴板…」+ 窗口 show/focus +
+  壳事件 `lk-shell-quick-save`；`clipboard_read` / `clipboard_clear`
+  command（arboard；剪贴板只在用户主动触发时读一次）。
+- **PR B（前端 + 收口）**：本地事件 `quick.save-request`（壳 → UI，不混入
+  守护进程通知协议）→ ipc-bridge 接入 + mock 钩子；ui-vault 内快存面板
+  （值预填 / 名称聚焦 / 启发建议名 / 重名软提示 / 「保存后清空剪贴板」勾选
+  默认关 / 复用 handleSaved 保存-刷新-选中）；锁态 → 只引导解锁 +
+  pending flush（解锁成功后自动重冒面板）；vitest + 文档收口
+  （README 地图、decisions.md #27、CONTEXT.md「快速保存」词条、AGENTS.md）。
+- **PR C（阶段二，独立立项，可选）**：全局热键（B 路径，
+  `tauri-plugin-global-shortcut` 设置可配可关）/ CLI `item add --clipboard`（E 路径）。
+- **不做**：剪贴板监听 + 系统通知被动提醒（通知点击无回调 + 隐私）、
+  锁态一步式「主密码 + 保存」（write-gate §12 留档一致）。
+
+**出口**：`cargo test` + vitest 全绿；M0–M2.98 回归通过；clippy/fmt 全绿；
+桌面手工验收清单（Windows 主导）：托盘入口 → 快存面板 → 落库 → 列表刷新
+选中；锁态入口 → 解锁页 → 解锁后自动重冒面板；issue #161 立项并关闭。
+
+> 本里程碑为 issue #161 提案拍板（补充拍板 #27）新增（插入 M2.98 之后、
+> M3 之前）；按 quick-capture.md §10 PR A-C 序列落地。
+
 ## M3 —— 浏览器填充（V1 之后）
 
 **目标**：浏览器扩展按 [browser-fill.md](browser-fill.md) 协议实现。

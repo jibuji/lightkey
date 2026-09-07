@@ -573,4 +573,48 @@ needs-decision，不得自行变更。
     - **验收**：Linux headless 规则命中 `lk inject` / `item.get` / `item.put`
       放行；`scripts/e2e_m1.sh` / `e2e_m2.sh`（Linux）恢复跑绿。
 
+27. **快速保存（quick capture）：一键把剪贴板 secret 存进 LightKey（2026-09-07
+    · 来源：issue #161 提案，五项决策点按建议采纳，船长拍板）**：用户复制
+    一个 API key / token 后，希望**最小交互**把它变成库内条目——「复制完的
+    secret 入库」压缩为 **1 次点击 + 1 次命名**。快速保存不是新数据通道：
+    写能力已存在（`item.put`，M2.97 写门），本项只做**交互面**。裁定：
+    - **主路径 A：托盘一键保存**——托盘菜单新增「快速保存剪贴板…」→ 显示
+      主窗口 → 壳事件 `lk-shell-quick-save` → 前端快存面板（值 = 剪贴板文本
+      预填、名称聚焦、启发建议名、回车落库）；**补充路径 C：应用内「从
+      剪贴板」按钮**共用同一面板；**旁路 E：CLI `item add --clipboard`**
+      （开发者向，可独立立项）；**B 全局热键 / D 剪贴板监听 + 系统通知不做**：
+      tauri-plugin-notification 桌面端**不发射点击事件**（lk-app
+      `approval_alert` 实证注释）→ 通知点击无回调路径；持续监听剪贴板隐私
+      敏感；B 列为阶段二（`tauri-plugin-global-shortcut`，设置可配可关）；
+      **F 浏览器扩展捕获**留 M3（browser-fill.md 协议目前只有填充方向）。
+    - **技术口径**：零协议变更、零新审批路径、零新第三方依赖（`arboard`
+      已在 workspace）；落库走 `item.put` desktop 通道**受信豁免**（写门
+      判定矩阵第一行，write-gate.md §3）+ 审计 `item.create <name>`
+      channel=desktop 照旧；lk-app 新增 `clipboard_read` / `clipboard_clear`
+      command 与托盘菜单项；前端新增本地事件 `quick.save-request`
+      （**壳 → UI 请求，不混入守护进程通知协议 NOTIFY_\***）+ ui-vault 内
+      快存面板（复用既有保存/刷新/选中逻辑）；锁态只引导解锁（不触碰 #24
+      留档的「锁态写一体化」）。
+    - **五项裁定**：① 锁态一步式「主密码 + 保存」**不做**（与 write-gate.md
+      §12 留档一致）；② pending（解锁后重冒面板）锁定不清、消费后清；
+      ③ 名称启发建议：保守前缀表内置 + 设置页可关（默认开）；④ 快存入口
+      不落审计（审计按数据变更事件，不记 UI 入口）；⑤ 里程碑 = **M2.99
+      （快速保存）**，插 M2.98 之后、M3 之前（M3 标签保持浏览器填充）。
+    - **安全与隐私**：剪贴板只在用户**主动触发**快存那一刻读取一次，无后台
+      轮询、无监听；值不进入日志 / 事件帧 / 审计 / 系统通知；「保存后清空
+      剪贴板」勾选**默认关**（剪贴板内容非 LightKey 复制出去的，30s 清除
+      语义仅适用 LightKey 写入内容；勾选开启才置空）；锁态不读剪贴板、不留
+      值。
+    - **被否选项**：
+      | 选项 | 否因 |
+      |------|------|
+      | 剪贴板监听 + 系统通知被动提醒（主路径） | 通知点击在桌面端无回调（approval_alert 实证）；持续读剪贴板隐私敏感、误报打扰 |
+      | 全局热键作主路径 | 注册系统级热键（冲突/学习成本/平台权限差异）换来的速度增量有限；退为阶段二设置项 |
+      | 新建独立 quick-add 插件 | 保存/选中/刷新/CAS 逻辑与 ui-vault 现有 `handleSaved` 同源，内嵌面板零复制、零跨插件消息 |
+      | 快存走 socket/CLI 通道 | 凭空引入写门弹窗（摩擦）与归因/规则依赖，桌面直调豁免即为此景设计 |
+    实现规格：[quick-capture.md](quick-capture.md)（**唯一出处**）；落点：
+    milestones.md M2.99、docs/README.md 文档地图、CONTEXT.md（「快速保存」词条）；
+    立项 issue #161，按 quick-capture.md §10 PR 序列落地（PR A lk-app /
+    PR B 前端 + 收口 / PR C 阶段二可选）。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

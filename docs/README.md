@@ -33,7 +33,7 @@
 | [value-disclosure.md](value-disclosure.md) | 值披露裁决：`item.get`/`item.export` 升为裁决方法、读规则、锁态一体化弹窗（补充拍板 #20/#23，issue #65/#105） | M2.9 / M2.95 |
 | [write-gate.md](write-gate.md) | 写入授权门（唯一实现规格）：`item.put`/`item.delete` 升裁决方法、写规则（capability=write + actions）、delete 恒弹窗（补充拍板 #24，已实现） | M2.97 |
 | [identity-binding.md](identity-binding.md) | 规则程序指纹绑定（唯一实现规格）：可选绑定可执行文件（canonical 路径 + SHA-256）、失配视同未命中 + 弹窗「以新指纹重新授权」、内存指纹缓存（补充拍板 #25，已实现） | M2.98 |
-| [quick-capture.md](quick-capture.md) | 快速保存（**草案，待拍板**，issue #161）：托盘一键把剪贴板 secret 存进 LightKey——值预填、命名即存；复用 item.put 桌面豁免、不做剪贴板监听、锁态引导解锁 | 候选 M2.99 |
+| [quick-capture.md](quick-capture.md) | 快速保存（唯一实现规格，补充拍板 #27，issue #161）：托盘一键把剪贴板 secret 存进 LightKey——值预填、命名即存；复用 item.put 桌面豁免、不做剪贴板监听、锁态引导解锁 | M2.99 |
 | [cross-subsystem.md](cross-subsystem.md) | 跨子系统 stdio 桥（WSL CLI ↔ Windows 桌面守护实例；补充拍板 #14） | M2.75 |
 | [testing-cross-subsystem.md](testing-cross-subsystem.md) | 跨子系统桥测试 Runbook：下载哪些 Release 产物、安装步骤、E2E/手动测试与排障 | M2.75 |
 | [browser-fill.md](browser-fill.md) | 浏览器填充通道协议（Native Messaging） | M3 |
