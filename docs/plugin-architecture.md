@@ -1,6 +1,9 @@
 # 插件化架构规格（plugin-architecture）
 
-- 状态：已拍板（船长插件化定案，2026-08；落地层 = 选项 A；已登记于决议集 D16）
+- 状态：已拍板（船长插件化定案，2026-08；落地层 = 选项 A；已登记于决议集 D16；
+  **#28 修订（2026-09-08，架构深化候选 1）**：Rust 侧（A/B 层）的 trait 服务层
+  已删除——现为**具体类型 + 事件总线**，保留的 trait 按三类真缝，见 §4.1；
+  D 层真 Cordis 不变）
 - 关联：[architecture.md](architecture.md)（边界纪律）· [milestones.md](milestones.md)
   （M1.5 插件化改造）· [decisions.md](decisions.md)（决议集——本定案已登记于 D16）
   · [design/spec.md](design/spec.md)（tokens/组件/槽位落点）· [ipc.md](ipc.md)（跨进程桥）
@@ -15,7 +18,7 @@
 | 层 | 技术 | 说明 |
 |----|------|------|
 | TS/桌面/前端（D 层） | **真 Cordis**（`@cordisjs/core` 4.x） | 插件框架 |
-| Rust 核心（A/B 层） | **单一 crate `lk-core`**，按同一套插件边界重组模块 | trait 服务 + 事件总线**模拟** Cordis 语义，不强行移植 Cordis |
+| Rust 核心（A/B 层） | **单一 crate `lk-core`**，按同一套插件边界重组模块 | 具体类型 + 事件总线**模拟** Cordis 语义，不强行移植 Cordis（保留的 trait 按三类真缝，见 §4.1） |
 | 安全核心（加密/数据/同步/审计） | 留在 Rust | 不重写为 TS |
 | CLI / Tauri 壳（C 层宿主 + 壳） | 只做编排与呈现 | 不复制业务逻辑 |
 
@@ -38,7 +41,7 @@
 
 | 术语 | 含义 |
 |------|------|
-| 插件（Service） | 有生命周期的服务单元。TS 侧 = Cordis Service（函数带 `inject`+`apply(ctx)` 或 Service 子类，以 `@cordisjs/core` 4.x 为准）；Rust 侧 = trait 服务 |
+| 插件（Service） | 有生命周期的服务单元。TS 侧 = Cordis Service（函数带 `inject`+`apply(ctx)` 或 Service 子类，以 `@cordisjs/core` 4.x 为准）；Rust 侧 = 具体类型 + 事件总线（无 trait 服务层；保留的 trait 仅三类真缝，见 §4.1） |
 | 原子组件 | 强交互 React 组件（密码字段+眼睛+复制、Markdown 高亮、倒计时环形、附件进度），手写、注册进组件注册表，**不拆内部结构** |
 | 槽位组件 | 挂入 `topbar`/`sidebar`/`content` 的组件（导航项、搜索框、同步状态点、页面），声明 `slot` 字段 |
 | 应用数据 | 随应用发布的**声明式装配契约**（驱动组件/插件/事件路由），永不运行时可变、永不含逻辑 |
@@ -95,29 +98,47 @@
 
 ## 4. 依赖图（inject 方向）
 
-### 4.1 Rust（A/B/C，trait 服务注入）
+### 4.1 Rust（A/B/C，具体类型 + 事件总线；保留 trait 按三类）
 
 ```
-地基（无依赖）
-├─ crypto            （session 可直接用；其余经 vault-store/audit/recovery 间接）
-├─ vault-store  ← crypto
-├─ recovery     ← crypto + vault-store
-├─ audit        ← crypto
-├─ session      （无依赖）
-└─ storage-backend （无依赖，可插拔：webdav/s3/local 三实现）
+A/B 层 = 具体类型模块（拍板 #28 候选 1：无 trait 服务层，模块间直接调用）
 
-B 层
-├─ sync-engine  ← vault-store + storage-backend
-└─ authz-gate   ← session + audit            （M2）
+A 层 数据平面（lk-core）
+├─ crypto / recovery / audit   （无状态地基与追加式审计，直接函数/类型调用）
+├─ vault（vault-store）        （数据平面；解锁后 attach_bus 挂事件总线）
+└─ session                     （构造后 attach_bus 挂事件总线）
 
-C 层
-└─ daemon：装配以上全部 A/B 插件 + IPC 路由 + 空闲自动锁定 + config.json 读写
+B 层 能力域（lk-core）
+├─ sync-engine    ← vault + storage-backend（引擎构造持 &dyn StorageBackend）
+└─ authz-gate     ← session + audit                     （M2）
+
+C 层 宿主（lk-daemon）
+└─ daemon：直持 Arc<EventBus>（session / vault 各一行 attach_bus 直连），
+    IPC 路由、空闲自动锁定、config.json 读写
+
+事件总线（lk-core bus）：item.changed / session.unlocked /
+session.locked / authz.request——有状态数据平面的解耦层（§5）
 ```
 
-- 注入方向 = 上层注入下层：`sync-engine` 注入 `vault-store` 与 `storage-backend`；
-  `recovery` 注入 `crypto` 与 `vault-store`；`authz-gate` 注入 `session` 与 `audit`。
-- `storage-backend` 的「可插拔」= trait 对象注入，三个实现（WebDAV/S3/本地）
-  按配置选择，与 D 层 `ctx.isolate` 的「服务换实现」语义对应（但 Rust 侧是 trait 实现切换）。
+**保留的 trait 按三类**（判据勿用「≥2 适配器」——②类生产就是单实现；真缝
+与否取决于它隔离的变化方向，不是实现计数）：
+
+| 类别 | trait | 所在 | 生产实现 / 测试替身 |
+|------|-------|------|--------------------|
+| ① 多生产实现真缝 | `StorageBackend` | lk-core `storage` | 本地模拟 / WebDAV / S3 三实现按配置切换 |
+| ① 多生产实现真缝 | `ProcessTable` | lk-core `starter` | Linux procfs / macOS sysctl / Windows Toolhelp+PEB |
+| ② 平台抽象 + 白盒测试缝（生产单实现 + 测试替身） | `VaultRead` | lk-core `sync` | 解锁 vault 只读视图 / daemon 短锁视图（测试 = 演进视图） |
+| ② 平台抽象 + 白盒测试缝 | `RuleVault` | lk-core `authz` | daemon `VaultRuleView`（短锁读规则面；测试 = 内存假库/损坏库） |
+| ② 平台抽象 + 白盒测试缝 | `PeerEnv` | lk-daemon `peer_env` | 平台对端 env 读取（测试 = 假 PATH） |
+| ② 平台抽象 + 白盒测试缝 | `FingerprintSource` | lk-daemon `exe_resolve` | 真实文件系统指纹（测试 = 计数替身） |
+| ③ 观察者契约 | `EventSink` | lk-core `bus` | 通知桥 / 测试订阅者（`emit` 观察广播，§5） |
+
+- 依赖方向 = 上层依赖下层：`sync-engine` 构造注入 `vault` 与 `storage-backend`；
+  `recovery` 编排 `crypto` 与 `vault`；`authz-gate` 消费 `session` 与 `audit`。
+  依赖注入 = 构造参数直接传递（具体类型），不再经 trait 服务容器。
+- `storage-backend` 的「可插拔」= ①类真缝：三个实现（WebDAV/S3/本地）按配置
+  选择，与 D 层 `ctx.isolate` 的「服务换实现」语义对应（Rust 侧是 trait 实现
+  切换，正是保留它的原因）。
 
 ### 4.2 TS（D 层，真 Cordis `inject`）
 
@@ -164,7 +185,8 @@ desktop-shell / approval / browser-fill  ← ipc-bridge
 - TS 侧（D 层）用 Cordis 事件：`emit`（观察广播，fire-and-forget）、
   `waterfall`（中间件短路，有返回值即可截断）、`parallel`（并行扇出，收集返回值）、
   `serial`（按序执行）。以 `@cordisjs/core` 4.x 为准。
-- Rust 侧（A/B 层）**模拟同套语义**（trait 事件 + 分发器），不移植 Cordis。
+- Rust 侧（A/B 层）**模拟同套语义**（事件枚举 + `EventSink` 观察者分发器），
+  不移植 Cordis。
 - **跨进程**：Rust ↔ TS 之间的事件经 `ipc-bridge` 翻译（Rust 事件 → IPC 通知 →
   TS 侧重新 `emit`；TS 侧需 Rust 决策的事件 → IPC 请求/响应，见 §5.3）。
 
@@ -209,7 +231,7 @@ desktop-shell / approval / browser-fill  ← ipc-bridge
 | `parallel`（并行扇出） | 备选：`item.changed` 若需聚合三方结果时 |
 | `serial`（按序） | 备选：锁定/卸载时的有序撤销（先停同步→擦密钥→失效令牌）；此为 Rust 内部确定性流程，硬编码，不靠事件总线保证顺序 |
 | 可逆副作用（`ctx.effect()`/`ctx.on()`） | D 层插件注册监听时用；插件卸载自动撤销（如 theme 卸下时移除重渲染订阅） |
-| 服务级替换/增强（`ctx.isolate`/`ctx.intercept`/`ctx.provide/set/get`） | D 层换插件实现/拦截配置的原生机制；对应 Rust 侧 trait 实现切换（storage-backend） |
+| 服务级替换/增强（`ctx.isolate`/`ctx.intercept`/`ctx.provide/set/get`） | D 层换插件实现/拦截配置的原生机制；对应 Rust 侧保留真缝 trait 的实现切换（storage-backend 多后端 / starter 平台表，§4.1 三类） |
 
 ## 6. 装配机制（四层）
 
@@ -334,8 +356,9 @@ plugins:
    - 订阅 `theme.changed` 等事件触发重渲染。
 2. **IPC 桥（ipc-bridge 插件）**：统一 IPC 门面 + mock/tauri 适配器；
    把 Rust 事件翻译成 TS Cordis 事件，把 TS 的审批结果/调用经 IPC 回传 Rust。
-3. **Rust 侧模拟**：不移植 Cordis；用 trait 服务 + 事件总线模拟 Cordis 的
-   Service/依赖注入/事件语义（见 §3/§5）。
+3. **Rust 侧模拟**：不移植 Cordis；A/B 层 = **具体类型 + 事件总线**，模拟
+   Cordis 的 Service/事件语义（依赖注入 = 构造参数直接传递；保留的 trait 按
+   三类真缝，见 §4.1；事件语义见 §5）。
 
 ## 9. 存储真相（现状澄清）
 

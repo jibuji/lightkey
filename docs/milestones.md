@@ -54,15 +54,17 @@
 ## M1.5 —— 插件化改造（Cordis）（已完成）
 
 **目标**：按 [plugin-architecture.md](plugin-architecture.md) 落地插件化架构——
-Rust 核心按 A/B 层边界重组（trait 服务 + 事件总线，**行为不回归**），D 层 TS 用
-真 Cordis 搭建宿主 + 首批插件（theme + ipc-bridge + preference-store + ui 骨架），
+Rust 核心按 A/B 层边界重组（trait 服务 + 事件总线，**行为不回归**；#28 候选 1 起
+trait 服务层已删除、现为具体类型 + 事件总线，见 [architecture-deepening.md](architecture-deepening.md) §4），
+D 层 TS 用真 Cordis 搭建宿主 + 首批插件（theme + ipc-bridge + preference-store + ui 骨架），
 并落地槽位机制 + `cordis.yml` 装配。
 
 范围：
 
 - Rust 核心（`lk-core`）按 A/B 层边界重组：crypto / vault-store / recovery / audit /
   session（A 层）+ storage-backend / sync-engine（B 层）→ trait 服务 + 事件总线
-  （模拟 Cordis 语义，见 plugin-architecture.md §3/§5）。
+  （模拟 Cordis 语义，见 plugin-architecture.md §3/§5；历史条目——#28 候选 1
+  起为具体类型 + 事件总线）。
 - C 层 daemon 宿主：装配 A/B、IPC 路由、空闲自动锁定、config.json 读写
   （现有 daemon 模块按此边界整理，行为不变）。
 - D 层 TS：引入真 Cordis（`@cordisjs/core` 4.x）+ `cordis.yml` + loader +
