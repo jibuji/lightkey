@@ -16,15 +16,23 @@ import type { Context, Plugin } from "@cordisjs/core";
 import type { ConfigView } from "../types";
 import type { SlotComponentConfig } from "./skeleton";
 import { slotComponentConfig } from "./skeleton";
+import { QUICK_SAVE_NAME_SUGGEST_KEY } from "./ui-quick-save";
 
 const AUTO_LOCK_OPTIONS = ["0", "1", "5", "15", "30", "60"];
 const POLL_OPTIONS = ["15", "30", "60", "300", "900", "3600"];
+
+/** M2.99 快速保存：名称建议开关初值（preference；"0" = 关，其余 = 开）。 */
+function nameSuggestInitial(ctx: Context): boolean {
+  return ctx.preference.get(QUICK_SAVE_NAME_SUGGEST_KEY) !== "0";
+}
 
 /** 设置页本体（content 槽位，page=settings）。 */
 export function SettingsPage({ ctx }: { ctx: Context }) {
   const toast = ctx.toast;
   const [config, setConfig] = useState<ConfigView | null>(null);
   const [saving, setSaving] = useState(false);
+  /** M2.99 快速保存：名称建议开关（preference 即时落盘，刷新即生效）。 */
+  const [nameSuggest, setNameSuggest] = useState(() => nameSuggestInitial(ctx));
 
   const load = useCallback(() => {
     void ctx.ipc
@@ -172,6 +180,28 @@ export function SettingsPage({ ctx }: { ctx: Context }) {
               <option value="dark">暗色</option>
               <option value="light">浅色</option>
             </select>
+          </div>
+        </div>
+
+        <div className="settings-group">
+          <div className="settings-group-title">快速保存（M2.99）</div>
+          <div className="setting-row">
+            <div>
+              <div className="setting-label">名称建议</div>
+              <div className="setting-desc">按剪贴板内容前缀建议条目名（如 sk- → api_key）· 建议只是初值，可改</div>
+            </div>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={nameSuggest}
+                onChange={(e) => {
+                  const on = e.target.checked;
+                  setNameSuggest(on);
+                  ctx.preference.set(QUICK_SAVE_NAME_SUGGEST_KEY, on ? "1" : "0");
+                }}
+              />
+              <span className="track" />
+            </label>
           </div>
         </div>
       </div>

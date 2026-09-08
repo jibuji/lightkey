@@ -133,6 +133,16 @@ export interface LightKeyIpc {
   pickDir(): Promise<string | null>;
 
   /**
+   * M2.99 快速保存（quick-capture.md §4/§5）：剪贴板读写。
+   * - `clipboardRead`：读取剪贴板文本（空/非文本 → null）。只在用户主动
+   *   触发快存那一刻调用，无后台轮询/监听——最小权限；
+   * - `clipboardClear`：置空剪贴板（「保存后清空剪贴板」勾选，默认关——
+   *   外部复制内容非 LightKey 所有，不自动清）。
+   */
+  clipboardRead(): Promise<string | null>;
+  clipboardClear(): Promise<void>;
+
+  /**
    * 通知订阅（决策 #3 A）：注册帧回调，返回退订函数。
    * - tauri：建立守护进程推送流（`subscribe` 命令；解锁后自动重订阅）；
    * - mock：仅登记回调（模拟帧经 QA 钩子 `simulateAuthzRequest` 触发）。

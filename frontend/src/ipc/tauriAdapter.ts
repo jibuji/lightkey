@@ -313,6 +313,21 @@ export class TauriAdapter implements LightKeyIpc {
     }
   }
 
+  /** M2.99 快速保存：读剪贴板文本（壳 command；空/非文本 → null）。
+   *  只在用户主动触发快存时调用（面板打开那一刻），无后台轮询。 */
+  async clipboardRead(): Promise<string | null> {
+    try {
+      return await invoke<string | null>("clipboard_read");
+    } catch {
+      return null; // 剪贴板不可用（无桌面/权限）→ 前端回退手动粘贴
+    }
+  }
+
+  /** M2.99 快速保存：置空剪贴板（「保存后清空剪贴板」勾选，默认关）。 */
+  async clipboardClear(): Promise<void> {
+    await invoke("clipboard_clear");
+  }
+
   async subscribeNotifications(
     handler: (frame: NotificationFrame) => void,
   ): Promise<() => void> {

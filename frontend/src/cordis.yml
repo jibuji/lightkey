@@ -82,3 +82,6 @@
 # 服务（无槽位；M2 桌面层）
 - name: approval
 - name: desktop-shell
+# M2.99 快速保存（服务插件；跨锁态自挂 portal——快存面板 + 锁态引导/pending
+# flush；依赖地基服务与宿主 nav）
+- name: quick-save

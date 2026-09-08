@@ -121,6 +121,9 @@ export class MockAdapter implements LightKeyIpc {
     approvalTimeoutSecs: 30,
     sync: { url: "webdavs://dav.example.com/lightkey", intervalSecs: 60 },
   };
+  /** M2.99 快速保存：模拟剪贴板文本（null = 空/非文本；默认空——真实
+   *  剪贴板也可能为空，QA 钩子 `setClipboardText` 注入后演示/测试）。 */
+  private mockClipboard: string | null = null;
 
   /** 解锁后重建内存库（fixture）；锁定则擦除。 */
   private resetStore(restore: boolean) {
@@ -368,6 +371,23 @@ export class MockAdapter implements LightKeyIpc {
     return delay(this.mockPickDir);
   }
 
+  /* ---------- 剪贴板（M2.99 快速保存；与真实 command 同语义——
+   *  不要求解锁态：剪贴板是 OS 级资源，非 vault 状态） ---------- */
+
+  async clipboardRead(): Promise<string | null> {
+    return delay(this.mockClipboard);
+  }
+
+  async clipboardClear(): Promise<void> {
+    this.mockClipboard = null;
+    return delay(undefined);
+  }
+
+  /** 注入模拟剪贴板内容（QA/测试；null = 空/非文本）。 */
+  setClipboardText(text: string | null): void {
+    this.mockClipboard = text;
+  }
+
   async subscribeNotifications(
     onFrame: (frame: NotificationFrame) => void,
   ): Promise<() => void> {
@@ -557,6 +577,14 @@ export function installMockQaHooks(adapter: MockAdapter) {
       adapter.simulateItemChanged(params),
     setPickDirResult: (path: string | null) => {
       adapter.mockPickDir = path;
+    },
+    setClipboardText: (text: string | null) => {
+      adapter.setClipboardText(text);
+    },
+    simulateQuickSaveRequest: () => {
+      // 模拟壳（托盘）的 `lk-shell-quick-save` 本地事件：与 tauri 真实事件
+      // 同名，ipc-bridge（mock 分支）监听同一 DOM 事件走同一条翻译路径
+      window.dispatchEvent(new CustomEvent("lk-shell-quick-save"));
     },
     simulateFreshInstall: () => adapter.simulateFreshInstall(),
     simulateInstalled: () => adapter.simulateInstalled(),

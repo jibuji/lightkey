@@ -168,6 +168,19 @@
   边界外。前端 `authz.request` 帧带 `fingerprintMismatch`（resolvedExePath +
   sha256Short 8 位前缀）。exe+哈希身份绑定由 write-gate.md §9 留档升级为
   正式立项。
+- [x] M2.99 快速保存（补充拍板 #27，2026-09-07 拍板，已实现；spec 唯一出处
+  `docs/quick-capture.md`，PR 序列 #162 规格 + #163 lk-app + #164 前端，立项
+  issue #161）：托盘「快速保存剪贴板…」→ 壳事件 `lk-shell-quick-save`（本地
+  UI 请求，**不进**守护进程通知协议 NOTIFY_*）→ 前端 ui-quick-save 服务插件
+  （approval 同款自挂 portal，跨锁态存活）快存面板：剪贴板值预填（clipboard_read
+  只在主动触发时读一次，最小权限）、名称启发建议（前缀表 sk-/ghp_/AKIA/eyJ…，
+  设置页可关 `quickSave.nameSuggest`，默认开）、重名软提示（名字即身份不阻止）、
+  「保存后清空剪贴板」默认关（外部复制内容非 LightKey 所有）；锁态只引导解锁
+  + pending flush（解锁后自动重冒，**不触碰** write-gate §12 锁态写一体化留档）；
+  保存走 `item.put` desktop 受信豁免 + 审计 channel=desktop；零协议变更、零新
+  审批路径、零新第三方依赖（arboard 已在 workspace）。阶段二（另行立项）：
+  全局热键 / CLI `item add --clipboard`。不做：剪贴板监听 + 系统通知（通知点击
+  无回调）、锁态一步式。
 - [ ] M3 浏览器填充
 
 ## Agent skills
