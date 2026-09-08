@@ -154,7 +154,7 @@ pub const M_SYNC_TRIGGER: &str = "sync.trigger";
 pub const M_SYNC_POLL: &str = "sync.poll";
 // M2：授权门 + 规则 + 审批回传 + 通知订阅（决策 #6：`rule.add/list/remove`；
 // 顶层阻塞判定 `authz.evaluate`；审批回传 `approval.result`——`approval.request`
-// 已移除，其语义并入 `ApprovalChannel::open` trait）
+// 已移除，其语义并入 daemon 侧审批注册表与 `authz.request` 广播）
 pub const M_AUTHZ_EVALUATE: &str = "authz.evaluate";
 pub const M_APPROVAL_RESULT: &str = "approval.result";
 pub const M_RULE_ADD: &str = "rule.add";

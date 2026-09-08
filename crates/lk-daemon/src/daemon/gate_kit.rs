@@ -2,13 +2,16 @@
 //! write）各自重抄的「五件套」中可下沉部分的唯一出处——纯下沉，零行为变更。
 //!
 //! - [`GateBegin`]：begin 阶段统一结果类型（四门各一个同构枚举合一）；
-//! - [`PendingGates`] / [`GateEntry`] / [`GateKind`]：**统一待审批注册表**
-//!   （四张 pending 表合一；key = 请求 id，payload = 门枚举）——审批解锁
-//!   辅助（needs_unlock 判定 / 临时 vault 存取）表无关，未来任何门带
+//! - [`ApprovalRegistry`] / [`ApprovalEntry`] / [`GateEntry`] / [`GateKind`]：
+//!   **守护进程侧审批注册表**（拍板 #28 候选 2，issue #166：取代 core
+//!   `PendingApprovals` + daemon `PendingGates` 双表——单表承载质询值 /
+//!   到期时刻 / 决策槽 + needs_unlock / 审批工作区 / 门负载；生命周期
+//!   三拍：登记 → 裁决写 → finalize 单点消费移除）；审批解锁辅助
+//!   （needs_unlock 判定 / 临时 vault 存取）表无关，未来任何门带
 //!   needs_unlock 自动被看见（#67/#23 类特性不再逐门特判）；
 //! - [`Daemon::open_gate_approval`]：审批请求（id / challenge / 超时）单点
-//!   铸造并经 `ApprovalChannel::open` 登记广播（challenge 一次性等不变量
-//!   只有一处实现，#78）；
+//!   铸造 + 注册表登记 + `authz.request` 广播（challenge 一次性等不变量
+//!   只有一处实现，#78）+ E2E 规则自动批准分支（#22 折入 daemon）；
 //! - [`Daemon::audit_gate`] + [`ActingVault`] + [`Daemon::with_acting_vault`]：
 //!   四门合一的审计辅助——事件字段由门提供，K_audit 按「本次执行所用
 //!   vault」签名（执行/审计入口统一收 ActingVault，issue #150 起无
@@ -24,6 +27,7 @@
 //! 编排收敛于 router.rs 的通用 deferred 编排器。
 
 use std::collections::HashMap;
+use std::sync::Condvar;
 use std::time::{Duration, Instant};
 
 use super::disclosure::PendingDisclosure;
@@ -55,10 +59,11 @@ pub(crate) enum DeferredOutcome {
 /// 一体化解锁路径（#67 inject / #23 读通道）由 `approval.result`（正确主
 /// 密码 + allowed）填充。
 ///
-/// 生命周期与条目**严格一致**：工作区只存在于 [`GateEntry`] 内，finalize
-/// 消费即随条目销毁；超时竞态（条目已被 finalize 取走）下 `store_workspace`
-/// 失败、工作区随调用方作用域整体 drop。由此**由构造与生命周期承载**的
-/// 不变量（取代既往散布各门 finalize / 审批回传路径的注释纪律）：
+/// 生命周期与条目**严格一致**：工作区只存在于 [`ApprovalEntry`] 内，finalize
+/// 消费即随条目销毁；超时竞态（条目已被 finalize 取走）下
+/// `store_workspace_and_resolve` 失败、工作区随调用方作用域整体 drop。由此
+/// **由构造与生命周期承载**的不变量（取代既往散布各门 finalize / 审批回传
+/// 路径的注释纪律）：
 ///
 /// - **单次即毁**：vault 字段私有、只出不进借用（[`Self::vault`]），
 ///   所有权无法离开工作区——不存在把临时 vault 移入 `shared.vault`（共享
@@ -106,8 +111,10 @@ impl ApprovalWorkspace {
     }
 }
 
-/// 统一待审批注册表条目（key = 请求 id，由外层 map 承担）。needs_unlock 与
-/// 审批工作区是条目级一等字段（issue #148/#150）：审批解锁辅助表无关。
+/// begin 侧待审批负载（各门在命令锁内构造，随后经
+/// [`Daemon::open_gate_approval`] 单点铸造质询值/到期后登记进审批注册表）。
+/// needs_unlock 与审批工作区是条目级一等字段（issue #148/#150）：审批解锁
+/// 辅助表无关。
 pub(crate) struct GateEntry {
     /// 锁定态一体化标志（#67 inject / #23 读通道）：审批需先临时解锁；
     /// `authz.request` 帧的 `needsUnlock` 与本值同源（单点铸造保证）。
@@ -116,7 +123,8 @@ pub(crate) struct GateEntry {
     pub needs_unlock: bool,
     /// 审批工作区（issue #150，见 [`ApprovalWorkspace`] 类型文档——不变量
     /// 「单次即毁 / 不签令牌 / 不置共享 vault」的单点出处）。正常路径恒
-    /// `None`，仅一体化解锁路径由审批回传填充。
+    /// `None`，仅一体化解锁路径由审批回传填充；二次审批条目（#140）由
+    /// finalize 转办时随条目携带。
     pub workspace: Option<ApprovalWorkspace>,
     /// 门负载（各门 begin 期已解析的产物）。
     pub kind: GateKind,
@@ -133,7 +141,7 @@ impl GateEntry {
     }
 
     /// 一体化解锁审批条目（锁定态 #67/#23：审批回传以主密码临时解锁后
-    /// 由 [`PendingGates::store_workspace`] 填充工作区）。
+    /// 由 [`ApprovalRegistry::store_workspace_and_resolve`] 填充工作区）。
     pub(crate) fn unified_unlock(kind: GateKind) -> Self {
         Self {
             needs_unlock: true,
@@ -155,53 +163,118 @@ pub(crate) enum GateKind {
     Write(PendingWrite),
 }
 
-/// 统一待审批注册表（issue #148：四张 pending 表并成一张；key = 请求 id）。
-///
-/// 命令线程登记 / finalize 消费，`approval.result` 回传线程写入（needs_unlock
-/// 判定与工作区存取经 [`Self::needs_unlock`] / [`Self::store_workspace`]
-/// ——表无关，不感知具体门）。
-#[derive(Default)]
-pub(crate) struct PendingGates {
-    entries: HashMap<uuid::Uuid, GateEntry>,
+/// 审批注册表行（key = 请求 id，由外层 map 承担）：门负载
+/// （[`GateEntry`]）+ 审批三要素（决策槽 / 到期时刻 / 一次性质询值）。
+/// 生命周期三拍（拍板 #28 候选 2）——登记（begin）→ 裁决写
+/// （`approval.result` 回传写决策与工作区）→ 收尾节点**唯一消费移除**
+/// （finalize 的 [`ApprovalRegistry::remove`]）；`await_decision` 只读
+/// 不移除，`resolve` 按过期/未知拒绝写（迟到回传不得回翻已超时的等待
+/// 结果）。
+pub(crate) struct ApprovalEntry {
+    /// 决策槽（`None` = 未裁决；写决策的唯一入口是审批回传路径的
+    /// `resolve` / `store_workspace_and_resolve`）。
+    pub(crate) decision: Option<ApprovalDecision>,
+    /// 到期时刻（登记值权威；到期 → 等待者收 `Timeout`、回传按过期拒绝写）。
+    pub(crate) expires_at: Instant,
+    /// 一次性质询值（#78 方案 B：仅随 `authz.request` 事件帧投桌面订阅者，
+    /// 回传必须原样带回；比较用普通等值判定——注册表为进程内共享内存，
+    /// 无逐字节侧信道面）。
+    pub(crate) challenge: String,
+    /// 锁定态一体化标志（同 [`GateEntry::needs_unlock`]，登记时随门负载
+    /// 入表——单表后不再有第二份拷贝）。
+    pub(crate) needs_unlock: bool,
+    /// 审批工作区（issue #150，见 [`ApprovalWorkspace`] 类型文档）。
+    pub(crate) workspace: Option<ApprovalWorkspace>,
+    /// 门负载（各门 begin 期已解析的产物）。
+    pub(crate) kind: GateKind,
 }
 
-impl PendingGates {
-    /// 登记待审条目（begin 阶段，命令锁内）。
-    pub(crate) fn insert(&mut self, request_id: uuid::Uuid, entry: GateEntry) {
-        self.entries.insert(request_id, entry);
+/// 守护进程侧**审批注册表**（拍板 #28 候选 2「审批注册表合一」，issue
+/// #166）：取代此前跨 core/daemon 的两张表（core `PendingApprovals` 的
+/// challenge/decision/expires + condvar await 与 daemon `PendingGates` 的
+/// needs_unlock/workspace/kind）——一次审批只登记进这一张表。
+///
+/// 跨线程共享：命令线程登记（begin，命令锁内）/ 锁外等待
+/// （[`Self::await_decision`]，只读），`approval.result` 回传线程写决策与
+/// 工作区（[`Self::resolve`] / [`Self::store_workspace_and_resolve`]），
+/// finalize 单点消费移除。锁为注册表内部短锁（G1：等待期间不持命令锁，
+/// 等待以 condvar 挂起、不持注册表锁阻塞写入方）。
+///
+/// 类型本身 `pub`（`SharedDaemon.approvals` 字段的可达性要求；方法面保持
+/// crate 内）。
+#[derive(Default)]
+pub struct ApprovalRegistry {
+    inner: Mutex<HashMap<uuid::Uuid, ApprovalEntry>>,
+    condvar: Condvar,
+}
+
+impl ApprovalRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
-    /// 消费待审条目（finalize 阶段，重取命令锁后）。条目已被消费（极端
-    /// 竞态 / 超时清理）→ `None`，调用方保守拒绝。按引用借取：调用方
-    /// （规则门 auto-approve 审计）finalize 后段还要用请求 id。
-    pub(crate) fn remove(&mut self, request_id: &uuid::Uuid) -> Option<GateEntry> {
-        self.entries.remove(request_id)
+    /// 三拍之一·登记（begin 阶段，命令锁内）：门负载条目 + 单点铸造的
+    /// 质询值与到期时刻入表（幂等：重复登记整条覆盖）。
+    pub(crate) fn insert(
+        &self,
+        request_id: uuid::Uuid,
+        gate: GateEntry,
+        expires_at: Instant,
+        challenge: String,
+    ) {
+        self.inner.lock().unwrap().insert(
+            request_id,
+            ApprovalEntry {
+                decision: None,
+                expires_at,
+                challenge,
+                needs_unlock: gate.needs_unlock,
+                workspace: gate.workspace,
+                kind: gate.kind,
+            },
+        );
     }
 
-    /// 待审条目是否带锁定态一体化标志（审批解锁辅助，表无关）：请求 id
-    /// 不在册或条目为常规（解锁态）审批 → false。
-    pub(crate) fn needs_unlock(&self, request_id: uuid::Uuid) -> bool {
-        self.entries
-            .get(&request_id)
-            .map(|e| e.needs_unlock)
-            .unwrap_or(false)
-    }
-
-    /// 把审批工作区存入待审条目（`approval.result` 的 allowed 决策，主密码
-    /// 临时解锁成功后；issue #150）。返回条目是否存在（true = 已存储）；
-    /// 条目已被 finalize 消费（超时竞态）→ false，工作区随调用方作用域
-    /// 整体 drop（生命周期与条目严格一致）。
+    /// 三拍之二·裁决写（`approval.result` 回传，非一体化路径）：条目存在
+    /// 且未到期**且质询值匹配** → 写入决策并唤醒等待者。
     ///
-    /// 条目已带工作区（#140 二次审批条目）时**替换解锁材料、保留单次裁决
-    /// 状态**：指纹单发状态属于条目侧裁决流程而非某一份解锁材料——重解锁
-    /// 不得重置「已裁决」标记，否则失配二次审批将再次裁决、再次失配，形成
-    /// 裁决死循环（#140 类竞态由结构排除）。
-    pub(crate) fn store_workspace(
-        &mut self,
+    /// - 伪造 requestId（未知）或条目已过期 → **拒绝写**（return false →
+    ///   桌面 `accepted=false` + 失败提交 Denied 审计）；条目**不移除**——
+    ///   迟到回传不得回翻等待侧已得的 Timeout，移除归 finalize；
+    /// - 质询不符（#78：无广播帧则拿不到 challenge）→ **不移除**条目，
+    ///   防止伪回传把真用户的待审批请求打掉（拒绝 DoS），仅本次忽略。
+    pub(crate) fn resolve(
+        &self,
+        request_id: uuid::Uuid,
+        decision: ApprovalDecision,
+        challenge: &str,
+    ) -> bool {
+        let mut map = self.inner.lock().unwrap();
+        write_decision_locked(&mut map, &self.condvar, request_id, decision, challenge)
+    }
+
+    /// 一体化解锁路径的裁决写（`approval.result` allowed + masterPassword，
+    /// session.rs）：**同一临界区**内先存工作区、再写决策——不产生错误
+    /// 结果（spec §2；白费临时解锁与 `vault.unlock` 审计在超时竞态下仍会
+    /// 发生——解锁发生在临界区之前，与折入前行为等价，非本次消除目标）。
+    ///
+    /// - 条目不在册（已被 finalize 消费的超时竞态）→ false，工作区随调用
+    ///   方作用域整体 drop（生命周期与条目严格一致）；
+    /// - 条目已带工作区（#140 二次审批条目）时**替换解锁材料、保留单次
+    ///   裁决状态**：指纹单发状态属于条目侧裁决流程而非某一份解锁材料
+    ///   ——重解锁不得重置「已裁决」标记，否则失配二次审批将再次裁决、
+    ///   再次失配，形成裁决死循环（#140 类竞态由结构排除）；
+    /// - 工作区存储后的决策写入语义与 [`Self::resolve`] 一致（过期/质询
+    ///   不符 → 拒绝写，条目保留）。
+    pub(crate) fn store_workspace_and_resolve(
+        &self,
         request_id: uuid::Uuid,
         mut ws: ApprovalWorkspace,
+        decision: ApprovalDecision,
+        challenge: &str,
     ) -> bool {
-        match self.entries.get_mut(&request_id) {
+        let mut map = self.inner.lock().unwrap();
+        match map.get_mut(&request_id) {
             Some(entry) => {
                 if let Some(prev) = entry.workspace.take() {
                     if prev.fingerprint_adjudicated() {
@@ -209,11 +282,119 @@ impl PendingGates {
                     }
                 }
                 entry.workspace = Some(ws);
-                true
             }
-            None => false,
+            None => return false,
+        }
+        write_decision_locked(&mut map, &self.condvar, request_id, decision, challenge)
+    }
+
+    /// 锁外等待决策（G1：命令锁外；**只读不移除**——消费移除归 finalize）：
+    /// 决策已写 → 返回之（条目留表等 finalize）；到期 → 返回
+    /// [`ApprovalDecision::Timeout`]（默认拒绝；条目仍留表，期间迟到回传
+    /// 按过期拒绝写）；条目不在册（已被消费的竞态）→ 保守 Denied。
+    /// 到期时刻以登记值为准。
+    pub(crate) fn await_decision(&self, request_id: uuid::Uuid) -> ApprovalDecision {
+        let mut map = self.inner.lock().unwrap();
+        loop {
+            match map.get(&request_id) {
+                Some(e) if e.decision.is_some() => {
+                    // 只读返回：条目留给 finalize 单点消费
+                    return e.decision.unwrap();
+                }
+                Some(e) if Instant::now() >= e.expires_at => {
+                    // 到期默认拒绝；不移除（迟到回传按过期拒绝写）
+                    return ApprovalDecision::Timeout;
+                }
+                Some(e) => {
+                    let remaining = e.expires_at.saturating_duration_since(Instant::now());
+                    let (guard, timeout_result) = self
+                        .condvar
+                        .wait_timeout(map, remaining.max(Duration::from_millis(1)))
+                        .unwrap();
+                    map = guard;
+                    if timeout_result.timed_out() {
+                        // 重新评估（防止虚假唤醒/时间竞争）
+                        continue;
+                    }
+                }
+                None => {
+                    // 条目已被消费（竞态）→ 保守视为拒绝
+                    return ApprovalDecision::Denied;
+                }
+            }
         }
     }
+
+    /// 三拍之三·收尾（finalize 阶段，重取命令锁后）：**唯一消费移除点**。
+    /// 条目已被消费（极端竞态）→ `None`，调用方保守拒绝。按值返回：决策、
+    /// 工作区与门负载随条目一并交出（调用方消费后即毁）。
+    pub(crate) fn remove(&self, request_id: &uuid::Uuid) -> Option<ApprovalEntry> {
+        self.inner.lock().unwrap().remove(request_id)
+    }
+
+    /// 待审条目是否带锁定态一体化标志（审批解锁辅助，表无关）：请求 id
+    /// 不在册或条目为常规（解锁态）审批 → false。
+    pub(crate) fn needs_unlock(&self, request_id: uuid::Uuid) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&request_id)
+            .map(|e| e.needs_unlock)
+            .unwrap_or(false)
+    }
+
+    /// 当前待审批数（测试断言用）。
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    /// 把所有待审批条目的到期时刻提前到当前时刻并唤醒等待者（测试专用）：
+    /// 需要同时断言「回传落地」与「超时拒绝」的测试（如 #67 错误主密码
+    /// 保留条目后 CLI 侧超时）不再依赖真实秒级等待——到期判定与默认拒绝
+    /// 走既有 `await_decision` 语义，仅时钟被测试掌控。
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn expire_all_for_tests(&self) {
+        let mut map = self.inner.lock().unwrap();
+        let now = Instant::now();
+        for e in map.values_mut() {
+            e.expires_at = now;
+        }
+        self.condvar.notify_all();
+    }
+}
+
+/// 决策写入（注册表锁内共用段，[`ApprovalRegistry::resolve`] /
+/// [`ApprovalRegistry::store_workspace_and_resolve`]）：过期/未知 → 拒绝写；
+/// 质询匹配 → 写决策 + 唤醒等待者。
+fn write_decision_locked(
+    map: &mut HashMap<uuid::Uuid, ApprovalEntry>,
+    condvar: &Condvar,
+    request_id: uuid::Uuid,
+    decision: ApprovalDecision,
+    challenge: &str,
+) -> bool {
+    let expired = map
+        .get(&request_id)
+        .map(|e| Instant::now() >= e.expires_at)
+        .unwrap_or(true);
+    if expired {
+        // 拒绝写：迟到回传不得回翻等待侧已得的 Timeout；条目留待 finalize
+        return false;
+    }
+    let matches = map
+        .get(&request_id)
+        .map(|e| e.challenge == challenge)
+        .unwrap_or(false);
+    if !matches {
+        return false;
+    }
+    if let Some(e) = map.get_mut(&request_id) {
+        e.decision = Some(decision);
+    }
+    condvar.notify_all();
+    true
 }
 
 /// 审批请求草稿（issue #148 单点铸造的入参）：id / challenge / 超时不在
@@ -237,12 +418,28 @@ pub(crate) struct ApprovalDraft {
 }
 
 impl Daemon {
-    /// 审批请求单点铸造 + 登记广播 + 统一注册表登记（issue #148）：
+    /// 桌面审批界面在场判定（拍板 #28 候选 2 折入 daemon：原 core
+    /// `LocalApprovalChannel::available` 的 `has_ui` 谓词）：只数**桌面来源**
+    /// 推送订阅者——socket 订阅（任何持令牌进程可建立）不算「有界面」
+    /// （#72/#78 方案 A）。`false` → 四门 begin 与锁态 precheck fail-closed
+    /// 立即拒绝，不登记、不阻塞。
+    pub(crate) fn approval_available(&self) -> bool {
+        self.shared.push.desktop_subscriber_count() > 0
+    }
+
+    /// 审批请求单点铸造 + 注册表登记 + `authz.request` 广播（issue #148；
+    /// 拍板 #28 候选 2 折入 daemon，取代 `ApprovalChannel::open`）：
     /// request_id / challenge / 超时在此**唯一铸造**（challenge 一次性等
-    /// 不变量单点实现，#78）；广播经 `ApprovalChannel::open`（仅投桌面
-    /// 订阅者）；待审条目随后入统一注册表。帧 `needsUnlock` 与条目
-    /// `needs_unlock` 同源（同一 [`GateEntry`] 承载，不会漂移）。
-    /// 返回请求 id（等待方据此 `await_decision`）。
+    /// 不变量单点实现，#78），门负载条目随质询/到期一并入**审批注册表**
+    /// （单表，不再有第二张 pending 表）；广播 `authz.request`（通知桥只投
+    /// 桌面订阅者）。帧 `needsUnlock` 与条目 `needs_unlock` 同源（同一
+    /// [`GateEntry`] 承载，不会漂移）。返回请求 id（等待方据此
+    /// `await_decision`）。
+    ///
+    /// **E2E 规则自动批准分支**（补充拍板 #22 折入 daemon）：`rule_auto`
+    /// 开启且 kind=Rule 时**不广播**（无 UI 参与）——登记后即刻写
+    /// decision=Allowed（同一质询值；等待者即刻拿到决策）；inject/读/写
+    /// 审批不在此分支，照旧要求 UI 在场。
     pub(crate) fn open_gate_approval(
         &mut self,
         draft: ApprovalDraft,
@@ -251,25 +448,38 @@ impl Daemon {
         let request_id = lk_core::crypto::random_uuid();
         let challenge = hex::encode(lk_core::crypto::random_array::<16>());
         let expires_at = Instant::now() + Duration::from_secs(self.approval_timeout());
-        let areq = ApprovalRequest {
+        let needs_unlock = pending.needs_unlock;
+        self.shared
+            .approvals
+            .insert(request_id, pending, expires_at, challenge.clone());
+        if self.rule_auto && draft.kind == lk_core::authz::ApprovalKind::Rule {
+            // 登记 + 立即写 Allowed（同一质询值 resolve；等待者即刻拿到
+            // 决策）；不广播 authz.request——自动批准无 UI 参与，弹窗不该
+            // 出现（#22：仅规则审批，永不碰 inject/读值/写入）。
+            let _ =
+                self.shared
+                    .approvals
+                    .resolve(request_id, ApprovalDecision::Allowed, &challenge);
+            return request_id;
+        }
+        // 广播 `authz.request`（通知 D 层弹窗；无密钥值；challenge 仅经本
+        // 事件通道下发——守护进程侧通知桥只投给桌面订阅者，#78 方案 A；
+        // kind/export_meta 供弹窗按审批类型渲染，M2.9 值披露；write_action
+        // 供「记住」生成 actions=[当前动作] 最小写规则，#137）
+        self.core.bus().emit(&VaultEvent::AuthzRequest {
             request_id,
             starter: draft.starter,
             project_dir: draft.project_dir,
             command: draft.command,
             keys: draft.keys,
             challenge,
-            needs_unlock: pending.needs_unlock,
+            needs_unlock,
             kind: draft.kind,
             write_action: draft.write_action,
             export_meta: draft.export_meta,
             fingerprint_mismatch: draft.fingerprint_mismatch,
             sub_kind: draft.sub_kind,
-        };
-        self.gate.approval().open(&areq, expires_at);
-        self.pending_gates
-            .lock()
-            .unwrap()
-            .insert(request_id, pending);
+        });
         request_id
     }
 
@@ -366,6 +576,11 @@ mod tests {
     use lk_core::crypto::test_kdf_params;
     use lk_core::vault::init_vault_with_params;
 
+    /// 登记用的远期到期时刻 + 质询值（测试默认值）。
+    fn far_expiry() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
     /// 构造一个 disclosure 门条目（字段全为简单值；GateKind 选哪个门不影响
     /// 条目级行为——这正是「表无关」的断言点）。
     fn disclosure_entry(needs_unlock: bool) -> GateEntry {
@@ -396,7 +611,7 @@ mod tests {
 
     #[test]
     fn unknown_request_is_not_needs_unlock() {
-        let registry = PendingGates::default();
+        let registry = ApprovalRegistry::new();
         assert!(!registry.needs_unlock(uuid::Uuid::new_v4()));
     }
 
@@ -404,13 +619,111 @@ mod tests {
     /// 看见，不感知具体门；常规条目不误报。
     #[test]
     fn needs_unlock_is_seen_for_any_gate_entry() {
-        let mut registry = PendingGates::default();
+        let registry = ApprovalRegistry::new();
         let unified = uuid::Uuid::new_v4();
         let plain = uuid::Uuid::new_v4();
-        registry.insert(unified, disclosure_entry(true));
-        registry.insert(plain, disclosure_entry(false));
+        registry.insert(unified, disclosure_entry(true), far_expiry(), "c".into());
+        registry.insert(plain, disclosure_entry(false), far_expiry(), "c".into());
         assert!(registry.needs_unlock(unified));
         assert!(!registry.needs_unlock(plain));
+    }
+
+    /// 三拍生命周期（issue #166 / 拍板 #28 候选 2 验收）：登记 → 裁决写 →
+    /// finalize 单点消费。覆盖质询不符不移除（#78）、await 只读不移除、
+    /// 二次 remove 恒 None。
+    #[test]
+    fn approval_registry_three_beat_lifecycle() {
+        let registry = ApprovalRegistry::new();
+        let id = uuid::Uuid::new_v4();
+        // 拍一·登记
+        registry.insert(id, disclosure_entry(false), far_expiry(), "chal-1".into());
+        assert_eq!(registry.pending_count(), 1);
+        // 质询不符 → 拒绝写且**不移除**条目（#78 防伪回传打掉真审批）
+        assert!(!registry.resolve(id, ApprovalDecision::Allowed, "wrong"));
+        assert_eq!(registry.pending_count(), 1);
+        // 拍二·裁决写：正确质询 → 决策入槽并唤醒等待者
+        assert!(registry.resolve(id, ApprovalDecision::Allowed, "chal-1"));
+        // await 只读：返回决策但条目仍在册（移除只归 finalize）
+        assert_eq!(registry.await_decision(id), ApprovalDecision::Allowed);
+        assert_eq!(
+            registry.pending_count(),
+            1,
+            "await 只读不移除（finalize 唯一消费点）"
+        );
+        // 拍三·finalize 单点消费：决策随条目交出；再次 remove 恒 None
+        let entry = registry.remove(&id).expect("条目在册");
+        assert_eq!(entry.decision, Some(ApprovalDecision::Allowed));
+        assert!(matches!(entry.kind, GateKind::Disclosure(_)));
+        assert!(registry.remove(&id).is_none());
+        assert_eq!(registry.pending_count(), 0);
+    }
+
+    /// 超时拍：await 已返 Timeout 后条目仍留表——finalize 未跑之间插入的
+    /// 迟到回传**按过期拒绝写**（不得回翻等待结果），移除归 finalize。
+    #[test]
+    fn approval_registry_timeout_rejects_late_resolve_until_finalize() {
+        let registry = ApprovalRegistry::new();
+        let id = uuid::Uuid::new_v4();
+        registry.insert(
+            id,
+            disclosure_entry(false),
+            Instant::now() + Duration::from_millis(20),
+            "c".into(),
+        );
+        // 等待侧超时默认拒绝（真实时钟驱动，20ms 窗口）
+        assert_eq!(registry.await_decision(id), ApprovalDecision::Timeout);
+        // 迟到回传（await 已返 Timeout、finalize 未跑）：拒绝写、条目不移除
+        assert!(
+            !registry.resolve(id, ApprovalDecision::Allowed, "c"),
+            "迟到审批不得回翻已超时的等待结果"
+        );
+        assert_eq!(
+            registry.pending_count(),
+            1,
+            "移除归 finalize（迟到回传无权移除）"
+        );
+        // finalize 仍能消费到条目（decision 槽未被迟到回传污染）
+        let entry = registry.remove(&id).expect("finalize 消费");
+        assert_eq!(entry.decision, None);
+    }
+
+    /// 一体化解锁路径的裁决写（issue #166）：条目不在册 → 放弃存储（工作区
+    /// 随调用方 drop）；在册 + 正确质询 → 工作区入条目 + 决策写入 + 唤醒
+    /// 等待者；finalize 消费时工作区随条目一并交出；消费后再存 → false
+    /// （一次性语义）。
+    #[test]
+    fn approval_registry_unlock_path_workspace_and_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        init_vault(dir.path());
+        let registry = ApprovalRegistry::new();
+        // 条目已被 finalize 消费（超时竞态）→ false，工作区随调用方 drop
+        let ghost = uuid::Uuid::new_v4();
+        assert!(!registry.store_workspace_and_resolve(
+            ghost,
+            workspace(dir.path()),
+            ApprovalDecision::Allowed,
+            "chal"
+        ));
+        // 在册 + 正确质询 → 工作区 + 决策一次落位
+        let id = uuid::Uuid::new_v4();
+        registry.insert(id, disclosure_entry(true), far_expiry(), "chal".into());
+        assert!(registry.store_workspace_and_resolve(
+            id,
+            workspace(dir.path()),
+            ApprovalDecision::Allowed,
+            "chal"
+        ));
+        assert_eq!(registry.await_decision(id), ApprovalDecision::Allowed);
+        let entry = registry.remove(&id).expect("finalize 消费");
+        assert!(entry.workspace.is_some(), "工作区随条目一并消费");
+        assert!(entry.needs_unlock);
+        // 消费后再存 → false（一次性语义）
+        assert!(!registry.store_workspace_and_resolve(
+            id,
+            workspace(dir.path()),
+            ApprovalDecision::Allowed,
+            "chal"
+        ));
     }
 
     /// 审批工作区生命周期与条目严格一致（issue #150）：在册条目存储成功、
@@ -420,16 +733,31 @@ mod tests {
     fn workspace_storage_follows_entry_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         init_vault(dir.path());
-        let mut registry = PendingGates::default();
+        let registry = ApprovalRegistry::new();
         // 条目不在册 → 放弃存储（调用方作用域 drop）
-        assert!(!registry.store_workspace(uuid::Uuid::new_v4(), workspace(dir.path())));
+        assert!(!registry.store_workspace_and_resolve(
+            uuid::Uuid::new_v4(),
+            workspace(dir.path()),
+            ApprovalDecision::Allowed,
+            "c"
+        ));
         let id = uuid::Uuid::new_v4();
-        registry.insert(id, disclosure_entry(true));
-        assert!(registry.store_workspace(id, workspace(dir.path())));
+        registry.insert(id, disclosure_entry(true), far_expiry(), "c".into());
+        assert!(registry.store_workspace_and_resolve(
+            id,
+            workspace(dir.path()),
+            ApprovalDecision::Allowed,
+            "c"
+        ));
         let entry = registry.remove(&id).expect("条目在册");
         assert!(entry.workspace.is_some());
         // 消费后再存 → false（一次性语义）
-        assert!(!registry.store_workspace(id, workspace(dir.path())));
+        assert!(!registry.store_workspace_and_resolve(
+            id,
+            workspace(dir.path()),
+            ApprovalDecision::Allowed,
+            "c"
+        ));
     }
 
     /// 单次裁决状态属于条目而非解锁材料（issue #150，#140 回归钉）：二次
@@ -440,15 +768,20 @@ mod tests {
     fn store_workspace_preserves_single_shot_state_of_repend_entry() {
         let dir = tempfile::tempdir().unwrap();
         init_vault(dir.path());
-        let mut registry = PendingGates::default();
+        let registry = ApprovalRegistry::new();
         let id = uuid::Uuid::new_v4();
         // 模拟二次审批条目：工作区已裁决（finalize reopen 侧标记）
-        registry.insert(id, disclosure_entry(true));
+        registry.insert(id, disclosure_entry(true), far_expiry(), "c".into());
         let mut ws = workspace(dir.path());
         ws.mark_fingerprint_adjudicated();
-        registry.store_workspace(id, ws);
+        registry.store_workspace_and_resolve(id, ws, ApprovalDecision::Allowed, "c");
         // 回传重解锁：全新解锁材料替换既有工作区
-        assert!(registry.store_workspace(id, workspace(dir.path())));
+        assert!(registry.store_workspace_and_resolve(
+            id,
+            workspace(dir.path()),
+            ApprovalDecision::Allowed,
+            "c"
+        ));
         let entry = registry.remove(&id).expect("条目在册");
         let ws = entry.workspace.expect("工作区在册");
         assert!(

@@ -105,12 +105,10 @@ impl Daemon {
             return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
         }
         // 4) 无审批界面（headless）且无 E2E 自动批准 → fail-closed 立即拒绝
-        //    （不登记、不阻塞；仅规则审批可走 auto 通道，补充拍板 #22）
-        let via_auto = self
-            .gate
-            .approval()
-            .auto_approves(lk_core::authz::ApprovalKind::Rule);
-        if !via_auto && !self.gate.approval().available() {
+        //    （不登记、不阻塞；仅规则审批可走自动批准，补充拍板 #22 折入
+        //    daemon：rule_auto 为启动读一次的布尔，永不碰 inject/读值/写入）
+        let via_auto = self.rule_auto;
+        if !via_auto && !self.approval_available() {
             self.audit_gate(
                 ActingVault::Shared,
                 &starter,
@@ -164,9 +162,10 @@ impl Daemon {
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
     ) -> String {
-        let removed = self.pending_gates.lock().unwrap().remove(&request_id);
+        // finalize = 审批注册表唯一消费移除点（拍板 #28 候选 2 三拍之三）
+        let removed = self.shared.approvals.remove(&request_id);
         // 条目已被消费（极端竞态）→ 保守拒绝
-        let Some(GateEntry {
+        let Some(ApprovalEntry {
             kind: GateKind::Rule(p),
             ..
         }) = removed

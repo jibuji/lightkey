@@ -4,8 +4,9 @@
 //!   `CoreServices::bus()`，把 [`VaultEvent`] 翻译成 JSON-RPC **notification
 //!   帧**（无 `id`，一行一帧）广播给订阅连接；
 //! - **`authz.request` 仅投递给桌面来源的订阅者**（#72/#78 方案 A：帧里的
-//!   一次性 challenge 是审批应答凭据，不得离开受信桌面通道；`has_ui` 同样
-//!   只数桌面订阅者——socket 订阅者收不到该帧也就无法自我批准）；
+//!   一次性 challenge 是审批应答凭据，不得离开受信桌面通道；UI 在场判定
+//!   （daemon 审批注册表的谓词）同样只数桌面订阅者——socket 订阅者收不到
+//!   该帧也就无法自我批准）；
 //! - **非阻塞**（总线契约）：广播只做内存 channel 投递，socket 写入由每个
 //!   订阅连接自己的 writer 线程承担（见 [`transport::PushHub`]）；
 //! - `item.changed` 帧的 `kind` 映射回协议字段 `type`（bus.rs 契约）。

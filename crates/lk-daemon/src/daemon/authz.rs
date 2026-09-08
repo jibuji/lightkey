@@ -81,7 +81,7 @@ impl Daemon {
             }
             // 无审批界面（纯 headless 守护进程）→ fail-closed（issue #67：
             // GUI 不在运行维持现状直接拒绝，不阻塞、不静默回落）
-            if !self.gate.approval().available() {
+            if !self.approval_available() {
                 return GateBegin::Final(
                     serde_json::to_string(&session_invalid(id)).unwrap_or_else(|_| "{}".into()),
                 );
@@ -232,7 +232,7 @@ impl Daemon {
         channel: AuditChannel,
         fingerprint_mismatch: Option<FingerprintMismatch>,
     ) -> GateBegin {
-        if !self.gate.approval().available() {
+        if !self.approval_available() {
             self.audit_authz(ActingVault::Shared, &req, channel, AuditResult::Denied);
             return GateBegin::Final(rpc_string(RpcResponse::ok(
                 id,
@@ -288,13 +288,15 @@ impl Daemon {
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
     ) -> DeferredOutcome {
-        let removed = self.pending_gates.lock().unwrap().remove(&request_id);
+        // finalize = 审批注册表唯一消费移除点（拍板 #28 候选 2 三拍之三）
+        let removed = self.shared.approvals.remove(&request_id);
         // 条目已被消费（极端竞态）或门不符 → 保守拒绝
         let (pending, workspace, needs_unlock) = match removed {
-            Some(GateEntry {
+            Some(ApprovalEntry {
                 needs_unlock,
                 workspace,
                 kind: GateKind::Authz(pending),
+                ..
             }) => (pending, workspace, needs_unlock),
             _ => {
                 return DeferredOutcome::Done(rpc_string(RpcResponse::ok(
@@ -525,7 +527,7 @@ impl Daemon {
         mut workspace: ApprovalWorkspace,
         mismatch: Option<FingerprintMismatch>,
     ) -> DeferredOutcome {
-        if !self.gate.approval().available() {
+        if !self.approval_available() {
             self.audit_authz(
                 ActingVault::Temporary(workspace.vault()),
                 req,

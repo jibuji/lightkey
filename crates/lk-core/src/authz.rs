@@ -10,24 +10,21 @@
 //! - 规则匹配：`projectDir` 祖先匹配（canonical 形态）+ `command` glob
 //!   （`*`/`?`，大小写敏感）；多规则命中取 **keys 并集**；注入集合 =
 //!   规则 keys ∩ 请求 keys（agent 只能看到被授权的 key 名）。
-//! - 审批通道抽象成接口（[`ApprovalChannel`]）：本地实现
-//!   （[`LocalApprovalChannel`]，桌面弹窗 + 30s 超时）；远程留接口不实现
-//!   （P1 不做）。
+//! - 第 3 层审批的**编排**（登记 / `authz.request` 广播 / 锁外等待 /
+//!   收尾）住在守护进程侧——daemon 审批注册表（单表承载 challenge/expires/
+//!   decision + needs_unlock/workspace/kind）+ 通用 deferred 编排器；本模块
+//!   只承载三层判定与规则匹配纯函数（拍板 #28 候选 2：`ApprovalChannel`
+//!   通道抽象已删除，core 不再持有待审批状态）。
 //! - 授权门三层是 Rust 内部确定性流程；`authz.request`（[`bus::VaultEvent`]）
 //!   只是「需要用户决策」的通知，决策权始终在 Rust 侧（§5.3）。
 //! - **G1 并发约束**：第 3 层的 30s 等待不得持有守护进程命令锁——实现为
-//!   三阶段（[`AuthzGate::begin`] 命令锁内 → [`AuthzGate::await_decision`]
-//!   锁外等待 → 守护进程重取锁收尾），见 `lk-daemon` 装配。
+//!   三阶段（begin 命令锁内 → 锁外等待 → 重取锁收尾），编排见 `lk-daemon`
+//!   的 router.rs 通用 deferred 编排器。
 //! - fail-closed：启动者未知 / 规则库损坏（解密失败）/ 无审批界面 /
 //!   请求 key 无法解析 → 一律拒绝，不弹窗、不留内容，仅审计拒绝事件。
 
 use std::collections::HashSet;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
 
-use uuid::Uuid;
-
-use crate::bus::{EventBus, VaultEvent};
 use crate::model::Rule;
 use crate::Result;
 
@@ -166,61 +163,20 @@ pub struct ExportMeta {
     pub size: u64,
 }
 
-/// 审批请求负载（`authz.request` 事件与弹窗展示用；keys 仅 key 名）。
-///
-/// `challenge` 为**一次性应答值**（#78 方案 B）：随 `open` 登记 + 仅经
-/// 事件总线广播给桌面订阅者（不出现在任何 RPC 响应里），`approval.result`
-/// 必须原样回带才被接受——纵使未来出现可伪造连接标签的进程内组件，无
-/// 挑战值仍无法自我批准。
-///
-/// M2.9 值披露（value-disclosure.md §5.2/§6）：`kind` 区分注入/读/导出
-/// 审批形态；`command` 字段填 `"item.get"` / `"item.export"`（展示用），
-/// `keys` 为单元素 [条目名]；`export_meta` 仅 export 审批有值。
-///
-/// M2.98 程序指纹失配（identity-binding.md §7）：`fingerprint_mismatch` 携带
-/// 「绑定注入规则命中命令形态但指纹不符」的展示信息——弹窗据「指纹不符」主题
-/// 展示当前解析路径、8 位哈希摘要并给「以新指纹重新授权」入口；未失配为
-/// `None`（常规审批）。**不含完整哈希、任何值或错误码差异化**（失配视同
-/// 未命中，headless 统一 `authz.denied`，防探测）。
+/// 程序指纹失配信息（M2.98，identity-binding.md §7）：绑定注入规则命中
+/// 命令形态但指纹不符时随 `authz.request` 帧携带（弹窗据此显示「指纹不符」
+/// 主题 + 当前解析路径、8 位哈希摘要并给「以新指纹重新授权」入口）；未失配
+/// 为 `None`（常规审批）。**不含完整哈希、任何值或错误码差异化**（失配视同
+/// 未命中，headless 统一 `authz.denied`，防探测）。审批帧的其余展示字段
+/// （starter / projectDir / command / keys / kind / writeAction / exportMeta /
+/// subKind / needsUnlock / challenge）由 [`crate::bus::VaultEvent::AuthzRequest`]
+/// 直接承载；一次性挑战值的登记与校验在 daemon 审批注册表（#78 方案 B）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FingerprintMismatch {
     /// 当前解析到的 canonical 绝对路径（daemon 侧重算；展示用，非安全依据）。
     pub resolved_exe_path: String,
     /// 8 位 SHA-256 前缀摘要（hex 小写；不展示完整值）。
     pub sha256_short: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovalRequest {
-    pub request_id: Uuid,
-    pub starter: String,
-    pub project_dir: String,
-    pub command: String,
-    pub keys: Vec<String>,
-    /// 一次性审批挑战（见结构体文档；守护进程侧生成的高熵随机值 hex）。
-    pub challenge: String,
-    /// 锁定态一体化（#67）：弹窗须同时收集主密码（临时解锁 + 本次授权
-    /// 一次交互）；守护进程拿到 `approval.result` 的 `masterPassword` 后
-    /// 先临时解锁再跑授权门，且不签发会话令牌。false = 常规解锁态审批。
-    pub needs_unlock: bool,
-    /// 审批类型（值披露读/导出弹窗按 kind 渲染；读/导出不带解锁一体化）。
-    pub kind: ApprovalKind,
-    /// 派生写动作（kind=Write 时有值；#137 最小授权修复）：daemon 从
-    /// `ItemPutParams.id` 有无权威派生（None=create / Some=update，§5.2
-    /// RPC 不拆——action 不进 RPC 面，但随 `authz.request` 帧回带
-    /// `writeAction` 字段），前端「允许并为此项目记住」据此生成
-    /// `actions=[当前动作]` 最小写规则（write-gate.md §6）；非写审批恒 None。
-    pub write_action: Option<WriteAction>,
-    /// export 审批的数据包规模元信息（kind=Export 时有值；读/注入为 None）。
-    pub export_meta: Option<ExportMeta>,
-    /// 程序指纹失配信息（M2.98，identity-binding.md §7）：绑定注入规则命中
-    /// 命令形态但指纹不符时携带（弹窗据此显示「指纹不符」主题 + 当前路径 +
-    /// 8 位哈希摘要 + 「以新指纹重新授权」）；未失配为 `None`。
-    pub fingerprint_mismatch: Option<FingerprintMismatch>,
-    /// 审批子类型（issue #147）：kind=Rule/Write 时 daemon 权威派生并随帧
-    /// 回带 `subKind`（取代前端 command 前缀匹配启发式）；read/export/inject
-    /// 恒 `None`（帧不携带该字段）。
-    pub sub_kind: Option<ApprovalSubKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,331 +193,21 @@ pub trait RuleVault: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// 审批通道（trait + 本地实现 + 待审批注册表）
-// ---------------------------------------------------------------------------
-
-/// 审批通道抽象（`docs/authorization-gate.md` §6；本地/远程可切换）。
-///
-/// 两阶段接口对应守护进程的 G1 三阶段编排（见模块文档）：
-/// [`ApprovalChannel::open`]（登记 + 广播，命令锁内、非阻塞）→
-/// [`ApprovalChannel::await_decision`]（命令锁外等待，超时默认拒绝）。
-pub trait ApprovalChannel: Send + Sync {
-    /// 是否有界面可能响应审批（桌面壳的进程内推送订阅；#72/#78 起 daemon
-    /// 装配只数**桌面来源**订阅者——socket 订阅不计，见 lk-daemon 装配）。
-    /// `false` → fail-closed 立即拒绝，不登记、不阻塞（authorization-gate.md §7）。
-    fn available(&self) -> bool;
-    /// 该通道是否会**立即自动裁决**给定类型的审批（E2E 门控，补充拍板 #22；
-    /// 默认 false = 无自动路径）。仅 [`AutoApproveChannel`] 在 env 门开启时
-    /// 对 [`ApprovalKind::Rule`] 返回 true；调用方据此跳过 `available()` 的
-    /// UI 在场判定（inject/披露审批不受影响，照旧要求 UI）。
-    fn auto_approves(&self, kind: ApprovalKind) -> bool {
-        let _ = kind;
-        false
-    }
-    /// 登记待审批 + 广播 `authz.request`（非阻塞；守护进程命令锁内调用）。
-    fn open(&self, req: &ApprovalRequest, expires_at: Instant);
-    /// 等待决策（守护进程命令锁外调用；最多等到 `expires_at`，超时默认拒绝）。
-    fn await_decision(&self, request_id: Uuid, expires_at: Instant) -> ApprovalDecision;
-}
-
-/// 待审批条目（`expires_at` 到期即清理；决策槽供 `approval.result` 写入）。
-///
-/// #78 方案 A+B：`challenge` 仅随事件总线广播（桌面订阅者可见），回传时
-/// 必须逐一比对——连接标签之外的纵深防御。
-#[derive(Debug, Clone)]
-struct PendingApproval {
-    decision: Option<ApprovalDecision>,
-    expires_at: Instant,
-    challenge: String,
-}
-
-/// 待审批注册表（守护进程跨线程共享：命令线程登记/等待，审批回传线程写入）。
-#[derive(Default)]
-pub struct PendingApprovals {
-    inner: Mutex<std::collections::HashMap<Uuid, PendingApproval>>,
-    condvar: Condvar,
-}
-
-impl PendingApprovals {
-    pub fn new() -> PendingApprovals {
-        PendingApprovals::default()
-    }
-
-    /// 登记待审批（幂等：重复登记刷新到期时刻与决策槽/挑战值）。
-    pub fn register(&self, request_id: Uuid, expires_at: Instant, challenge: String) {
-        self.inner.lock().unwrap().insert(
-            request_id,
-            PendingApproval {
-                decision: None,
-                expires_at,
-                challenge,
-            },
-        );
-    }
-
-    /// 回传决策（`approval.result`）：条目存在且未到期**且挑战值匹配** →
-    /// 写入并唤醒等待者；未知/已超时/挑战不符 → 忽略并返回 false。
-    ///
-    /// - 伪造 requestId（未知/已超时）→ 移除已到期条目、返回 false；
-    /// - 挑战不符（#78：无广播帧则拿不到 challenge）→ **不移除**条目，
-    ///   防止伪回传把真用户的待审批请求打掉（拒绝 DoS），仅本次忽略；
-    /// - 比较用普通等值判定：注册表跨进程共享内存，无逐字节侧信道面。
-    pub fn resolve(&self, request_id: Uuid, decision: ApprovalDecision, challenge: &str) -> bool {
-        let mut map = self.inner.lock().unwrap();
-        let expired = map
-            .get(&request_id)
-            .map(|p| Instant::now() >= p.expires_at)
-            .unwrap_or(true);
-        if expired {
-            map.remove(&request_id);
-            return false;
-        }
-        let matches = map
-            .get(&request_id)
-            .map(|p| p.challenge == challenge)
-            .unwrap_or(false);
-        if !matches {
-            return false;
-        }
-        if let Some(p) = map.get_mut(&request_id) {
-            p.decision = Some(decision);
-        }
-        self.condvar.notify_all();
-        true
-    }
-
-    /// 等待决策（命令锁外）：决策到达 → 消费并返回；到期 → 清理并返回
-    /// [`ApprovalDecision::Timeout`]（默认拒绝）。到期时刻以登记值为准。
-    pub fn await_decision(&self, request_id: Uuid) -> ApprovalDecision {
-        let mut map = self.inner.lock().unwrap();
-        loop {
-            match map.get(&request_id) {
-                Some(p) if p.decision.is_some() => {
-                    let d = p.decision.unwrap();
-                    map.remove(&request_id);
-                    return d;
-                }
-                Some(p) if Instant::now() >= p.expires_at => {
-                    map.remove(&request_id);
-                    return ApprovalDecision::Timeout;
-                }
-                Some(p) => {
-                    let remaining = p.expires_at.saturating_duration_since(Instant::now());
-                    let (guard, timeout_result) = self
-                        .condvar
-                        .wait_timeout(map, remaining.max(Duration::from_millis(1)))
-                        .unwrap();
-                    map = guard;
-                    if timeout_result.timed_out() {
-                        // 重新评估（防止虚假唤醒/时间竞争）
-                        continue;
-                    }
-                }
-                None => {
-                    // 条目已被消费/清理（竞态）→ 保守视为拒绝
-                    return ApprovalDecision::Denied;
-                }
-            }
-        }
-    }
-
-    /// 当前待审批数（测试断言用）。
-    pub fn pending_count(&self) -> usize {
-        self.inner.lock().unwrap().len()
-    }
-
-    /// 把所有待审批条目的到期时刻提前到当前时刻并唤醒等待者（测试专用）：
-    /// 需要同时断言「回传落地」与「超时拒绝」的测试（如 #67 错误主密码
-    /// 保留条目后 CLI 侧超时）不再依赖真实秒级等待——到期判定、清理与
-    /// 默认拒绝走既有 `await_decision` 语义，仅时钟被测试掌控。
-    #[doc(hidden)]
-    pub fn expire_all_for_tests(&self) {
-        let mut map = self.inner.lock().unwrap();
-        let now = Instant::now();
-        for p in map.values_mut() {
-            p.expires_at = now;
-        }
-        self.condvar.notify_all();
-    }
-}
-
-/// 本地审批通道：登记 → 广播 `authz.request` → 在注册表上等待
-/// `approval.result` 或超时（30s 默认拒绝）。`available` = 推送连接存在
-/// （桌面壳已订阅；无界面 fail-closed）。
-pub struct LocalApprovalChannel {
-    approvals: Arc<PendingApprovals>,
-    bus: Arc<EventBus>,
-    /// 推送连接存在性（守护进程装配的 PushHub；无订阅 = 无界面）。
-    has_ui: Box<dyn Fn() -> bool + Send + Sync>,
-}
-
-impl LocalApprovalChannel {
-    pub fn new(
-        approvals: Arc<PendingApprovals>,
-        bus: Arc<EventBus>,
-        has_ui: Box<dyn Fn() -> bool + Send + Sync>,
-    ) -> LocalApprovalChannel {
-        LocalApprovalChannel {
-            approvals,
-            bus,
-            has_ui,
-        }
-    }
-}
-
-impl ApprovalChannel for LocalApprovalChannel {
-    fn available(&self) -> bool {
-        (self.has_ui)()
-    }
-
-    fn open(&self, req: &ApprovalRequest, expires_at: Instant) {
-        self.approvals
-            .register(req.request_id, expires_at, req.challenge.clone());
-        // 广播 `authz.request`（通知 D 层弹窗；无密钥值；challenge 仅经本
-        // 事件通道下发——守护进程侧通知桥只投给桌面订阅者，#78 方案 A；
-        // kind/export_meta 供弹窗按审批类型渲染，M2.9 值披露；write_action
-        // 供「记住」生成 actions=[当前动作] 最小写规则，#137）
-        self.bus.emit(&VaultEvent::AuthzRequest {
-            request_id: req.request_id,
-            starter: req.starter.clone(),
-            project_dir: req.project_dir.clone(),
-            command: req.command.clone(),
-            keys: req.keys.clone(),
-            challenge: req.challenge.clone(),
-            needs_unlock: req.needs_unlock,
-            kind: req.kind,
-            write_action: req.write_action,
-            export_meta: req.export_meta.clone(),
-            fingerprint_mismatch: req.fingerprint_mismatch.clone(),
-            sub_kind: req.sub_kind,
-        });
-    }
-
-    fn await_decision(&self, request_id: Uuid, expires_at: Instant) -> ApprovalDecision {
-        // 到期时刻以登记值为准（`expires_at` 参数为远程通道语义预留）
-        let _ = expires_at;
-        self.approvals.await_decision(request_id)
-    }
-}
-
-/// E2E 自动批准通道（补充拍板 #22；装饰器，套在 [`LocalApprovalChannel`] 外）。
-///
-/// **env 门控**：daemon **启动时**读一次 [`AutoApproveChannel::ENV`]，值为
-/// `rule` 时对 [`ApprovalKind::Rule`] 的审批**立即 Allowed**（登记后即刻
-/// resolve，不广播 `authz.request`——无 UI 参与）。inject/读/导出审批一律
-/// 不碰（`available()` 语义原样透传内层，headless 照旧 fail-closed 立即拒绝）。
-///
-/// 取舍（decisions #22，勿自行变更）：
-/// - **release 二进制保留此路径是有意决策**——E2E 必须测发布物本体；
-///   编译期 feature/cfg 门为被否选项（会测非发布物、削弱 E2E 价值）。
-/// - 攻击面：env 仅在 daemon 启动时读取；攻击者自带该变量拉起的新 daemon
-///   库是锁的，`rule.add` 仍过会话门（`session.invalid`），无权限增益。
-/// - 审计独立标注：经此通道放行的规则变更在 daemon 侧落
-///   `channel=auto-approve`（含 requestId 与规则内容），绝不静默。
-pub struct AutoApproveChannel {
-    inner: Arc<dyn ApprovalChannel>,
-    approvals: Arc<PendingApprovals>,
-    rule_enabled: bool,
-}
-
-impl AutoApproveChannel {
-    /// env 变量名（值 `rule` = 仅规则审批自动批准）。
-    pub const ENV: &'static str = "LIGHTKEY_E2E_AUTO_APPROVE";
-
-    /// 生产构造：daemon 启动时读一次 env。
-    pub fn new(
-        inner: Arc<dyn ApprovalChannel>,
-        approvals: Arc<PendingApprovals>,
-    ) -> AutoApproveChannel {
-        let rule_enabled = Self::env_rule_enabled();
-        AutoApproveChannel {
-            inner,
-            approvals,
-            rule_enabled,
-        }
-    }
-
-    /// 当前 env 是否开启规则自动批准（`LIGHTKEY_E2E_AUTO_APPROVE=rule`）。
-    pub fn env_rule_enabled() -> bool {
-        std::env::var(Self::ENV).ok().as_deref() == Some("rule")
-    }
-
-    /// 测试/装配构造：显式给定门控状态（不读 env，避免并行测试竞争；
-    /// lk-daemon 装配在 `Daemon::start` 读一次 env 后传入）。
-    pub fn with_rule_enabled(
-        inner: Arc<dyn ApprovalChannel>,
-        approvals: Arc<PendingApprovals>,
-        rule_enabled: bool,
-    ) -> AutoApproveChannel {
-        AutoApproveChannel {
-            inner,
-            approvals,
-            rule_enabled,
-        }
-    }
-
-    /// 门控当前状态（daemon 启动横幅用）。
-    pub fn rule_enabled(&self) -> bool {
-        self.rule_enabled
-    }
-
-    /// 测试专用：翻转门控（生产路径不调用）。
-    #[doc(hidden)]
-    pub fn set_rule_enabled_for_tests(&mut self, enabled: bool) {
-        self.rule_enabled = enabled;
-    }
-}
-
-impl ApprovalChannel for AutoApproveChannel {
-    fn available(&self) -> bool {
-        // UI 在场性不因 E2E 门改变：inject/披露审批照旧据此 fail-closed
-        self.inner.available()
-    }
-
-    fn auto_approves(&self, kind: ApprovalKind) -> bool {
-        self.rule_enabled && kind == ApprovalKind::Rule
-    }
-
-    fn open(&self, req: &ApprovalRequest, expires_at: Instant) {
-        if self.auto_approves(req.kind) {
-            // 登记 + 立即 Allowed（同一挑战值 resolve；等待者即刻拿到决策）；
-            // 不广播 authz.request——自动批准无 UI 参与，弹窗不该出现
-            self.approvals
-                .register(req.request_id, expires_at, req.challenge.clone());
-            let _ =
-                self.approvals
-                    .resolve(req.request_id, ApprovalDecision::Allowed, &req.challenge);
-            return;
-        }
-        self.inner.open(req, expires_at);
-    }
-
-    fn await_decision(&self, request_id: Uuid, expires_at: Instant) -> ApprovalDecision {
-        // 内外层共用同一注册表（装饰器只改 open 的规则分支）
-        self.inner.await_decision(request_id, expires_at)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 授权门（三层模型，硬编码确定性流程）
 // ---------------------------------------------------------------------------
 
 /// B 层 **authz-gate** 插件（`docs/plugin-architecture.md` §3.2；注入
-/// session + audit + vault-store + approval）。`Send + Sync`：守护进程
-/// 命令线程与审批回传线程共享。
-pub struct AuthzGate {
-    approval: Arc<dyn ApprovalChannel>,
-}
+/// session + audit + vault-store）。承载三层模型的第 1/2 层非阻塞短路
+/// （waterfall，命中即短路）；第 3 层审批编排（登记 / `authz.request` 广播 /
+/// 锁外等待 / 收尾）在守护进程侧的审批注册表与通用 deferred 编排器
+/// （拍板 #28 候选 2：`ApprovalChannel` 通道抽象已删除，本类型不再持有
+/// 审批状态或通道字段）。
+#[derive(Default)]
+pub struct AuthzGate;
 
 impl AuthzGate {
-    /// 装配审批通道（守护进程注入 [`LocalApprovalChannel`]；远程留接口）。
-    pub fn new(approval: Arc<dyn ApprovalChannel>) -> AuthzGate {
-        AuthzGate { approval }
-    }
-
-    /// 审批通道引用（守护进程等待决策用）。
-    pub fn approval(&self) -> &Arc<dyn ApprovalChannel> {
-        &self.approval
+    pub fn new() -> AuthzGate {
+        AuthzGate
     }
 
     /// 第 1/2 层（**非阻塞**；守护进程命令锁内调用）：
@@ -832,7 +478,7 @@ fn all_keys_resolvable(req: &AuthzRequest, vault: &dyn RuleVault) -> bool {
 mod tests {
     use super::*;
     use crate::Error;
-    use std::sync::mpsc;
+    use uuid::Uuid;
 
     fn rule(project_dir: &str, command: &str, keys: &[&str]) -> Rule {
         Rule {
@@ -900,7 +546,7 @@ mod tests {
     #[test]
     fn layer1_denies_unknown_starter_before_rules() {
         let vault = FakeVault::new(vec![rule("/proj", "*", &["A"])], &[("A", "a")]);
-        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let gate = AuthzGate::new();
         let r = gate.evaluate_layers(&req("unknown", "/proj", "npm publish", &["A"]), &vault);
         assert_eq!(
             r,
@@ -914,7 +560,7 @@ mod tests {
     #[test]
     fn layer1_denies_missing_cwd() {
         let vault = FakeVault::new(vec![rule("/proj", "*", &["A"])], &[("A", "a")]);
-        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let gate = AuthzGate::new();
         assert_eq!(
             gate.evaluate_layers(&req("/bin/zsh", "", "npm publish", &["A"]), &vault),
             LayerResult::Denied {
@@ -927,7 +573,7 @@ mod tests {
     #[test]
     fn layer1_denies_unresolvable_keys() {
         let vault = FakeVault::new(vec![rule("/proj", "*", &["A"])], &[("A", "a")]);
-        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let gate = AuthzGate::new();
         let r = gate.evaluate_layers(&req("/bin/zsh", "/proj", "npm publish", &["GHOST"]), &vault);
         assert_eq!(
             r,
@@ -940,7 +586,7 @@ mod tests {
     /// 第 1 层：规则库损坏 → fail-closed 拒绝。
     #[test]
     fn layer1_denies_corrupt_rule_vault() {
-        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let gate = AuthzGate::new();
         let r = gate.evaluate_layers(
             &req("/bin/zsh", "/proj", "npm publish", &["A"]),
             &CorruptVault,
@@ -960,7 +606,7 @@ mod tests {
             vec![rule("/proj", "npm *", &["A", "B"])],
             &[("A", "a"), ("B", "b")],
         );
-        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let gate = AuthzGate::new();
         // 请求 [A] → 注入 [A]（B 未请求，不注入——不泄漏未请求的值）
         let r = gate.evaluate_layers(&req("/bin/zsh", "/proj", "npm publish", &["A"]), &vault);
         assert_eq!(
@@ -992,7 +638,7 @@ mod tests {
             ],
             &[("A", "a"), ("B", "b"), ("C", "c")],
         );
-        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let gate = AuthzGate::new();
         // 两条规则都命中 → 并集 {A, B}
         let r = gate.evaluate_layers(
             &req("/bin/zsh", "/proj", "npm publish", &["A", "B"]),
@@ -1048,7 +694,7 @@ mod tests {
             vec![rule("wsl://Debian/home/u/p", "*", &["A"])],
             &[("A", "a")],
         );
-        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let gate = AuthzGate::new();
         let cwd = crate::path_ns::canonical_project_dir(r"\\wsl.localhost\DEBIAN\home\u\p\");
         assert_eq!(
             gate.evaluate_layers(&req("starter", &cwd, "npm publish", &["A"]), &vault),
@@ -1088,148 +734,12 @@ mod tests {
         assert!(rule_matches(&r, &canonical_link.to_string_lossy(), "x"));
     }
 
-    /// 审批决策三态 + 超时（PendingApprovals 注册表语义）。
-    #[test]
-    fn approval_decisions_allowed_denied_timeout() {
-        let reg = Arc::new(PendingApprovals::new());
-        let id = Uuid::new_v4();
-        // 回传决策 → 唤醒等待者
-        reg.register(id, Instant::now() + Duration::from_secs(10), "c1".into());
-        // 挑战不符 → 忽略且**不清除**条目（防伪回传 DoS 掉真审批）
-        assert!(!reg.resolve(id, ApprovalDecision::Allowed, "wrong"));
-        assert_eq!(reg.pending_count(), 1);
-        let h = std::thread::spawn({
-            let reg = Arc::clone(&reg);
-            move || {
-                std::thread::sleep(Duration::from_millis(50));
-                assert!(reg.resolve(id, ApprovalDecision::Allowed, "c1"));
-            }
-        });
-        let d = reg.await_decision(id);
-        h.join().unwrap();
-        assert_eq!(d, ApprovalDecision::Allowed);
-        assert_eq!(reg.pending_count(), 0, "消费后清理");
-
-        // 超时 → 默认拒绝 + 清理
-        reg.register(id, Instant::now() + Duration::from_millis(30), "c2".into());
-        let d = reg.await_decision(id);
-        assert_eq!(d, ApprovalDecision::Timeout);
-        assert_eq!(reg.pending_count(), 0);
-
-        // 伪造 requestId（未知/已清理）→ 忽略
-        assert!(!reg.resolve(Uuid::new_v4(), ApprovalDecision::Allowed, "c2"));
-    }
-
-    /// LocalApprovalChannel：登记 + 广播 `authz.request` + 等待/超时。
-    #[test]
-    fn local_channel_broadcasts_and_waits() {
-        let reg = Arc::new(PendingApprovals::new());
-        let bus = Arc::new(EventBus::new());
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let e = Arc::clone(&events);
-        bus.subscribe(Arc::new(crate::bus::FnSink::new(move |ev| {
-            e.lock().unwrap().push(ev.clone());
-        })));
-        let ch = LocalApprovalChannel::new(Arc::clone(&reg), Arc::clone(&bus), Box::new(|| true));
-        assert!(ch.available());
-        let req = ApprovalRequest {
-            request_id: Uuid::new_v4(),
-            starter: "/bin/zsh".into(),
-            project_dir: "/proj".into(),
-            command: "npm publish".into(),
-            keys: vec!["A".into()],
-            challenge: "chal-xyz".into(),
-            needs_unlock: false,
-            kind: ApprovalKind::Inject,
-            write_action: None,
-            export_meta: None,
-            fingerprint_mismatch: None,
-            sub_kind: None,
-        };
-        // open：登记 + 广播（非阻塞）
-        ch.open(&req, Instant::now() + Duration::from_secs(10));
-        assert_eq!(reg.pending_count(), 1);
-        assert_eq!(events.lock().unwrap().len(), 1);
-        match &events.lock().unwrap()[0] {
-            VaultEvent::AuthzRequest {
-                request_id,
-                starter,
-                project_dir,
-                command,
-                keys,
-                challenge,
-                needs_unlock,
-                kind,
-                write_action,
-                export_meta,
-                fingerprint_mismatch,
-                sub_kind,
-            } => {
-                assert_eq!(*request_id, req.request_id);
-                assert_eq!(starter, "/bin/zsh");
-                assert_eq!(project_dir, "/proj");
-                assert_eq!(command, "npm publish");
-                assert_eq!(keys, &vec!["A".to_string()]);
-                // challenge 仅经事件通道下发（#78 方案 B）
-                assert_eq!(challenge, "chal-xyz");
-                // #67：常规（解锁态）审批不带 needs_unlock
-                assert!(!needs_unlock);
-                // M2.9 值披露：inject 审批不带导出元信息
-                assert_eq!(*kind, ApprovalKind::Inject);
-                // #137：非写审批不携带派生写动作
-                assert!(write_action.is_none());
-                assert!(export_meta.is_none());
-                // M2.98：非失配注入审批不带指纹失配信息
-                assert!(fingerprint_mismatch.is_none());
-                // #147：inject 审批不带审批子类型
-                assert!(sub_kind.is_none());
-            }
-            other => panic!("应广播 authz.request：{other:?}"),
-        }
-        // await：回传决策后返回
-        let id = req.request_id;
-        let h = std::thread::spawn({
-            let reg = Arc::clone(&reg);
-            move || {
-                std::thread::sleep(Duration::from_millis(50));
-                assert!(reg.resolve(id, ApprovalDecision::Allowed, "chal-xyz"));
-            }
-        });
-        let d = ch.await_decision(req.request_id, Instant::now() + Duration::from_secs(10));
-        h.join().unwrap();
-        assert_eq!(d, ApprovalDecision::Allowed);
-        assert_eq!(reg.pending_count(), 0);
-    }
-
-    /// 无界面 → available()=false（守护进程据此立即拒绝，不阻塞）。
-    #[test]
-    fn local_channel_unavailable_without_ui() {
-        let ch = LocalApprovalChannel::new(
-            Arc::new(PendingApprovals::new()),
-            Arc::new(EventBus::new()),
-            Box::new(|| false),
-        );
-        assert!(!ch.available());
-    }
-
-    /// 无界面审批通道的模拟（测试用；open/await 直接给结果）。
-    struct NoopApproval;
-    impl ApprovalChannel for NoopApproval {
-        fn available(&self) -> bool {
-            false
-        }
-        fn open(&self, _req: &ApprovalRequest, _expires_at: Instant) {}
-        fn await_decision(&self, _id: Uuid, _expires_at: Instant) -> ApprovalDecision {
-            ApprovalDecision::Denied
-        }
-    }
-
-    /// 完整三层短路（NoopApproval 无界面）：规则命中 → Allowed；
-    /// 未命中 → NeedsApproval（守护进程再判 available → 拒绝）。
+    /// 完整三层短路：规则命中 → Allowed；未命中 → NeedsApproval
+    /// （守护进程再判 UI 在场谓词 → 拒绝）。
     #[test]
     fn three_layer_short_circuit() {
         let vault = FakeVault::new(vec![rule("/proj", "npm *", &["A"])], &[("A", "a")]);
-        let gate = AuthzGate::new(Arc::new(NoopApproval));
+        let gate = AuthzGate::new();
         // 第 1 层：未知启动者
         assert!(matches!(
             gate.evaluate_layers(&req("unknown", "/proj", "npm publish", &["A"]), &vault),
@@ -1266,67 +776,6 @@ mod tests {
         let long = "x".repeat(10_000);
         assert!(glob_match(&format!("{}*", "x".repeat(9_999)), &long));
         assert!(!glob_match(&format!("{}y", "x".repeat(9_999)), &long));
-    }
-
-    /// 广播 authz.request 不影响其它订阅者（emit 语义回归）。
-    #[test]
-    fn authz_request_emit_is_fire_and_forget() {
-        let bus = Arc::new(EventBus::new());
-        bus.subscribe(Arc::new(crate::bus::FnSink::new(|_| panic!("订阅者故障"))));
-        let ch =
-            LocalApprovalChannel::new(Arc::new(PendingApprovals::new()), bus, Box::new(|| true));
-        ch.open(
-            &ApprovalRequest {
-                request_id: Uuid::new_v4(),
-                starter: "s".into(),
-                project_dir: "p".into(),
-                command: "c".into(),
-                keys: vec![],
-                challenge: String::new(),
-                needs_unlock: false,
-                kind: ApprovalKind::Inject,
-                write_action: None,
-                export_meta: None,
-                fingerprint_mismatch: None,
-                sub_kind: None,
-            },
-            Instant::now() + Duration::from_secs(10),
-        );
-    }
-
-    /// 并发冒烟：多个等待者各自拿到自己的决策（Condvar 正确唤醒）。
-    #[test]
-    fn concurrent_awaiters_resolve_independently() {
-        let reg = Arc::new(PendingApprovals::new());
-        let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
-        for id in &ids {
-            reg.register(*id, Instant::now() + Duration::from_secs(10), "c".into());
-        }
-        let (tx, rx) = mpsc::channel::<Uuid>();
-        let mut handles = Vec::new();
-        for id in ids.clone() {
-            let reg = Arc::clone(&reg);
-            let tx = tx.clone();
-            handles.push(std::thread::spawn(move || {
-                let d = reg.await_decision(id);
-                assert_eq!(d, ApprovalDecision::Allowed);
-                tx.send(id).unwrap();
-            }));
-        }
-        drop(tx);
-        std::thread::sleep(Duration::from_millis(50));
-        for &id in &ids {
-            assert!(reg.resolve(id, ApprovalDecision::Allowed, "c"));
-        }
-        let mut resolved: Vec<Uuid> = rx.iter().collect();
-        resolved.sort();
-        let mut expect = ids.clone();
-        expect.sort();
-        assert_eq!(resolved, expect);
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(reg.pending_count(), 0);
     }
 
     // -- M2.9 值披露（补充拍板 #20）：读规则匹配 + ApprovalKind ------------
@@ -1657,141 +1106,12 @@ mod tests {
         assert_eq!(back, ApprovalKind::Write);
     }
 
-    // -- 规则管理审批门（补充拍板 #22）：E2E 自动批准通道 --------------------
-
-    fn auto_rule_req(kind: ApprovalKind) -> ApprovalRequest {
-        ApprovalRequest {
-            request_id: Uuid::new_v4(),
-            starter: "/bin/zsh".into(),
-            project_dir: "/proj".into(),
-            command: "rule.add pub".into(),
-            keys: vec!["NPM_TOKEN".into()],
-            challenge: "chal".into(),
-            needs_unlock: false,
-            kind,
-            write_action: None,
-            export_meta: None,
-            fingerprint_mismatch: None,
-            sub_kind: None,
-        }
-    }
-
-    /// env 门控开启时仅规则审批立即 Allowed：不广播（无 UI 参与）、
-    /// 等待者即刻拿到决策；inject/read/export 不受影响（走内层通道）。
+    /// WriteAction 协议面字符串（`authz.request` 帧的 `writeAction` 字段；
+    /// #137 最小授权——前端「记住」按帧内 action 生成 `actions=[当前动作]`）。
     #[test]
-    fn auto_channel_allows_rule_kind_immediately() {
-        let reg = Arc::new(PendingApprovals::new());
-        let bus = Arc::new(EventBus::new());
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let e = Arc::clone(&events);
-        bus.subscribe(Arc::new(crate::bus::FnSink::new(move |ev| {
-            e.lock().unwrap().push(ev.clone());
-        })));
-        let inner =
-            LocalApprovalChannel::new(Arc::clone(&reg), Arc::clone(&bus), Box::new(|| false));
-        let ch = AutoApproveChannel::with_rule_enabled(Arc::new(inner), Arc::clone(&reg), true);
-        // auto_approves 仅对 rule 为真；available 语义不因 E2E 门改变（无 UI）
-        assert!(ch.auto_approves(ApprovalKind::Rule));
-        assert!(!ch.auto_approves(ApprovalKind::Inject));
-        assert!(!ch.auto_approves(ApprovalKind::Read));
-        assert!(
-            !ch.available(),
-            "无 UI 时 available 仍为 false（inject 照旧 fail-closed）"
-        );
-        // open(rule)：登记 + 立即 Allowed，不广播 authz.request
-        let req = auto_rule_req(ApprovalKind::Rule);
-        ch.open(&req, Instant::now() + Duration::from_secs(10));
-        assert_eq!(
-            events.lock().unwrap().len(),
-            0,
-            "自动批准不广播（无 UI 参与）"
-        );
-        let d = ch.await_decision(req.request_id, Instant::now() + Duration::from_secs(10));
-        assert_eq!(d, ApprovalDecision::Allowed);
-        assert_eq!(reg.pending_count(), 0, "消费后清理");
-    }
-
-    /// env 门控关闭（生产缺省）：一切 kind 都走内层通道（auto_approves 恒 false）。
-    #[test]
-    fn auto_channel_disabled_delegates_to_inner() {
-        let reg = Arc::new(PendingApprovals::new());
-        let bus = Arc::new(EventBus::new());
-        let inner =
-            LocalApprovalChannel::new(Arc::clone(&reg), Arc::clone(&bus), Box::new(|| true));
-        let mut ch = AutoApproveChannel::with_rule_enabled(Arc::new(inner), Arc::clone(&reg), true);
-        ch.set_rule_enabled_for_tests(false);
-        assert!(!ch.auto_approves(ApprovalKind::Rule));
-        // open(rule) 走内层：广播 authz.request（桌面弹窗语义不变）
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let e = Arc::clone(&events);
-        bus.subscribe(Arc::new(crate::bus::FnSink::new(move |ev| {
-            e.lock().unwrap().push(ev.clone());
-        })));
-        ch.open(
-            &auto_rule_req(ApprovalKind::Rule),
-            Instant::now() + Duration::from_secs(10),
-        );
-        assert_eq!(events.lock().unwrap().len(), 1, "未启用时照常广播");
-        assert_eq!(reg.pending_count(), 1, "等待桌面回传");
-    }
-
-    /// env 读取：LIGHTKEY_E2E_AUTO_APPROVE=rule → 开启（daemon 启动时读一次）。
-    /// 测试环境不设置该变量 → 关闭（不与并行测试竞争 env）。
-    #[test]
-    fn auto_channel_env_probe() {
-        assert_eq!(
-            std::env::var(AutoApproveChannel::ENV).ok().as_deref(),
-            None,
-            "测试进程不得携带 E2E 自动批准变量（否则用例互相污染）"
-        );
-        assert!(!AutoApproveChannel::env_rule_enabled());
-    }
-
-    /// 审批请求携带 kind + export 数据包元信息（export 弹窗展示规模用）。
-    #[test]
-    fn approval_request_carries_kind_and_export_meta() {
-        let areq = ApprovalRequest {
-            request_id: Uuid::new_v4(),
-            starter: "/bin/zsh".into(),
-            project_dir: "/proj".into(),
-            command: "item.export".into(),
-            keys: vec!["合同.pdf".into()],
-            challenge: "chal".into(),
-            needs_unlock: false,
-            kind: ApprovalKind::Export,
-            write_action: None,
-            export_meta: Some(ExportMeta {
-                name: "合同.pdf".into(),
-                mime: "application/pdf".into(),
-                size: 1024,
-            }),
-            fingerprint_mismatch: None,
-            sub_kind: None,
-        };
-        assert_eq!(areq.kind, ApprovalKind::Export);
-        assert_eq!(areq.export_meta.as_ref().unwrap().size, 1024);
-        // #147：read/export/inject 审批不带审批子类型
-        assert!(areq.sub_kind.is_none());
-        // 常规注入审批不带 export 元信息
-        let inject_req = ApprovalRequest {
-            kind: ApprovalKind::Inject,
-            export_meta: None,
-            ..areq.clone()
-        };
-        assert!(inject_req.export_meta.is_none());
-        // #137 最小授权修复：写审批携带 daemon 权威派生的写动作（随
-        // `authz.request` 帧回带 `writeAction`），非写审批恒 None
-        let mut write_req = areq.clone();
-        write_req.kind = ApprovalKind::Write;
-        write_req.command = "item.put 合同.pdf".into();
-        write_req.export_meta = None;
-        write_req.write_action = Some(WriteAction::Update);
-        assert_eq!(write_req.write_action, Some(WriteAction::Update));
+    fn write_action_as_str_contract() {
         assert_eq!(WriteAction::Create.as_str(), "create");
         assert_eq!(WriteAction::Update.as_str(), "update");
-        // #147：写审批携带审批子类型（daemon 权威派生随帧回带 subKind）
-        write_req.sub_kind = Some(ApprovalSubKind::ItemPut);
-        assert_eq!(write_req.sub_kind, Some(ApprovalSubKind::ItemPut));
     }
 
     /// ApprovalSubKind 协议面序列化（serde rename = RPC 方法名字符串；

@@ -146,7 +146,12 @@ fn authz_denies_without_ui_fast() {
     // 自 #92 起就是生产默认 30s，上界若与窗口同阶，误等时要跑满 30s 才红、
     // 判据失去判别力。功能面由下方 reason=no_ui 断言锁定：走审批等待的
     // 结果是 timeout 而非 no_ui，时间上界只是让它早点红。
-    assert!(t0.elapsed() < NO_WAIT_BOUND, "无界面必须立即拒绝");
+    assert!(
+        t0.elapsed() < NO_WAIT_BOUND,
+        "无界面必须立即拒绝 elapsed={:?} resp={}",
+        t0.elapsed(),
+        resp
+    );
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["allowed"], false);
     assert_eq!(v["result"]["reason"], "no_ui");
@@ -740,7 +745,7 @@ fn socket_subscribers_are_not_ui_and_receive_no_authz_frames() {
     let handler = make_handler(&state, &shared);
 
     // 场景 1：只有 socket 订阅者（模拟持令牌攻击进程自行 subscribe）→
-    // has_ui 仍为 false → 第 3 层立即 fail-closed
+    // UI 在场判定仍为 false → 第 3 层立即 fail-closed
     let (_sock_sid, sock_rx) = shared.push.subscribe(false);
     assert_eq!(shared.push.subscriber_count(), 1);
     assert_eq!(shared.push.desktop_subscriber_count(), 0);
@@ -906,7 +911,7 @@ fn authz_locked_inject_unified_unlock_approval_roundtrip() {
     assert!(!dir.path().join(crate::SESSION_TOKEN_FILE).exists());
 
     let handler = make_handler(&state, &shared);
-    // 桌面壳订阅（进程内登记 = desktop 来源）→ has_ui=true
+    // 桌面壳订阅（进程内登记 = desktop 来源）→ UI 在场判定为 true
     let (_sid, rx) = shared.push.subscribe(true);
     assert_eq!(shared.push.subscriber_count(), 1);
     // 记录流程前审计水位（夹具 unlock/lock 各写一条；只断言本次流程新增）

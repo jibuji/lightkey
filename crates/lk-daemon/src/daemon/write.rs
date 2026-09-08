@@ -78,8 +78,8 @@ impl Daemon {
     /// 4. socket：真实 starter + cwd（#66 归因链路）；未知 → fail-closed
     ///    拒绝不弹窗；
     /// 5. 写规则匹配（create/update；**delete 跳过**恒弹窗）→ 命中静默放行；
-    /// 6. 未命中：无审批界面 → 立即拒绝；否则登记 `PendingApprovals`
-    ///    （challenge 防伪 #78）+ 广播 `authz.request`。
+    /// 6. 未命中：无审批界面 → 立即拒绝；否则登记待审批（审批注册表，
+    ///    challenge 防伪 #78）+ 广播 `authz.request`。
     pub(crate) fn write_begin(
         &mut self,
         id: Value,
@@ -174,7 +174,7 @@ impl Daemon {
         }
         // 6) 无审批界面（headless）→ fail-closed 立即拒绝（不登记、不阻塞；
         //    E2E 自动批准不扩到写门——弹窗路径由集成测试覆盖，拍板 #24）
-        if !self.gate.approval().available() {
+        if !self.approval_available() {
             self.audit_gate(
                 ActingVault::Shared,
                 &starter,
@@ -241,9 +241,10 @@ impl Daemon {
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
     ) -> String {
-        let removed = self.pending_gates.lock().unwrap().remove(&request_id);
+        // finalize = 审批注册表唯一消费移除点（拍板 #28 候选 2 三拍之三）
+        let removed = self.shared.approvals.remove(&request_id);
         // 条目已被消费（极端竞态）→ 保守拒绝
-        let Some(GateEntry {
+        let Some(ApprovalEntry {
             kind: GateKind::Write(p),
             ..
         }) = removed

@@ -689,7 +689,7 @@ fn locked_disclosure_get_unified_unlock_returns_value_trace_free() {
     let item_id = locked_item_id(&state, "APIKey");
     assert!(!shared.vault.read().unwrap().is_some(), "夹具应回到锁态");
 
-    // 桌面订阅在场 → has_ui=true
+    // 桌面订阅在场 → UI 在场判定为 true
     let handler = make_handler(&state, &shared);
     let (_sid, rx) = shared.push.subscribe(true);
     let audit_before = audit_events(dir.path()).len();
@@ -1141,4 +1141,87 @@ fn disclosure_missing_item_reports_not_found() {
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["error"]["code"], ERR_ITEM_NOT_FOUND, "{resp}");
     assert_eq!(shared.approvals.pending_count(), 0);
+}
+
+/// 迟到审批交错（issue #166 / 拍板 #28 候选 2 验收）：await 已返 Timeout、
+/// finalize 未跑之间插入桌面 `approval.result`——单表注册表按过期**拒绝写**
+/// （`accepted=false`，不回翻等待侧已得的 Timeout）+ 失败提交 Denied 审计；
+/// 条目不被迟到回传移除，finalize 仍单点消费到未被污染的条目。
+/// 直接驱动 begin / await / finalize 三段（不经 handler 线程）以钉死交错次序。
+#[test]
+fn late_approval_between_timeout_and_finalize_rejected_and_audited() {
+    use crate::daemon::gate_kit::GateBegin;
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let (state, shared, token) = m2_daemon(dir.path(), Some(("NPM_TOKEN", "sekrit")));
+    // 桌面订阅在场（否则 begin 直接 no_ui 拒绝，不登记待审批）
+    let (_sid, rx) = shared.push.subscribe(true);
+    let peer = test_peer(Some(proj.path()));
+    // 目标条目 id（m2_daemon 的 seed 未回传 id，经 item.list 取）
+    let secret_id = {
+        let resp = state.lock().unwrap().handle(
+            &rpc_line(M_ITEM_LIST, Some(&token), json!({})),
+            &PeerInfo::desktop(),
+        );
+        rpc_result(&resp)["items"].as_array().unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    // ① begin（命令锁内直调）：socket + 无读规则 → 登记待审批
+    let request_id = {
+        let mut g = state.lock().unwrap();
+        match g.disclosure_begin(json!(1), M_ITEM_GET, json!({ "id": secret_id }), &peer) {
+            GateBegin::Pending { request_id } => request_id,
+            GateBegin::Final(resp) => panic!("应进入待审批：{resp}"),
+        }
+    };
+    assert_eq!(shared.approvals.pending_count(), 1, "登记入单表");
+    // challenge 只在广播帧里（#78 方案 B）
+    let frame = rx.recv_timeout(FRAME_WAIT).unwrap();
+    let fv: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(fv["method"], "authz.request");
+    let challenge = fv["params"]["challenge"].as_str().unwrap().to_string();
+    // ② 锁外等待已返 Timeout（测试钩子即时到期；到期判定走 await 既有语义）
+    shared.approvals.expire_all_for_tests();
+    assert_eq!(
+        shared.approvals.await_decision(request_id),
+        ApprovalDecision::Timeout
+    );
+    assert_eq!(shared.approvals.pending_count(), 1, "await 只读不移除");
+    let audit_before = audit_events(dir.path()).len();
+    // ③ finalize 未跑之间插入桌面 approval.result（原样回带 challenge）：
+    //    按过期拒绝写 → accepted=false + 失败提交 Denied 审计（#78）
+    let resp = state.lock().unwrap().handle(
+        &rpc_line(
+            M_APPROVAL_RESULT,
+            Some(&token),
+            json!({ "requestId": request_id, "decision": "allowed", "challenge": challenge }),
+        ),
+        &PeerInfo::desktop(),
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["result"]["accepted"], false,
+        "迟到回传按过期拒绝写（不得回翻已超时的等待结果）：{resp}"
+    );
+    let flow = &audit_events(dir.path())[audit_before..];
+    let failed = flow
+        .iter()
+        .find(|e| e.command == M_APPROVAL_RESULT)
+        .expect("失败提交审计（command=approval.result）");
+    assert_eq!(failed.result, lk_core::audit::AuditResult::Denied);
+    assert_eq!(shared.approvals.pending_count(), 1, "迟到回传无权移除条目");
+    // ④ finalize 单点消费（条目未被迟到回传移除/污染）→ 统一拒绝尾
+    let resp =
+        state
+            .lock()
+            .unwrap()
+            .disclosure_finalize(json!(1), request_id, ApprovalDecision::Timeout);
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        v["error"]["code"], ERR_AUTHZ_DENIED,
+        "超时统一拒绝尾：{resp}"
+    );
+    assert_eq!(shared.approvals.pending_count(), 0, "finalize 单点消费");
 }
