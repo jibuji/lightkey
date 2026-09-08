@@ -12,11 +12,8 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use lk_core::audit::{AuditChannel, AuditLog, AuditResult, EventInput};
 use lk_core::audit_anchor::{AnchorCheck, CompositeAuditAnchor};
-use lk_core::authz::{
-    ApprovalChannel, ApprovalDecision, ApprovalRequest, AuthzGate, AuthzRequest,
-    AutoApproveChannel, DenyReason, LayerResult, LocalApprovalChannel, PendingApprovals,
-};
-use lk_core::bus::LockReason;
+use lk_core::authz::{ApprovalDecision, AuthzGate, AuthzRequest, DenyReason, LayerResult};
+use lk_core::bus::{LockReason, VaultEvent};
 use lk_core::ipc::*;
 use lk_core::model::{ItemDraft, Rule, RuleDraft};
 use lk_core::recovery::RecoveryCode;
@@ -34,13 +31,27 @@ use crate::router::{run_deferred, strategy_of, ExecutionStrategy};
 use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 
 use self::gate_kit::{
-    invalid_params, parse_gate_params, ActingVault, ApprovalDraft, ApprovalWorkspace,
-    DeferredOutcome, GateBegin, GateEntry, GateKind, PendingGates,
+    invalid_params, parse_gate_params, ActingVault, ApprovalDraft, ApprovalEntry,
+    ApprovalWorkspace, DeferredOutcome, GateBegin, GateEntry, GateKind,
 };
+// 审批注册表类型对外可达（`SharedDaemon.approvals` 的字段类型；方法面
+// crate 内）。
+pub use self::gate_kit::ApprovalRegistry;
 use self::lifecycle::{install_shutdown_handlers, load_config};
 
 /// 会话令牌文件名（0600；CLI 进程间传递，锁定即删除）。
 pub const SESSION_TOKEN_FILE: &str = "session.token";
+
+/// E2E 规则自动批准 env 变量名（补充拍板 #22；值 `rule` = 仅规则审批自动
+/// 批准，永不碰 inject/读值/写入）。daemon **启动时读一次**（拍板 #28
+/// 候选 2 折入 daemon：原 core `AutoApproveChannel` 的 env 门控；release
+/// 二进制保留此路径是有意决策——E2E 测发布物本体）。
+pub(crate) const RULE_AUTO_APPROVE_ENV: &str = "LIGHTKEY_E2E_AUTO_APPROVE";
+
+/// 当前 env 是否开启规则自动批准（`LIGHTKEY_E2E_AUTO_APPROVE=rule`）。
+pub(crate) fn rule_auto_env_enabled() -> bool {
+    std::env::var(RULE_AUTO_APPROVE_ENV).ok().as_deref() == Some("rule")
+}
 
 /// `vault.unlock` / `vault.recover` 限流：失败计数 + 指数退避（5 次后 2^(n-5) 秒，封顶 300s）。
 #[derive(Debug, Default)]
@@ -87,10 +98,13 @@ pub struct SharedDaemon {
     pub config: RwLock<Config>,
     /// 同步运行状态（水位 / 最近摘要 / 风暴等级）。
     pub sync: Mutex<SyncRuntime>,
-    /// 待审批注册表（跨线程：命令线程登记/等待，`approval.result` 回传线程写入）。
-    pub approvals: Arc<PendingApprovals>,
-    /// 推送通道（通知订阅连接集合；`subscriber_count>0` = 桌面壳已订阅 =
-    /// 有审批界面）。
+    /// 审批注册表（拍板 #28 候选 2 单表合一，daemon/gate_kit.rs：质询值/
+    /// 到期/决策槽 + needs_unlock/工作区/门负载；命令线程登记（命令锁内）、
+    /// 锁外等待，`approval.result` 回传线程写决策与工作区，finalize 单点
+    /// 消费移除）。
+    pub approvals: Arc<ApprovalRegistry>,
+    /// 推送通道（通知订阅连接集合；`desktop_subscriber_count>0` = 桌面壳已
+    /// 订阅 = 有审批界面——UI 在场谓词 [`Daemon::approval_available`]）。
     pub push: Arc<PushHub>,
 }
 
@@ -115,11 +129,14 @@ pub struct Daemon {
     shared: Arc<SharedDaemon>,
     /// C 层装配（事件总线 + 无状态地基服务；session/vault 经其挂总线）。
     core: CoreServices,
-    /// 授权门（第 1/2 层短路 + 第 3 层审批编排）。
+    /// 授权门（第 1/2 层非阻塞短路；第 3 层审批编排在审批注册表 +
+    /// 通用 deferred 编排器，拍板 #28 候选 2 起 `AuthzGate` 不再持有通道）。
     gate: AuthzGate,
-    /// 统一待审批注册表（issue #148：四张 pending 表合一；key = 请求 id，
-    /// payload = 门枚举；审批解锁辅助表无关，见 daemon/gate_kit.rs）。
-    pending_gates: Mutex<PendingGates>,
+    /// E2E 规则自动批准门（补充拍板 #22 折入 daemon）：启动时读一次 env
+    /// 的布尔（`LIGHTKEY_E2E_AUTO_APPROVE=rule`）；仅规则审批直接写
+    /// decision=Allowed，永不碰 inject/读值/写入。集成测试经
+    /// `start_with_rule_auto` 显式传值（避免并行测试竞争进程 env）。
+    rule_auto: bool,
     /// 对端真实 env PATH 读取（M2.98 程序指纹，identity-binding.md §5.1；
     /// 生产 = 平台实现，测试注入假 PATH——信 daemon 不信客户端）。
     peer_env: Arc<dyn crate::peer_env::PeerEnv>,
@@ -146,10 +163,10 @@ pub(crate) struct PendingAuthz {
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 impl Daemon {
-    /// 启动（加载配置、装配总线/授权门/通知桥）。规则 E2E 自动批准门按
+    /// 启动（加载配置、装配总线/审批注册表/通知桥）。规则 E2E 自动批准门按
     /// 进程环境（daemon 启动时读一次）装配。
     pub fn start(dir: &Path) -> std::result::Result<Daemon, String> {
-        Daemon::start_with_rule_auto(dir, AutoApproveChannel::env_rule_enabled())
+        Daemon::start_with_rule_auto(dir, rule_auto_env_enabled())
     }
 
     /// 装配入口（env 探测与装配分离；集成测试显式传门控，避免并行测试
@@ -166,40 +183,27 @@ impl Daemon {
         install_shutdown_handlers();
         let core = CoreServices::new();
         let sessions = core.new_session();
-        // M2 装配：待审批注册表 + 推送通道 + 本地审批通道 + 通知桥
-        // （通知桥订阅总线：Rust 事件 → notification 帧 → 订阅连接，非阻塞）
-        let approvals = Arc::new(PendingApprovals::new());
+        // M2 装配：审批注册表（拍板 #28 候选 2 单表：质询/到期/决策 +
+        // needs_unlock/工作区/门负载）+ 推送通道 + 通知桥（通知桥订阅总线：
+        // Rust 事件 → notification 帧 → 订阅连接，非阻塞）。UI 在场谓词 =
+        // 桌面订阅计数（`Daemon::approval_available`）；`authz.request`
+        // 广播在 `Daemon::open_gate_approval`（单点铸造质询值）。
+        let approvals = Arc::new(ApprovalRegistry::new());
         let push = PushHub::new();
-        // #72/#78 方案 A：`has_ui` 只数**桌面来源**订阅者——socket 订阅者
-        // （任何持令牌进程可建立）不算「有界面」；审批挑战帧也只投给桌面
-        // 订阅者（notifier），双重收紧第 3 层的信任前提。
-        let local: Arc<dyn ApprovalChannel> = Arc::new(LocalApprovalChannel::new(
-            Arc::clone(&approvals),
-            Arc::clone(core.bus()),
-            Box::new({
-                let push = Arc::clone(&push);
-                move || push.desktop_subscriber_count() > 0
-            }),
-        ));
-        // 规则管理审批门（补充拍板 #22）：E2E 自动批准装饰器套本地通道外
-        // ——env 门开启时仅规则审批立即 Allowed（不碰 inject/披露审批）。
-        // release 二进制保留此路径是有意决策（E2E 测发布物本体）；启用即
-        // 打启动横幅，测试通道绝不静默。
+        // 规则管理审批门（补充拍板 #22 折入 daemon）：E2E 自动批准 =
+        // 启动读一次的布尔——env 门开启时仅规则审批登记后立即写 Allowed
+        // （不碰 inject/披露/写审批）。release 二进制保留此路径是有意决策
+        // （E2E 测发布物本体）；启用即打启动横幅，测试通道绝不静默。
         if rule_auto {
             eprintln!(
                 "lk daemon: 警告：E2E 自动批准通道已启用（{}=rule）——仅规则审批立即放行，\
                  inject/披露审批不受影响；审计以 channel=auto-approve 留痕。\
                  测试专用，勿在生产环境使用。",
-                AutoApproveChannel::ENV
+                RULE_AUTO_APPROVE_ENV
             );
         }
-        let approval: Arc<dyn ApprovalChannel> = Arc::new(AutoApproveChannel::with_rule_enabled(
-            local,
-            Arc::clone(&approvals),
-            rule_auto,
-        ));
         core.subscribe(Arc::new(Notifier::new(Arc::clone(&push))));
-        let gate = AuthzGate::new(approval);
+        let gate = AuthzGate::new();
         let shared = Arc::new(SharedDaemon {
             dir: dir.clone(),
             vault: Arc::new(RwLock::new(None)),
@@ -220,7 +224,7 @@ impl Daemon {
             shared,
             core,
             gate,
-            pending_gates: Mutex::new(PendingGates::default()),
+            rule_auto,
             // M2.98 程序指纹：生产装配平台真实对端 env 读取 + 真实文件系统缓存。
             peer_env: Arc::new(crate::peer_env::PlatformPeerEnv),
             fingerprint_cache: crate::exe_resolve::FingerprintCache::new(),
@@ -434,7 +438,8 @@ impl Daemon {
             // M2：通知订阅（连接转入流模式由传输层处理；此处做会话校验）。
             // #67（锁定态一体化）：桌面内嵌直调允许在**锁定态**建立推送流
             // ——锁定态 inject 需要 GUI 收到 `authz.request(needsUnlock)` 并
-            // 回传 masterPassword，且 `has_ui` 判定依赖桌面订阅者在场。
+            // 回传 masterPassword，且 UI 在场判定（桌面订阅计数）依赖
+            // 桌面订阅者在场。
             // 桌面直调无 IPC 对端，`require_session` 会因 vault 锁定而失败；
             // 订阅本身只注册推送目标（会话事件/挑战帧仍按来源过滤），
             // 锁态订阅不泄露明文——帧无密钥值（桌面终态订阅由前端在
@@ -504,7 +509,7 @@ impl Daemon {
         } else {
             // 锁态：无会话可言——只要桌面审批界面在，就值得让锁态 inject
             // 进入一体化流程（headless 直接 fail-closed）
-            self.gate.approval().available()
+            self.approval_available()
         }
     }
 

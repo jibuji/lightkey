@@ -9,7 +9,8 @@ impl Daemon {
         RpcResponse::ok(id, json!({}))
     }
     /// `approval.result`：审批回传（决策权始终在 Rust 侧）。调用方限制
-    /// （仅桌面内嵌直调）与挑战值校验见 dispatch / [`PendingApprovals::resolve`]：
+    /// （仅桌面内嵌直调）与挑战值校验见 dispatch / 审批注册表的
+    /// [`ApprovalRegistry::resolve`](gate_kit::ApprovalRegistry::resolve)：
     /// 伪造 requestId、已超时或**挑战不符** → 忽略（`accepted=false`，
     /// testing.md 第三层 #17/#78）。失败提交写审计（#78：谁在提交审批可
     /// 归因；socket 来源被 `channel.forbidden` 拒绝的审计在 dispatch 拒绝
@@ -46,9 +47,9 @@ impl Daemon {
         };
         // 锁定态一体化（#67 注入 / #23 读通道）：allowed 需先临时解锁（主
         // 密码），失败不回传决策——错误响应让弹窗停留，倒计时内可重试
-        // （AuthGuard 防暴破）。统一 pending 注册表（issue #148：四表合一）
-        // 里任何门的 needs_unlock 条目都要求携带主密码（dispatch 的会话
-        // 绕过亦查同一张表——表无关，未来新门自动被看见）。
+        // （AuthGuard 防暴破）。审批注册表（拍板 #28 候选 2 单表）里任何
+        // 门的 needs_unlock 条目都要求携带主密码（dispatch 的会话绕过亦查
+        // 同一张表——表无关，未来新门自动被看见）。
         if decision == ApprovalDecision::Allowed && self.pending_needs_unlock(p.request_id) {
             return self.approval_result_unlock(id, p, caller);
         }
@@ -110,18 +111,17 @@ impl Daemon {
                     vault.keys(),
                     &caller.event(M_VAULT_UNLOCK, AuditResult::Allowed),
                 );
-                // 审批工作区（issue #150）存入待审条目：临时解锁材料的
-                // 生命周期与条目严格一致（finalize 消费即随条目销毁；超时
-                // 竞态则放弃存储、随本函数作用域整体 drop）——「不签令牌 /
-                // 不置共享 vault / 单次即毁」由工作区类型与生命周期承载
-                // （见 gate_kit.rs `ApprovalWorkspace` 类型文档）。
-                let _ = self
-                    .pending_gates
-                    .lock()
-                    .unwrap()
-                    .store_workspace(p.request_id, ApprovalWorkspace::new(vault));
-                let accepted = self.shared.approvals.resolve(
+                // 审批工作区（issue #150）存入待审条目 + 决策写入：审批
+                // 注册表**同一临界区**内先存工作区再写决策（拍板 #28 候选 2
+                // ——不产生错误结果；白费解锁/`vault.unlock` 审计在超时竞态
+                // 下仍会发生——解锁发生在临界区之前，与折入前行为等价）。
+                // 临时解锁材料的生命周期与条目严格一致（finalize 消费即随
+                // 条目销毁；超时竞态则放弃存储、随本函数作用域整体 drop）
+                // ——「不签令牌 / 不置共享 vault / 单次即毁」由工作区类型与
+                // 生命周期承载（见 gate_kit.rs `ApprovalWorkspace` 类型文档）。
+                let accepted = self.shared.approvals.store_workspace_and_resolve(
                     p.request_id,
+                    ApprovalWorkspace::new(vault),
                     ApprovalDecision::Allowed,
                     &p.challenge,
                 );
@@ -138,15 +138,15 @@ impl Daemon {
     }
 
     /// 待审条目是否带锁定态一体化标志（#67 inject / #23 读通道，以及未来
-    /// 任何带 needs_unlock 的门——issue #148 表无关）：查统一 pending
-    /// 注册表（四表合一，gate_kit.rs）。`approval.result` 的 allowed 决策
-    /// 对这类条目要求携带 masterPassword 先做临时解锁（dispatch 会话绕过
-    /// 与 [`Self::approval_result`] 共用本判定，见 daemon/mod.rs
+    /// 任何带 needs_unlock 的门——issue #148 表无关）：查审批注册表
+    /// （拍板 #28 候选 2 单表，gate_kit.rs）。`approval.result` 的 allowed
+    /// 决策对这类条目要求携带 masterPassword 先做临时解锁（dispatch 会话
+    /// 绕过与 [`Self::approval_result`] 共用本判定，见 daemon/mod.rs
     /// `approval_needs_unlock`；通用 deferred 编排器的 debug 一致性断言
     /// 亦用——needs_unlock 条目只能由声明支持一体化解锁的门登记，issue
     /// #150）。
     pub(crate) fn pending_needs_unlock(&self, request_id: uuid::Uuid) -> bool {
-        self.pending_gates.lock().unwrap().needs_unlock(request_id)
+        self.shared.approvals.needs_unlock(request_id)
     }
 
     /// 审批超时（config 可配；默认 30s，第 3 层超时默认拒绝）。

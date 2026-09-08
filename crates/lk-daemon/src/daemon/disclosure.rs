@@ -58,7 +58,7 @@ impl Daemon {
         if self.vault_peek() {
             self.sessions.validate(token.unwrap_or(&[]))
         } else {
-            lk_core::vault::vault_exists(&self.shared.dir) && self.gate.approval().available()
+            lk_core::vault::vault_exists(&self.shared.dir) && self.approval_available()
         }
     }
 
@@ -107,7 +107,7 @@ impl Daemon {
             if starter == UNKNOWN_STARTER || cwd.is_empty() {
                 return GateBegin::Final(rpc_string(authz_denied(id)));
             }
-            if !self.gate.approval().available() {
+            if !self.approval_available() {
                 return GateBegin::Final(rpc_string(authz_denied(id)));
             }
             // 登记待审批（needs_unlock=true）+ 广播 authz.request
@@ -227,7 +227,7 @@ impl Daemon {
             }
         }
         // 6) get 未命中 / export 恒弹窗：无审批界面 → fail-closed 立即拒绝
-        if !self.gate.approval().available() {
+        if !self.approval_available() {
             self.audit_gate(
                 ActingVault::Shared,
                 &starter,
@@ -288,12 +288,14 @@ impl Daemon {
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
     ) -> String {
-        let removed = self.pending_gates.lock().unwrap().remove(&request_id);
+        // finalize = 审批注册表唯一消费移除点（拍板 #28 候选 2 三拍之三）
+        let removed = self.shared.approvals.remove(&request_id);
         // 条目已被消费（极端竞态）→ 保守拒绝
-        let Some(GateEntry {
+        let Some(ApprovalEntry {
             needs_unlock,
             workspace,
             kind: GateKind::Disclosure(p),
+            ..
         }) = removed
         else {
             return rpc_string(authz_denied(id));

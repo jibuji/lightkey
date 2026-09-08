@@ -95,6 +95,8 @@ Rust 核心按 A/B 层边界重组（trait 服务 + 事件总线，**行为不�
   见 [authorization-gate.md](authorization-gate.md)）——落在 authz-gate 插件（B 层）。
 - 审批通道接口化（本地实现；远程留接口，P1 不做）——approval 插件（D 层）
   弹窗 + 30s 倒计时；`authz.request` 事件接入（plugin-architecture.md §5）。
+  （历史记录：通道接口已按 #28 候选 2 删除、审批注册表下沉 daemon，见
+  [architecture-deepening.md](architecture-deepening.md) §2。）
 - Tauri 壳接入：窗口、IPC 桥、解锁/锁定联动、审批弹窗、托盘——desktop-shell 插件。
 - React 前端按 [design/spec.md](design/spec.md) 实现（解锁/条目/规则/设置/审计）——
   在骨架上实现 ui-unlock / ui-vault / ui-rules / ui-settings / ui-audit 插件。
@@ -228,6 +230,8 @@ export 转为恒拒绝断言（附件往返由 lk-core/daemon 测试覆盖）。
   `ApprovalChannel` 新增 `auto_approves` 默认假 + `AutoApproveChannel`
   （env 门控装饰器，`LIGHTKEY_E2E_AUTO_APPROVE=rule` 仅对规则审批立即放行）；
   审计 `AuditChannel::AutoApprove`（`channel=auto-approve`）。
+  （历史记录：上述通道抽象已按 #28 候选 2 删除、自动批准折入 daemon，见
+  [architecture-deepening.md](architecture-deepening.md) §2。）
 - lk-daemon：`strategy_of` 升 `rule.add` / `rule.remove` 为 ApprovalDeferred
   （`rule.list` 维持 Inline）；`rule_begin`（参数校验/归一化 + id→规则解析
   补全 + desktop 豁免 + fail-closed 登记/广播）→ 锁外等待 → `rule_finalize`
@@ -291,6 +295,9 @@ milestones、AGENTS.md、CONTEXT.md）；**#104/#105 关闭**。
 - E2E：**不扩展** auto-approve 到写门——shell E2E 覆盖 headless 拒绝 /
   写规则命中静默（`auto-approve=rule` 预插）/ delete 恒弹窗拒绝；弹窗
   批准路径由 daemon 集成测试（`LocalApprovalChannel`）覆盖。
+  （历史记录：`LocalApprovalChannel` 已按 #28 候选 2 删除，测试改为进程内
+  桌面订阅 + `approval.result` 直调回传，见
+  [architecture-deepening.md](architecture-deepening.md) §2。）
 
 **出口**：`cargo test` + vitest 全绿；M0/M1/M2/M2.75/M2.8/M2.9/M2.95 回归 +
 写门集成测试（tests/write_gate.rs）通过；clippy/fmt 全绿；文档同步
