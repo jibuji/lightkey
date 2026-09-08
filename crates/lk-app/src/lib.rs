@@ -73,6 +73,8 @@ pub fn run() {
             pick_dir,
             approval_alert,
             app_quit,
+            clipboard_read,
+            clipboard_clear,
         ])
         .setup(|app| {
             // 托盘（决策 #4 A）：显示 / 锁定 / 退出
@@ -282,6 +284,28 @@ fn app_quit(app: tauri::AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// 剪贴板读写（M2.99 快速保存，docs/quick-capture.md §4.1/§5）
+// ---------------------------------------------------------------------------
+
+/// 读取剪贴板文本（快速保存：只在用户**主动触发**快存那一刻读一次，无后台
+/// 轮询/监听）。空剪贴板或非文本内容（如图片）→ `null`，前端提示手动粘贴。
+#[tauri::command]
+fn clipboard_read() -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    cb.get_text().ok()
+}
+
+/// 置空剪贴板（快速保存「保存后清空剪贴板」勾选，默认关——剪贴板内容非
+/// LightKey 复制出去的，不清外部内容；勾选开启才置空，复用 lk-cli 同款
+/// arboard 语义）。
+#[tauri::command]
+fn clipboard_clear() -> Result<(), String> {
+    let mut cb = arboard::Clipboard::new().map_err(|e| format!("无法访问剪贴板: {e}"))?;
+    cb.set_text(String::new())
+        .map_err(|e| format!("清空剪贴板失败: {e}"))
+}
+
+// ---------------------------------------------------------------------------
 // 审批强提醒（#95）
 // ---------------------------------------------------------------------------
 
@@ -338,10 +362,13 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::tray::TrayIconBuilder;
     use tauri::Manager;
 
+    // M2.99 快速保存（quick-capture.md §3.1/§4.1）：显示主窗口 + 发壳事件
+    // `lk-shell-quick-save`（本地 UI 请求，不进守护进程通知协议 NOTIFY_*）
+    let quick_save = MenuItem::with_id(app, "quick-save", "快速保存剪贴板…", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let lock = MenuItem::with_id(app, "lock", "锁定", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &lock, &quit])?;
+    let menu = Menu::with_items(app, &[&quick_save, &show, &lock, &quit])?;
     let mut tray = TrayIconBuilder::with_id("lightkey-tray")
         .tooltip("LightKey · 轻钥")
         .menu(&menu)
@@ -351,13 +378,16 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         tray = tray.icon(icon.clone());
     }
     tray.on_menu_event(|app, event| match event.id.as_ref() {
-        "show" => {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
+        "quick-save" => {
+            // 先显示 + 聚焦主窗口（决策 #4 A：关闭=隐藏到托盘；Wayland 下
+            // 剪贴板读取也需窗口焦点），再通知前端打开快存面板
+            show_main_window(app);
+            // Emitter：壳 → UI 本地请求（前端 ipc-bridge 监听翻译为
+            // `quick.save-request` 总线事件）
+            use tauri::Emitter;
+            let _ = app.emit("lk-shell-quick-save", ());
         }
+        "show" => show_main_window(app),
         "lock" => {
             // 侧栏「锁定」同语义：立即锁定（manual）
             app.state::<AppState>()
@@ -368,6 +398,17 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     })
     .build(app)?;
     Ok(())
+}
+
+/// 显示/还原并聚焦主窗口（托盘「显示主窗口」与「快速保存剪贴板」共用；
+/// 决策 #4 A：关闭 = 隐藏到托盘、保持解锁）。
+fn show_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
 }
 
 /// 数据目录（桌面壳与 CLI 共用同一解析；测试/调试经 `LIGHTKEY_HOME` 覆盖）。

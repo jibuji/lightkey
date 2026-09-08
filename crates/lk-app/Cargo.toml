@@ -18,6 +18,9 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 # 操作系统通知（#95 审批强提醒；走 Rust command 桥，JS 面不依赖其 npm 包）
 tauri-plugin-notification = "2"
+# 剪贴板读写（M2.99 快速保存：clipboard_read / clipboard_clear；同
+# lk-cli 的 arboard 用法，只在用户主动触发时读写一次）
+arboard.workspace = true
 lk-core = { path = "../lk-core" }
 lk-daemon = { path = "../lk-daemon" }
 serde.workspace = true
