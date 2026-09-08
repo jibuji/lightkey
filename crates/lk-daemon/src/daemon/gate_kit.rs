@@ -1,7 +1,10 @@
 //! gate-kit（issue #148）：四个授权门模块（authz / disclosure / rules /
-//! write）各自重抄的「五件套」中可下沉部分的唯一出处——纯下沉，零行为变更。
+//! write）各自重抄的「五件套」中可下沉部分的唯一出处——纯下沉，零行为变更
+//!（issue #167 起结果类型升为**分层裁决结果**，见 [`GateBegin`] /
+//! [`DeferredOutcome`]）。
 //!
-//! - [`GateBegin`]：begin 阶段统一结果类型（四门各一个同构枚举合一）；
+//! - [`GateBegin`] / [`GateDeny`]：begin 阶段**分层裁决结果**（拒绝(reason) /
+//!   放行·直返(负载) / 未命中需审批；issue #167）；
 //! - [`ApprovalRegistry`] / [`ApprovalEntry`] / [`GateEntry`] / [`GateKind`]：
 //!   **守护进程侧审批注册表**（拍板 #28 候选 2，issue #166：取代 core
 //!   `PendingApprovals` + daemon `PendingGates` 双表——单表承载质询值 /
@@ -20,11 +23,12 @@
 //!   单次裁决状态的条目内一等对象；「单次即毁 / 不签令牌 / 不置共享
 //!   vault / 指纹裁决单发」不变量的**单点出处**（类型文档即权威）；
 //! - 参数解析辅助（[`parse_gate_params`] / [`invalid_params`]）；
-//! - [`DeferredOutcome`]：finalize 阶段统一结果类型（RePended 由通用
-//!   deferred 编排器内建循环消费）。
+//! - [`DeferredOutcome`]：finalize 阶段**分层结果**（决策结局 vs 执行结果
+//!   两层 + RePended；issue #167）。
 //!
-//! 预检（precheck）/ begin / finalize 由各门声明为流程（issue #149），锁
-//! 编排收敛于 router.rs 的通用 deferred 编排器。
+//! 预检（precheck）/ begin / finalize 由各门以**静态门声明**承载（issue
+//! #167，`router::GateDecl`），锁编排与字节收线收敛于 router.rs 的通用
+//! deferred 编排器。
 
 use std::collections::HashMap;
 use std::sync::Condvar;
@@ -35,22 +39,86 @@ use super::rules::PendingRuleChange;
 use super::write::PendingWrite;
 use super::*;
 
-/// begin 阶段统一结果类型（issue #148）：最终响应（不阻塞）或待审批
-/// （等待移出命令锁，G1）。到期时刻以登记值为准（审批注册表侧超时默认
-/// 拒绝），此处不重复携带。取代 authz / disclosure / rules / write 四个
-/// 同构枚举（`AuthzBegin` 等，已删除）。
+/// begin 阶段分层裁决结果（issue #167 / 拍板 #28 候选 3）：裁决本体的
+/// 三态 = 拒绝(reason) / 放行·直返(负载) / 未命中需审批；`Final` 亦承载
+/// **非裁决**的协议层直返（参数解析失败 / `item.not_found` / 方法未知）。
+///
+/// 关键分层：**拒绝的响应字节不在此决定**——`Deny(reason)` 的 reason 是
+/// 一等数据，字节由门声明的渲染器按 (门 × 锁态/会话态) 唯一渲染（同一
+/// reason 跨门跨锁态字节不同：解锁态 inject=`ok{no_ui}` vs disclosure=
+/// `authz.denied`(-32017)，不得压平）。而「锁态 headless inject =
+/// `session.invalid`」是**会话前置失败**（执行层，编排器预检 / begin 锁态
+/// 分支直返 `Final(session.invalid)`），不是裁决拒绝——这正是两层结果
+/// 防止 6 类 spec 钉死的 fail-closed 码被压平的机制（§1.6）。
+#[derive(Debug, Clone)]
 pub(crate) enum GateBegin {
+    /// 裁决拒绝：reason 一等数据，字节交门声明渲染器（唯一决定点）。
+    Deny(GateDeny),
+    /// 放行 / 协议层直返（payload = 已渲染的响应行：规则命中执行结果 /
+    /// desktop 豁免执行结果 / 解析错误 / 会话前置失败 `session.invalid`）。
     Final(String),
+    /// 未命中需审批（登记 + 广播已完成；等待移出命令锁，G1）。
     Pending { request_id: uuid::Uuid },
 }
 
-/// finalize 阶段统一结果类型（issue #149）：最终响应，或锁定态一体化指纹
-/// 失配转**二次审批**（issue #140）——RePended 循环内建于通用 deferred 编排器
-/// （router.rs `run_deferred`），finalize 返回 [`DeferredOutcome::RePended`]
-/// 即回到锁外等待；注入裁决不再是编排特例。取代 authz 特有的
-/// `AuthzFinalize`（已删除）。
+/// 跨门拒绝原因（issue #167）：随分层裁决结果流动的一等数据。**不含字节**——
+/// 字节由各门渲染器按 (门 × 锁态/会话态) 决定；同一 reason 跨门跨锁态
+/// 字节不同是 spec 钉死的安全不变量（§1.6 六类 fail-closed 码）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateDeny {
+    /// 启动者未知（第 1 层 fail-closed，不弹窗）。
+    UnknownStarter,
+    /// 对端 cwd 不可得（规则按项目目录绑定）。
+    NoCwd,
+    /// 无审批界面（headless；含锁态一体化二次审批界面离场）。
+    NoUi,
+    /// 决策拒绝 / 待审条目消费竞态的保守拒绝（finalize 决策结局）。
+    Rejected,
+    /// 审批超时（默认拒绝；finalize 决策结局）。
+    Timeout,
+    /// 第 1/2 层裁决拒绝（核心 [`DenyReason`] 透传：missing_keys /
+    /// rule_corrupt / 层内 unknown_starter 等；渲染按 `as_str`）。
+    Layer(DenyReason),
+}
+
+impl GateDeny {
+    /// CLI/弹窗文案映射（与核心 [`DenyReason::as_str`] 同词表）。
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            GateDeny::UnknownStarter => "unknown_starter",
+            GateDeny::NoCwd => "no_cwd",
+            GateDeny::NoUi => "no_ui",
+            GateDeny::Rejected => "rejected",
+            GateDeny::Timeout => "timeout",
+            GateDeny::Layer(r) => r.as_str(),
+        }
+    }
+}
+
+/// finalize 阶段分层结果（issue #167 / 拍板 #28 候选 3，实现以规格 §3
+/// 评审修订为准）：**决策结局**与**执行结果**分两层建模——
+///
+/// - 决策结局：`Denied`（deny / timeout / 条目消费竞态 → 统一拒绝尾，
+///   字节交门声明渲染器）；
+/// - 执行结果：`Executed`（决策已定后的执行成功，payload = 响应行）/
+///   `SessionInvalid`（决策已 Allowed 而 vault 已锁 / 解析失败——**执行
+///   失败而非 Denied 决策**，跨门统一 `session.invalid`）/ `ExecutionDenied`
+///   （TOCTOU 重验失效、审批工作区缺失、二次审批界面离场等执行层保守
+///   拒绝——字节走本门拒绝尾，但**不是**用户决策）；
+/// - `RePended`：锁态一体化指纹补裁决失配转二次审批（issue #140；仅
+///   `rependable` 门声明可达，编排器消费声明、违例 release fail-closed）。
+#[derive(Debug, Clone)]
 pub(crate) enum DeferredOutcome {
-    Done(String),
+    /// 执行成功（payload = 执行结果响应行）。
+    Executed(String),
+    /// 执行失败：锁态/会话材料不可用 → 统一 `session.invalid`。
+    SessionInvalid,
+    /// 执行失败：保守拒绝（TOCTOU 重验失效 / 工作区缺失 / 二次审批界面
+    /// 离场）→ 字节走本门拒绝尾。
+    ExecutionDenied(GateDeny),
+    /// 决策结局：统一拒绝尾（deny / timeout / 条目消费竞态）。
+    Denied(GateDeny),
+    /// 转二次审批（回到锁外等待；RePended 循环内建于编排器）。
     RePended { request_id: uuid::Uuid },
 }
 
@@ -119,7 +187,7 @@ pub(crate) struct GateEntry {
     /// 锁定态一体化标志（#67 inject / #23 读通道）：审批需先临时解锁；
     /// `authz.request` 帧的 `needsUnlock` 与本值同源（单点铸造保证）。
     /// 规则门/写门恒 false——由 [`GateEntry::approval`] 构造器与各门流程
-    /// 声明（`DeferredFlow::unlock_supported`）显式承载（issue #150）。
+    /// 声明（`GateDecl::unlock_supported`，issue #167）显式承载。
     pub needs_unlock: bool,
     /// 审批工作区（issue #150，见 [`ApprovalWorkspace`] 类型文档——不变量
     /// 「单次即毁 / 不签令牌 / 不置共享 vault」的单点出处）。正常路径恒
@@ -399,6 +467,8 @@ fn write_decision_locked(
 
 /// 审批请求草稿（issue #148 单点铸造的入参）：id / challenge / 超时不在
 /// 其中——由 [`Daemon::open_gate_approval`] 唯一铸造；展示字段由各门自带。
+/// 九字段克隆经 [`ApprovalDraft::new`] + `with_*` **单点构造**（issue #167：
+/// 四个门事实可选字段在此唯一写 `None`，各门 begin 只补自己携带的事实）。
 pub(crate) struct ApprovalDraft {
     pub starter: String,
     pub project_dir: String,
@@ -417,6 +487,57 @@ pub(crate) struct ApprovalDraft {
     pub fingerprint_mismatch: Option<lk_core::authz::FingerprintMismatch>,
 }
 
+impl ApprovalDraft {
+    /// 单点构造（issue #167）：五个基字段 + 四个门事实可选字段缺省 `None`
+    /// （此前各门手写九字段克隆、`None` 散布 7 处）。
+    pub(crate) fn new(
+        starter: String,
+        project_dir: String,
+        command: String,
+        keys: Vec<String>,
+        kind: lk_core::authz::ApprovalKind,
+    ) -> Self {
+        Self {
+            starter,
+            project_dir,
+            command,
+            keys,
+            kind,
+            sub_kind: None,
+            write_action: None,
+            export_meta: None,
+            fingerprint_mismatch: None,
+        }
+    }
+
+    /// 携带审批子类型事实（#147：规则门 / 写门随帧回带 subKind）。
+    pub(crate) fn with_sub_kind(mut self, sub_kind: lk_core::authz::ApprovalSubKind) -> Self {
+        self.sub_kind = Some(sub_kind);
+        self
+    }
+
+    /// 携带写审批的权威派生动作（#137：随帧回带 writeAction）。
+    pub(crate) fn with_write_action(mut self, action: lk_core::authz::WriteAction) -> Self {
+        self.write_action = Some(action);
+        self
+    }
+
+    /// 携带 export 审批的数据包规模元信息。
+    pub(crate) fn with_export_meta(mut self, meta: lk_core::authz::ExportMeta) -> Self {
+        self.export_meta = Some(meta);
+        self
+    }
+
+    /// 携带指纹失配展示信息（M2.98 identity-binding.md §7）。
+    pub(crate) fn with_fingerprint_mismatch(
+        mut self,
+        mismatch: lk_core::authz::FingerprintMismatch,
+    ) -> Self {
+        self.fingerprint_mismatch = Some(mismatch);
+        self
+    }
+}
+
 impl Daemon {
     /// 桌面审批界面在场判定（拍板 #28 候选 2 折入 daemon：原 core
     /// `LocalApprovalChannel::available` 的 `has_ui` 谓词）：只数**桌面来源**
@@ -425,6 +546,14 @@ impl Daemon {
     /// 立即拒绝，不登记、不阻塞。
     pub(crate) fn approval_available(&self) -> bool {
         self.shared.push.desktop_subscriber_count() > 0
+    }
+
+    /// 门声明违例的 fail-closed 收线（issue #167，release 防御路径）：消费
+    /// 误登记的待审批条目（迟到的 `approval.result` 按 unknown 拒绝写 →
+    /// `accepted=false` + 失败提交审计；不残留无主弹窗空等超时）。按构造
+    /// 不可达——needs_unlock 条目只能由声明支持一体化解锁的门登记。
+    pub(crate) fn consume_gate_entry(&mut self, request_id: uuid::Uuid) {
+        let _ = self.shared.approvals.remove(&request_id);
     }
 
     /// 审批请求单点铸造 + 注册表登记 + `authz.request` 广播（issue #148；

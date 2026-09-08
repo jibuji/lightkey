@@ -24,7 +24,15 @@ enum FingerprintVerdict {
 impl Daemon {
     /// 阶段①（命令锁内）：会话预检 + 启动者判定 + 第 1/2 层短路；需要审批
     /// 时登记待审批 + 广播 `authz.request`，返回 Pending（等待移出命令锁）。
-    pub(crate) fn authz_begin(&mut self, id: Value, params: Value, peer: &PeerInfo) -> GateBegin {
+    /// 返回**分层裁决结果**（issue #167）：拒绝以 reason 承载（字节由门
+    /// 声明渲染器唯一渲染），放行/协议直返为已渲染负载。
+    pub(crate) fn authz_begin(
+        &mut self,
+        _method: &str,
+        id: Value,
+        params: Value,
+        peer: &PeerInfo,
+    ) -> GateBegin {
         let p: AuthzEvaluateParams = match parse_gate_params(&id, params) {
             Ok(p) => p,
             Err(line) => return GateBegin::Final(line),
@@ -50,62 +58,41 @@ impl Daemon {
         let vault = shared.vault.read().unwrap();
         let Some(v) = vault.as_ref() else {
             // 锁定态（#67）：桌面审批界面在场 → 一体化解锁+审批；否则沿旧
-            // 行为 fail-closed `session.invalid`（headless，CLI 提示先解锁）。
-            // 锁态无法裁决规则项（规则在加密 vault 内）：只做不依赖 vault
-            // 的第 1 层 fail-closed（unknown starter / 无 cwd），其余裁决
-            // 全部推迟到弹窗批准 + 临时解锁之后的 finalize（届时使用临时
-            // vault 跑完整三层，见 authz_finalize）。unknown starter 不弹窗
-            // （fail-closed 不打扰用户、不留内容；锁态无 K_audit 无法审计，
-            // 与 v0 锁态 session.invalid 同口径）。
+            // 行为 fail-closed `session.invalid`（headless，CLI 提示先解锁）
+            // ——会话前置失败（执行层），不是裁决拒绝，不经渲染器（分层见
+            // gate_kit.rs `GateBegin` 类型文档）。锁态无法裁决规则项（规则
+            // 在加密 vault 内）：只做不依赖 vault 的第 1 层 fail-closed
+            // （unknown starter / 无 cwd），其余裁决全部推迟到弹窗批准 +
+            // 临时解锁之后的 finalize（届时使用临时 vault 跑完整三层，见
+            // authz_finalize）。unknown starter 不弹窗（fail-closed 不打扰
+            // 用户、不留内容；锁态无 K_audit 无法审计，与 v0 锁态
+            // session.invalid 同口径）。
             if req.starter == UNKNOWN_STARTER {
-                return GateBegin::Final(rpc_string(RpcResponse::ok(
-                    id,
-                    serde_json::to_value(AuthzEvaluateResult {
-                        allowed: false,
-                        reason: Some(DenyReason::UnknownStarter.as_str().to_string()),
-                        env: None,
-                    })
-                    .unwrap_or(Value::Null),
-                )));
+                return GateBegin::Deny(GateDeny::UnknownStarter);
             }
             if req.cwd.is_empty() {
-                return GateBegin::Final(rpc_string(RpcResponse::ok(
-                    id,
-                    serde_json::to_value(AuthzEvaluateResult {
-                        allowed: false,
-                        reason: Some(DenyReason::NoCwd.as_str().to_string()),
-                        env: None,
-                    })
-                    .unwrap_or(Value::Null),
-                )));
+                return GateBegin::Deny(GateDeny::NoCwd);
             }
             // 无审批界面（纯 headless 守护进程）→ fail-closed（issue #67：
             // GUI 不在运行维持现状直接拒绝，不阻塞、不静默回落）
             if !self.approval_available() {
-                return GateBegin::Final(
-                    serde_json::to_string(&session_invalid(id)).unwrap_or_else(|_| "{}".into()),
-                );
+                return GateBegin::Final(rpc_string(session_invalid(id)));
             }
             // 登记待审批（needs_unlock=true）+ 广播 authz.request
             // （needsUnlock=true，D 层弹窗须同时展示主密码输入与授权栏）。
             // challenge 语义不变：一次性应答值，仅投递桌面订阅者（#78）。
             drop(vault);
             let request_id = self.open_gate_approval(
-                ApprovalDraft {
-                    starter: req.starter.clone(),
-                    project_dir: req.cwd.clone(),
-                    command: req.command.clone(),
-                    keys: req.keys.clone(),
-                    kind: lk_core::authz::ApprovalKind::Inject,
-                    // #147：inject 审批不带审批子类型（帧不含 subKind 字段）
-                    sub_kind: None,
-                    write_action: None,
-                    export_meta: None,
-                    // 锁态：规则在加密 vault 内无指纹可比（须待解锁后
-                    // finalize——issue #140：finalize 在临时 vault 上补裁决，
-                    // 失配转二次审批），审批帧不携带失配信息。
-                    fingerprint_mismatch: None,
-                },
+                ApprovalDraft::new(
+                    req.starter.clone(),
+                    req.cwd.clone(),
+                    req.command.clone(),
+                    req.keys.clone(),
+                    lk_core::authz::ApprovalKind::Inject,
+                ),
+                // 锁态：规则在加密 vault 内无指纹可比（须待解锁后
+                // finalize——issue #140：finalize 在临时 vault 上补裁决，
+                // 失配转二次审批），审批帧不携带失配信息。
                 GateEntry::unified_unlock(GateKind::Authz(PendingAuthz {
                     request: req,
                     peer: peer.clone(),
@@ -149,15 +136,7 @@ impl Daemon {
             LayerResult::Denied { reason } => {
                 // 第 1 层：拒绝（不弹窗、不留内容，仅审计拒绝事件）
                 self.audit_authz(ActingVault::Shared, &req, channel, AuditResult::Denied);
-                GateBegin::Final(rpc_string(RpcResponse::ok(
-                    id,
-                    serde_json::to_value(AuthzEvaluateResult {
-                        allowed: false,
-                        reason: Some(reason.as_str().to_string()),
-                        env: None,
-                    })
-                    .unwrap_or(Value::Null),
-                )))
+                GateBegin::Deny(GateDeny::Layer(reason))
             }
             LayerResult::NeedsApproval =>
             // 第 3 层：登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）；
@@ -226,7 +205,7 @@ impl Daemon {
     /// 承载（issue #150），解锁态条目无工作区、finalize 走共享 vault 路径。
     fn open_inject_approval(
         &mut self,
-        id: Value,
+        _id: Value,
         req: AuthzRequest,
         peer: &PeerInfo,
         channel: AuditChannel,
@@ -234,28 +213,24 @@ impl Daemon {
     ) -> GateBegin {
         if !self.approval_available() {
             self.audit_authz(ActingVault::Shared, &req, channel, AuditResult::Denied);
-            return GateBegin::Final(rpc_string(RpcResponse::ok(
-                id,
-                serde_json::to_value(AuthzEvaluateResult {
-                    allowed: false,
-                    reason: Some(DenyReason::NoUi.as_str().to_string()),
-                    env: None,
-                })
-                .unwrap_or(Value::Null),
-            )));
+            return GateBegin::Deny(GateDeny::NoUi);
         }
         let request_id = self.open_gate_approval(
-            ApprovalDraft {
-                starter: req.starter.clone(),
-                project_dir: req.cwd.clone(),
-                command: req.command.clone(),
-                keys: req.keys.clone(),
-                kind: lk_core::authz::ApprovalKind::Inject,
-                // #147：inject 审批不带审批子类型（帧不含 subKind 字段）
-                sub_kind: None,
-                write_action: None,
-                export_meta: None,
-                fingerprint_mismatch,
+            // #147：inject 审批不带审批子类型 / 写动作 / 导出元信息（帧不含
+            // 相应字段）；指纹失配展示信息（M2.98）按携带与否补充——九字段
+            // 克隆经 ApprovalDraft::new 单点构造（issue #167）。
+            {
+                let draft = ApprovalDraft::new(
+                    req.starter.clone(),
+                    req.cwd.clone(),
+                    req.command.clone(),
+                    req.keys.clone(),
+                    lk_core::authz::ApprovalKind::Inject,
+                );
+                match fingerprint_mismatch {
+                    Some(m) => draft.with_fingerprint_mismatch(m),
+                    None => draft,
+                }
             },
             GateEntry::approval(GateKind::Authz(PendingAuthz {
                 request: req,
@@ -290,7 +265,7 @@ impl Daemon {
     ) -> DeferredOutcome {
         // finalize = 审批注册表唯一消费移除点（拍板 #28 候选 2 三拍之三）
         let removed = self.shared.approvals.remove(&request_id);
-        // 条目已被消费（极端竞态）或门不符 → 保守拒绝
+        // 条目已被消费（极端竞态）或门不符 → 保守拒绝（决策结局）
         let (pending, workspace, needs_unlock) = match removed {
             Some(ApprovalEntry {
                 needs_unlock,
@@ -298,22 +273,12 @@ impl Daemon {
                 kind: GateKind::Authz(pending),
                 ..
             }) => (pending, workspace, needs_unlock),
-            _ => {
-                return DeferredOutcome::Done(rpc_string(RpcResponse::ok(
-                    id,
-                    serde_json::to_value(AuthzEvaluateResult {
-                        allowed: false,
-                        reason: Some(DenyReason::Rejected.as_str().to_string()),
-                        env: None,
-                    })
-                    .unwrap_or(Value::Null),
-                )))
-            }
+            _ => return DeferredOutcome::Denied(GateDeny::Rejected),
         };
         if needs_unlock {
             return self.authz_finalize_unlock(id, pending, workspace, decision);
         }
-        let result = match decision {
+        match decision {
             ApprovalDecision::Allowed => {
                 match self.resolve_env(ActingVault::Shared, &pending.request.keys) {
                     Ok(env) => {
@@ -323,18 +288,20 @@ impl Daemon {
                             AuditChannel::Approval,
                             AuditResult::Allowed,
                         );
-                        AuthzEvaluateResult {
-                            allowed: true,
-                            reason: None,
-                            env: Some(env),
-                        }
+                        DeferredOutcome::Executed(rpc_string(RpcResponse::ok(
+                            id,
+                            serde_json::to_value(AuthzEvaluateResult {
+                                allowed: true,
+                                reason: None,
+                                env: Some(env),
+                            })
+                            .unwrap_or(Value::Null),
+                        )))
                     }
                     Err(_) => {
-                        // 等待期间锁定/密钥不可用 → 无法满足
-                        return DeferredOutcome::Done(
-                            serde_json::to_string(&session_invalid(id))
-                                .unwrap_or_else(|_| "{}".into()),
-                        );
+                        // 等待期间锁定/密钥不可用 → 执行失败（非 Denied 决策，
+                        // issue #167 分层）：统一 session.invalid
+                        DeferredOutcome::SessionInvalid
                     }
                 }
             }
@@ -345,11 +312,7 @@ impl Daemon {
                     AuditChannel::Approval,
                     AuditResult::Denied,
                 );
-                AuthzEvaluateResult {
-                    allowed: false,
-                    reason: Some(DenyReason::Rejected.as_str().to_string()),
-                    env: None,
-                }
+                DeferredOutcome::Denied(GateDeny::Rejected)
             }
             ApprovalDecision::Timeout => {
                 self.audit_authz(
@@ -358,17 +321,9 @@ impl Daemon {
                     AuditChannel::Approval,
                     AuditResult::Timeout,
                 );
-                AuthzEvaluateResult {
-                    allowed: false,
-                    reason: Some(DenyReason::Timeout.as_str().to_string()),
-                    env: None,
-                }
+                DeferredOutcome::Denied(GateDeny::Timeout)
             }
-        };
-        DeferredOutcome::Done(rpc_string(RpcResponse::ok(
-            id,
-            serde_json::to_value(result).unwrap_or(Value::Null),
-        )))
+        }
     }
 
     /// 锁定态一体化 finalize（#67，见 [`Self::authz_finalize`]）。审批工作区
@@ -387,17 +342,9 @@ impl Daemon {
         match decision {
             ApprovalDecision::Allowed => {
                 // 工作区由 approval_result 以正确主密码解锁后存入；
-                // 缺失（异常路径）→ 保守拒绝
+                // 缺失（异常路径）→ 保守拒绝（执行层，issue #167 分层）
                 let Some(workspace) = workspace else {
-                    return DeferredOutcome::Done(rpc_string(RpcResponse::ok(
-                        id,
-                        serde_json::to_value(AuthzEvaluateResult {
-                            allowed: false,
-                            reason: Some(DenyReason::Rejected.as_str().to_string()),
-                            env: None,
-                        })
-                        .unwrap_or(Value::Null),
-                    )));
+                    return DeferredOutcome::ExecutionDenied(GateDeny::Rejected);
                 };
                 // 锁定态补指纹裁决（issue #140，identity-binding.md §2 目标 2/
                 // §3/§7）：临时解锁后规则在临时 vault 内、对端 env 可读——
@@ -419,7 +366,7 @@ impl Daemon {
                 let layer = self
                     .gate
                     .evaluate_layers(req, &VaultRuleView { vault, secrets });
-                let result = match layer {
+                match layer {
                     LayerResult::Allowed { keys } => {
                         match self.resolve_env(ActingVault::Temporary(vault), &keys) {
                             Ok(env) => {
@@ -429,18 +376,17 @@ impl Daemon {
                                     AuditChannel::Approval,
                                     AuditResult::Allowed,
                                 );
-                                AuthzEvaluateResult {
-                                    allowed: true,
-                                    reason: None,
-                                    env: Some(env),
-                                }
+                                DeferredOutcome::Executed(rpc_string(RpcResponse::ok(
+                                    id,
+                                    serde_json::to_value(AuthzEvaluateResult {
+                                        allowed: true,
+                                        reason: None,
+                                        env: Some(env),
+                                    })
+                                    .unwrap_or(Value::Null),
+                                )))
                             }
-                            Err(_) => {
-                                return DeferredOutcome::Done(
-                                    serde_json::to_string(&session_invalid(id))
-                                        .unwrap_or_else(|_| "{}".into()),
-                                )
-                            }
+                            Err(_) => DeferredOutcome::SessionInvalid,
                         }
                     }
                     LayerResult::Denied { reason } => {
@@ -450,11 +396,7 @@ impl Daemon {
                             AuditChannel::Approval,
                             AuditResult::Denied,
                         );
-                        AuthzEvaluateResult {
-                            allowed: false,
-                            reason: Some(reason.as_str().to_string()),
-                            env: None,
-                        }
+                        DeferredOutcome::Denied(GateDeny::Layer(reason))
                     }
                     // 未命中规则：第 3 层弹窗已批准（allowed 决策即批准）
                     LayerResult::NeedsApproval => {
@@ -466,48 +408,27 @@ impl Daemon {
                                     AuditChannel::Approval,
                                     AuditResult::Allowed,
                                 );
-                                AuthzEvaluateResult {
-                                    allowed: true,
-                                    reason: None,
-                                    env: Some(env),
-                                }
+                                DeferredOutcome::Executed(rpc_string(RpcResponse::ok(
+                                    id,
+                                    serde_json::to_value(AuthzEvaluateResult {
+                                        allowed: true,
+                                        reason: None,
+                                        env: Some(env),
+                                    })
+                                    .unwrap_or(Value::Null),
+                                )))
                             }
-                            Err(_) => {
-                                return DeferredOutcome::Done(
-                                    serde_json::to_string(&session_invalid(id))
-                                        .unwrap_or_else(|_| "{}".into()),
-                                )
-                            }
+                            Err(_) => DeferredOutcome::SessionInvalid,
                         }
                     }
-                };
+                }
                 // 工作区随本函数结束 drop——临时解锁态销毁（不变量由构造与
                 // 生命周期承载，见 gate_kit.rs ApprovalWorkspace 类型文档）
-                DeferredOutcome::Done(rpc_string(RpcResponse::ok(
-                    id,
-                    serde_json::to_value(result).unwrap_or(Value::Null),
-                )))
             }
             // 拒绝/超时：未解锁（无工作区）→ 无 K_audit 可签名，审计
             // 不可写（与 v0 锁态拒绝同口径——fail-closed 不留审计内容）
-            ApprovalDecision::Denied => DeferredOutcome::Done(rpc_string(RpcResponse::ok(
-                id,
-                serde_json::to_value(AuthzEvaluateResult {
-                    allowed: false,
-                    reason: Some(DenyReason::Rejected.as_str().to_string()),
-                    env: None,
-                })
-                .unwrap_or(Value::Null),
-            ))),
-            ApprovalDecision::Timeout => DeferredOutcome::Done(rpc_string(RpcResponse::ok(
-                id,
-                serde_json::to_value(AuthzEvaluateResult {
-                    allowed: false,
-                    reason: Some(DenyReason::Timeout.as_str().to_string()),
-                    env: None,
-                })
-                .unwrap_or(Value::Null),
-            ))),
+            ApprovalDecision::Denied => DeferredOutcome::Denied(GateDeny::Rejected),
+            ApprovalDecision::Timeout => DeferredOutcome::Denied(GateDeny::Timeout),
         }
     }
 
@@ -521,28 +442,24 @@ impl Daemon {
     /// fail-closed no_ui（与解锁态 headless 失配同码、防探测）。
     fn authz_finalize_reopen(
         &mut self,
-        id: Value,
+        _id: Value,
         req: &AuthzRequest,
         peer: PeerInfo,
         mut workspace: ApprovalWorkspace,
         mismatch: Option<FingerprintMismatch>,
     ) -> DeferredOutcome {
         if !self.approval_available() {
+            // 二次审批界面离场（审批期间断开）→ 用临时 vault 的 K_audit 审计
+            // 拒绝 + fail-closed no_ui（与解锁态 headless 失配同码、防探测）。
+            // 执行层保守拒绝（issue #167 分层：决策已 Allowed、转二次审批的
+            // 执行材料离场，非 Denied 决策），字节走本门拒绝尾（ok{no_ui}）。
             self.audit_authz(
                 ActingVault::Temporary(workspace.vault()),
                 req,
                 AuditChannel::Approval,
                 AuditResult::Denied,
             );
-            return DeferredOutcome::Done(rpc_string(RpcResponse::ok(
-                id,
-                serde_json::to_value(AuthzEvaluateResult {
-                    allowed: false,
-                    reason: Some(DenyReason::NoUi.as_str().to_string()),
-                    env: None,
-                })
-                .unwrap_or(Value::Null),
-            )));
+            return DeferredOutcome::ExecutionDenied(GateDeny::NoUi);
         }
         // 二次审批不再重复指纹裁决（单发状态已随工作区标记，issue #150；
         // 防裁决 → 审批 → 裁决死循环由结构承载——二次弹窗批准即本次允许，
@@ -555,17 +472,20 @@ impl Daemon {
         // 工作区（含临时解锁材料）随新条目存留（finalize 消费即毁）
         entry.workspace = Some(workspace);
         let request_id = self.open_gate_approval(
-            ApprovalDraft {
-                starter: req.starter.clone(),
-                project_dir: req.cwd.clone(),
-                command: req.command.clone(),
-                keys: req.keys.clone(),
-                kind: lk_core::authz::ApprovalKind::Inject,
-                // #147：inject 审批不带审批子类型（帧不含 subKind 字段）
-                sub_kind: None,
-                write_action: None,
-                export_meta: None,
-                fingerprint_mismatch: mismatch,
+            {
+                // inject 审批只携带指纹失配展示信息（M2.98）；其余门事实
+                // 字段恒 None——九字段克隆单点构造（issue #167）。
+                let draft = ApprovalDraft::new(
+                    req.starter.clone(),
+                    req.cwd.clone(),
+                    req.command.clone(),
+                    req.keys.clone(),
+                    lk_core::authz::ApprovalKind::Inject,
+                );
+                match mismatch {
+                    Some(m) => draft.with_fingerprint_mismatch(m),
+                    None => draft,
+                }
             },
             entry,
         );
@@ -624,48 +544,39 @@ impl Daemon {
 }
 
 // -------------------------------------------------------------------------
-// 流程声明（issue #149：通用 deferred 编排器的注册项）
+// 门声明（issue #167：静态声明取代 DeferredFlow trait 空壳；注册于
+// router.rs 流程注册表）
 // -------------------------------------------------------------------------
 
-/// 注入门流程声明（issue #149）：预检 / begin / finalize 委托既有门方法，
-/// 锁编排由 router.rs 通用 deferred 编排器统一承担。**可 RePended**——
-/// 锁定态一体化 finalize 补指纹裁决失配转二次审批（issue #140），RePended
-/// 循环内建于编排器（注入裁决不再是编排特例）。
-pub(crate) struct AuthzFlow;
-
-impl crate::router::DeferredFlow for AuthzFlow {
-    fn precheck(&self, daemon: &Daemon, token: Option<&[u8]>) -> bool {
-        daemon.authz_evaluate_precheck(token)
-    }
-
-    fn begin(
-        &self,
-        daemon: &mut Daemon,
-        _method: &str,
-        id: Value,
-        params: Value,
-        peer: &PeerInfo,
-    ) -> GateBegin {
-        daemon.authz_begin(id, params, peer)
-    }
-
-    fn finalize(
-        &self,
-        daemon: &mut Daemon,
-        id: Value,
-        request_id: uuid::Uuid,
-        decision: ApprovalDecision,
-    ) -> DeferredOutcome {
-        daemon.authz_finalize(id, request_id, decision)
-    }
-
-    fn rependable(&self) -> bool {
-        true
-    }
-
-    fn unlock_supported(&self) -> bool {
-        true
-    }
+/// 注入门拒绝响应渲染器（issue #167）：(门 × 锁态/会话态 × reason) → 字节
+/// 的**唯一决定点**。inject 的 spec 钉死形态 = `ok{allowed:false,reason}`
+/// （authorization-gate §5；与其余三门 `authz.denied`(-32017) 字节不同，
+/// 不得跨门压平）。锁态 headless 的 `session.invalid` 是会话前置失败
+/// （编排器预检 / begin 锁态分支直返 Final，分层见 [`GateBegin`] 类型
+/// 文档），不经本渲染器——渲染器拿 daemon 上下文是为未来「拒绝码随锁态
+/// 变化」的门保留决定面，也是防把渲染误写成全局「决策 → 字节」纯函数的
+/// 结构钩子（golden 表钉住全部字节，tests/gate_golden.rs）。
+fn render_inject_deny(_daemon: &Daemon, id: Value, deny: GateDeny) -> String {
+    rpc_string(RpcResponse::ok(
+        id,
+        serde_json::to_value(AuthzEvaluateResult {
+            allowed: false,
+            reason: Some(deny.as_str().to_string()),
+            env: None,
+        })
+        .unwrap_or(Value::Null),
+    ))
 }
 
-pub(crate) const AUTHZ_FLOW: AuthzFlow = AuthzFlow;
+/// 注入门静态声明：**可 RePended**——锁态一体化 finalize 补指纹裁决失配
+/// 转二次审批（issue #140），RePended 循环内建于编排器（注入裁决不再是
+/// 编排特例）；支持锁态一体化解锁（#67）。
+pub(crate) static AUTHZ_GATE: crate::router::GateDecl = crate::router::GateDecl {
+    name: "authz.evaluate",
+    rependable: true,
+    unlock_supported: true,
+    precheck: Daemon::authz_evaluate_precheck,
+    begin: Daemon::authz_begin,
+    finalize: Daemon::authz_finalize,
+    render_deny: render_inject_deny,
+};

@@ -1171,9 +1171,10 @@ fn late_approval_between_timeout_and_finalize_rejected_and_audited() {
     // ① begin（命令锁内直调）：socket + 无读规则 → 登记待审批
     let request_id = {
         let mut g = state.lock().unwrap();
-        match g.disclosure_begin(json!(1), M_ITEM_GET, json!({ "id": secret_id }), &peer) {
+        match g.disclosure_begin(M_ITEM_GET, json!(1), json!({ "id": secret_id }), &peer) {
             GateBegin::Pending { request_id } => request_id,
             GateBegin::Final(resp) => panic!("应进入待审批：{resp}"),
+            GateBegin::Deny(d) => panic!("应进入待审批：拒绝 {}", d.as_str()),
         }
     };
     assert_eq!(shared.approvals.pending_count(), 1, "登记入单表");
@@ -1213,11 +1214,18 @@ fn late_approval_between_timeout_and_finalize_rejected_and_audited() {
     assert_eq!(failed.result, lk_core::audit::AuditResult::Denied);
     assert_eq!(shared.approvals.pending_count(), 1, "迟到回传无权移除条目");
     // ④ finalize 单点消费（条目未被迟到回传移除/污染）→ 统一拒绝尾
-    let resp =
-        state
-            .lock()
-            .unwrap()
-            .disclosure_finalize(json!(1), request_id, ApprovalDecision::Timeout);
+    //    （分层结果经编排器的唯一渲染点收线，issue #167）
+    let resp = {
+        let mut g = state.lock().unwrap();
+        let raw = g.disclosure_finalize(json!(1), request_id, ApprovalDecision::Timeout);
+        crate::router::settle_outcome(
+            &mut g,
+            crate::router::gate_flow(M_ITEM_GET).unwrap(),
+            json!(1),
+            raw,
+        )
+        .expect("披露门不可 RePended")
+    };
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(
         v["error"]["code"], ERR_AUTHZ_DENIED,
