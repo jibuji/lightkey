@@ -260,12 +260,20 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
 
 1. 单元（lk-core）：
    - `fingerprint` serde 往返 + 缺省 `None`；旧规则 JSON（无字段）→ None；
-   - 比对序：路径不符免哈希 / size 不符免哈希 / 哈希一致命中 / 不一致失配；
    - PATH 解析候选序：前置假程序场景（候选序靠前但 ≠ 规则 exePath → 失配）；
      绝对路径免解析；
    - 流式哈希：大文件（≥64 MiB 基准）内存占用断言（块式读取，不高驻全量）；
    - read/write 指纹绑定仅显式启用（默认不校验）。
-2. 集成（lk-daemon，`tests/identity_binding.rs`，先红）：
+
+   （比对序原在此层——core `fingerprint_matches` 纯函数 + 单测；拍板 #28
+   候选 4 删除该零生产调用、与 daemon 缓存感知版重复的纯函数后，比对序的
+   唯一实现与测试归属反转至 lk-daemon `binding::adjudicate_binding`，见
+   §10.2 首条。）
+2. 集成（lk-daemon，`tests/identity_binding.rs` + `binding.rs` 单测，先红）：
+   - 比对序（拍板 #28 候选 4 归属反转自 §10.1，缓存感知版白盒断言）：路径
+     不符免哈希 / size 不符免哈希 / 哈希一致命中 / 不一致失配；未绑定短路
+     放行；候选不可解析 fail-closed——「决策免哈希」用哈希恒失败源探针
+     钉住（哈希不可用时决策仍作出）；
    - 绑定规则命中 → 静默放行 + 审计；失配 → NeedsApproval 路径 + 弹窗主题
      「指纹不符」；headless 失配 → `authz.denied`（与未命中同码断言）；
    - 「以新指纹重新授权」→ 规则门弹窗批准 → 落盘新指纹 + 审计（command=
@@ -285,6 +293,10 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
 
 1. **PR A（lk-core，#123）**：`ProgramFingerprint` + `Rule.fingerprint`（serde
    default）+ 比对序与匹配 + PATH 解析纯函数 + 流式哈希工具 + 单测（§10.1）；
+   （拍板 #28 候选 4 修订：core 比对序纯函数 `fingerprint_matches` 零生产
+   调用、与 PR B 的缓存感知版重复，已删——比对序唯一实现与测试归属反转至
+   lk-daemon `binding::adjudicate_binding`（§10.2 首条）；PATH 解析纯函数
+   与流式哈希工具仍留 lk-core。）
 2. **PR B（lk-daemon，#124）**：对端 env PATH 读取（Linux/Windows 本期，
    macOS fail-closed）+ 内存指纹缓存/元信息失效 + 审批 finalize 侧指纹
    计算 + 失配路径/弹窗主题 + 集成测试（§10.2）；
