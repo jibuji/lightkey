@@ -1,23 +1,24 @@
-//! 规则程序指纹（M2.98，identity-binding.md §5/§6）——T1（lk-core）三件核心件：
+//! 规则程序指纹（M2.98，identity-binding.md §5/§6）——T1（lk-core）核心件：
 //!
-//! 1. **绑定规则比对序纯函数**（[`fingerprint_matches`]，§5.2）：路径不符 →
-//!    免哈希失配；size 不符 → 免哈希失配；否则 SHA-256 比对决定命中/失配。
-//!    未绑定（`fingerprint=None`）→ 恒放行（直接按现行逻辑短路，行为零变化）。
-//! 2. **`command[0]` → canonical 绝对路径解析**（[`command0`] /
+//! 1. **`command[0]` → canonical 绝对路径解析**（[`command0`] /
 //!    [`exe_candidates`] / [`resolve_exe`]，§5.1）：按 PATH 序解析（第一个
 //!    命中项即候选）、绝对路径免解析、PATH 全未命中时 `cwd` 兜底。
-//! 3. **流式 SHA-256 工具**（[`sha256_reader`] / [`file_sha256`]，§6）：1 MiB
+//! 2. **流式 SHA-256 工具**（[`sha256_reader`] / [`file_sha256`]，§6）：1 MiB
 //!    块读取，大文件不高驻全量内存（峰值缓冲 = 块大小）。
 //!
 //! T1 边界：解析/比对的**最终执行走 daemon 侧**（信 daemon 不信客户端，读取
-//! 对端真实 env 的 PATH——T2 落地）。本模块提供跨平台纯函数与可测试的候选
-//! 序/失配门，供 daemon 装配。解析候选路径的 canonicalize 与对端 env PATH
-//! 读取由 daemon（T2）承担；size 快速失配门在此纯函数层即可测。
+//! 对端 env 的 PATH——T2 落地）。本模块提供跨平台纯函数与可测试的候选
+//! 序，供 daemon 装配。解析候选路径的 canonicalize 与对端 env PATH 读取由
+//! daemon（T2）承担。
+//!
+//! 绑定规则**比对序**（§5.2：路径失配免哈希 → size 失配免哈希 → 哈希比对）
+//! 的唯一实现在 daemon 侧缓存感知版 `lk_daemon::binding::adjudicate_binding`
+//! （比对 + 元信息失效缓存一体；原 core 纯函数重复件已随拍板 #28 候选 4
+//! 删除，比对序测试归属同步反转至 daemon）。
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::model::ProgramFingerprint;
 use crate::Result;
 
 /// 流式 SHA-256 块大小（1 MiB，identity-binding.md §6）：决定预计算/重算的
@@ -29,44 +30,6 @@ pub const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 /// （`lk-core::authz`）与守护进程 PATHEXT **缺省回落**（`lk-daemon`）共用
 /// 同一集合。统一小写；后缀检查按大小写不敏感进行（Windows FS 大小写不敏感）。
 pub const EXEC_EXTENSIONS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
-
-// ---------------------------------------------------------------------------
-// 1. 绑定规则比对序（§5.2）
-// ---------------------------------------------------------------------------
-
-/// 绑定规则比对序纯函数（§5.2）+ 未绑定短路（§4）：
-///
-/// - 规则**未绑定**（`rule` 为 `None`）→ 恒 `true`（直接按现行逻辑短路，
-///   匹配行为零变化；调用方由此决定是否追加指纹裁决）。
-/// - 规则**绑定**（`Some`），对已解析出的候选可执行文件 `(candidate_path,
-///   candidate_size, candidate_sha256)` 依比对序裁决：
-///   1. 路径不一致 → 失配（**免哈希**）；
-///   2. size 与记录不符 → 失配（**免哈希**，改内容必改大小的伪装才轮到哈希）；
-///   3. 否则 SHA-256 比对 → 一致命中 / 不一致失配（size 同长覆盖场景由哈希
-///      兜底）。
-///
-/// `candidate_path` 应为 canonical 绝对路径（daemon 解析侧产出），与规则
-/// `exe_path` 用平台无关的路径相等比较（`Path` 相等=绝对路径标准化后比对）。
-pub fn fingerprint_matches(
-    rule: Option<&ProgramFingerprint>,
-    candidate_path: &str,
-    candidate_size: u64,
-    candidate_sha256: &str,
-) -> bool {
-    let Some(fp) = rule else {
-        return true; // 未绑定 → 现状语义，短路放行
-    };
-    // 1. 路径不符 → 免哈希失配
-    if Path::new(candidate_path) != Path::new(&fp.exe_path) {
-        return false;
-    }
-    // 2. size 不符 → 免哈希失配
-    if candidate_size != fp.size {
-        return false;
-    }
-    // 3. SHA-256 兜底（同长覆盖场景）
-    candidate_sha256 == fp.sha256
-}
 
 // ---------------------------------------------------------------------------
 // 2. command[0] → canonical 绝对路径解析（§5.1）
@@ -177,18 +140,6 @@ pub fn file_sha256(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn fp(exe: &str, sha: &str, size: u64) -> ProgramFingerprint {
-        ProgramFingerprint {
-            exe_path: exe.into(),
-            sha256: sha.into(),
-            size,
-        }
-    }
-
-    fn sha64(c: char) -> String {
-        c.to_string().repeat(64)
-    }
-
     /// 候选路径父目录名（平台无关的断言辅助）。
     fn parent_name(p: &Path) -> Option<&str> {
         p.parent()
@@ -196,77 +147,9 @@ mod tests {
             .and_then(|n| n.to_str())
     }
 
-    // -- 比对序（§5.2）------------------------------------------------------
-
-    /// 未绑定（None）→ 短路恒放行，匹配行为零变化（regression 语义）。
-    #[test]
-    fn unbound_fingerprint_short_circuits_to_match() {
-        assert!(fingerprint_matches(None, "/any/path", 0, ""));
-        assert!(fingerprint_matches(None, "/other", 999, "whatever"));
-    }
-
-    /// 路径不一致 → 失配且免走哈希（即使提供任意哈希也失配）。
-    #[test]
-    fn path_mismatch_short_circuits_miss() {
-        let rule = fp("/usr/bin/node", &sha64('a'), 100);
-        // 候选路径不同 → 失配；哈希即使一致（但本应免比）也按序先失配
-        assert!(!fingerprint_matches(
-            Some(&rule),
-            "/usr/bin/custom-node",
-            100,
-            &sha64('a')
-        ));
-    }
-
-    /// size 不符 → 失配且免走哈希。
-    #[test]
-    fn size_mismatch_short_circuits_miss() {
-        let rule = fp("/usr/bin/node", &sha64('a'), 100);
-        assert!(!fingerprint_matches(
-            Some(&rule),
-            "/usr/bin/node",
-            101,
-            &sha64('a'),
-        ));
-    }
-
-    /// 路径与 size 均一致 + 哈希一致 → 命中。
-    #[test]
-    fn hash_match_hits() {
-        let rule = fp("/usr/bin/node", &sha64('a'), 100);
-        assert!(fingerprint_matches(
-            Some(&rule),
-            "/usr/bin/node",
-            100,
-            &sha64('a'),
-        ));
-    }
-
-    /// 路径与 size 均一致但哈希不一致 → 失配（size 同长覆盖场景由哈希兜底）。
-    #[test]
-    fn hash_mismatch_misses_when_same_path_size() {
-        let rule = fp("/usr/bin/node", &sha64('a'), 100);
-        assert!(!fingerprint_matches(
-            Some(&rule),
-            "/usr/bin/node",
-            100,
-            &sha64('b'),
-        ));
-    }
-
-    /// 路径相等按平台无关的 Path 相等比对（尾斜杠/平台分隔符差异不误判）。
-    #[test]
-    fn path_comparison_tolerates_trailing_separator() {
-        #[cfg(windows)]
-        let (rule_p, cand_p) = (r"C:\bin\node.exe", r"C:\bin\node.exe");
-        #[cfg(not(windows))]
-        let (rule_p, cand_p) = ("/usr/bin/node", "/usr/bin/node");
-        let rule = fp(rule_p, &sha64('a'), 100);
-        assert!(!fingerprint_matches(Some(&rule), cand_p, 100, &sha64('b')));
-        assert!(fingerprint_matches(Some(&rule), cand_p, 100, &sha64('a')));
-    }
-
     // -- command[0] 解析（§5.1）---------------------------------------------
+    // （比对序 §5.2 的测试随拍板 #28 候选 4 归属反转至 daemon
+    // `binding::adjudicate_binding` 缓存感知版。）
 
     /// 命令首词提取：空白切分。
     #[test]
@@ -295,10 +178,11 @@ mod tests {
         assert_eq!(cands, vec![PathBuf::from(abs)]);
     }
 
-    /// PATH 序候选（可观测）：候选按 PATH 目录序拼接 + cwd 兜底次序；前置假程序
-    /// 靠前即候选序靠前，但 ≠ 规则 exePath → 解析命中假程序 → 比对失配。
+    /// PATH 序候选（可观测）：候选按 PATH 目录序拼接 + cwd 兜底次序；前置假
+    /// 程序靠前即候选序靠前——resolve 命中假程序（§5.1「PATH 前置假程序」
+    /// 场景的上游半边；路径失配比对在 daemon 缓存感知版裁决）。
     #[test]
-    fn path_candidate_order_observable_and_prefix_fake_misses() {
+    fn path_candidate_order_observable_prefix_fake_resolves_first() {
         let dirs = vec![
             PathBuf::from("/evil"), // PATH 前置假 `npm`
             PathBuf::from("/usr/bin"),
@@ -318,8 +202,7 @@ mod tests {
         assert_eq!(parents, vec!["npm@evil", "npm@bin", "npm@cwd"]);
 
         // 规则绑定的真实程序在 /usr/bin，PATH 前置假程序 /evil/npm 先命中 →
-        // resolve 拿到假程序（父目录 evil）→ fingerprint 按路径不符失配（免哈希）。
-        let rule = fp("/usr/bin/npm", &sha64('a'), 50);
+        // resolve 拿到假程序（父目录 evil）——比对序按路径失配免哈希拒绝。
         let resolved = resolve_exe("npm publish", &dirs, &cwd, &[], |p| {
             // 候选父目录为 `evil`（前置假程序）或 `bin`（真实程序）即视为存在；
             // resolve 取第一个存在项 = 前置假程序。
@@ -331,26 +214,16 @@ mod tests {
             resolved.parent().and_then(|p| p.file_name()),
             Some(std::ffi::OsStr::new("evil")),
         );
-        // 候选路径 ≠ 规则 exePath → 未命中（仿 PATH 前置假程序场景）
-        assert!(!fingerprint_matches(
-            Some(&rule),
-            &resolved.to_string_lossy(),
-            50,
-            &sha64('a'),
-        ));
 
-        // 控制组：若前置 PATH 缺假程序，则命中真实规则程序所在（bin）→ 路径
-        // 一致 + size/hash 一致 → 命中。
+        // 控制组：若前置 PATH 缺假程序，则命中真实规则程序所在（bin）。
         let resolved2 = resolve_exe("npm publish", &dirs, &cwd, &[], |p| {
             parent_name(p) == Some("bin")
         });
         let resolved2 = resolved2.expect("真实程序应命中");
-        assert!(!fingerprint_matches(
-            Some(&rule),
-            &resolved2.to_string_lossy(),
-            50,
-            &sha64('b'),
-        ));
+        assert_eq!(
+            resolved2.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("bin")),
+        );
     }
 
     /// PATH 全未命中 → cwd 兜底命中。

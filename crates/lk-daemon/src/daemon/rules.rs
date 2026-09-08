@@ -90,9 +90,10 @@ impl Daemon {
             let resp = self.rule_op_exec(id, &parsed.op, &starter, channel, &command);
             return GateBegin::Final(rpc_string(resp));
         }
-        // 3) socket 通道：真实 starter（#66 进程链回溯；客户端自报不信任）；
-        //    未知 → fail-closed 拒绝（不弹窗，与 inject/披露同口径）
-        let starter = derive_starter(peer);
+        // 3) socket 通道：对端身份单点解析（真实 starter，#66 进程链回溯；
+        //    客户端自报不信任）；未知 → fail-closed 拒绝（不弹窗，与
+        //    inject/披露同口径）
+        let starter = crate::identity::resolve(self.peer_env.as_ref(), peer, None).starter;
         let channel = client_channel(channel_param.as_deref(), peer_channel(peer));
         let command = parsed.command_summary();
         if starter == UNKNOWN_STARTER {

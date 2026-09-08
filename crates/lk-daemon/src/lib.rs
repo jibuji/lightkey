@@ -34,6 +34,11 @@ pub mod dirs;
 /// `command[0]` → canonical 候选解析 + 内存指纹缓存（M2.98；identity 三拆
 /// 之一）：PATH/PATHEXT 解析为纯函数，指纹缓存走可注入 [`exe_resolve::FingerprintSource`]。
 pub mod exe_resolve;
+/// 对端身份面（拍板 #28 候选 4，issue #169）：[`identity::resolve`] 单一解析
+/// 入口 → 对端身份 { starter, canonical_cwd, exe_path }（CONTEXT.md「对端
+/// 身份」）；委托 core `starter` 与 [`peer_env`] / [`exe_resolve`] / [`binding`]
+/// 三拆（保留为内部缝）。**指纹裁决不并入门面**（消费 exe 路径的单独一步）。
+pub mod identity;
 pub mod notifier;
 /// 对端真实 env 读取（M2.98；identity 三拆之一）：Linux `/proc` /
 /// Windows PEB（`lk_core::peb` 原语）/ macOS KERN_PROCARGS2，失败 fail-closed；

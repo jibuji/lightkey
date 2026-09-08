@@ -129,10 +129,12 @@ impl Daemon {
             );
             return GateBegin::Final(rpc_string(resp));
         }
-        // 4) socket 通道：真实 starter + cwd（#66 归因链路复用；客户端自报
-        //    字段不信任）；未知 → 第 1 层 fail-closed 拒绝（不弹窗、不留内容）
-        let starter = derive_starter(peer);
-        let cwd = lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
+        // 4) socket 通道：对端身份单点解析（真实 starter + canonical cwd，
+        //    #66 归因链路复用；客户端自报字段不信任）；未知 → 第 1 层
+        //    fail-closed 拒绝（不弹窗、不留内容）
+        let identity = crate::identity::resolve(self.peer_env.as_ref(), peer, None);
+        let starter = identity.starter;
+        let cwd = identity.canonical_cwd;
         let channel = peer_channel(peer);
         let command_summary = write_command_summary(&parsed.op, &target);
         if starter == UNKNOWN_STARTER {

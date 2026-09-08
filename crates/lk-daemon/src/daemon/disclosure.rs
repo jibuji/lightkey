@@ -103,13 +103,11 @@ impl Daemon {
         //     不写审计，与 #67 锁态拒绝同口径）。可用性已由 precheck 分派，
         //     此处仍复核（纵深防御）。
         if !self.vault_peek() {
-            let starter = derive_starter(peer);
-            let cwd =
-                lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
-            if starter == UNKNOWN_STARTER {
+            let identity = crate::identity::resolve(self.peer_env.as_ref(), peer, None);
+            if identity.starter == UNKNOWN_STARTER {
                 return GateBegin::Deny(GateDeny::UnknownStarter);
             }
-            if cwd.is_empty() {
+            if identity.canonical_cwd.is_empty() {
                 return GateBegin::Deny(GateDeny::NoCwd);
             }
             if !self.approval_available() {
@@ -124,12 +122,18 @@ impl Daemon {
             let request_id = self.open_gate_approval(
                 // read/export 审批不带子类型 / 写动作 / 指纹失配信息（帧不含
                 // 相应字段）；九字段克隆单点构造（issue #167）。
-                ApprovalDraft::new(starter.clone(), cwd, method.to_string(), vec![], kind),
+                ApprovalDraft::new(
+                    identity.starter.clone(),
+                    identity.canonical_cwd,
+                    method.to_string(),
+                    vec![],
+                    kind,
+                ),
                 GateEntry::unified_unlock(GateKind::Disclosure(PendingDisclosure {
                     method: method.to_string(),
                     item_id,
                     item_name: None,
-                    starter,
+                    starter: identity.starter,
                 })),
             );
             return GateBegin::Pending { request_id };
@@ -187,10 +191,12 @@ impl Daemon {
             };
             return GateBegin::Final(rpc_string(resp));
         }
-        // 4) socket 通道：真实 starter + cwd（#66 归因链路复用；客户端自报
-        //    字段不信任）；未知 → 第 1 层 fail-closed 拒绝（不弹窗、不留内容）
-        let starter = derive_starter(peer);
-        let cwd = lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
+        // 4) socket 通道：对端身份单点解析（真实 starter + canonical cwd，
+        //    #66 归因链路复用；客户端自报字段不信任）；未知 → 第 1 层
+        //    fail-closed 拒绝（不弹窗、不留内容）
+        let identity = crate::identity::resolve(self.peer_env.as_ref(), peer, None);
+        let starter = identity.starter;
+        let cwd = identity.canonical_cwd;
         let channel = client_channel(channel_param.as_deref(), peer_channel(peer));
         if starter == UNKNOWN_STARTER {
             self.audit_gate(
