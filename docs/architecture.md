@@ -62,7 +62,9 @@ Linux → 本地 UDS 守护实例（Linux 侧 GUI 的宿主），WSL2 → 经 `l
 
 - `lk-core` 保持**单一 crate**，内部按插件边界重组为 **A 层数据平面**（crypto/
 vault-store/recovery/audit/session）与 **B 层能力域**（storage-backend/sync-engine/
-authz-gate），trait 服务 + 事件总线**模拟** Cordis 语义（不移植 Cordis）。
+authz-gate），具体类型 + 事件总线**模拟** Cordis 语义（不移植 Cordis；无 trait
+服务层，保留的 trait 仅三类真缝——多生产实现 / 平台抽象+白盒测试缝 / 观察者，
+拍板 #28 候选 1，见 [plugin-architecture.md](plugin-architecture.md) §4.1）。
 - **C 层宿主 daemon**（共享 crate `crates/lk-daemon`）：装配 A/B、IPC 路由、空闲自动锁定、config.json。
 - **D 层桌面/前端**用**真 Cordis**（`@cordisjs/core` 4.x）+ 薄 React 宿主；插件清单与
   inject 依赖图见 plugin-architecture.md §3/§4。

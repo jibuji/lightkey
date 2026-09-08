@@ -1,7 +1,8 @@
 //! 通知桥（M2 决策 #3 A）：守护进程 → 订阅连接的推送通道。
 //!
 //! - [`Notifier`] 是 [`EventSink`](lk_core::bus::EventSink) 实现，订阅
-//!   `CoreServices::bus()`，把 [`VaultEvent`] 翻译成 JSON-RPC **notification
+//!   守护进程的事件总线（[`Daemon::bus`](crate::daemon::Daemon::bus)），把
+//!   [`VaultEvent`] 翻译成 JSON-RPC **notification
 //!   帧**（无 `id`，一行一帧）广播给订阅连接；
 //! - **`authz.request` 仅投递给桌面来源的订阅者**（#72/#78 方案 A：帧里的
 //!   一次性 challenge 是审批应答凭据，不得离开受信桌面通道；UI 在场判定

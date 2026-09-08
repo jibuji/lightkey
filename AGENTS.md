@@ -72,11 +72,13 @@
   后台同步并发，网络 I/O 不持守护进程锁；vault 内存用读写锁（权限层与数据层
   互斥解耦，见 docs/sync.md §2.3 与 `crates/lk-daemon/src/daemon/mod.rs` 的
   `SharedDaemon` 文档）
-- [x] M1.5 插件化改造（Cordis）：lk-core A/B 层 trait 服务 + 事件总线
-  （`crates/lk-core/src/service.rs` / `bus.rs`；密文格式/存储布局/IPC 协议零变更）；
-  daemon 按 C 层边界拆模块并装配总线（现位于 `crates/lk-daemon/src/`，见下方
-  M2 下沉条目）；D 层真 Cordis 宿主 + `frontend/src/cordis.yml` 装配（theme /
-  ipc-bridge / preference-store / toast + 槽位骨架），事件契约见
+- [x] M1.5 插件化改造（Cordis）：lk-core A/B 层具体类型 + 事件总线
+  （`crates/lk-core/src/bus.rs`；原 trait 服务层 service.rs 已随拍板 #28 候选 1
+  删除，保留 trait 按三类真缝，见 docs/plugin-architecture.md §4.1；密文格式/
+  存储布局/IPC 协议零变更）；
+  daemon 按 C 层边界拆模块并直持 `Arc<EventBus>`（现位于 `crates/lk-daemon/src/`，
+  见下方 M2 下沉条目）；D 层真 Cordis 宿主 + `frontend/src/cordis.yml` 装配
+  （theme / ipc-bridge / preference-store / toast + 槽位骨架），事件契约见
   `frontend/src/events.ts`
 - [x] M2 核心（Rust 授权门 + 推送通道 + daemon 下沉）：
   - C 层 daemon 宿主下沉到共享 crate **`crates/lk-daemon`**（决策 #2 A；
