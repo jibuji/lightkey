@@ -13,11 +13,10 @@ use base64::Engine as _;
 use lk_core::audit::{AuditChannel, AuditLog, AuditResult, EventInput};
 use lk_core::audit_anchor::{AnchorCheck, CompositeAuditAnchor};
 use lk_core::authz::{ApprovalDecision, AuthzGate, AuthzRequest, DenyReason, LayerResult};
-use lk_core::bus::{LockReason, VaultEvent};
+use lk_core::bus::{EventBus, LockReason, VaultEvent};
 use lk_core::ipc::*;
 use lk_core::model::{ItemDraft, Rule, RuleDraft};
 use lk_core::recovery::RecoveryCode;
-use lk_core::service::CoreServices;
 use lk_core::session::SessionManager;
 use lk_core::starter::{self, UNKNOWN_STARTER};
 use lk_core::vault::{self, UnlockedVault};
@@ -127,8 +126,9 @@ pub struct Daemon {
     last_activity: Instant,
     /// 跨线程共享状态（命令线程与同步轮询线程并发访问）。
     shared: Arc<SharedDaemon>,
-    /// C 层装配（事件总线 + 无状态地基服务；session/vault 经其挂总线）。
-    core: CoreServices,
+    /// 事件总线（拍板 #28 候选 1：原 `CoreServices` 装配点溶解，daemon 直持
+    /// 总线；session / vault 解锁后各自 `attach_bus` 直连挂总线）。
+    bus: Arc<EventBus>,
     /// 授权门（第 1/2 层非阻塞短路；第 3 层审批编排在审批注册表 +
     /// 通用 deferred 编排器，拍板 #28 候选 2 起 `AuthzGate` 不再持有通道）。
     gate: AuthzGate,
@@ -181,8 +181,12 @@ impl Daemon {
         let config = load_config(&dir);
         let sync = SyncRuntime::load(&dir);
         install_shutdown_handlers();
-        let core = CoreServices::new();
-        let sessions = core.new_session();
+        // 事件总线直连装配（拍板 #28 候选 1：`CoreServices` 溶解，daemon 直持
+        // `Arc<EventBus>`）：session 构造后 `attach_bus`、vault 解锁后
+        // `attach_bus`（vault_cmds.rs），两行直连取代原装配点。
+        let bus = Arc::new(EventBus::new());
+        let mut sessions = SessionManager::new();
+        sessions.attach_bus(Arc::clone(&bus));
         // M2 装配：审批注册表（拍板 #28 候选 2 单表：质询/到期/决策 +
         // needs_unlock/工作区/门负载）+ 推送通道 + 通知桥（通知桥订阅总线：
         // Rust 事件 → notification 帧 → 订阅连接，非阻塞）。UI 在场谓词 =
@@ -202,7 +206,7 @@ impl Daemon {
                 RULE_AUTO_APPROVE_ENV
             );
         }
-        core.subscribe(Arc::new(Notifier::new(Arc::clone(&push))));
+        bus.subscribe(Arc::new(Notifier::new(Arc::clone(&push))));
         let gate = AuthzGate::new();
         let shared = Arc::new(SharedDaemon {
             dir: dir.clone(),
@@ -222,7 +226,7 @@ impl Daemon {
             recover_guard: AuthGuard::default(),
             last_activity: Instant::now(),
             shared,
-            core,
+            bus,
             gate,
             rule_auto,
             // M2.98 程序指纹：生产装配平台真实对端 env 读取 + 真实文件系统缓存。
@@ -339,8 +343,8 @@ impl Daemon {
     }
 
     /// 事件总线引用（测试装配用）。
-    pub fn bus(&self) -> &Arc<lk_core::bus::EventBus> {
-        self.core.bus()
+    pub fn bus(&self) -> &Arc<EventBus> {
+        &self.bus
     }
 
     /// M2.98 对端 env 读取注入缝（身份绑定测试/嵌入环境用；生产 = 平台真实

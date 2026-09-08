@@ -8,9 +8,9 @@
 //!
 //! ## 模块与规格文档
 //!
-//! ### A 层 · 数据平面（安全核心，trait 服务 + 事件总线，`docs/plugin-architecture.md` §3.1）
+//! ### A 层 · 数据平面（安全核心，具体类型 + 事件总线，`docs/plugin-architecture.md` §3.1）
 //!
-//! | 插件 | 模块 | 规格 |
+//! | 模块 | 职责 | 规格 |
 //! |------|------|------|
 //! | crypto | [`crypto`] | vault 头、KDF 派生、AEAD、自描述密文格式 | `docs/crypto.md` |
 //! | vault-store | [`vault`] | 落盘存储层：条目 CRUD、加密索引、CAS、软删除、初始化/恢复编排 | `docs/data-model.md`、`docs/recovery.md` |
@@ -20,7 +20,7 @@
 //!
 //! ### B 层 · 能力域
 //!
-//! | 插件 | 模块 | 规格 |
+//! | 模块 | 职责 | 规格 |
 //! |------|------|------|
 //! | storage-backend | [`storage`] | BYO 存储后端抽象：本地模拟 / WebDAV / S3（可插拔 trait） | `docs/sync.md` |
 //! | sync-engine | [`sync`] | BYO 变更发现、轮询、冲突收敛 | `docs/sync.md` |
@@ -35,16 +35,17 @@
 //! | [`model`] | 条目（四类 v2）/附件/索引/墓碑数据模型 | `docs/data-model.md` |
 //! | [`ipc`] | JSON-RPC 2.0 协议类型、会话令牌、错误码 | `docs/ipc.md` |
 //! | [`bus`] | 事件总线（模拟 Cordis `emit`：观察广播，fire-and-forget） | `docs/plugin-architecture.md` §5 |
-//! | [`service`] | A/B 层 trait 服务 + C 层装配点（[`service::CoreServices`]） | `docs/plugin-architecture.md` §3/§4 |
 //! | [`peb`]（Windows） | 远端进程 PEB 读取原语（唯一一份；进程链回溯 cwd + 对端 env 块共用） | `docs/identity-binding.md` §5.1 |
 //!
 //! ## 里程碑状态
 //!
 //! M0（单机闭环）+ M1（同步）已实现：加密、四类条目 CRUD、CAS、墓碑、会话、
 //! 恢复信封、审计、IPC 协议类型、BYO 变更发现（轮询 + CAS 上传 + 墓碑收敛）。
-//! M1.5（插件化改造）已实现：A/B 层按插件边界重组为 trait 服务 + 事件总线
-//! （[`service`] / [`bus`]；行为不回归：密文格式、存储布局、IPC 协议零变更），
-//! D 层真 Cordis 宿主见 `frontend/`。M2 授权门为占位模块。
+//! M1.5（插件化改造）已实现：A/B 层按插件边界重组为具体类型 + 事件总线
+//! （[`bus`]；行为不回归：密文格式、存储布局、IPC 协议零变更），D 层真
+//! Cordis 宿主见 `frontend/`。M2 授权门为占位模块。
+//! （拍板 #28 候选 1：原 trait 服务层 `service.rs` 已删除，A/B 层具体类型
+//! 直用；保留的 trait 按三类，见 `docs/plugin-architecture.md` §4.1。）
 
 pub mod audit;
 pub mod audit_anchor;
@@ -58,7 +59,6 @@ pub mod path_ns;
 #[cfg(windows)]
 pub mod peb;
 pub mod recovery;
-pub mod service;
 pub mod session;
 pub mod starter;
 pub mod storage;

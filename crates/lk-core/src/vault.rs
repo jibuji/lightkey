@@ -2012,6 +2012,106 @@ mod tests {
         .is_err());
     }
 
+    /// 事件总线契约（自 service.rs 装配点迁回，拍板 #28 候选 1——vault 是
+    /// `item.changed` 的发送方，测试各归其位）：一事件三方响应（sync-engine
+    /// 推送 / audit 记录 / ui 刷新；互不依赖、无需返回值聚合 → `emit`）。
+    #[test]
+    fn item_changed_three_party_response() {
+        let (dir, _audit, _code) = temp_vault("item-events");
+        let mut vault = unlock_vault(dir.path(), "pw123456").unwrap();
+
+        let bus = Arc::new(crate::bus::EventBus::new());
+        // 三个独立订阅者（sync / audit / ui），各自收集收到的事件
+        let recorder = || {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let e = Arc::clone(&events);
+            bus.subscribe(Arc::new(crate::bus::FnSink::new(move |ev| {
+                e.lock().unwrap().push(ev.clone());
+            })));
+            events
+        };
+        let sync_seen = recorder();
+        let audit_seen = recorder();
+        let ui_seen = recorder();
+        vault.attach_bus(bus);
+
+        // 新建 → 三方都收到 item.changed（deleted=false，revision 递增）
+        let item = vault.put(None, login_draft("GitHub"), None).unwrap();
+        for (name, events) in [
+            ("sync", &sync_seen),
+            ("audit", &audit_seen),
+            ("ui", &ui_seen),
+        ] {
+            let seen = events.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{name} 应收到 1 个事件");
+            match &seen[0] {
+                crate::bus::VaultEvent::ItemChanged {
+                    item_id,
+                    revision_date,
+                    kind,
+                    deleted,
+                } => {
+                    assert_eq!(*item_id, item.id());
+                    assert_eq!(*revision_date, item.revision().to_string());
+                    assert_eq!(kind, "login");
+                    assert!(!deleted);
+                }
+                other => panic!("{name} 收到非 item.changed 事件：{other:?}"),
+            }
+        }
+
+        // 软删除 → 三方收到 deleted=true 且 revision 前进
+        let before = item.revision().to_string();
+        vault.delete(item.id()).unwrap();
+        for events in [&sync_seen, &audit_seen, &ui_seen] {
+            let seen = events.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            match &seen[1] {
+                crate::bus::VaultEvent::ItemChanged {
+                    item_id,
+                    revision_date,
+                    deleted,
+                    ..
+                } => {
+                    assert_eq!(*item_id, item.id());
+                    assert!(deleted);
+                    assert!(*revision_date > before, "删除后 revision 前进");
+                }
+                other => panic!("非 item.changed 事件：{other:?}"),
+            }
+        }
+    }
+
+    /// 三方互不依赖：一个订阅者失败不影响其余（emit 语义；自 service.rs
+    /// 迁回，同上）。
+    #[test]
+    fn item_changed_subscriber_isolation() {
+        let (dir, _audit, _code) = temp_vault("item-events-isolation");
+        let mut vault = unlock_vault(dir.path(), "pw123456").unwrap();
+        let bus = Arc::new(crate::bus::EventBus::new());
+        bus.subscribe(Arc::new(crate::bus::FnSink::new(|_| panic!("订阅者故障"))));
+        let ui_seen = {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let e = Arc::clone(&events);
+            bus.subscribe(Arc::new(crate::bus::FnSink::new(move |ev| {
+                e.lock().unwrap().push(ev.clone());
+            })));
+            events
+        };
+        vault.attach_bus(bus);
+        vault
+            .put(
+                None,
+                ItemDraft::Note {
+                    name: "n".into(),
+                    content: "c".into(),
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(ui_seen.lock().unwrap().len(), 1);
+    }
+
     /// M2：软删后同 id 复活规则 → 陈旧墓碑必须清理，否则非同步模式的
     /// `purge_expired` 会把活跃规则误删。
     #[test]

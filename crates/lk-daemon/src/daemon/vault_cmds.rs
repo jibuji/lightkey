@@ -95,8 +95,9 @@ impl Daemon {
                     vault.keys(),
                     &caller.event(M_VAULT_UNLOCK, AuditResult::Allowed),
                 );
-                // C 层装配：vault-store 挂总线（写成功 → `item.changed`）
-                self.core.attach_vault(&mut vault);
+                // 事件总线直连：vault 解锁后挂总线（写成功 → `item.changed`；
+                // 拍板 #28 候选 1，取代原 `CoreServices::attach_vault` 装配点）
+                vault.attach_bus(Arc::clone(&self.bus));
                 *self.shared.vault.write().unwrap() = Some(vault);
                 // 审计锚点：解锁后链尾即「vault.unlock」事件，同步写入锚点
                 // （低频点；平台不可用 → fail-open 降级侧写并警告，不阻断解锁）

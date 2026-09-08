@@ -466,7 +466,7 @@ impl Daemon {
         // 事件通道下发——守护进程侧通知桥只投给桌面订阅者，#78 方案 A；
         // kind/export_meta 供弹窗按审批类型渲染，M2.9 值披露；write_action
         // 供「记住」生成 actions=[当前动作] 最小写规则，#137）
-        self.core.bus().emit(&VaultEvent::AuthzRequest {
+        self.bus.emit(&VaultEvent::AuthzRequest {
             request_id,
             starter: draft.starter,
             project_dir: draft.project_dir,
