@@ -95,16 +95,18 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   1. 进程链回溯 + cwd 判定启动者与项目目录。
   2. 查规则白名单：命中 → 注入该规则授权的 env 变量集（值来自 vault 解密，
      **最小字段**，见 [ipc.md](ipc.md)）。
-  3. 未命中 → 弹窗审批（本地弹窗，30s 超时默认拒绝；审批通道可切换，见 §6）。
+  3. 未命中 → 弹窗审批（本地弹窗，30s 超时默认拒绝；登记入 daemon 审批
+     注册表，见 §6）。
   4. 允许 → 以「原命令 + 注入 env」启动子进程；拒绝/超时 → 非零退出 + 审计。
 - **锁定态一体化（#67，补充拍板 #19）**：库处于**锁定态**时收到 `authz.evaluate`
-  （即 `lk inject`），若桌面审批界面在场（desktop 推送订阅存在，`has_ui`），
+  （即 `lk inject`），若桌面审批界面在场（UI 在场判定：桌面来源推送订阅
+  存在，见 §6），
   把「临时解锁 + 本次授权」折叠为 GUI 上的一次交互——见 §5.1。
 
 ### 5.1 锁定态：临时解锁 + 本次授权一体化（#67）
 
-- **触发**：锁定态收到 `authz.evaluate`（`lk inject`），且 `has_ui`（桌面来源的
-  推送订阅存在；非 socket 订阅者）。**GUI 不在运行（纯 headless）** → 维持现状
+- **触发**：锁定态收到 `authz.evaluate`（`lk inject`），且 UI 在场判定为真
+  （桌面来源的推送订阅存在；非 socket 订阅者，见 §6）。**GUI 不在运行（纯 headless）** → 维持现状
   fail-closed `session.invalid`（CLI 提示先解锁；不阻塞、不静默回落）。
 - **一次性交互**：守护进程登记待审批（`needs_unlock=true`）+ 广播
   `authz.request`（帧带 `needsUnlock=true`）→ 桌面弹窗同时展示：
@@ -139,7 +141,7 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 > [value-disclosure.md](value-disclosure.md) §3 锁态行 / §5.2-5.3（唯一出处）。
 
 - **触发**：锁定态收到 `item.get` / `item.export`，且库**已初始化** +
-  `has_ui`（桌面来源推送订阅在场）→ 登记 `Pending{needs_unlock:true}` +
+  UI 在场（桌面来源推送订阅在场）→ 登记待审批条目（`needs_unlock=true`）+
   广播 `authz.request(needsUnlock=true)`（协议零新增：`needsUnlock` /
   `masterPassword` / `kind` 三要素即 #67 已就位）。未初始化库 / 无 UI →
   fail-closed `session.invalid`（不弹窗）；解锁态行为零变化。
@@ -167,19 +169,31 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   （每个 pending 30s 超时默认拒）；同 (starter, 条目) 合并去重 + 并发上限/
   限流为后续可选加固，不阻塞本规格。
 
-## 6. 审批通道抽象（D8）
+## 6. 审批注册表（D8；拍板 #28 修订：审批通道抽象已删除）
 
-- 审批通道 = 接口（trait）`ApprovalChannel`（本地/远程可切换）；两阶段接口
-  对应守护进程的 G1 三阶段编排（`authz.evaluate` 锁内登记 → 锁外等待 → 重取锁
-  收尾）：
-  - `available()` — 是否有界面可能响应审批（**桌面来源的推送订阅存在**；
-    #72/#78：socket 订阅者不计——任何持令牌进程都能建立 socket 订阅，
-    「有订阅」不等于「有人类可批准」）；`false` → fail-closed 立即拒绝
-    （不登记、不阻塞）。
-  - `open(req, expires_at)` — 登记待审批（含一次性 challenge）+ 广播
-    `authz.request`（命令锁内、非阻塞）。
-  - `await_decision(request_id, expires_at)` — 命令锁外等待决策，返回
-    `Allowed` / `Denied` / `Timeout`（到期默认拒绝）。
+> **#28 修订（2026-09-07，架构深化候选 2）**：D8 原拍板的「审批通道抽象成
+> 接口（`ApprovalChannel`，本地/远程可切换）」已删除——一次审批只登记进
+> **一张表**：守护进程侧**审批注册表**（`crates/lk-daemon/src/daemon/
+> gate_kit.rs` 的 `ApprovalRegistry`，key = request_id），条目承载质询值
+> （challenge）/ 到期时刻 / 决策槽 + 锁态一体化标志（needs_unlock）/ 审批
+> 工作区 / 门负载。core `PendingApprovals` 连同 await/resolve 一并下沉
+> daemon。历史拍板原文见 [decisions.md](decisions.md) D8 行（只加指针不改写）。
+
+- **生命周期三拍**（对应守护进程的 G1 三阶段编排：命令锁内登记 → 锁外
+  等待 → 重取锁收尾）：
+  - **登记**（begin，命令锁内、非阻塞）——`open_gate_approval` 单点铸造
+    request_id / 一次性 challenge / 超时，入注册表并广播 `authz.request`；
+  - **裁决写**（`approval.result` 回传）——写决策槽（一体化解锁路径在
+    **同一临界区**先存审批工作区再写决策）；
+  - **收尾**（finalize）——**唯一消费移除点**；锁外等待（`await_decision`）
+    **只读不移除**，返回 `Allowed` / `Denied` / `Timeout`（到期默认拒绝）。
+- **UI 在场判定**（原 `available()` 谓词，折入 daemon）：`desktop_subscriber_count() > 0`
+  ——只数**桌面来源的推送订阅**（#72/#78：socket 订阅者不计——任何持令牌
+  进程都能建立 socket 订阅，「有订阅」不等于「有人类可批准」）；`false` →
+  fail-closed 立即拒绝（不登记、不阻塞）。
+- **迟到回传语义**：条目已过期或未知 requestId → **拒绝写决策**
+  （`accepted=false` + 失败提交 Denied 审计，不回翻等待侧已得的 Timeout；
+  移除归 finalize）；challenge 不符 → 不移除条目（#78 防伪回传 DoS）。
 - **信任绑定（#72/#78，补充拍板 #16）**：审批提交与通知投递按连接来源收紧，
   双重防线：
   - **方案 A · 连接标签**：订阅登记带来源标签（桌面内嵌直调 / socket 流连接）；
@@ -194,9 +208,10 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   - 失败提交（伪造 id / 过期 / 挑战不符 / socket 来源被 `channel.forbidden`
     拒绝）写审计（command=`approval.result`，starter/channel 取对端归因）；
     成功提交由第 3 层 finalize 路径审计（channel=approval），不重复记。
-- **本地通道**（V1）：桌面弹窗/系统通知，30s 超时默认拒绝。
-- **远程通道**（未来，P1 不做）：远程审批中继 = 未来服务端付费点；本阶段
-  只留接口与类型，不实现。
+- **本地形态**（V1）：桌面弹窗/系统通知，30s 超时默认拒绝。
+- **远程审批**（未来，P1 不做）：远程审批中继 = 未来服务端付费点；#28 起
+  不再保留 trait 通道缝（原 `ApprovalChannel` 的「远程留接口」占位已随候选 2
+  删除），将来落地时按产品需求重开设计（见 decisions.md #28）。
 - 弹窗内容（最小展示）：启动者、项目目录、目标命令、请求的 key 名、
   倒计时；不展示密钥值。**锁定态一体化帧（`needsUnlock=true`，#67）额外展示
   主密码输入栏**（身份确认），见 §5.1。
@@ -224,7 +239,7 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
     （常驻进程持令牌）降级为观望，不与本项捆绑。
 - **headless 锁态**：GUI 不在运行（纯 CLI daemon / headless）时锁态
   `authz.evaluate` 维持 fail-closed `session.invalid`（§5.1）。
-- 审批通道对抗性测试（#72/#78）：socket 来源提交（即使参数完整正确）→
+- 审批回传对抗性测试（#72/#78）：socket 来源提交（即使参数完整正确）→
   `channel.forbidden` 且条目保留；挑战不符 → 忽略 + 条目保留 + 审计；
   仅 socket 订阅者 → no_ui 立即拒绝；authz.request 帧绝不投 socket 订阅者。
 - 规则变更（add/list/remove）写审计；规则匹配逻辑单测覆盖 glob、目录绑定。
@@ -286,7 +301,7 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 - **begin（命令锁内，非阻塞）**：参数解析 + 字段校验 + projectDir 归一化/
   canonicalize（与既有 Inline 语义一致，无效参数原错误直返）；remove 顺带
   解析 id→规则补全 name/keys/projectDir（弹窗展示「拆了哪堵墙」）；desktop
-  直调豁免直执行；socket 走 fail-closed 检查后登记 `PendingApprovals`
+  直调豁免直执行；socket 走 fail-closed 检查后登记入 daemon 审批注册表
   （challenge 防伪 #78）+ 广播 `authz.request`。
 - **锁外等待**（≤30s 超时默认拒绝，G1：不持命令锁）。
 - **finalize（重取命令锁）**：**TOCTOU 锁内重校验**——等待窗内规则库可能
@@ -317,13 +332,13 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 
 锁定后（K_audit 擦除）无法签名 → 跳过审计（与授权路径同口径）。
 
-### 9.5 E2E 自动批准通道（AutoApproveChannel）
+### 9.5 E2E 自动批准门（#28 起折入 daemon）
 
-- `ApprovalChannel` 的 env 门控装饰器：daemon **启动时**读一次
-  `LIGHTKEY_E2E_AUTO_APPROVE=rule`，仅对 `ApprovalKind::Rule` 立即 Allowed
-  （登记后即刻 resolve，**不广播** `authz.request`——无 UI 参与）；
-  `available()` 语义原样透传内层，**inject/披露审批不受影响**（headless
-  照旧立即拒绝，不等待）。
+- daemon **启动时**读一次 `LIGHTKEY_E2E_AUTO_APPROVE=rule`（布尔；原
+  `AutoApproveChannel` 装饰器已随 #28 候选 2 删除，语义折入
+  `open_gate_approval`），仅对 `ApprovalKind::Rule` 立即 Allowed（登记后
+  即刻写 decision，**不广播** `authz.request`——无 UI 参与）；UI 在场判定
+  语义原样，**inject/披露审批不受影响**（headless 照旧立即拒绝，不等待）。
 - 启用即打 daemon 启动日志横幅；放行留 channel=auto-approve 审计。
 - **release 二进制保留此路径是有意决策**（E2E 测发布物本体；编译期
   feature/cfg 门为被否选项）。攻击面：env 仅启动时读取，攻击者自带该变量
@@ -334,7 +349,7 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 - daemon 集成（`lk-daemon/src/tests/rule_gate.rs`）：desktop 豁免 / no_ui
   拒绝 / 未知启动者 / pending→批准→落规则 / deny / 超时 / remove 弹窗展示
   解析规则 / 锁态 session.invalid / 等待期锁定 / TOCTOU 竞争 / auto 通道
-  （进程内驱动 `LocalApprovalChannel` 模拟桌面订阅）。
+  （进程内桌面订阅 + `approval.result` 直调回传模拟 GUI 在场）。
 - shell E2E：`e2e_m2.sh` 传 env 主流程 + 「无 env 时 headless rule add
   被拒」（独立数据目录另起无 env 守护）+ auto-approve 审计断言；
   `e2e_m0/m1` 传 env（主流程含 rule add 预插）；`e2e_cross_subsystem.sh`

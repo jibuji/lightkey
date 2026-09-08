@@ -371,7 +371,7 @@ plugins:
 | [data-model.md](data-model.md) | 不矛盾。A 层 vault-store 能力（条目/索引/墓碑/附件 CRUD、CAS、30 天延迟硬删）与该文档 §2/§4 一致 |
 | [sync.md](sync.md) | 不矛盾。sync-engine 能力（变更发现、CAS 收敛、墓碑同步）与该文档一致；`item.changed` 推送对应 §3 上传 |
 | [ipc.md](ipc.md) | 不矛盾。事件总线是 IPC 之上的解耦层，**不替代** JSON-RPC 2.0；ipc-bridge 是门面；session 插件对应 §3 令牌 |
-| [authorization-gate.md](authorization-gate.md) | 不矛盾。authz-gate（B）承载三层模型/规则库/启动者判定；approval（D）= 弹窗 + 30s 倒计时；审批通道抽象对应 trait |
+| [authorization-gate.md](authorization-gate.md) | 不矛盾。authz-gate（B）承载三层模型/规则库/启动者判定；approval（D）= 弹窗 + 30s 倒计时；审批编排在 daemon 审批注册表（#28：通道 trait 已删除） |
 | [audit.md](audit.md) | 不矛盾。audit 插件能力（追加日志 + HMAC + 密钥轮换链）与该文档 §3/§3.1 一致 |
 | [crypto.md](crypto.md) / [recovery.md](recovery.md) | 不矛盾。crypto/recovery 插件能力分别对应两文档的 KDF/AEAD/信封/重加密轮换 |
 | [browser-fill.md](browser-fill.md) | 不矛盾。browser-fill 插件（D）对应 M3 协议，仍为「协议落定、实现 V1 之后」 |

@@ -25,7 +25,8 @@ Windows 主机 GUI。
 
 ### 非目标
 
-- 跨主机访问（D8 远程审批通道仍为 P1 不做）；
+- 跨主机访问（远程审批中继仍为 P1 不做；#28 起通道 trait 缝已删除，
+  落地时按产品需求重开设计，见 [authorization-gate.md](authorization-gate.md) §6）；
 - 免审批通道（任何跨子系统路径都不绕过第③层弹窗的可用性）；
 - WSL1 支持（仅 WSL2；WSL1 无 interop 管道语义，明确不支持）。
 
@@ -90,7 +91,7 @@ Windows 主机 GUI。
 │       spawn <linux-cmd>（注入）  │           │    ▼ named pipe 端点（两形态同一端点）                 │
 │                                  │           │  守护形态二选一在跑：                                  │
 │  会话令牌仅在 lk 进程内存        │           │  [A] 桌面应用形态：lk-app.exe                          │
-└──────────────────────────────────┘           │      内置守护实例 + 托盘常驻；作为 ApprovalChannel     │
+└──────────────────────────────────┘           │      内置守护实例 + 托盘常驻；作为审批 UI 订阅者     │
                                                │      订阅者提供第③层弹窗 GUI（30s 倒计时）✓            │
                                                │  [B] 纯 CLI daemon 形态：无任何 UI                     │
                                                │      任一本地 lk.exe 命令经 ensure_daemon() 自动拉起， │
@@ -122,7 +123,7 @@ Windows 侧守护实例有两种承载形态（二选一就位）；named pipe �
 | | 形态 A：桌面应用 | 形态 B：纯 CLI daemon |
 |---|---|---|
 | 就位方式 | 启动 `lk-app.exe`：进程内内置守护实例（`serve_embedded`）+ 托盘常驻 | Windows 侧跑任一本地 `lk.exe` 命令经 `ensure_daemon()` 自动拉起，并写 `%APPDATA%\lightkey\daemon.json` |
-| 第③层弹窗 | **有**——桌面端作为 `ApprovalChannel` 订阅者接收 `authz.request` 广播，弹出审批窗（30s 倒计时） | 无任何 UI，没有提醒用户的手段 |
+| 第③层弹窗 | **有**——桌面端作为审批 UI 订阅者接收 `authz.request` 广播，弹出审批窗（30s 倒计时） | 无任何 UI，没有提醒用户的手段 |
 | 未命中第②层规则白名单时 | 进入第③层弹窗等人裁决 | 立即 fail-closed 拒绝：`no_ui` |
 
 形态 B 的 `no_ui` fail-closed 语义（代码出处）：

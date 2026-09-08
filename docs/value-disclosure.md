@@ -126,11 +126,11 @@ pub struct Rule {
    豁免，不登记审批）；
 4. socket 通道：取真实 starter + cwd（#66 归因链路复用）；未知 → 第 1 层
    拒绝（新错误码，见 5.4）；
-5. `item.get`：读规则匹配（§4）→ 命中 → 放行 + 审计；未命中 →
-   `ApprovalChannel::open`（GUI 不在场 `available() == false` → 立即拒绝）；
-6. `item.export`：跳过规则匹配，直接 `open`；
-7. `ApprovalRequest` 填充：starter / project_dir（cwd）/ keys=[条目名] /
-   kind（见 §6）/ challenge / `needs_unlock = false`。
+5. `item.get`：读规则匹配（§4）→ 命中 → 放行 + 审计；未命中 → 登记入
+   daemon 审批注册表并广播 `authz.request`（UI 在场判定 false → 立即拒绝）；
+6. `item.export`：跳过规则匹配，直接登记待审批；
+7. 审批帧（`authz.request`）填充：starter / project_dir（cwd）/ keys=[条目名] /
+   kind（见 §6）/ challenge（daemon 单点铸造）/ `needs_unlock = false`。
 
 **锁定态分流（补充拍板 #23，issue #105）**：begin 前 `disclosure_precheck`
 把「vault 锁定 + 已初始化 + 桌面 UI 在场」放行至一体化路径——锁态无法
@@ -142,7 +142,7 @@ pub struct Rule {
 
 ### 5.3 finalize（命令锁外）
 
-- `await_decision`（30s 超时默认拒绝，复用 `PendingApprovals`）；
+- `await_decision`（30s 超时默认拒绝，daemon 审批注册表，只读不移除）；
 - allow → 返回值 / 数据包 + 审计 allowed；
 - deny / timeout / 无 UI → `authz.denied` + 审计（锁态一体化条目 deny /
   timeout：无 K_audit 可签名 → 不写审计，与 #67 注入拒绝同口径）；

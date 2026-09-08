@@ -83,8 +83,10 @@
     `lk_daemon::run(dir)` CLI 入口 / `serve_embedded` 桌面内嵌入口）
   - 推送通道（决策 #3 A）：`transport::PushHub` + `notifier::Notifier`
     （EventSink），订阅连接收 JSON-RPC notification 帧（`subscribe` 方法）
-  - 授权门（`lk-core/src/authz.rs`）：三层模型 + `ApprovalChannel` trait +
-    `PendingApprovals`（30s 超时默认拒绝）；RPC 分发走**执行计划路由**
+  - 授权门（`lk-core/src/authz.rs` 三层判定 + 规则匹配）：第 3 层审批编排
+    在 daemon 审批注册表（`lk-daemon/src/daemon/gate_kit.rs`
+    `ApprovalRegistry` 单表，30s 超时默认拒绝；拍板 #28 候选 2，通道抽象
+    已删）；RPC 分发走**执行计划路由**
     （ADR-0001：`lk-daemon::router` 唯一分发点，三策略 Inline / OutsideLock /
     ApprovalDeferred；G1 锁纪律集中一处）
   - 启动者判定（`lk-core/src/starter.rs`）：IPC 对端 PID 进程链回溯

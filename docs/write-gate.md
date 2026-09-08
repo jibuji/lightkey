@@ -2,7 +2,8 @@
 
 - 状态：**已实现**（2026-09-02 拍板；M2.97 PR A-D 序列经 PR CI 门禁落地——
   #112 core / #113 daemon / #114 cli+E2E / #115 前端+文档收口）
-- 关联：[authorization-gate.md](authorization-gate.md)（三层模型 / 审批通道 /
+- 关联：[authorization-gate.md](authorization-gate.md)（三层模型 / 审批注册表（#28：
+  通道抽象已删除）/
   §10 摘要）· [value-disclosure.md](value-disclosure.md)（读/导出裁决，本规格的
   对称扩展）· [ipc.md](ipc.md)（令牌 = 认证 ≠ 授权）·
   [data-model.md](data-model.md)（规则对象 schema 扩展）· [decisions.md](decisions.md)
@@ -137,10 +138,10 @@ CLI/daemon/审计/测试表面翻倍。保留单 `M_ITEM_PUT`：
    拒绝（`authz.denied`，不弹窗）；
 5. 写规则匹配（§4）：命中 → 放行 + 审计；delete **跳过规则匹配**，直接
    `open`（恒弹窗）；
-6. 未命中：`ApprovalChannel::available()` false（GUI 不在场）→ 立即拒绝
-   `authz.denied`；否则登记 `PendingApprovals`（challenge 防伪 #78）+ 广播
-   `authz.request`；
-7. `ApprovalRequest` 填充：kind = `Write`；command = `"item.put <name>"` /
+6. 未命中：UI 在场判定 false（GUI 不在场；daemon 审批注册表谓词）→ 立即
+   拒绝 `authz.denied`；否则登记入 daemon 审批注册表（challenge 防伪 #78）+
+   广播 `authz.request`；
+7. 审批帧（`authz.request`）填充：kind = `Write`；command = `"item.put <name>"` /
    `"item.delete <name>"`（展示用）；keys = 单元素 [目标条目名]；
    project_dir = cwd（canonical / wsl:// 规范形）；`needs_unlock = false`；
    `write_action` = 步骤 2 派生的动作（create/update）——随 `authz.request`
@@ -152,7 +153,7 @@ CLI/daemon/审计/测试表面翻倍。保留单 `M_ITEM_PUT`：
 
 ### 5.4 finalize（命令锁外等待后，重取命令锁）
 
-- `await_decision`（30s 超时默认拒绝，复用 `PendingApprovals`）；
+- `await_decision`（30s 超时默认拒绝，daemon 审批注册表，只读不移除）；
 - allow → **TOCTOU 锁内重校验**（等待窗内可能被并发审批落盘 / 同步轮次
   改变）：
   - vault 仍解锁（锁定 → `session.invalid`，K_audit 已擦除无法签名审计，
