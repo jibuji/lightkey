@@ -617,4 +617,75 @@ needs-decision，不得自行变更。
     立项 issue #161，按 quick-capture.md §10 PR 序列落地（PR A lk-app /
     PR B 前端 + 收口 / PR C 阶段二可选）。
 
+28. **架构深化：服务层 trait 假设缝移除 + 授权门管线收敛（2026-09-07 ·
+    来源：`/improve-codebase-architecture` 评审，四项深化机会经 grilling 拍板，
+    船长确认「先落盘 + 先评审」，实施后置）**：四处摩擦——(1) `service.rs`
+    六个 A/B trait 服务各一适配器、`dyn` 生产零派发；(2) 待审批「决策表 +
+    负载表」双注册表跨 core/daemon 缝；(3) 四条门 begin 骨架 + fail-closed
+    次序四份手写副本 + `DeferredFlow` trait 空壳；(4) 对端身份合成散落多处。
+    裁定：
+    - **候选 1（本决议的文档反转）**：废除 `lk-core/src/service.rs` 的 trait
+      服务层——六个 trait + 各自唯一透传 impl + `CoreServices` 的 `crypto`/
+      `recovery` 两个 `Box<dyn>` 字段删除，具体类型直用，`CoreServices`
+      溶解（daemon 直持 `Arc<EventBus>`）。**反转 `plugin-architecture.md`
+      「Rust 侧 = trait 服务」措辞**（精确 4 处 + 变体 3 处，非仅 §3/§4；逐处
+      枚举见 architecture-deepening §4）：修订为「A/B 层 = 具体类型 + 事件
+      总线；保留的 trait 按**三类**——① 多生产实现真缝：`StorageBackend` /
+      `ProcessTable`；② 平台抽象 + 白盒测试缝（生产单实现 + 测试替身）：
+      `VaultRead` / `RuleVault` / `PeerEnv` / `FingerprintSource`；③ 观察者
+      契约：`EventSink`」（`ApprovalChannel` 不在保留列——候选 2 整体删除），
+      §4.1 注入图按现实重画。
+    - **候选 2（审批注册表合一）**：单表安 daemon（承载 challenge/expires/
+      decision + needs_unlock/workspace/kind），core `PendingApprovals` 连同
+      await/resolve 下沉；`ApprovalChannel`/`LocalApprovalChannel`/
+      `AutoApproveChannel` 三件**直接删除**（UI 在场判定 `available()` 与
+      `authz.request` 广播随注册表一并折入 daemon）；E2E `rule` 自动批准折入
+      daemon（`LIGHTKEY_E2E_AUTO_APPROVE` 范围/**审计 channel=auto-approve**/
+      横幅**原样**，#22 不动）；finalize 为唯一消费移除点。**文档面（第三轮
+      评审补）**：`ApprovalChannel` 是 D8 拍板内容——`authorization-gate.md`
+      §6 重写为 daemon 侧审批注册表语义 + **D8 加 #28 修订注记**（同候选 1
+      对 D16 的处理法）+ 引用文档清点（7 份，见 architecture-deepening §2）。
+    - **候选 3（裁决骨架收敛）**：「门 = 一份静态声明」（fn 指针 + 布尔 +
+      渲染器），骨架只 emit 裁决结果、各门渲染器产响应（inject ok-result vs
+      其余错误码的 spec 分叉保留）；顺带消 `ApprovalDraft` 九字段克隆与
+      finalize「denied 尾」复制。ADR-0001 的延伸，补 consequence 注记。
+    - **候选 4（对端身份面）**：daemon 新增 `identity` 深度模块门面，委托
+      #152 三拆的 `starter` / `peer_env` / `exe_resolve` / `binding`；删 core
+      死代码 `fingerprint_matches`；`CallerId` 归因单点。
+    - **回归边界（不因重构变）**：CLI 数据读写必走三层授权门（除非规则命中）；
+      无自动审批（除规则命中）；规则增删必过 GUI（headless fail-closed）；
+      desktop 受信豁免、恒弹窗（export/delete）语义不变；元数据
+      `item.list`/`rule.list` 仍只过令牌门。
+    - **实施顺序**：候选 2 → 3 → 1 → 4；每步 `cargo test` + `cargo clippy
+      --all-targets -- -D warnings` 绿再进下一步。
+    - **与既有拍板 / #146 的关系（二次评审核实）**：本计划是 #146「授权门链路
+      架构深化」（2026-09-06 评审，六重构 #147–#152 已合并进 v0.1.17）落地后的
+      **第二轮回溯**，四候选是其后的残留摩擦、候选编号为本计划自用（不与 #146
+      内部编号对应）；候选 3 对应 #146 Out of Scope「AuthzGate 统一求值，编排
+      收敛落地后可重新评估」的续评。**修订 #146 的「不新增 CONTEXT.md 词条」
+      决策**（该条针对 #146 自身六重构；本计划三词条对应新候选的新概念）。候选 1
+      的文档反转同时**修订 D16**（2026-08-15 拍板集「trait 服务 + 事件总线」→
+      「具体类型 + 事件总线，真缝 trait 保留」）。
+    - **落点**：详细规格 [architecture-deepening.md](architecture-deepening.md)
+      （唯一出处）；CONTEXT.md 增「对端身份 / 审批注册表 / 门声明 / 流程注册表」
+      四词条（流程注册表承接 #146/#149 已落地的流程声明面）；立项 issue 待开，
+      按该文档 PR 序列落地。
+    - **评审修订（2026-09-07 · 全新 agent 对抗评审后，已折回计划 §8）**：候选 1
+      SOUND；候选 2/3/4 各一处结构修正——候选 2 明定单表 `resolve` **保留过期/未知
+      拒绝写**（迟到回传 `accepted=false` 与失败提交审计不回翻）；候选 3 决策枚举
+      分两层（「执行失败」非「Denied 决策」：decision 已 Allowed 而 vault 锁定 /
+      resolve_env 失败 / TOCTOU 失效 → `session.invalid`/拒绝，渲染器须带锁态/会话态
+      上下文）；候选 4 `对端身份` 不含指纹裁决、desktop 豁免键在 `peer.origin`（非
+      `pid==0`，后者是死代码）、删 core `fingerprint_matches` 须同步改
+      identity-binding.md §10.1/§11 或走 needs-decision。
+    - **第三轮评审修订（2026-09-08 · 全新 agent 逐条对照代码复核后，已折回计划
+      §10）**：候选 2 补文档面（`ApprovalChannel` 是 D8 拍板内容：authorization-gate
+      §6 重写 + D8 注记 + 7 份引用清点）与 PR A 迁移面（`available()`/广播折入
+      daemon，剥通道字段即需、非留候选 3）；候选 1 真缝判据由「≥2 适配器」改为
+      三类分法（原判据对名单 8 trait 中 6 个不成立——仅 StorageBackend/
+      ProcessTable 有 ≥2 生产实现）、措辞枚举修正为精确 4 处 + 变体 3 处；回归
+      边界补**对端观测不变量**（starter/cwd 不信客户端自报）与 `e2e_m2.sh` /
+      `e2e_cross_subsystem.sh` 两条 E2E 验收；记录修正（落点四词条、候选 2 直接
+      删、CONTEXT 门声明六步、文件表 daemon/ 子目录路径）。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

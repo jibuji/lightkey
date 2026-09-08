@@ -38,8 +38,13 @@ locality——每个方法的锁正确性从策略继承，而非在每个新方
   （无 token/peer），只要求复用共享预检辅助函数；不要未来"修复"它。
 - 新增 RPC 方法 = 在路由表声明策略，不再抄锁样板。
 - **注册表承载流程是本决策的延伸**（2026-09-06，授权门链路架构深化
-  #146/T3 #149）：ApprovalDeferred 各方法在流程注册表声明自己的
-  预检 / begin / finalize / 可否 RePended，通用 deferred 编排器按声明执行，
-  RePended 循环内建；直调入口复用同一编排器的持锁形态，route 与直调等价
-  由构造保证。这是策略表思想的自然推广——锁纪律的 locality 从「策略级」
+  #146/T3 #149；**并见拍板 #28 的进一步延伸**，未实施）：ApprovalDeferred 各方法
+  在流程注册表声明自己的预检 / begin / finalize / 可否 RePended，通用 deferred
+  编排器按声明执行，RePended 循环内建；直调入口复用同一编排器的持锁形态，route
+  与直调等价由构造保证。这是策略表思想的自然推广——锁纪律的 locality 从「策略级」
   细化到「流程级」，不推翻本决策（Inline / OutsideLock 不变）。
+  拍板 #28（未实施）把流程注册表再从 trait + 空壳 struct 细化为「门 = 一份静态
+  声明」（fn 指针 + 布尔 + 响应渲染器，裁决骨架只 emit 裁决结果），并把待审批由
+  「决策表 + 负载表」合一为 daemon 侧单表、finalize 单点消费移除；仍属「收敛只在
+  ApprovalDeferred 流之间」。见 [architecture-deepening.md](../architecture-deepening.md)
+  候选 2/3。
