@@ -15,6 +15,7 @@
  * | `vault.search` | `{ query }` | topbar 搜索框（TS 内 emit，300ms 防抖） | ui-vault（过滤列表） |
  * | `vault.search-enter` | `{ query }` | topbar 搜索框回车（TS 内 emit） | ui-vault（空态引导新建） |
  * | `vault.initialized` | `{ initialized }` | ipc-bridge（守护进程 `vault.status` 探测结果，TS 内 emit，不跨进程） | 宿主（锁态整页互斥门控：无库→onboarding / 有库→unlock） |
+ * | `quick.save-request` | 无负载（零密钥值） | 壳（托盘「快速保存剪贴板…」→ Tauri `lk-shell-quick-save` 本地事件 → ipc-bridge 翻译，TS 内 emit，不跨进程） | 快存面板（ui-quick-save 服务插件） |
  *
  * 分发语义：`emit`（观察广播，fire-and-forget）；`authz.request` 的审批结果
  * 经 IPC 方法 `approval.result` 回传（跨进程无同步事件返回值，§5.3）。
@@ -128,6 +129,12 @@ declare module "@cordisjs/core" {
     /** 首启门控：守护进程库状态探测结果（ipc-bridge 本地 emit；宿主据
      *  此在初始化向导与解锁页间互斥切换，M2.5）。 */
     "vault.initialized"(payload: { initialized: boolean }): void;
+    /** 快速保存请求（M2.99，quick-capture.md §3.1）：壳（托盘「快速保存
+     *  剪贴板…」）→ UI 的本地请求，**零负载**（值只经 clipboard_read 在
+     *  面板打开时单次读取，绝不进事件帧）。不进守护进程通知协议——该
+     *  事件由 ipc-bridge 单独翻译（tauri 监听 `lk-shell-quick-save`；
+     *  mock 监听同名 DOM CustomEvent，QA 钩子模拟同一条路径）。 */
+    "quick.save-request"(): void;
   }
 }
 

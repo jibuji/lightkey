@@ -41,19 +41,21 @@ describe("cordis.yml loader", () => {
   it("解析 + schema 校验（非法条目拒绝）", () => {
     const loader = new CordisLoader(new Context(), {});
     const entries = loader.parse(cordisYml);
-    // 20 条：6 服务（4 地基 + approval + desktop-shell）+ 14 槽位组件
+    // 21 条：7 服务（4 地基 + approval + desktop-shell + M2.99 quick-save）+ 14 槽位组件
     // （5 sidebar + 3 topbar + 6 content ui-*：M2.5 增 ui-onboarding）
-    expect(entries).toHaveLength(20);
+    expect(entries).toHaveLength(21);
     expect(entries[0].name).toBe("ipc-bridge");
     expect(entries.find((e) => e.name === "lock")?.order).toBe(99);
     expect(entries.find((e) => e.name === "theme")?.config).toEqual({
       defaultTheme: "dark",
     });
-    // M2/M2.5：ui-* 挂 content；approval / desktop-shell 为服务
+    // M2/M2.5：ui-* 挂 content；approval / desktop-shell 为服务；
+    // M2.99：quick-save 为无槽位服务（自挂 portal，跨锁态存活）
     expect(entries.find((e) => e.name === "ui-unlock")?.page).toBe("unlock");
     expect(entries.find((e) => e.name === "ui-onboarding")?.page).toBe("onboarding");
     expect(entries.find((e) => e.name === "approval")?.slot).toBeUndefined();
     expect(entries.find((e) => e.name === "desktop-shell")?.slot).toBeUndefined();
+    expect(entries.find((e) => e.name === "quick-save")?.slot).toBeUndefined();
 
     // 非法条目：缺 name / 非法 slot → ValidationError
     expect(() =>

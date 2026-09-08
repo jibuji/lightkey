@@ -25,6 +25,7 @@ import { theme } from "../plugins/theme";
 import { toast } from "../plugins/toast";
 import { approval } from "../plugins/approval";
 import { desktopShell } from "../plugins/desktop-shell";
+import { uiQuickSave } from "../plugins/ui-quick-save";
 import { uiOnboarding } from "../plugins/ui-onboarding";
 import { uiUnlock } from "../plugins/ui-unlock";
 import { uiVault } from "../plugins/ui-vault";
@@ -73,6 +74,8 @@ export const PLUGIN_REGISTRY: Record<string, Plugin> = {
   // 服务（无槽位）
   approval,
   "desktop-shell": desktopShell,
+  // M2.99 快速保存（无槽位服务：跨锁态自挂 portal——快存面板 + 锁态引导/pending flush）
+  "quick-save": uiQuickSave,
 };
 
 export interface HostInstance {

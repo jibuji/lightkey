@@ -19,6 +19,7 @@
  */
 
 import type { Context, Plugin } from "@cordisjs/core";
+import { listen } from "@tauri-apps/api/event";
 import type { AuthzRequestPayload, ItemChangedPayload } from "../events";
 import { createIpc } from "../ipc";
 import type { LightKeyIpc, NotificationFrame } from "../ipc/types";
@@ -154,9 +155,35 @@ export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assig
       unsubscribe = u;
     });
 
+    // M2.99 快速保存：壳 → UI 本地事件翻译（托盘「快速保存剪贴板…」，
+    // quick-capture.md §4.2）。**不进** NOTIFICATION_EVENTS 翻译路径——
+    // 该集合严格镜像守护进程通知协议（NOTIFY_*），本事件是壳（Tauri 壳）
+    // → UI 的本地请求，非守护进程帧、零负载、不落审计。
+    // tauri：监听 Rust 壳 emit 的 `lk-shell-quick-save`；mock：监听同名
+    // DOM CustomEvent（QA 钩子 `simulateQuickSaveRequest` 走同一条路径）。
+    let offShellQuickSave: (() => void) | null = null;
+    const onShellQuickSave = () => ctx.emit("quick.save-request");
+    if (ipc.kind === "tauri") {
+      // 真实 Tauri 环境才有 window.__TAURI_INTERNALS__；伪 tauri 适配器
+      // （测试）下 @tauri-apps/api 的 listen 会同步抛错——静默降级
+      // （壳事件是增强通道，缺了只影响托盘入口，审批等主流程不受影响）
+      void listen("lk-shell-quick-save", onShellQuickSave)
+        .then((u) => {
+          offShellQuickSave = u;
+        })
+        .catch(() => {
+          offShellQuickSave = null;
+        });
+    } else {
+      window.addEventListener("lk-shell-quick-save", onShellQuickSave);
+      offShellQuickSave = () =>
+        window.removeEventListener("lk-shell-quick-save", onShellQuickSave);
+    }
+
     // 可逆副作用：卸载时退订通知（Cordis 卸载自动撤销语义 §5.4）
     return () => {
       unsubscribe?.();
+      offShellQuickSave?.();
     };
   },
 );

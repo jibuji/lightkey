@@ -580,6 +580,8 @@ describe("tauri 模式：会话事件去重（本地广播 + 推送帧不双发�
     configGet = vi.fn(async () => ({ autoLockMinutes: 5, approvalTimeoutSecs: 30, sync: null }));
     configSet = vi.fn(async () => undefined);
     pickDir = vi.fn(async () => null);
+    clipboardRead = vi.fn(async () => null);
+    clipboardClear = vi.fn(async () => undefined);
     subscribeNotifications = vi.fn(async (h: (f: NotificationFrame) => void) => {
       this.handler = h;
       return () => {

@@ -121,17 +121,23 @@
   额外 `listen("lk-shell-quick-save")` → `ctx.emit("quick.save-request")`。
   这是本地壳事件，**不**经过 `NOTIFICATION_EVENTS` 翻译路径（该集合严格镜像
   守护进程通知协议，勿混入）。
-- **快存面板（放 ui-vault 插件内，不新建插件）**：复用 `Modal` 与现有
-  `<ItemForm>` 的 secret 分支场域，新增薄面板组件：
-  - 打开时 `invoke("clipboard_read")` → 预填值；名称聚焦；
-  - 保存 = `ctx.ipc.create(draft)`（`type:"secret"`）+ 复用
-    `handleSaved`（toast / `setSelectedId` / reload）——保存、CAS、刷新、
-    选中逻辑与现有新建表单同源，不复制；
-  - 面板内嵌于 ui-vault，天然获得 `items`（重名检查 §4.3）与
-    `session`（锁态引导 §4.4）上下文，无跨插件消息。
-- **触发源汇总**：① 托盘事件（A）；② 应用内入口按钮（C，`e.g.` 列表头
-  「新建」旁加「快速保存」图标按钮或新建表单内「从剪贴板填入」）；
-  ③ mock/QA 钩子。
+- **快存面板（实现注记：无槽位服务插件 `ui-quick-save`，approval 同款
+  自挂 portal；非 ui-vault 内嵌）**：`VaultPage` 在锁态整页 ↔ 三栏切换时
+  **会被卸载**（宿主互斥门控），锁态引导 / pending flush / 面板本体若内嵌
+  ui-vault 则锁态下收不到事件——故拆为**跨锁态存活**的服务插件。面板：
+  - 打开时 `ctx.ipc.clipboardRead()` → 预填值（值只在面板打开那一刻读
+    一次，锁态不读——由服务插件在 request 处理器里先行判定会话状态）；
+  - 保存 = `ctx.ipc.create(draft)`（`type:"secret"`）→ toast + 关闭 +
+    `ctx.nav.go("vault")`；列表刷新不经跨插件消息——`item.changed` 三方
+    响应既有路径（ui-vault 订阅刷新），新条目自动可见；
+  - 重名检查（§4.3）数据源 = `ctx.ipc.list()`（面板打开时取一次快照，
+    best-effort，读失败静默），与 ui-vault 内嵌方案的 `items` 等价；
+  - 面板生命周期（打开/关闭/pending）全部由插件作用域事件管理，不依赖
+    页面挂载态。
+- **触发源汇总**：① 托盘事件（A）；② 应用内入口按钮（C，可选：列表头
+  「新建」旁加「快速保存」图标按钮或新建表单内「从剪贴板填入」，均走
+  `ctx.emit("quick.save-request")`——未随本 PR 实现，后续小步补）；
+  ③ mock/QA 钩子（`simulateQuickSaveRequest`）。
 
 ### 4.3 名称建议与重名
 
@@ -141,7 +147,8 @@
   **结构提示**：`sk-*` / `ghp_*` / `github_pat_*` / `AKIA*` / `eyJ*`（JWT）/
   `xox[baprs]-*`（Slack）→ 对应 `api_key` / `github_token` / `aws_access_key` /
   `jwt_token` / `slack_token` 等静态建议名（用户编辑），无匹配 → 留空。
-  （§9.3 拍板点：映射表范围与「可关」）
+  （§9 拍板点 ③：保守前缀表内置 + 设置页可关——preference
+  `quickSave.nameSuggest`，默认开；已定）
 - **重名**：`data-model.md` 无名称唯一约束（名字即身份，重名合法）——保存前
   面板内**软提示**「已存在同名条目（N 个）」，不阻止（用户可改名或继续）；
   与 `item.list` 现有数据同源，无额外 IPC。
