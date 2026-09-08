@@ -61,11 +61,13 @@ impl Daemon {
     /// 阶段①（命令锁内，非阻塞）：参数解析 + 校验 + 归一化（与既有 Inline
     /// 语义一致：无效参数原错误直返）→ 通道判定（desktop 直调豁免直执行）
     /// → socket 走 fail-closed 检查（未知启动者 / 无审批界面且无 E2E 自动
-    /// 批准 → 立即拒绝 + 审计）→ 登记待审批 + 广播 `authz.request`。
+    /// 批准 → 立即拒绝 + 审计）→ 登记待审批 + 广播 `authz.request`。返回
+    /// **分层裁决结果**（issue #167：拒绝以 reason 承载，字节由门声明渲染
+    /// 器唯一渲染——本门恒 `authz.denied`）。
     pub(crate) fn rule_begin(
         &mut self,
-        id: Value,
         method: &str,
+        id: Value,
         params: Value,
         peer: &PeerInfo,
     ) -> GateBegin {
@@ -102,7 +104,7 @@ impl Daemon {
                 channel,
                 AuditResult::Denied,
             );
-            return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
+            return GateBegin::Deny(GateDeny::UnknownStarter);
         }
         // 4) 无审批界面（headless）且无 E2E 自动批准 → fail-closed 立即拒绝
         //    （不登记、不阻塞；仅规则审批可走自动批准，补充拍板 #22 折入
@@ -117,28 +119,28 @@ impl Daemon {
                 channel,
                 AuditResult::Denied,
             );
-            return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
+            return GateBegin::Deny(GateDeny::NoUi);
         }
         // 5) 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞；单一 kind
         //    + command 字段承载操作：`rule.add <name>` / `rule.remove <name>`，
         //    补充拍板 #22——E2E 自动批准分支不广播，无 UI 参与）
         let request_id = self.open_gate_approval(
-            ApprovalDraft {
-                starter: starter.clone(),
-                project_dir: parsed.display_project_dir.clone(),
-                command: format!("{} {}", method, parsed.display_name),
-                keys: parsed.display_keys.clone(),
-                kind: lk_core::authz::ApprovalKind::Rule,
-                // #147：审批帧携带门事实——规则门子类型随帧回带 subKind
-                //（取代前端 command 前缀匹配启发式）
-                sub_kind: Some(if method == lk_core::ipc::M_RULE_ADD {
+            {
+                // 规则审批携带门事实：subKind（rule.add / rule.remove，#147）；
+                // 不携带写动作 / 导出元信息 / 指纹失配——九字段克隆单点构造
+                // （issue #167）。
+                ApprovalDraft::new(
+                    starter.clone(),
+                    parsed.display_project_dir.clone(),
+                    format!("{} {}", method, parsed.display_name),
+                    parsed.display_keys.clone(),
+                    lk_core::authz::ApprovalKind::Rule,
+                )
+                .with_sub_kind(if method == lk_core::ipc::M_RULE_ADD {
                     lk_core::authz::ApprovalSubKind::RuleAdd
                 } else {
                     lk_core::authz::ApprovalSubKind::RuleRemove
-                }),
-                write_action: None,
-                export_meta: None,
-                fingerprint_mismatch: None,
+                })
             },
             // 常规审批条目（issue #150：`GateEntry::approval` 显式声明规则门
             // 无需一体化解锁——锁态 `session.invalid` 先行，见 precheck）
@@ -154,30 +156,32 @@ impl Daemon {
 
     /// 阶段③（重取命令锁）：Allowed → **锁内重校验（TOCTOU）**——30s 等待
     /// 窗内规则库可能被并发审批落盘或同步轮次改变，vault 解锁态与（remove
-    /// 的）规则存在性失效则拒绝并落审计；通过则落盘 + 审计（channel=
-    /// approval / auto-approve）。deny / timeout → `authz.denied` + 审计。
+    /// 的）规则存在性失效则拒绝并落审计（执行层保守拒绝，issue #167 分层）；
+    /// 通过则落盘 + 审计（channel=approval / auto-approve）。deny / timeout
+    /// → 决策结局拒绝尾 + 审计。返回分层结果，字节由编排器经门声明渲染器
+    /// 收线。
     pub(crate) fn rule_finalize(
         &mut self,
         id: Value,
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
-    ) -> String {
+    ) -> DeferredOutcome {
         // finalize = 审批注册表唯一消费移除点（拍板 #28 候选 2 三拍之三）
         let removed = self.shared.approvals.remove(&request_id);
-        // 条目已被消费（极端竞态）→ 保守拒绝
+        // 条目已被消费（极端竞态）→ 保守拒绝（决策结局）
         let Some(ApprovalEntry {
             kind: GateKind::Rule(p),
             ..
         }) = removed
         else {
-            return rpc_string(super::disclosure::authz_denied(id));
+            return DeferredOutcome::Denied(GateDeny::Rejected);
         };
         match decision {
             ApprovalDecision::Allowed => {
                 // TOCTOU 重校验①：vault 解锁态（等待期锁定 → K_audit 已擦除，
                 // 无法签名审计，与披露 finalize 同口径保守 session.invalid）
                 if !self.vault_peek() {
-                    return rpc_string(session_invalid(id));
+                    return DeferredOutcome::SessionInvalid;
                 }
                 // TOCTOU 重校验②：remove 的目标规则仍存在（等待窗内被并发
                 // 审批落盘 / 同步轮次应用远端变更改变）。存在性按**未删除**
@@ -205,7 +209,7 @@ impl Daemon {
                             AuditChannel::Approval,
                             AuditResult::Denied,
                         );
-                        return rpc_string(super::disclosure::authz_denied(id));
+                        return DeferredOutcome::ExecutionDenied(GateDeny::Rejected);
                     }
                 }
                 // 落盘 + 审计：弹窗批准 → channel=approval；E2E 自动批准 →
@@ -220,7 +224,7 @@ impl Daemon {
                     (AuditChannel::Approval, p.command_summary.clone())
                 };
                 let resp = self.rule_op_exec(id, &p.op, &p.starter, channel, &audit_command);
-                rpc_string(resp)
+                DeferredOutcome::Executed(rpc_string(resp))
             }
             ApprovalDecision::Denied | ApprovalDecision::Timeout => {
                 let result = match decision {
@@ -236,7 +240,11 @@ impl Daemon {
                     AuditChannel::Approval,
                     result,
                 );
-                rpc_string(super::disclosure::authz_denied(id))
+                DeferredOutcome::Denied(if decision == ApprovalDecision::Timeout {
+                    GateDeny::Timeout
+                } else {
+                    GateDeny::Rejected
+                })
             }
         }
     }
@@ -562,49 +570,29 @@ struct RuleListParams {
 }
 
 // -------------------------------------------------------------------------
-// 流程声明（issue #149：通用 deferred 编排器的注册项）
+// 门声明（issue #167：静态声明取代 DeferredFlow trait 空壳；注册于
+// router.rs 流程注册表）
 // -------------------------------------------------------------------------
 
-/// 规则管理审批门流程声明（issue #149）：预检 / begin / finalize 委托既有
-/// 门方法，锁编排由 router.rs 通用 deferred 编排器统一承担。**不可
-/// RePended**——规则门 finalize 一步收尾（TOCTOU 重校验后落盘），无二次
-/// 审批路径。**无需一体化解锁**（issue #150 显式声明，产品决策留档）：
-/// 锁态先失败（规则在加密库内，`session.invalid`），不弹解锁窗。
-pub(crate) struct RuleFlow;
-
-impl crate::router::DeferredFlow for RuleFlow {
-    fn precheck(&self, daemon: &Daemon, token: Option<&[u8]>) -> bool {
-        daemon.rule_precheck(token)
-    }
-
-    fn begin(
-        &self,
-        daemon: &mut Daemon,
-        method: &str,
-        id: Value,
-        params: Value,
-        peer: &PeerInfo,
-    ) -> GateBegin {
-        daemon.rule_begin(id, method, params, peer)
-    }
-
-    fn finalize(
-        &self,
-        daemon: &mut Daemon,
-        id: Value,
-        request_id: uuid::Uuid,
-        decision: ApprovalDecision,
-    ) -> DeferredOutcome {
-        DeferredOutcome::Done(daemon.rule_finalize(id, request_id, decision))
-    }
-
-    fn rependable(&self) -> bool {
-        false
-    }
-
-    fn unlock_supported(&self) -> bool {
-        false
-    }
+/// 规则门拒绝响应渲染器（issue #167）：(门 × 锁态/会话态 × reason) → 字节
+/// 的**唯一决定点**。本门一切拒绝统一 `authz.denied`(-32017)（协议零新增，
+/// 补充拍板 #22；与 inject 的 `ok{allowed,reason}` 字节不同，不得跨门压平）。
+/// 渲染器拿 daemon 上下文是防「决策 → 字节」全局纯函数的结构钩子
+/// （golden 表钉住全部字节，tests/gate_golden.rs）。
+fn render_rule_deny(_daemon: &Daemon, id: Value, _deny: GateDeny) -> String {
+    rpc_string(super::disclosure::authz_denied(id))
 }
 
-pub(crate) const RULE_FLOW: RuleFlow = RuleFlow;
+/// 规则管理审批门静态声明：**不可 RePended**——规则门 finalize 一步收尾
+/// （TOCTOU 重校验后落盘），无二次审批路径。**无需一体化解锁**（issue
+/// #150 显式声明，产品决策留档）：锁态先失败（规则在加密库内，
+/// `session.invalid`），不弹解锁窗。
+pub(crate) static RULE_GATE: crate::router::GateDecl = crate::router::GateDecl {
+    name: "rule(rule.add/rule.remove)",
+    rependable: false,
+    unlock_supported: false,
+    precheck: Daemon::rule_precheck,
+    begin: Daemon::rule_begin,
+    finalize: Daemon::rule_finalize,
+    render_deny: render_rule_deny,
+};

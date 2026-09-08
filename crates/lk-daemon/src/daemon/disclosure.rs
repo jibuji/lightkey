@@ -62,7 +62,9 @@ impl Daemon {
         }
     }
 
-    /// 阶段①（命令锁内，非阻塞；spec §5.2 步骤 1-7）。
+    /// 阶段①（命令锁内，非阻塞；spec §5.2 步骤 1-7）。返回**分层裁决
+    /// 结果**（issue #167）：拒绝以 reason 承载（字节由门声明渲染器唯一
+    /// 渲染——本门恒 `authz.denied`），放行/协议直返为已渲染负载。
     ///
     /// 锁态分流（补充拍板 #23）：vault 未解锁 → 一体化解锁弹窗路径；解锁态
     /// → 既有裁决路径。两条路径在同一命令锁内切换，期间 vault **只可能从
@@ -70,8 +72,8 @@ impl Daemon {
     /// 验令牌（解锁态）或被跳过（锁态）的语义不会因竞态被反转。
     pub(crate) fn disclosure_begin(
         &mut self,
-        id: Value,
         method: &str,
+        id: Value,
         params: Value,
         peer: &PeerInfo,
     ) -> GateBegin {
@@ -104,31 +106,25 @@ impl Daemon {
             let starter = derive_starter(peer);
             let cwd =
                 lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
-            if starter == UNKNOWN_STARTER || cwd.is_empty() {
-                return GateBegin::Final(rpc_string(authz_denied(id)));
+            if starter == UNKNOWN_STARTER {
+                return GateBegin::Deny(GateDeny::UnknownStarter);
+            }
+            if cwd.is_empty() {
+                return GateBegin::Deny(GateDeny::NoCwd);
             }
             if !self.approval_available() {
-                return GateBegin::Final(rpc_string(authz_denied(id)));
+                return GateBegin::Deny(GateDeny::NoUi);
             }
             // 登记待审批（needs_unlock=true）+ 广播 authz.request
             // （needsUnlock=true，D 层弹窗同时展示主密码输入 + 授权栏）。
-            // challenge 语义同 #67 注入一体化：一次性应答值，仅投桌面订阅者，
+            // challenge 语义同 #67 注入一体化：一次性应答值，仅投递桌面订阅者，
             // 回传必须原样带回（#78）。锁态不知道条目名，keys 空（finalize
             // 在临时 vault 上解析后写审计 target）。
             let kind = disclosure_kind(method);
             let request_id = self.open_gate_approval(
-                ApprovalDraft {
-                    starter: starter.clone(),
-                    project_dir: cwd,
-                    command: method.to_string(),
-                    keys: vec![],
-                    kind,
-                    // #147：read/export 审批不带审批子类型（帧不含 subKind 字段）
-                    sub_kind: None,
-                    write_action: None,
-                    export_meta: None,
-                    fingerprint_mismatch: None,
-                },
+                // read/export 审批不带子类型 / 写动作 / 指纹失配信息（帧不含
+                // 相应字段）；九字段克隆单点构造（issue #167）。
+                ApprovalDraft::new(starter.clone(), cwd, method.to_string(), vec![], kind),
                 GateEntry::unified_unlock(GateKind::Disclosure(PendingDisclosure {
                     method: method.to_string(),
                     item_id,
@@ -196,7 +192,7 @@ impl Daemon {
         let starter = derive_starter(peer);
         let cwd = lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
         let channel = client_channel(channel_param.as_deref(), peer_channel(peer));
-        if starter == UNKNOWN_STARTER || cwd.is_empty() {
+        if starter == UNKNOWN_STARTER {
             self.audit_gate(
                 ActingVault::Shared,
                 &starter,
@@ -205,7 +201,18 @@ impl Daemon {
                 channel,
                 AuditResult::Denied,
             );
-            return GateBegin::Final(rpc_string(authz_denied(id)));
+            return GateBegin::Deny(GateDeny::UnknownStarter);
+        }
+        if cwd.is_empty() {
+            self.audit_gate(
+                ActingVault::Shared,
+                &starter,
+                item_name.as_deref().unwrap_or(""),
+                method,
+                channel,
+                AuditResult::Denied,
+            );
+            return GateBegin::Deny(GateDeny::NoCwd);
         }
         // 5) item.get：读规则匹配（spec §4）→ 命中静默放行 + 审计 allowed
         if method == M_ITEM_GET {
@@ -236,27 +243,31 @@ impl Daemon {
                 channel,
                 AuditResult::Denied,
             );
-            return GateBegin::Final(rpc_string(authz_denied(id)));
+            return GateBegin::Deny(GateDeny::NoUi);
         }
         // 7) 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞；challenge
         //    语义同 inject——仅投递桌面订阅者，回传必须原样带回，#78）
         let kind = disclosure_kind(method);
         let request_id = self.open_gate_approval(
-            ApprovalDraft {
-                starter: starter.clone(),
-                project_dir: cwd,
-                command: method.to_string(),
-                keys: vec![item_name.clone().unwrap_or_default()],
-                kind,
-                // #147：read/export 审批不带审批子类型（帧不含 subKind 字段）
-                sub_kind: None,
-                write_action: None,
-                export_meta: if method == M_ITEM_EXPORT {
-                    export_meta
+            {
+                // read/export 审批不带子类型 / 写动作 / 指纹失配信息（帧不含
+                // 相应字段）；export 审批携带数据包规模元信息——九字段克隆
+                // 单点构造（issue #167）。
+                let draft = ApprovalDraft::new(
+                    starter.clone(),
+                    cwd,
+                    method.to_string(),
+                    vec![item_name.clone().unwrap_or_default()],
+                    kind,
+                );
+                if method == M_ITEM_EXPORT {
+                    match export_meta {
+                        Some(m) => draft.with_export_meta(m),
+                        None => draft,
+                    }
                 } else {
-                    None
-                },
-                fingerprint_mismatch: None,
+                    draft
+                }
             },
             GateEntry::approval(GateKind::Disclosure(PendingDisclosure {
                 method: method.to_string(),
@@ -270,8 +281,10 @@ impl Daemon {
 
     /// 阶段③（重取命令锁；spec §5.3）：Allowed → 披露值/数据包 + 审计
     /// allowed（channel=approval 与 inject 同口径）；deny / timeout / 条目
-    /// 被消费（极端竞态）→ `authz.denied` + 审计。等待期间锁定 →
-    /// `session.invalid`（exec 内 vault 为空时保守失败，无法签名审计）。
+    /// 被消费（极端竞态）→ 决策结局拒绝尾 + 审计。等待期间锁定 →
+    /// `session.invalid`（exec 内 vault 为空时保守失败，无法签名审计——
+    /// 执行失败而非 Denied 决策，issue #167 分层）。返回分层结果，字节由
+    /// 编排器经门声明渲染器收线。
     ///
     /// 锁定态一体化（#23）：统一注册表条目 `needs_unlock` 时（issue #148
     /// 起 needs_unlock 条目级承载，issue #150 起解锁材料承载于审批工作区）——
@@ -287,10 +300,10 @@ impl Daemon {
         id: Value,
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
-    ) -> String {
+    ) -> DeferredOutcome {
         // finalize = 审批注册表唯一消费移除点（拍板 #28 候选 2 三拍之三）
         let removed = self.shared.approvals.remove(&request_id);
-        // 条目已被消费（极端竞态）→ 保守拒绝
+        // 条目已被消费（极端竞态）→ 保守拒绝（决策结局）
         let Some(ApprovalEntry {
             needs_unlock,
             workspace,
@@ -298,7 +311,7 @@ impl Daemon {
             ..
         }) = removed
         else {
-            return rpc_string(authz_denied(id));
+            return DeferredOutcome::Denied(GateDeny::Rejected);
         };
         match decision {
             ApprovalDecision::Allowed => {
@@ -327,19 +340,23 @@ impl Daemon {
                         AuditResult::Denied,
                     );
                 }
-                rpc_string(authz_denied(id))
+                DeferredOutcome::Denied(if decision == ApprovalDecision::Timeout {
+                    GateDeny::Timeout
+                } else {
+                    GateDeny::Rejected
+                })
             }
         }
     }
 
     /// 常态路径 finalize（解锁态既有语义；锁定态一体化在等待期整库被解锁
     /// 时也走本路径——#23「finalize 走常态路径」，披露与审计均用共享 vault）。
-    fn disclosure_finalize_normal(&mut self, id: Value, p: PendingDisclosure) -> String {
+    fn disclosure_finalize_normal(&mut self, id: Value, p: PendingDisclosure) -> DeferredOutcome {
         // 等待期间锁定（手动/自动/锁屏/恢复）：vault 与 K_audit 已
         // 擦除，无法披露也无法签名审计 → 保守 `session.invalid`
         // （与 authz_finalize resolve_env 失败同口径；exec 不再 unwrap）
         if !self.vault_peek() {
-            return rpc_string(session_invalid(id));
+            return DeferredOutcome::SessionInvalid;
         }
         let resp = match p.method.as_str() {
             M_ITEM_GET => self.item_get_exec(
@@ -357,7 +374,7 @@ impl Daemon {
                 AuditChannel::Approval,
             ),
         };
-        rpc_string(resp)
+        DeferredOutcome::Executed(rpc_string(resp))
     }
 
     /// 锁定态一体化 finalize（#23）：**临时 vault**（审批工作区，
@@ -371,11 +388,11 @@ impl Daemon {
         id: Value,
         p: PendingDisclosure,
         workspace: Option<ApprovalWorkspace>,
-    ) -> String {
+    ) -> DeferredOutcome {
         // 工作区由 approval_result 以正确主密码解锁后存入；
-        // 缺失（异常路径）→ 保守拒绝
+        // 缺失（异常路径）→ 保守拒绝（执行层，issue #167 分层）
         let Some(workspace) = workspace else {
-            return rpc_string(authz_denied(id));
+            return DeferredOutcome::ExecutionDenied(GateDeny::Rejected);
         };
         let resp = match p.method.as_str() {
             M_ITEM_GET => self.item_get_exec(
@@ -394,7 +411,7 @@ impl Daemon {
             ),
         };
         // 工作区随本函数结束 drop——临时解锁材料即用即毁
-        rpc_string(resp)
+        DeferredOutcome::Executed(rpc_string(resp))
     }
 }
 
@@ -404,47 +421,28 @@ pub(crate) fn authz_denied(id: Value) -> RpcResponse {
 }
 
 // -------------------------------------------------------------------------
-// 流程声明（issue #149：通用 deferred 编排器的注册项）
+// 门声明（issue #167：静态声明取代 DeferredFlow trait 空壳；注册于
+// router.rs 流程注册表）
 // -------------------------------------------------------------------------
 
-/// 值披露门流程声明（issue #149）：预检 / begin / finalize 委托既有门方法，
-/// 锁编排由 router.rs 通用 deferred 编排器统一承担。**不可 RePended**——
-/// 披露 finalize 一步收尾，无二次审批路径。
-pub(crate) struct DisclosureFlow;
-
-impl crate::router::DeferredFlow for DisclosureFlow {
-    fn precheck(&self, daemon: &Daemon, token: Option<&[u8]>) -> bool {
-        daemon.disclosure_precheck(token)
-    }
-
-    fn begin(
-        &self,
-        daemon: &mut Daemon,
-        method: &str,
-        id: Value,
-        params: Value,
-        peer: &PeerInfo,
-    ) -> GateBegin {
-        daemon.disclosure_begin(id, method, params, peer)
-    }
-
-    fn finalize(
-        &self,
-        daemon: &mut Daemon,
-        id: Value,
-        request_id: uuid::Uuid,
-        decision: ApprovalDecision,
-    ) -> DeferredOutcome {
-        DeferredOutcome::Done(daemon.disclosure_finalize(id, request_id, decision))
-    }
-
-    fn rependable(&self) -> bool {
-        false
-    }
-
-    fn unlock_supported(&self) -> bool {
-        true
-    }
+/// 值披露门拒绝响应渲染器（issue #167）：(门 × 锁态/会话态 × reason) →
+/// 字节的**唯一决定点**。本门一切拒绝（含锁态 begin 的 unknown_starter /
+/// no_cwd / no_ui）统一 `authz.denied`(-32017)（spec §5.4 不区分原因防
+/// 探测；-32015 被 bridge 错误码占用）——与 inject 的 `ok{allowed,reason}`
+/// 字节不同，不得跨门压平。渲染器拿 daemon 上下文是防「决策 → 字节」
+/// 全局纯函数的结构钩子（golden 表钉住全部字节，tests/gate_golden.rs）。
+fn render_disclosure_deny(_daemon: &Daemon, id: Value, _deny: GateDeny) -> String {
+    rpc_string(authz_denied(id))
 }
 
-pub(crate) const DISCLOSURE_FLOW: DisclosureFlow = DisclosureFlow;
+/// 值披露门静态声明：**不可 RePended**——披露 finalize 一步收尾，无二次
+/// 审批路径；支持锁态一体化解锁（#23 读通道）。
+pub(crate) static DISCLOSURE_GATE: crate::router::GateDecl = crate::router::GateDecl {
+    name: "disclosure(item.get/item.export)",
+    rependable: false,
+    unlock_supported: true,
+    precheck: Daemon::disclosure_precheck,
+    begin: Daemon::disclosure_begin,
+    finalize: Daemon::disclosure_finalize,
+    render_deny: render_disclosure_deny,
+};

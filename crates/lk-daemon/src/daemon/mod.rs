@@ -31,7 +31,7 @@ use crate::transport::{PeerInfo, PeerOrigin, PushHub};
 
 use self::gate_kit::{
     invalid_params, parse_gate_params, ActingVault, ApprovalDraft, ApprovalEntry,
-    ApprovalWorkspace, DeferredOutcome, GateBegin, GateEntry, GateKind,
+    ApprovalWorkspace, DeferredOutcome, GateBegin, GateDeny, GateEntry, GateKind,
 };
 // 审批注册表类型对外可达（`SharedDaemon.approvals` 的字段类型；方法面
 // crate 内）。

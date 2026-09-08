@@ -14,9 +14,11 @@
 //!
 //! ApprovalDeferred 的锁编排收敛在**通用 deferred 编排器**
 //! （[`run_deferred`]，issue #149）：每个审批延迟方法在流程注册表
-//! （[`gate_flow`]）声明自己的预检 / begin / finalize / 可否 RePended
-//! （[`DeferredFlow`]），编排器只依赖「持命令锁跑一段」与「锁外等一次
-//! 决策」两个原语（[`DeferredSeam`]）；RePended 循环内建（锁定态一体化
+//! （[`gate_flow`]）持有一份**静态门声明**（[`GateDecl`]，issue #167——
+//! precheck/begin/finalize 三拍 + rependable/unlock_supported 两个事实
+//! 布尔 + 拒绝响应渲染器），编排器只依赖「持命令锁跑一段」与「锁外等一次
+//! 决策」两个原语（[`DeferredSeam`]）并按声明执行——fail-closed 次序与
+//! 分层裁决结果的字节收线只此一处承载；RePended 循环内建（锁定态一体化
 //! 指纹失配转二次审批，issue #140），注入裁决不再是编排特例。
 //!
 //! 两条缝共用同一套编排（interface 即测试面，等价由构造保证）：
@@ -33,7 +35,7 @@
 //!
 //! 新增 RPC 方法 = 在 [`strategy_of`] 登记（新方法默认 Inline，两阶段的
 //! 显式声明策略）；新增审批门方法 = [`strategy_of`] 一行 + [`gate_flow`]
-//! 一行 + 门流程模块（各门模块内的流程声明结构体），不抄锁样板。
+//! 一行 + 门模块一份静态门声明（含渲染器），不抄锁样板。
 
 use std::sync::{Arc, Mutex};
 
@@ -41,7 +43,7 @@ use lk_core::authz::ApprovalDecision;
 use lk_core::ipc::*;
 use serde_json::Value;
 
-use crate::daemon::gate_kit::{DeferredOutcome, GateBegin};
+use crate::daemon::gate_kit::{DeferredOutcome, GateBegin, GateDeny};
 use crate::transport::PeerInfo;
 use crate::{extract_token, rpc_string, Daemon, SharedDaemon};
 
@@ -81,59 +83,75 @@ pub fn strategy_of(method: &str) -> ExecutionStrategy {
 }
 
 // -------------------------------------------------------------------------
-// 审批门流程注册表（issue #149：通用 deferred 编排器的声明面）
+// 审批门流程注册表（issue #149：通用 deferred 编排器的声明面；
+// issue #167：trait 空壳 → 静态门声明）
 // -------------------------------------------------------------------------
 
-/// 审批门流程声明（issue #149）：每个审批延迟方法声明自己的预检 / begin /
-/// finalize / 可否 RePended。流程实例为各门模块内的无状态单元结构体
-/// （`AuthzFlow` / `DisclosureFlow` / `RuleFlow` / `WriteFlow`），委托既有
-/// 门方法；锁编排由 [`run_deferred`] 统一承担。
-pub(crate) trait DeferredFlow {
+/// 门声明（issue #167 / 拍板 #28 候选 3；术语见 CONTEXT.md「门声明」）：
+/// 每个裁决门的一份**静态声明**——precheck / begin / finalize 三个 fn 指针、
+/// 「可否二次审批」「可否锁态一体化解锁」两个事实布尔、门名与拒绝响应渲染器。
+/// [`gate_flow`] 返回它；通用裁决骨架 [`run_deferred`] 按声明执行：
+/// fail-closed 次序（预检先于裁决 / 拒绝检查先于登记 / 分层结果字节收线
+/// 唯一 / 声明契约违例 fail-closed）**只此一处**承载。
+///
+/// 布尔是一等数据：release 下被编排器**真消费**（不可 RePended 的门返回
+/// RePended / 不支持一体化解锁的门登记 needs_unlock 条目 → 立即按本门
+/// 拒绝尾 fail-closed，§0「行为保持」唯一例外脚注——按构造不可达的防御
+/// 路径硬化；debug 仍断言）。取代 `DeferredFlow` trait + 四个 `*Flow`
+/// 纯委托空壳形态（issue #149 的过渡结构）。
+pub(crate) struct GateDecl {
+    /// 门名（诊断 / 契约违例消息）。
+    pub(crate) name: &'static str,
+    /// 可否 RePended（二次审批）：仅注入门 true（锁态一体化补指纹裁决
+    /// 失配转二次审批，issue #140）；声明 false 的门 finalize 恒不返回
+    /// [`DeferredOutcome::RePended`]。
+    pub(crate) rependable: bool,
+    /// 是否支持锁态一体化解锁（#67 inject / #23 读通道，issue #150 显式
+    /// 声明）：规则门 / 写门恒 false——产品决策留档（规则门锁态
+    /// `session.invalid` 先行；写门无解锁窗，write-gate.md §5.3 拍板
+    /// 保留）；needs_unlock 条目只能由声明 true 的门登记。
+    pub(crate) unlock_supported: bool,
     /// 阶段①预检（命令锁内）：会话/锁态分流（锁态一体化放行 or
-    /// fail-closed）。失败 → `session.invalid`，不进 begin。
-    fn precheck(&self, daemon: &Daemon, token: Option<&[u8]>) -> bool;
-
-    /// 阶段①（命令锁内）：参数解析 + 裁决分流 + 通道判定；需要审批则
-    /// 登记待审并广播 `authz.request`，返回 Pending（等待移出命令锁，G1）。
-    fn begin(
-        &self,
+    /// fail-closed）。失败 → `session.invalid`（会话前置失败，执行层），
+    /// 不进 begin。
+    pub(crate) precheck: fn(&Daemon, Option<&[u8]>) -> bool,
+    /// 阶段①（命令锁内）：六步裁决（解析 → desktop 豁免 → starter/cwd →
+    /// fail-closed → 规则命中 → 登记广播），返回**分层裁决结果**
+    /// （拒绝 reason / 放行·直返负载 / 未命中需审批）。
+    pub(crate) begin: fn(
         daemon: &mut Daemon,
         method: &str,
         id: Value,
         params: Value,
         peer: &PeerInfo,
-    ) -> GateBegin;
-
-    /// 阶段③（重取命令锁）：收决策收尾；返回 [`DeferredOutcome::RePended`]
-    /// 表示转二次审批（回到锁外等待）。
-    fn finalize(
-        &self,
+    ) -> GateBegin,
+    /// 阶段③（重取命令锁）：收决策收尾，返回**分层结果**（决策结局 vs
+    /// 执行结果两层）。
+    pub(crate) finalize: fn(
         daemon: &mut Daemon,
         id: Value,
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
-    ) -> DeferredOutcome;
-
-    /// 可否 RePended（二次审批）：仅注入裁决声明 true（锁定态一体化补
-    /// 指纹裁决，issue #140）；声明 false 的流程 finalize 恒 Done。
-    fn rependable(&self) -> bool;
-
-    /// 是否支持锁定态一体化解锁（#67 inject / #23 读通道，issue #150 显式
-    /// 声明）：规则门 / 写门恒 false——产品决策留档（规则门锁态
-    /// `session.invalid` 先行；写门无解锁窗，write-gate.md §5.3 拍板保留），
-    /// 不被管道意外改变；注册表完整性测试钉住声明值。
-    fn unlock_supported(&self) -> bool;
+    ) -> DeferredOutcome,
+    /// 拒绝响应渲染器：(门 × 锁态/会话态 × reason) → 响应字节（**唯一
+    /// 决定点**，issue #167）。必须拿 daemon 上下文而非「决策 → 字节」纯
+    /// 函数——同一 reason（no_ui / unknown_starter）跨门跨锁态字节不同
+    /// （解锁态 inject=`ok{no_ui}` vs disclosure=`authz.denied`(-32017)；
+    /// 锁态 headless inject=`session.invalid` 是会话前置失败，不经渲染器
+    /// ——分层见 [`GateBegin`] 类型文档），否则 6 类 spec 钉死的
+    /// fail-closed 码会被压平（§1.6；golden 表测试钉住）。
+    pub(crate) render_deny: fn(daemon: &Daemon, id: Value, deny: GateDeny) -> String,
 }
 
-/// 流程注册表（唯一分发依据）：method → 流程声明。与 [`strategy_of`] 的
+/// 流程注册表（唯一分发依据）：method → 门声明。与 [`strategy_of`] 的
 /// ApprovalDeferred 集合严格同步（完整性测试钉住，见本模块 tests）；
-/// 新增审批门方法 = 此处一行 + 门流程模块。
-pub(crate) fn gate_flow(method: &str) -> Option<&'static dyn DeferredFlow> {
+/// 新增审批门方法 = [`strategy_of`] 一行 + 此处一行 + 门模块一份静态声明。
+pub(crate) fn gate_flow(method: &str) -> Option<&'static GateDecl> {
     match method {
-        M_AUTHZ_EVALUATE => Some(&crate::daemon::authz::AUTHZ_FLOW),
-        M_ITEM_GET | M_ITEM_EXPORT => Some(&crate::daemon::disclosure::DISCLOSURE_FLOW),
-        M_RULE_ADD | M_RULE_REMOVE => Some(&crate::daemon::rules::RULE_FLOW),
-        M_ITEM_PUT | M_ITEM_DELETE => Some(&crate::daemon::write::WRITE_FLOW),
+        M_AUTHZ_EVALUATE => Some(&crate::daemon::authz::AUTHZ_GATE),
+        M_ITEM_GET | M_ITEM_EXPORT => Some(&crate::daemon::disclosure::DISCLOSURE_GATE),
+        M_RULE_ADD | M_RULE_REMOVE => Some(&crate::daemon::rules::RULE_GATE),
+        M_ITEM_PUT | M_ITEM_DELETE => Some(&crate::daemon::write::WRITE_GATE),
         _ => None,
     }
 }
@@ -191,77 +209,154 @@ impl DeferredSeam for DirectSeam<'_> {
     }
 }
 
-/// 通用 deferred 编排器（issue #149）：全部七个审批延迟方法共用同一三阶段
-/// 骨架——①命令锁内空闲超时检查 + 预检 + begin（需要审批则登记待审批 +
-/// 广播 `authz.request`）→ ②命令锁外等待决策（≤超时默认拒绝；等待期间
-/// 其他命令照常服务，G1）→ ③重取命令锁收尾；finalize 返回 RePended 即
-/// 回到②（内建循环；仅 `rependable` 流程可能产生，issue #140）。活动
-/// 时间戳在收尾（Done）段统一刷新，与常规路径语义一致。
+/// 通用 deferred 编排器（issue #149；issue #167 起按静态门声明执行）：
+/// 全部七个审批延迟方法共用同一裁决骨架——①命令锁内空闲超时检查 + 预检 +
+/// begin（需要审批则登记待审批 + 广播 `authz.request`）→ ②命令锁外等待
+/// 决策（≤超时默认拒绝；等待期间其他命令照常服务，G1）→ ③重取命令锁
+/// 收尾；finalize 返回 RePended 即回到②（内建循环；仅 `rependable` 门
+/// 声明可能产生，issue #140）。
+///
+/// fail-closed 次序只此一处承载（issue #167）：
+/// - 预检失败 → `session.invalid`（会话前置失败，先于任何裁决，不进 begin）；
+/// - begin 裁决拒绝 → 门声明渲染器在**同一锁段**内渲染字节（锁态/会话态
+///   与裁决时刻一致——渲染唯一决定点，六类 spec 钉死的 fail-closed 码不
+///   跨门压平）；
+/// - 一体化解锁声明一致性：needs_unlock 条目只能由声明支持的门登记，
+///   违例 release fail-closed（布尔一等数据）；
+/// - finalize 分层结果的字节收线唯一在 [`settle_outcome`]（决策结局与执行
+///   层保守拒绝走渲染器；`session.invalid` = 执行失败，跨门统一）；
+/// - RePended 契约：声明不可 RePended 却返回 → release 立即 fail-closed
+///   （§0「行为保持」唯一例外脚注）。
+///
+/// 活动时间戳在收尾终局刷新（RePended 不刷），与常规路径语义一致。
 pub(crate) fn run_deferred<S: DeferredSeam>(
     seam: &mut S,
-    flow: &dyn DeferredFlow,
+    gate: &GateDecl,
     method: &str,
     id: Value,
     token: Option<Vec<u8>>,
     params: Value,
     peer: &PeerInfo,
 ) -> String {
-    // ① 命令锁内：预检失败 → session.invalid（与既有逐门编排一致）
+    // ① 命令锁内：预检 + begin（裁决拒绝同锁段渲染）
     let begin = seam.locked(|g| {
         g.auto_lock_if_idle();
-        if !flow.precheck(g, token.as_deref()) {
-            None
-        } else {
-            let begin = flow.begin(g, method, id.clone(), params, peer);
-            // 一体化解锁声明一致性（issue #150，debug 钉）：needs_unlock 条目
-            // 只能由声明支持一体化解锁的门登记（注册表完整性测试亦钉住声明）。
-            if let GateBegin::Pending { request_id } = &begin {
-                debug_assert!(
-                    !g.pending_needs_unlock(*request_id) || flow.unlock_supported(),
-                    "{method} 流程声明不支持一体化解锁却登记 needs_unlock 条目"
-                );
-            }
-            Some(begin)
+        if !(gate.precheck)(g, token.as_deref()) {
+            return None;
         }
+        let begin = (gate.begin)(g, method, id.clone(), params, peer);
+        Some(match begin {
+            GateBegin::Deny(deny) => GateBegin::Final((gate.render_deny)(g, id.clone(), deny)),
+            GateBegin::Pending { request_id } => {
+                // 一体化解锁声明一致性（布尔一等数据，release 真消费）：
+                // needs_unlock 条目只能由声明支持一体化解锁的门登记——
+                // 违例即 fail-closed（消费误登记条目 + 本门拒绝尾，不进入
+                // 等待；按构造不可达的防御硬化，§0 例外脚注）。debug 仍断言。
+                let violated = g.pending_needs_unlock(request_id) && !gate.unlock_supported;
+                debug_assert!(
+                    !violated,
+                    "{} 声明不支持一体化解锁却登记 needs_unlock 条目",
+                    gate.name
+                );
+                if violated {
+                    unlock_violation_fail_closed(g, gate, id.clone(), request_id)
+                } else {
+                    GateBegin::Pending { request_id }
+                }
+            }
+            passthrough => passthrough,
+        })
     });
     let Some(begin) = begin else {
         return rpc_string(session_invalid(id));
     };
     match begin {
         GateBegin::Final(resp) => resp,
+        // begin 拒绝已在①锁段内经门声明渲染器折为 Final（字节唯一决定点）；
+        // 此臂按构造不可达。
+        GateBegin::Deny(_) => unreachable!("begin 拒绝已在锁段①内渲染为 Final"),
         GateBegin::Pending { request_id } => {
             let mut request_id = request_id;
             loop {
                 // ② 锁外等待（不持命令锁；vault/审批注册表短锁除外，G1）
                 let decision = seam.await_decision(request_id);
-                // ③ 重取命令锁收尾
-                let outcome =
-                    seam.locked(
-                        |g| match flow.finalize(g, id.clone(), request_id, decision) {
-                            DeferredOutcome::Done(r) => {
-                                g.touch_activity();
-                                DeferredOutcome::Done(r)
-                            }
-                            other => other,
-                        },
-                    );
-                match outcome {
-                    DeferredOutcome::Done(r) => break r,
-                    DeferredOutcome::RePended { request_id: next } => {
-                        // 可否二次审批由流程声明承载（issue #149）：声明不可
-                        // RePended 的流程返回 RePended 属编排契约违反（debug
-                        // 构建即断言失败；注册表完整性测试亦钉住 per-method
-                        // 声明）。release 下循环照常内建（不可达路径）。
+                // ③ 重取命令锁收尾（分层结果 → 字节单点收线）
+                let step = seam.locked(|g| {
+                    let raw = (gate.finalize)(g, id.clone(), request_id, decision);
+                    // RePended 契约（debug 断言半边；release 语义在
+                    // settle_outcome 的违例折叠）。
+                    if matches!(raw, DeferredOutcome::RePended { .. }) && !gate.rependable {
                         debug_assert!(
-                            flow.rependable(),
-                            "{method} 流程声明不可 RePended 却返回 RePended"
+                            gate.rependable,
+                            "{} 声明不可 RePended 却返回 RePended（release 已 fail-closed）",
+                            gate.name
                         );
-                        request_id = next;
                     }
+                    settle_outcome(g, gate, id.clone(), raw)
+                });
+                match step {
+                    Ok(resp) => break resp,
+                    Err(next) => request_id = next,
                 }
             }
         }
     }
+}
+
+/// finalize 分层结果的字节收线（issue #167 **唯一渲染点**；编排器与直驱
+/// finalize 的测试共用）：决策结局 [`DeferredOutcome::Denied`] 与执行层保守
+/// 拒绝 [`DeferredOutcome::ExecutionDenied`] 都走门声明渲染器（同一 reason
+/// 跨门字节不同，不压平）；执行失败 [`DeferredOutcome::SessionInvalid`] 跨门
+/// 统一 `session.invalid`；终局刷新活动时间戳（与常规路径语义一致）。
+///
+/// RePended 契约违例的 **release 语义**（§0「行为保持」唯一例外脚注）：
+/// 声明不可 RePended 的门返回 RePended → 立即 fail-closed——不等待无主的
+/// 二次审批，按本门拒绝尾收线（按构造不可达的防御路径硬化，裁决结果不变）。
+/// debug 断言半边在 [`run_deferred`]（本函数保持纯 release 语义，供测试
+/// 直驱钉字节）。返回 `Err(next_request_id)` 表示正常转二次审批（回到
+/// 锁外等待）。
+pub(crate) fn settle_outcome(
+    g: &mut Daemon,
+    gate: &GateDecl,
+    id: Value,
+    raw: DeferredOutcome,
+) -> std::result::Result<String, uuid::Uuid> {
+    // RePended 契约违例（不可达防御路径）：折为本门拒绝尾
+    let raw = if matches!(raw, DeferredOutcome::RePended { .. }) && !gate.rependable {
+        DeferredOutcome::Denied(GateDeny::Rejected)
+    } else {
+        raw
+    };
+    match raw {
+        DeferredOutcome::RePended { request_id: next } => Err(next),
+        DeferredOutcome::Executed(resp) => {
+            g.touch_activity();
+            Ok(resp)
+        }
+        DeferredOutcome::SessionInvalid => {
+            g.touch_activity();
+            Ok(rpc_string(session_invalid(id)))
+        }
+        DeferredOutcome::ExecutionDenied(deny) | DeferredOutcome::Denied(deny) => {
+            g.touch_activity();
+            Ok((gate.render_deny)(g, id, deny))
+        }
+    }
+}
+
+/// 一体化解锁声明违例的 release fail-closed 收线（§0 例外脚注的 release
+/// 半边；debug 断言在 [`run_deferred`]，本函数保持纯 release 语义供测试
+/// 直驱）：消费误登记的待审批条目（迟到的 `approval.result` 按 unknown
+/// 拒绝写 → `accepted=false` + 失败提交审计，不残留无主弹窗空等超时）+
+/// 本门拒绝尾，不进入等待。
+fn unlock_violation_fail_closed(
+    g: &mut Daemon,
+    gate: &GateDecl,
+    id: Value,
+    request_id: uuid::Uuid,
+) -> GateBegin {
+    g.consume_gate_entry(request_id);
+    GateBegin::Final((gate.render_deny)(g, id, GateDeny::Rejected))
 }
 
 /// 主缝：按策略编排命令锁，处理一行 JSON-RPC 请求，返回一行响应。
@@ -282,12 +377,12 @@ pub fn route(
         Some(ExecutionStrategy::ApprovalDeferred) => {
             let req: RpcRequest = serde_json::from_str(line).expect("route 已按策略分派");
             // 策略表与流程注册表同步由完整性测试钉住；生产不可达 None。
-            let flow = gate_flow(&req.method).expect("策略表与流程注册表同步");
+            let gate = gate_flow(&req.method).expect("策略表与流程注册表同步");
             let token = extract_token(&req.params);
             let mut seam = RouteSeam { state, shared };
             run_deferred(
                 &mut seam,
-                flow,
+                gate,
                 &req.method,
                 req.id.clone(),
                 token,
@@ -342,101 +437,157 @@ mod tests {
     use std::collections::VecDeque;
 
     // ---------------------------------------------------------------------
-    // 编排器单测（issue #149）：MockFlow / MockSeam 驱动 run_deferred，
-    // 钉三阶段骨架与内建 RePended 循环；真实流程由各门集成测试覆盖。
+    // 编排器单测（issue #149 / #167）：mock 门声明 + MockSeam 驱动
+    // run_deferred，钉三阶段骨架、内建 RePended 循环、begin 拒绝渲染与
+    // 两条声明契约违例的 release fail-closed 路径；真实门由各门集成测试
+    // 与响应字节 golden 表（tests/gate_golden.rs）覆盖。
     // ---------------------------------------------------------------------
 
-    /// Mock 流程：预检开关 + begin 脚本 + finalize 脚本；调用计数收在
-    /// 实例字段（并行测试下进程级静态会互相污染）。
-    struct MockFlow {
+    /// mock 门状态：fn 指针无捕获 → 只能进程级；四个编排器测试经
+    /// [`MOCK_LOCK`] 串行防交叉污染（取锁后先覆写全量状态，用毕即弃）。
+    struct MockGateState {
         precheck_ok: bool,
-        begin: GateBegin,
-        /// finalize 脚本：逐次弹出（耗尽后恒 Done("{}")）。
-        finalize_script: Mutex<VecDeque<DeferredOutcome>>,
-        precheck_calls: std::sync::atomic::AtomicUsize,
-        begin_calls: std::sync::atomic::AtomicUsize,
-        finalize_calls: std::sync::atomic::AtomicUsize,
+        /// begin 脚本（一次性取出；重复调用即脚本耗尽）。
+        begin: Option<GateBegin>,
+        /// begin 返回 Pending 时是否向真实审批注册表登记 needs_unlock 条目
+        /// （驱动 unlock_supported 违例路径）。
+        register_needs_unlock: bool,
+        /// finalize 脚本：逐次弹出（耗尽后恒 Executed("{}")）。
+        finalize_script: VecDeque<DeferredOutcome>,
+        precheck_calls: usize,
+        begin_calls: usize,
+        finalize_calls: usize,
     }
 
-    impl MockFlow {
-        fn new(
-            precheck_ok: bool,
-            begin: GateBegin,
-            finalize_script: VecDeque<DeferredOutcome>,
-        ) -> Self {
-            Self {
-                precheck_ok,
-                begin,
-                finalize_script: Mutex::new(finalize_script),
-                precheck_calls: std::sync::atomic::AtomicUsize::new(0),
-                begin_calls: std::sync::atomic::AtomicUsize::new(0),
-                finalize_calls: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn count(v: &std::sync::atomic::AtomicUsize) -> usize {
-            v.load(std::sync::atomic::Ordering::SeqCst)
-        }
+    impl MockGateState {
+        const EMPTY: MockGateState = MockGateState {
+            precheck_ok: true,
+            begin: None,
+            register_needs_unlock: false,
+            finalize_script: VecDeque::new(),
+            precheck_calls: 0,
+            begin_calls: 0,
+            finalize_calls: 0,
+        };
     }
 
-    impl DeferredFlow for MockFlow {
-        fn precheck(&self, _daemon: &Daemon, _token: Option<&[u8]>) -> bool {
-            self.precheck_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.precheck_ok
-        }
+    static MOCK: Mutex<MockGateState> = Mutex::new(MockGateState::EMPTY);
 
-        fn begin(
-            &self,
-            _daemon: &mut Daemon,
-            _method: &str,
-            _id: Value,
-            _params: Value,
-            _peer: &PeerInfo,
-        ) -> GateBegin {
-            self.begin_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match &self.begin {
-                GateBegin::Final(resp) => GateBegin::Final(resp.clone()),
-                GateBegin::Pending { request_id } => GateBegin::Pending {
-                    request_id: *request_id,
+    /// 编排器 mock 测试串行锁（fn 指针无捕获 → 状态进程级，并行会互染）。
+    static MOCK_LOCK: Mutex<()> = Mutex::new(());
+
+    fn mock_precheck(_daemon: &Daemon, _token: Option<&[u8]>) -> bool {
+        let mut m = MOCK.lock().unwrap();
+        m.precheck_calls += 1;
+        m.precheck_ok
+    }
+
+    fn mock_begin(
+        daemon: &mut Daemon,
+        _method: &str,
+        _id: Value,
+        _params: Value,
+        _peer: &PeerInfo,
+    ) -> GateBegin {
+        let mut m = MOCK.lock().unwrap();
+        m.begin_calls += 1;
+        let begin = m.begin.take().expect("begin 脚本缺失");
+        if m.register_needs_unlock {
+            // 向真实审批注册表登记 needs_unlock 条目（驱动违例路径）
+            let GateBegin::Pending { request_id } = begin else {
+                panic!("register_needs_unlock 只配 Pending begin")
+            };
+            let kind = crate::daemon::gate_kit::GateKind::Disclosure(
+                crate::daemon::disclosure::PendingDisclosure {
+                    method: M_ITEM_GET.to_string(),
+                    item_id: uuid::Uuid::new_v4(),
+                    item_name: Some("item".to_string()),
+                    starter: "test".to_string(),
                 },
-            }
+            );
+            daemon.shared().approvals.insert(
+                request_id,
+                crate::daemon::gate_kit::GateEntry::unified_unlock(kind),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                "mock-challenge".into(),
+            );
+            return GateBegin::Pending { request_id };
         }
-
-        fn finalize(
-            &self,
-            _daemon: &mut Daemon,
-            _id: Value,
-            _request_id: uuid::Uuid,
-            _decision: ApprovalDecision,
-        ) -> DeferredOutcome {
-            self.finalize_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.finalize_script
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(DeferredOutcome::Done("{}".into()))
-        }
-
-        fn rependable(&self) -> bool {
-            true
-        }
-
-        fn unlock_supported(&self) -> bool {
-            true
-        }
+        begin
     }
 
-    /// Mock 缝：锁段计数 + 预编程决策队列（耗尽后恒 Denied）；持有一个
-    /// 真实 Daemon（tempdir 与实例同生命周期）供编排器触达
-    /// auto_lock_if_idle / touch_activity。
+    fn mock_finalize(
+        _daemon: &mut Daemon,
+        _id: Value,
+        _request_id: uuid::Uuid,
+        _decision: ApprovalDecision,
+    ) -> DeferredOutcome {
+        let mut m = MOCK.lock().unwrap();
+        m.finalize_calls += 1;
+        m.finalize_script
+            .pop_front()
+            .unwrap_or(DeferredOutcome::Executed("{}".into()))
+    }
+
+    /// mock 渲染器：字节含 reason（钉「渲染经门声明而非全局决策→字节」）。
+    fn mock_render_deny(_daemon: &Daemon, _id: Value, deny: GateDeny) -> String {
+        format!(r#"{{"mockDeny":"{}"}}"#, deny.as_str())
+    }
+
+    /// 常规 mock 门（两布尔均 true）。
+    static MOCK_GATE: GateDecl = GateDecl {
+        name: "mock",
+        rependable: true,
+        unlock_supported: true,
+        precheck: mock_precheck,
+        begin: mock_begin,
+        finalize: mock_finalize,
+        render_deny: mock_render_deny,
+    };
+
+    /// 不可 RePended 的 mock 门（驱动 RePended 契约违例 fail-closed 路径）。
+    static MOCK_NONREPEND_GATE: GateDecl = GateDecl {
+        name: "mock-nonrepend",
+        rependable: false,
+        unlock_supported: true,
+        precheck: mock_precheck,
+        begin: mock_begin,
+        finalize: mock_finalize,
+        render_deny: mock_render_deny,
+    };
+
+    /// 不支持一体化解锁的 mock 门（驱动 needs_unlock 声明违例 fail-closed
+    /// 路径）。
+    static MOCK_NO_UNLOCK_GATE: GateDecl = GateDecl {
+        name: "mock-no-unlock",
+        rependable: true,
+        unlock_supported: false,
+        precheck: mock_precheck,
+        begin: mock_begin,
+        finalize: mock_finalize,
+        render_deny: mock_render_deny,
+    };
+
+    /// 装配 mock 状态（须持 [`MOCK_LOCK`] 串行）。
+    fn install_mock(state: MockGateState) {
+        *MOCK.lock().unwrap() = state;
+    }
+
+    /// 读取调用计数（begin / finalize / precheck）。
+    fn mock_calls() -> (usize, usize, usize) {
+        let m = MOCK.lock().unwrap();
+        (m.begin_calls, m.finalize_calls, m.precheck_calls)
+    }
+
+    /// Mock 缝：锁段计数 + 等待计数 + 预编程决策队列（耗尽后恒 Denied）；
+    /// 持有一个真实 Daemon（tempdir 与实例同生命周期）供编排器触达
+    /// auto_lock_if_idle / touch_activity / 审批注册表。
     struct MockSeam {
         _dir: tempfile::TempDir,
         daemon: Daemon,
         decisions: Mutex<VecDeque<ApprovalDecision>>,
         lock_segments: std::sync::atomic::AtomicUsize,
+        awaits: std::sync::atomic::AtomicUsize,
     }
 
     impl MockSeam {
@@ -448,11 +599,16 @@ mod tests {
                 daemon,
                 decisions: Mutex::new(decisions),
                 lock_segments: std::sync::atomic::AtomicUsize::new(0),
+                awaits: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn lock_segments(&self) -> usize {
             self.lock_segments.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn awaits(&self) -> usize {
+            self.awaits.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -464,6 +620,8 @@ mod tests {
         }
 
         fn await_decision(&self, _request_id: uuid::Uuid) -> ApprovalDecision {
+            self.awaits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.decisions
                 .lock()
                 .unwrap()
@@ -479,11 +637,16 @@ mod tests {
     /// 预检失败 → session.invalid：begin / finalize 均不执行。
     #[test]
     fn orchestrator_fails_closed_on_precheck() {
-        let flow = MockFlow::new(false, GateBegin::Final("begin".into()), VecDeque::new());
+        let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        install_mock(MockGateState {
+            precheck_ok: false,
+            begin: Some(GateBegin::Final("begin".into())),
+            ..MockGateState::EMPTY
+        });
         let mut seam = MockSeam::new(VecDeque::new());
         let resp = run_deferred(
             &mut seam,
-            &flow,
+            &MOCK_GATE,
             M_AUTHZ_EVALUATE,
             json!(7),
             None,
@@ -492,22 +655,24 @@ mod tests {
         );
         let parsed: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(parsed["error"]["code"], json!(ERR_SESSION_INVALID));
-        assert_eq!(MockFlow::count(&flow.begin_calls), 0);
-        assert_eq!(MockFlow::count(&flow.finalize_calls), 0);
+        let (begin_calls, finalize_calls, precheck_calls) = mock_calls();
+        assert_eq!(begin_calls, 0);
+        assert_eq!(finalize_calls, 0);
+        assert_eq!(precheck_calls, 1);
     }
 
-    /// begin 直返 Final → 响应透传，finalize 不执行。
+    /// begin 直返 Final（放行负载/协议直返）→ 响应透传，finalize 不执行。
     #[test]
     fn orchestrator_passthrough_final() {
-        let flow = MockFlow::new(
-            true,
-            GateBegin::Final(r#"{"ok":true}"#.into()),
-            VecDeque::new(),
-        );
+        let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        install_mock(MockGateState {
+            begin: Some(GateBegin::Final(r#"{"ok":true}"#.into())),
+            ..MockGateState::EMPTY
+        });
         let mut seam = MockSeam::new(VecDeque::new());
         let resp = run_deferred(
             &mut seam,
-            &flow,
+            &MOCK_GATE,
             M_ITEM_GET,
             json!(1),
             None,
@@ -515,23 +680,54 @@ mod tests {
             &mock_peer(),
         );
         assert_eq!(resp, r#"{"ok":true}"#);
-        assert_eq!(MockFlow::count(&flow.finalize_calls), 0);
+        let (_, finalize_calls, _) = mock_calls();
+        assert_eq!(finalize_calls, 0);
     }
 
-    /// Pending → 锁外等一次决策 → 锁内收尾 Done：三阶段各一段锁。
+    /// begin 裁决拒绝 → 门声明渲染器渲染字节（同一锁段内，不进等待，
+    /// finalize 不执行）——渲染唯一决定点，字节不在门 begin 手写。
+    #[test]
+    fn orchestrator_renders_begin_deny_via_gate_renderer() {
+        let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        install_mock(MockGateState {
+            begin: Some(GateBegin::Deny(GateDeny::NoUi)),
+            ..MockGateState::EMPTY
+        });
+        let mut seam = MockSeam::new(VecDeque::new());
+        let resp = run_deferred(
+            &mut seam,
+            &MOCK_GATE,
+            M_ITEM_GET,
+            json!(1),
+            None,
+            json!({}),
+            &mock_peer(),
+        );
+        assert_eq!(resp, r#"{"mockDeny":"no_ui"}"#);
+        let (begin_calls, finalize_calls, _) = mock_calls();
+        assert_eq!(begin_calls, 1);
+        assert_eq!(finalize_calls, 0);
+        assert_eq!(seam.awaits(), 0, "begin 拒绝不进审批等待");
+        assert_eq!(seam.lock_segments(), 1, "渲染收敛在 begin 同一锁段");
+    }
+
+    /// Pending → 锁外等一次决策 → 锁内收尾 Executed：三阶段各一段锁。
     #[test]
     fn orchestrator_pending_done_roundtrip() {
-        let flow = MockFlow::new(
-            true,
-            GateBegin::Pending {
+        let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        install_mock(MockGateState {
+            begin: Some(GateBegin::Pending {
                 request_id: uuid::Uuid::new_v4(),
-            },
-            VecDeque::from([DeferredOutcome::Done(r#"{"allowed":true}"#.into())]),
-        );
+            }),
+            finalize_script: VecDeque::from([DeferredOutcome::Executed(
+                r#"{"allowed":true}"#.into(),
+            )]),
+            ..MockGateState::EMPTY
+        });
         let mut seam = MockSeam::new(VecDeque::from([ApprovalDecision::Allowed]));
         let resp = run_deferred(
             &mut seam,
-            &flow,
+            &MOCK_GATE,
             M_ITEM_EXPORT,
             json!(1),
             None,
@@ -541,31 +737,33 @@ mod tests {
         assert_eq!(resp, r#"{"allowed":true}"#);
         // 段①（预检+begin）+ 段③（finalize）= 两段锁；等待在锁外。
         assert_eq!(seam.lock_segments(), 2);
-        assert_eq!(MockFlow::count(&flow.finalize_calls), 1);
+        let (_, finalize_calls, _) = mock_calls();
+        assert_eq!(finalize_calls, 1);
     }
 
     /// RePended 循环内建（issue #149 / #140）：finalize 转二次审批 → 回到
     /// 锁外等待 → 二次决策落地后收尾；循环次数由 finalize 脚本承载。
     #[test]
     fn orchestrator_builtin_repend_loop() {
+        let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let next = uuid::Uuid::new_v4();
-        let flow = MockFlow::new(
-            true,
-            GateBegin::Pending {
+        install_mock(MockGateState {
+            begin: Some(GateBegin::Pending {
                 request_id: uuid::Uuid::new_v4(),
-            },
-            VecDeque::from([
+            }),
+            finalize_script: VecDeque::from([
                 DeferredOutcome::RePended { request_id: next },
-                DeferredOutcome::Done(r#"{"allowed":false}"#.into()),
+                DeferredOutcome::Executed(r#"{"allowed":false}"#.into()),
             ]),
-        );
+            ..MockGateState::EMPTY
+        });
         let mut seam = MockSeam::new(VecDeque::from([
             ApprovalDecision::Allowed, // 首次决策 → finalize 转 RePended
-            ApprovalDecision::Allowed, // 二次决策 → finalize Done
+            ApprovalDecision::Allowed, // 二次决策 → finalize Executed
         ]));
         let resp = run_deferred(
             &mut seam,
-            &flow,
+            &MOCK_GATE,
             M_AUTHZ_EVALUATE,
             json!(1),
             None,
@@ -573,15 +771,149 @@ mod tests {
             &mock_peer(),
         );
         assert_eq!(resp, r#"{"allowed":false}"#);
-        assert_eq!(MockFlow::count(&flow.finalize_calls), 2);
+        let (_, finalize_calls, _) = mock_calls();
+        assert_eq!(finalize_calls, 2);
         assert_eq!(seam.lock_segments(), 3);
+        assert_eq!(seam.awaits(), 2);
     }
 
-    /// 注册表完整性（issue #149 验收 1 + issue #150）：策略表
-    /// ApprovalDeferred 集合与流程注册表严格同步——每个审批延迟方法都有
-    /// 流程声明（可 RePended 仅注入门；一体化解锁支持 = 注入门 + 读通道，
-    /// 规则门/写门显式声明 false），每个有流程声明的方法都在策略表内；
-    /// Inline / OutsideLock 方法无流程声明。
+    /// RePended 契约违例的 **release 语义**（issue #167 / §0 唯一「行为
+    /// 保持」例外脚注；debug 断言半边由 should_panic 测试钉住）：声明不可
+    /// RePended 的门 finalize 返回 RePended → settle_outcome 折为本门拒绝
+    /// 尾——不等待无主的二次审批。
+    #[test]
+    fn settle_outcome_fails_closed_on_repend_violation() {
+        let mut seam = MockSeam::new(VecDeque::new());
+        let resp = settle_outcome(
+            &mut seam.daemon,
+            &MOCK_NONREPEND_GATE,
+            json!(1),
+            DeferredOutcome::RePended {
+                request_id: uuid::Uuid::new_v4(),
+            },
+        )
+        .expect("违例不得转二次审批");
+        assert_eq!(
+            resp, r#"{"mockDeny":"rejected"}"#,
+            "违例按本门拒绝尾收线（渲染器字节）"
+        );
+        // 正常路径回归：可 RePended 声明的 RePended 原样转出
+        let next = uuid::Uuid::new_v4();
+        let out = settle_outcome(
+            &mut seam.daemon,
+            &MOCK_GATE,
+            json!(1),
+            DeferredOutcome::RePended { request_id: next },
+        )
+        .expect_err("可 RePended 声明正常转二次审批");
+        assert_eq!(out, next);
+    }
+
+    /// 一体化解锁声明违例的 **release 语义**（issue #167，布尔一等数据；
+    /// debug 断言半边由 should_panic 测试钉住）：误登记的 needs_unlock 条目
+    /// 被消费（迟到的 approval.result 按 unknown 拒绝写）+ 本门拒绝尾。
+    #[test]
+    fn unlock_violation_fail_closed_consumes_entry() {
+        let mut seam = MockSeam::new(VecDeque::new());
+        // 向真实审批注册表登记 needs_unlock 条目（模拟误登记）
+        let request_id = uuid::Uuid::new_v4();
+        {
+            let kind = crate::daemon::gate_kit::GateKind::Disclosure(
+                crate::daemon::disclosure::PendingDisclosure {
+                    method: M_ITEM_GET.to_string(),
+                    item_id: uuid::Uuid::new_v4(),
+                    item_name: Some("item".to_string()),
+                    starter: "test".to_string(),
+                },
+            );
+            seam.daemon.shared().approvals.insert(
+                request_id,
+                crate::daemon::gate_kit::GateEntry::unified_unlock(kind),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                "mock-challenge".into(),
+            );
+        }
+        assert_eq!(seam.daemon.shared().approvals.pending_count(), 1);
+        let begin = unlock_violation_fail_closed(
+            &mut seam.daemon,
+            &MOCK_NO_UNLOCK_GATE,
+            json!(1),
+            request_id,
+        );
+        match begin {
+            GateBegin::Final(resp) => assert_eq!(
+                resp, r#"{"mockDeny":"rejected"}"#,
+                "违例按本门拒绝尾收线（渲染器字节）"
+            ),
+            other => panic!("违例必须收线为 Final：{other:?}"),
+        }
+        assert_eq!(
+            seam.daemon.shared().approvals.pending_count(),
+            0,
+            "误登记条目被消费（不残留无主弹窗）"
+        );
+    }
+
+    /// RePended 契约违例的 **debug 断言半边**（§0 例外脚注「debug 仍断言」
+    /// 的字面钉子）：debug 构建下编排器对违例即时断言（release 走
+    /// settle_outcome 的 fail-closed 折叠）。
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "声明不可 RePended 却返回 RePended")]
+    #[test]
+    fn orchestrator_asserts_repend_violation_in_debug() {
+        let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        install_mock(MockGateState {
+            begin: Some(GateBegin::Pending {
+                request_id: uuid::Uuid::new_v4(),
+            }),
+            finalize_script: VecDeque::from([DeferredOutcome::RePended {
+                request_id: uuid::Uuid::new_v4(),
+            }]),
+            ..MockGateState::EMPTY
+        });
+        let mut seam = MockSeam::new(VecDeque::from([ApprovalDecision::Allowed]));
+        let _ = run_deferred(
+            &mut seam,
+            &MOCK_NONREPEND_GATE,
+            M_ITEM_GET,
+            json!(1),
+            None,
+            json!({}),
+            &mock_peer(),
+        );
+    }
+
+    /// 一体化解锁声明违例的 **debug 断言半边**（「debug 仍断言」的字面钉子）。
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "声明不支持一体化解锁却登记 needs_unlock 条目")]
+    #[test]
+    fn orchestrator_asserts_unlock_violation_in_debug() {
+        let _guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        install_mock(MockGateState {
+            begin: Some(GateBegin::Pending {
+                request_id: uuid::Uuid::new_v4(),
+            }),
+            register_needs_unlock: true,
+            ..MockGateState::EMPTY
+        });
+        let mut seam = MockSeam::new(VecDeque::new());
+        let _ = run_deferred(
+            &mut seam,
+            &MOCK_NO_UNLOCK_GATE,
+            M_ITEM_GET,
+            json!(1),
+            None,
+            json!({}),
+            &mock_peer(),
+        );
+    }
+
+    /// 注册表完整性（issue #149 验收 1 + issue #150/#167）：策略表
+    /// ApprovalDeferred 集合与门声明注册表严格同步——每个审批延迟方法都有
+    /// 门声明（可 RePended 仅注入门；一体化解锁支持 = 注入门 + 读通道，
+    /// 规则门/写门显式声明 false），每个有门声明的方法都在策略表内；
+    /// Inline / OutsideLock 方法无门声明。响应字节的逐门钉住另见
+    /// tests/gate_golden.rs（本测试只钉声明布尔，不钉字节）。
     #[test]
     fn flow_registry_matches_strategy_table() {
         let deferred = [
@@ -599,18 +931,22 @@ mod tests {
                 ExecutionStrategy::ApprovalDeferred,
                 "{m} 应为 ApprovalDeferred"
             );
-            let flow = gate_flow(m).unwrap_or_else(|| panic!("{m} 缺流程声明"));
+            let gate = gate_flow(m).unwrap_or_else(|| panic!("{m} 缺门声明"));
             // RePended 声明：仅注入门（锁定态一体化补指纹裁决，#140）。
-            assert_eq!(flow.rependable(), m == M_AUTHZ_EVALUATE);
+            assert_eq!(
+                gate.rependable,
+                m == M_AUTHZ_EVALUATE,
+                "{m} RePended 声明不符"
+            );
             // 一体化解锁声明（issue #150）：注入门（#67）+ 读通道（#23）
             // 支持；规则门/写门显式无需（产品决策留档）。
             assert_eq!(
-                flow.unlock_supported(),
+                gate.unlock_supported,
                 matches!(m, M_AUTHZ_EVALUATE | M_ITEM_GET | M_ITEM_EXPORT),
                 "{m} 一体化解锁声明不符"
             );
         }
-        // 策略表外的方法无流程声明（新增审批门 = 策略表一行 + 注册表一行）。
+        // 策略表外的方法无门声明（新增审批门 = 策略表一行 + 注册表一行）。
         for m in [M_SYNC_TRIGGER, M_VAULT_STATUS, M_ITEM_LIST, M_RULE_LIST] {
             assert_ne!(strategy_of(m), ExecutionStrategy::ApprovalDeferred);
             assert!(gate_flow(m).is_none());

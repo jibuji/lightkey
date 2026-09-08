@@ -69,7 +69,9 @@ impl Daemon {
         self.vault_peek() && self.sessions.validate(token.unwrap_or(&[]))
     }
 
-    /// 阶段①（命令锁内，非阻塞；write-gate.md §5.3）：
+    /// 阶段①（命令锁内，非阻塞；write-gate.md §5.3）。返回**分层裁决
+    /// 结果**（issue #167）：拒绝以 reason 承载（字节由门声明渲染器唯一
+    /// 渲染——本门恒 `authz.denied`），放行/协议直返为已渲染负载。
     ///
     /// 1. 参数解析（无效参数原错误直返，与既有 Inline 语义一致）；
     /// 2. 解析目标条目名（update/delete 按 id；不存在 → `item.not_found`
@@ -82,8 +84,8 @@ impl Daemon {
     ///    challenge 防伪 #78）+ 广播 `authz.request`。
     pub(crate) fn write_begin(
         &mut self,
-        id: Value,
         method: &str,
+        id: Value,
         params: Value,
         peer: &PeerInfo,
     ) -> GateBegin {
@@ -133,7 +135,7 @@ impl Daemon {
         let cwd = lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
         let channel = peer_channel(peer);
         let command_summary = write_command_summary(&parsed.op, &target);
-        if starter == UNKNOWN_STARTER || cwd.is_empty() {
+        if starter == UNKNOWN_STARTER {
             self.audit_gate(
                 ActingVault::Shared,
                 &starter,
@@ -142,7 +144,18 @@ impl Daemon {
                 channel,
                 AuditResult::Denied,
             );
-            return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
+            return GateBegin::Deny(GateDeny::UnknownStarter);
+        }
+        if cwd.is_empty() {
+            self.audit_gate(
+                ActingVault::Shared,
+                &starter,
+                &target,
+                &command_summary,
+                channel,
+                AuditResult::Denied,
+            );
+            return GateBegin::Deny(GateDeny::NoCwd);
         }
         // 5) 写规则匹配（§4 双向名约束；delete 跳过——恒弹窗）
         if let Some(action) = write_action(&parsed.op) {
@@ -183,7 +196,7 @@ impl Daemon {
                 channel,
                 AuditResult::Denied,
             );
-            return GateBegin::Final(rpc_string(super::disclosure::authz_denied(id)));
+            return GateBegin::Deny(GateDeny::NoUi);
         }
         // 7) 登记待审批 + 广播 `authz.request`（命令锁内、非阻塞）：kind=
         //    write、command=`item.put/delete <name>`（展示用）、keys=单元素
@@ -201,21 +214,25 @@ impl Daemon {
             target
         );
         let request_id = self.open_gate_approval(
-            ApprovalDraft {
-                starter: starter.clone(),
-                project_dir: cwd,
-                command: display_command,
-                keys: vec![target.clone()],
-                kind: lk_core::authz::ApprovalKind::Write,
-                // #147：审批帧携带门事实——写门子类型随帧回带 subKind
-                //（item.put / item.delete；取代前端 command 前缀匹配启发式）
-                sub_kind: Some(match parsed.op {
+            {
+                // 写审批携带门事实：subKind（item.put / item.delete，#147）
+                // + writeAction（begin 期权威派生，#137；delete 无动作）——
+                // 九字段克隆单点构造（issue #167）。
+                let draft = ApprovalDraft::new(
+                    starter.clone(),
+                    cwd,
+                    display_command,
+                    vec![target.clone()],
+                    lk_core::authz::ApprovalKind::Write,
+                )
+                .with_sub_kind(match parsed.op {
                     PendingWriteOp::Delete(_) => lk_core::authz::ApprovalSubKind::ItemDelete,
                     _ => lk_core::authz::ApprovalSubKind::ItemPut,
-                }),
-                write_action: write_action(&parsed.op),
-                export_meta: None,
-                fingerprint_mismatch: None,
+                });
+                match write_action(&parsed.op) {
+                    Some(a) => draft.with_write_action(a),
+                    None => draft,
+                }
             },
             // 常规审批条目（issue #150：`GateEntry::approval` 显式声明写门
             // 无需一体化解锁——写门无解锁窗，write-gate.md §5.3 拍板保留）
@@ -233,30 +250,32 @@ impl Daemon {
 
     /// 阶段③（重取命令锁；write-gate.md §5.4）：Allowed → **锁内 TOCTOU
     /// 重校验**（等待窗内可能被并发审批落盘 / 同步轮次应用远端变更 / 锁定）
-    /// → 执行 + 审计（channel=approval）；deny / timeout / 重验失效 →
-    /// `authz.denied` + 审计。
+    /// → 执行 + 审计（channel=approval）；deny / timeout → 决策结局拒绝尾 +
+    /// 审计；重验失效 → 执行层保守拒绝（issue #167 分层：TOCTOU 失效是执行
+    /// 失败而非 Denied 决策）；等待期锁定 → `session.invalid`（执行失败）。
+    /// 返回分层结果，字节由编排器经门声明渲染器收线。
     pub(crate) fn write_finalize(
         &mut self,
         id: Value,
         request_id: uuid::Uuid,
         decision: ApprovalDecision,
-    ) -> String {
+    ) -> DeferredOutcome {
         // finalize = 审批注册表唯一消费移除点（拍板 #28 候选 2 三拍之三）
         let removed = self.shared.approvals.remove(&request_id);
-        // 条目已被消费（极端竞态）→ 保守拒绝
+        // 条目已被消费（极端竞态）→ 保守拒绝（决策结局）
         let Some(ApprovalEntry {
             kind: GateKind::Write(p),
             ..
         }) = removed
         else {
-            return rpc_string(super::disclosure::authz_denied(id));
+            return DeferredOutcome::Denied(GateDeny::Rejected);
         };
         match decision {
             ApprovalDecision::Allowed => {
                 // TOCTOU 重校验①：vault 解锁态（等待期锁定 → K_audit 已擦除，
                 // 无法签名审计，与披露/规则门 finalize 同口径保守 session.invalid）
                 if !self.vault_peek() {
-                    return rpc_string(session_invalid(id));
+                    return DeferredOutcome::SessionInvalid;
                 }
                 // TOCTOU 重校验②：delete 目标仍存在（按**未删除**口径——
                 // `read_item_file` 含墓碑、幂等 delete 静默成功，不能用作
@@ -279,7 +298,7 @@ impl Daemon {
                             AuditChannel::Approval,
                             AuditResult::Denied,
                         );
-                        return rpc_string(super::disclosure::authz_denied(id));
+                        return DeferredOutcome::ExecutionDenied(GateDeny::Rejected);
                     }
                 }
                 // 执行 + 审计（弹窗批准 → channel=approval）
@@ -291,7 +310,7 @@ impl Daemon {
                     &p.starter,
                     AuditChannel::Approval,
                 );
-                rpc_string(resp)
+                DeferredOutcome::Executed(rpc_string(resp))
             }
             ApprovalDecision::Denied | ApprovalDecision::Timeout => {
                 // 拒绝/超时统一 denied（§8：不区分原因防探测，与值披露同口径）
@@ -303,7 +322,11 @@ impl Daemon {
                     AuditChannel::Approval,
                     AuditResult::Denied,
                 );
-                rpc_string(super::disclosure::authz_denied(id))
+                DeferredOutcome::Denied(if decision == ApprovalDecision::Timeout {
+                    GateDeny::Timeout
+                } else {
+                    GateDeny::Rejected
+                })
             }
         }
     }
@@ -404,48 +427,28 @@ fn write_action(op: &PendingWriteOp) -> Option<lk_core::authz::WriteAction> {
 }
 
 // -------------------------------------------------------------------------
-// 流程声明（issue #149：通用 deferred 编排器的注册项）
+// 门声明（issue #167：静态声明取代 DeferredFlow trait 空壳；注册于
+// router.rs 流程注册表）
 // -------------------------------------------------------------------------
 
-/// 写入授权门流程声明（issue #149）：预检 / begin / finalize 委托既有门
-/// 方法，锁编排由 router.rs 通用 deferred 编排器统一承担。**不可
-/// RePended**——写门 finalize 一步收尾（TOCTOU 重校验后执行），无二次
-/// 审批路径（写门无解锁窗，write-gate.md §5.3 拍板保留）。
-pub(crate) struct WriteFlow;
-
-impl crate::router::DeferredFlow for WriteFlow {
-    fn precheck(&self, daemon: &Daemon, token: Option<&[u8]>) -> bool {
-        daemon.write_precheck(token)
-    }
-
-    fn begin(
-        &self,
-        daemon: &mut Daemon,
-        method: &str,
-        id: Value,
-        params: Value,
-        peer: &PeerInfo,
-    ) -> GateBegin {
-        daemon.write_begin(id, method, params, peer)
-    }
-
-    fn finalize(
-        &self,
-        daemon: &mut Daemon,
-        id: Value,
-        request_id: uuid::Uuid,
-        decision: ApprovalDecision,
-    ) -> DeferredOutcome {
-        DeferredOutcome::Done(daemon.write_finalize(id, request_id, decision))
-    }
-
-    fn rependable(&self) -> bool {
-        false
-    }
-
-    fn unlock_supported(&self) -> bool {
-        false
-    }
+/// 写入门拒绝响应渲染器（issue #167）：(门 × 锁态/会话态 × reason) → 字节
+/// 的**唯一决定点**。本门一切拒绝统一 `authz.denied`(-32017)（§5.5 协议
+/// 零新增；与 inject 的 `ok{allowed,reason}` 字节不同，不得跨门压平）。
+/// 渲染器拿 daemon 上下文是防「决策 → 字节」全局纯函数的结构钩子
+/// （golden 表钉住全部字节，tests/gate_golden.rs）。
+fn render_write_deny(_daemon: &Daemon, id: Value, _deny: GateDeny) -> String {
+    rpc_string(super::disclosure::authz_denied(id))
 }
 
-pub(crate) const WRITE_FLOW: WriteFlow = WriteFlow;
+/// 写入门静态声明：**不可 RePended**——写门 finalize 一步收尾（TOCTOU
+/// 重校验后执行），无二次审批路径（写门无解锁窗，write-gate.md §5.3
+/// 拍板保留）；**无需一体化解锁**（issue #150 显式声明，产品决策留档）。
+pub(crate) static WRITE_GATE: crate::router::GateDecl = crate::router::GateDecl {
+    name: "write(item.put/item.delete)",
+    rependable: false,
+    unlock_supported: false,
+    precheck: Daemon::write_precheck,
+    begin: Daemon::write_begin,
+    finalize: Daemon::write_finalize,
+    render_deny: render_write_deny,
+};
