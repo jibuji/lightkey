@@ -204,6 +204,15 @@ sweep() {
       continue
     fi
 
+    # 认领中途失败兑底：无戳无 PR（如换标签后才在 run_implement 里被拒）
+    # → 退回 ready-for-agent（没开始过活，不算 attempt、不弹 needs-human）。
+    if [[ -z "$pr_n" && -z "$stamp_created" ]]; then
+      ap_log "#$n 认领无戳（claim 中途失败）→ 退回 ready-for-agent"
+      ap_label_remove "$n" agent-working; ap_label_add "$n" ready-for-agent
+      hb_line "#$n 认领无戳 → 退回 ready-for-agent"
+      continue
+    fi
+
     # 泄漏判定：checks 红 / 无 PR 且戳 2h 无心跳
     local leak=0 why=""
     if [[ -n "$pr_n" && "$pr_state" == OPEN ]]; then
@@ -520,6 +529,16 @@ claim_phase() {
   local inflight; inflight=$(gh issue list --state open --label agent-working --limit 5 --json number \
     --jq '[.[] | select(.number != '"$TRACKING"')] | length' 2>/dev/null)
   if (( ${inflight:-0} > 0 )); then hb_line "已有 agent-working 在跑，本轮不认领（并发=1）"; return 0; fi
+  # 实现槽可用性（§11）：不可用就不换标签 —— 换了却跑不起来 = 卡在 agent-working
+  # 无戳无 PR（sweep 兜底只能被动收回，且配额尽时会被误判 needs-human）。
+  if (( $(ap_quota_read) >= QUOTA_DAILY_IMPL )); then
+    hb_line "本轮不认领：今日 implement 配额已用尽（$(ap_quota_read)/$QUOTA_DAILY_IMPL）"
+    return 0
+  fi
+  if (( $(round_left_s) < 600 )); then
+    hb_line "本轮不认领：墙钟余量不足（$(round_left_s)s）"
+    return 0
+  fi
   if [[ -n "$RECLAIM_CANDIDATE" ]]; then
     local attempt; attempt=$(stamp_attempt_of "$(ap_comments_tsv "$RECLAIM_CANDIDATE")")
     run_implement "$RECLAIM_CANDIDATE" implement "" "" "$((attempt + 1))"
