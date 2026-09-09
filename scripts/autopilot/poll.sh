@@ -161,7 +161,7 @@ sweep() {
   local n line title created body labels assignee stamp_host stamp_run stamp_attempt stamp_hb
   while IFS=$'\t' read -r n created title; do
     [[ "$n" == "$TRACKING" ]] && continue
-    body=$(gh issue view "$n" --json body,assignee --jq '[.body, (.assignee.login // "")] | @tsv' 2>/dev/null) || continue
+    body=$(gh issue view "$n" --json body,assignees --jq '[.body, ((.assignees // [])[0].login // "")] | @tsv' 2>/dev/null) || continue
     labels=$(ap_issue_labels "$n")
     tsv=$(ap_comments_tsv "$n")
 
@@ -530,7 +530,7 @@ claim_phase() {
     [[ "$n" == "$TRACKING" ]] && continue
     (( $(round_left_s) < 600 )) && break
     # 资格过滤（§6）：无 assignee ∧ 无 blocker ∧ attempt 未尽
-    body=$(gh issue view "$n" --json body,assignee --jq '[.body, (.assignee.login // "")] | @tsv' 2>/dev/null) || continue
+    body=$(gh issue view "$n" --json body,assignees --jq '[.body, ((.assignees // [])[0].login // "")] | @tsv' 2>/dev/null) || continue
     [[ -z "$(printf '%s' "$body" | cut -f2)" ]] || continue
     blocked=$(gh api "repos/$REPO_PATH/issues/$n/dependencies/summary" --jq .blocked_by 2>/dev/null || true)
     [[ "$blocked" =~ ^[0-9]+$ ]] && (( blocked > 0 )) && continue
