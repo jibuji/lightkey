@@ -592,9 +592,14 @@ needs-decision，不得自行变更。
       判定矩阵第一行，write-gate.md §3）+ 审计 `item.create <name>`
       channel=desktop 照旧；lk-app 新增 `clipboard_read` / `clipboard_clear`
       command 与托盘菜单项；前端新增本地事件 `quick.save-request`
-      （**壳 → UI 请求，不混入守护进程通知协议 NOTIFY_\***）+ ui-vault 内
-      快存面板（复用既有保存/刷新/选中逻辑）；锁态只引导解锁（不触碰 #24
-      留档的「锁态写一体化」）。
+      （**壳 → UI 请求，不混入守护进程通知协议 NOTIFY_\***）+ 前端快存
+      面板实为**独立服务插件 `ui-quick-save`**（approval 同款自挂 portal、
+      跨锁态存活；**#170 修订注记**：偏离原裁定「ui-vault 内嵌 + 复用既有
+      保存/刷新/选中逻辑零复制」——实装时因 `VaultPage` 锁态整页 ↔ 三栏
+      切换被宿主卸载、内嵌面板锁态下收不到 `quick.save-request`，故拆为
+      服务插件，理由见 quick-capture.md §4.2 实现注记，代码与注记一致；
+      写路径 `item.put` desktop 豁免与审计口径不变）；锁态只引导解锁
+      （不触碰 #24 留档的「锁态写一体化」）。
     - **五项裁定**：① 锁态一步式「主密码 + 保存」**不做**（与 write-gate.md
       §12 留档一致）；② pending（解锁后重冒面板）锁定不清、消费后清；
       ③ 名称启发建议：保守前缀表内置 + 设置页可关（默认开）；④ 快存入口
@@ -610,12 +615,12 @@ needs-decision，不得自行变更。
       |------|------|
       | 剪贴板监听 + 系统通知被动提醒（主路径） | 通知点击在桌面端无回调（approval_alert 实证）；持续读剪贴板隐私敏感、误报打扰 |
       | 全局热键作主路径 | 注册系统级热键（冲突/学习成本/平台权限差异）换来的速度增量有限；退为阶段二设置项 |
-      | 新建独立 quick-add 插件 | 保存/选中/刷新/CAS 逻辑与 ui-vault 现有 `handleSaved` 同源，内嵌面板零复制、零跨插件消息 |
+      | 新建独立 quick-add 插件 | 原否因：保存/选中/刷新/CAS 逻辑与 ui-vault 现有 `handleSaved` 同源，内嵌面板零复制、零跨插件消息（**#170 修订注记**：实装已采纳独立服务插件形态，此否因撤回，原因见上「技术口径」修订注记） |
       | 快存走 socket/CLI 通道 | 凭空引入写门弹窗（摩擦）与归因/规则依赖，桌面直调豁免即为此景设计 |
     实现规格：[quick-capture.md](quick-capture.md)（**唯一出处**）；落点：
     milestones.md M2.99、docs/README.md 文档地图、CONTEXT.md（「快速保存」词条）；
     立项 issue #161，按 quick-capture.md §10 PR 序列落地（PR A lk-app /
-    PR B 前端 + 收口 / PR C 阶段二可选）。
+    PR B 前端 + 收口——**已随 issues #162-#164 完成**；PR C 阶段二可选，另行立项）。
 
 28. **架构深化：服务层 trait 假设缝移除 + 授权门管线收敛（2026-09-07 ·
     来源：`/improve-codebase-architecture` 评审，四项深化机会经 grilling 拍板，

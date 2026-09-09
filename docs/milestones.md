@@ -345,7 +345,7 @@ data-model、milestones、decisions #25 状态翻转、AGENTS.md、CONTEXT.md �
 > （issues #123-#126，父立项 #121）。**read/write 调用方链绑定按 spec §12
 > 默认仅字段预留**，不落地 CLI/UI（适用边界=独立工具二进制场景，文档明示）。
 
-## M2.99 —— 快速保存（quick capture）（进行中）
+## M2.99 —— 快速保存（quick capture）（已完成）
 
 **目标**：补充拍板 #27（2026-09-07 · 来源 issue #161）——用户复制 API key /
 token 后**一键**存进 LightKey：托盘「快速保存剪贴板…」→ 值预填、命名即存
@@ -359,9 +359,11 @@ token 后**一键**存进 LightKey：托盘「快速保存剪贴板…」→ 值
   壳事件 `lk-shell-quick-save`；`clipboard_read` / `clipboard_clear`
   command（arboard；剪贴板只在用户主动触发时读一次）。
 - **PR B（前端 + 收口）**：本地事件 `quick.save-request`（壳 → UI，不混入
-  守护进程通知协议）→ ipc-bridge 接入 + mock 钩子；ui-vault 内快存面板
-  （值预填 / 名称聚焦 / 启发建议名 / 重名软提示 / 「保存后清空剪贴板」勾选
-  默认关 / 复用 handleSaved 保存-刷新-选中）；锁态 → 只引导解锁 +
+  守护进程通知协议）→ ipc-bridge 接入 + mock 钩子；**独立服务插件
+  `ui-quick-save`**（approval 同款自挂 portal、跨锁态存活——非 ui-vault
+  内嵌：`VaultPage` 锁态整页 ↔ 三栏切换时被宿主卸载，内嵌面板锁态下收不到
+  事件，见 quick-capture.md §4.2 实现注记；值预填 / 名称聚焦 / 启发建议名 /
+  重名软提示 / 「保存后清空剪贴板」勾选默认关）；锁态 → 只引导解锁 +
   pending flush（解锁成功后自动重冒面板）；vitest + 文档收口
   （README 地图、decisions.md #27、CONTEXT.md「快速保存」词条、AGENTS.md）。
 - **PR C（阶段二，独立立项，可选）**：全局热键（B 路径，
@@ -374,7 +376,9 @@ token 后**一键**存进 LightKey：托盘「快速保存剪贴板…」→ 值
 选中；锁态入口 → 解锁页 → 解锁后自动重冒面板；issue #161 立项并关闭。
 
 > 本里程碑为 issue #161 提案拍板（补充拍板 #27）新增（插入 M2.98 之后、
-> M3 之前）；按 quick-capture.md §10 PR A-C 序列落地。
+> M3 之前）；**已按 quick-capture.md §10 PR A-B 序列落地**（issues #162 规格 /
+> #163 lk-app / #164 前端，立项 #161；PR C 阶段二另行立项）；文档收口经
+> issue #170 完成（状态翻转 + decisions.md #27 形态修订注记）。
 
 ## M3 —— 浏览器填充（V1 之后）
 
