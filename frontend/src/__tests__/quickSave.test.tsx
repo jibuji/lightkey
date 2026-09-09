@@ -7,7 +7,9 @@
  *   锁态 → 不开面板（不读剪贴板）+ toast + pending → 解锁后自动重冒；
  *   未初始化 → 指向向导（不置 pending）；面板打开期间锁定 → 关闭；
  * - 保存闭环：创建 secret 条目（mock 库断言）、面板关闭、切 vault 页、
- *   「保存后清空剪贴板」勾选 → clipboardRead 变 null；重名软提示；
+ *   「保存后清空剪贴板」勾选 → clipboardRead 变 null；§5.3 规格 toast
+ *   「勾选保存后清空可避免明文残留」保存成功必现（勾选/未勾选均断言）；
+ *   重名软提示；
  * - 壳事件翻译：`lk-shell-quick-save`（DOM CustomEvent，mock 分支）→
  *   总线事件 `quick.save-request`（与 tauri 真实事件同名同路径）；
  * - 名称建议偏好开关（preference）关闭 → 不预填建议名。
@@ -21,6 +23,7 @@ import { ipcBridge } from "../plugins/ipc-bridge";
 import { preferenceStore } from "../plugins/preference-store";
 import { toast } from "../plugins/toast";
 import {
+  QUICK_SAVE_CLEAR_HINT_TOAST,
   QUICK_SAVE_NAME_SUGGEST_KEY,
   suggestSecretName,
   uiQuickSave,
@@ -296,7 +299,20 @@ describe("保存闭环", () => {
     expect(go).toHaveBeenCalledWith("vault");
   });
 
-  it("勾选「保存后清空剪贴板」→ 保存成功后剪贴板被置空", async () => {
+  it("保存成功 → §5.3 规格 toast「勾选保存后清空可避免明文残留」（默认未勾选也提示）", async () => {
+    const { ctx, mock } = await mountQuickSave();
+    await unlock(ctx);
+    mock.setClipboardText("sk-toast-hint");
+    fireShellQuickSave();
+    await flush();
+    formSubmit();
+    await flush();
+    // 主 toast + §5.3 提醒 toast 并现
+    expect(ctx.toast.all.some((t) => t.text === "已保存到 LightKey")).toBe(true);
+    expect(ctx.toast.all.some((t) => t.text === QUICK_SAVE_CLEAR_HINT_TOAST)).toBe(true);
+  });
+
+  it("勾选「保存后清空剪贴板」→ 保存成功后剪贴板被置空，§5.3 toast 同时提示", async () => {
     const { ctx, mock } = await mountQuickSave();
     await unlock(ctx);
     mock.setClipboardText("sk-clear-me");
@@ -320,6 +336,8 @@ describe("保存闭环", () => {
     const readP = ctx.ipc.clipboardRead();
     await flush(); // 读路径 300ms
     expect(await readP).toBeNull();
+    // 勾选清空（已置空）仍按规格提示 §5.3 toast
+    expect(ctx.toast.all.some((t) => t.text === QUICK_SAVE_CLEAR_HINT_TOAST)).toBe(true);
   });
 
   it("重名软提示：库内已有同名条目 → 面板提示（不阻止保存）", async () => {

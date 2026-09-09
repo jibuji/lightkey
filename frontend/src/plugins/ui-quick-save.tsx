@@ -17,9 +17,9 @@
  *   合法，data-model 无唯一约束）、可选「用途」+「保存后清空剪贴板」勾选
  *   （**默认关**——外部复制内容非 LightKey 所有，不自动清，quick-capture.md
  *   §5）；保存 = `ctx.ipc.create`（secret 类型，desktop 通道写门受信豁免）
- *   → toast + 切到 vault 页（列表经 `item.changed` 既有刷新路径自动可见；
- *   新条目**选中**经 `vault.select` 本地事件交给 ui-vault，§3.1 步骤 4，
- *   issue #171）；
+ *   → toast（「已保存到 LightKey」+ §5.3 提醒「勾选保存后清空可避免明文残留」）
+ *   + 切到 vault 页（列表经 `item.changed` 既有刷新路径自动可见；新条目
+ *   **选中**经 `vault.select` 本地事件交给 ui-vault，§3.1 步骤 4，issue #171）；
  * - **锁态** → 只 toast「解锁后即可快速保存」+ 置 pending，**不读剪贴板、
  *   不留值**（锁态 fail-closed 同向，§5）；`session.unlocked` → flush 自动
  *   重冒面板（拍板点 ②：锁定不清 pending，消费后清）；
@@ -41,6 +41,11 @@ import type { ItemDraft } from "../types";
 /** 名称建议偏好键（preference-store；"0" = 关闭，其余 = 开启，默认开）。
  *  非敏感 UI 偏好，localStorage 落盘，不进加密库/config.json。 */
 export const QUICK_SAVE_NAME_SUGGEST_KEY = "quickSave.nameSuggest";
+
+/** 保存成功后的规格 toast 文案（quick-capture.md §5.3：「勾选开启时才置空……
+ *  toast 提示『勾选保存后清空可避免明文残留』」）。保存成功无论是否勾选
+ *  清空都提示——勾选者是确认动作防残留、未勾选者是提醒（默认关）。 */
+export const QUICK_SAVE_CLEAR_HINT_TOAST = "勾选保存后清空可避免明文残留";
 
 /** 启发建议前缀表（保守静态映射，只做输入框初值、用户可改；quick-capture.md
  *  §4.3）。无匹配 → null（名称留空由用户输入）。 */
@@ -144,6 +149,9 @@ function QuickSavePanel({
         }
       }
       toast.show("已保存到 LightKey");
+      // 规格 toast（quick-capture.md §5.3）：保存成功后提示勾选清空可避免
+      // 明文残留（默认关：勾选已清者作确认、未勾选者作提醒）
+      toast.show(QUICK_SAVE_CLEAR_HINT_TOAST);
       // 选中新条目（quick-capture.md §3.1 步骤 4）：把 created.id 经
       // vault.select（TS 内事件，载荷只有 id，零密钥值）交给 ui-vault；
       // VaultPage 未挂载（如从设置页发起）时由 ui-vault 插件层 pending
