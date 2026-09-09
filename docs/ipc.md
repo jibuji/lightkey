@@ -44,7 +44,7 @@
 ## 3. 会话令牌（D10）
 
 - 解锁成功 → 守护进程签发**会话令牌**（高熵随机，如 256-bit），**随每次解锁轮换**。
-- 后续所有请求必须携带令牌；令牌错误/过期 → `-32601` 风格错误（统一为
+- 后续所有请求必须携带令牌；令牌错误/过期 → `-32002`（应用错误段，统一为
   `session.invalid`），客户端不得据此区分「库未解锁」与「令牌错」（防探测）。
 - 令牌存放（**A1 取舍**，2026-08 规格矛盾裁决沿用）：CLI 每次调用是独立
   进程，令牌须经进程间传递才能跨命令复用解锁态——守护进程把令牌 hex 写入
@@ -82,7 +82,7 @@
 | `approval.result` | 客户端回传审批结果（M2；`approval.request` 已移除，语义并入 daemon 审批注册表 + `authz.request` 广播，authorization-gate.md §6）。**仅桌面内嵌直调可提交**——socket/pipe 连接 → `channel.forbidden`（-32014）；params 含 `challenge`（`authz.request` 帧下发的一次性应答值，错值 → `accepted=false` 且条目保留；#72/#78 / 补充拍板 #16）；锁定态一体化待审+allowed 时含可选 `masterPassword`（守护进程临时解锁，§4.1） | accepted（是否接受） |
 | `rule.add` / `rule.list` / `rule.remove` | 规则管理（M2，决策 #6；M2.9 起规则含 `capability`：`inject`（注入，缺省）\|`read`（读值，command 恒空串、keys=可读条目名）；M2.97 增 `write`（写规则，command 恒空串、keys=可写条目名、`actions`=create/update 子集且**缺省 create+update**——传 `delete` 校验拒绝，恒弹窗由协议保证；schema 见 [write-gate.md](write-gate.md) §4），能力两两不互授）。**M2.95（#104）**：socket/pipe 通道的 `rule.add` / `rule.remove` 升为桌面审批门（制定/撤销授权都是授权事件；desktop 直调豁免、headless fail-closed 复用 `authz.denied`，见 [authorization-gate.md](authorization-gate.md) §9）；`rule.list` 维持令牌门。**M2.98 程序指纹（已实现）**：注入规则可带 `fingerprint`（`exePath`/`sha256`/`size`——**daemon 不信任客户端上报的 sha/size**，审批 finalize 侧重算固化；请求侧只声明「绑哪个 exe」，`sha256`/`size` 传空/0，schema 见 [identity-binding.md](identity-binding.md) §4/§5.3）。read/write 的调用方链绑定按 spec §12 仅字段预留、不落地 CLI/UI | 规则 / 规则列表 / 无 |
 | `audit.list` | 审计查询 | 事件（无密钥值） |
-| `audit.verify` | 校验审计 HMAC 链 | 已验证事件数 |
+| `audit.verify` | 校验审计 HMAC 链 | 已验证事件数 + 锚点状态/截断检测（`anchorOk`/`anchorDegraded`/`truncated`/`chainOrdinal`/`anchorOrdinal`，issue #75，见 [audit.md](audit.md) §3.2） |
 | `subscribe` | 推送通道订阅（M2；连接转入流模式，收 JSON-RPC notification 帧，决策 #3 A）。来源标签：桌面壳为进程内直调订阅，socket 流连接为普通订阅——后者**不计入审批界面判定、也收不到 `authz.request` 帧**（#72/#78：帧内 challenge 是审批应答凭据，只走桌面通道）。**锁定态订阅**（#67）：desktop 来源允许锁态订阅（推送目标注册，桌面直调无需会话令牌；socket 订阅照旧要求有效会话），使锁态 `authz.request` 帧到达 GUI；帧无密钥值，不泄露明文 | 无 |
 
 - **最小字段原则**：IPC 响应只包含调用方被授权的最小已解密字段——例如
@@ -108,18 +108,25 @@
   解密故缺省）。**M2.98 程序指纹失配（已实现）**：绑定注入规则命中命令形态
    但指纹不符时带可选 `fingerprintMismatch`（`resolvedExePath` 当前解析路径 +
    `sha256Short` 8 位 SHA-256 前缀摘要——**不含完整哈希、任何值或错误码差异
-   化**，identity-binding.md §7）；未失配为缺省（常规审批帧）。失配视同未命中
-   （headless 统一 `authz.denied`），弹窗据字段渲染「指纹不符」主题 + 路径 +
-   摘要 +「以新指纹重新授权」按钮（触发 `rule.add` 携带 `fingerprint` → 规则
-   管理审批门 → finalize 侧重算指纹落盘）。**审批帧携带门事实（#147，已实现）**：
+   化**，identity-binding.md §7）；未失配为 `null`（`writeAction`/`exportMeta`
+   同理——键恒在、`null` = 不适用；仅 `subKind` 是条件插入真缺席）。失配视同
+   未命中（注入门 headless 返回 `allowed:false, reason=no_ui`，与未命中同形、
+   不打错误码；读/写/规则门 headless 统一 `-32017 authz.denied`），弹窗据字段
+   渲染「指纹不符」主题 + 路径 + 摘要 +「以新指纹重新授权」按钮（桌面端构造
+   一条绑定新指纹的注入规则经 `rule.add` 落库——desktop 直调受信豁免直执行，
+   daemon finalize 侧重算指纹落盘，旧规则保留）。**审批帧携带门事实（#147，
+   已实现）**：
    `kind=rule`/`write` 帧恒带 `subKind`（`rule.add`\|`rule.remove`\|`item.put`\|
    `item.delete`，daemon 权威派生，serde 值 = RPC 方法名，常量 `SUB_KIND_*` /
    TS 镜像 `APPROVAL_SUB_KINDS`，契约测试钉死）；`read`/`export`/`inject` 帧
    **不带**该字段（缺字段 = 旧帧信号）。前端单一解析器据帧产出唯一事实对象
-   ApprovalContext——「记住」可记性（rememberable）由 `subKind + writeAction +
-   needsUnlock` 纯派生、**不进协议**，command 前缀匹配启发式全删；旧帧（缺
-   `subKind`）下「记住」按钮不渲染（spec 唯一行为修正）；决策回调收结构化
-   ApprovalResolution。
+   ApprovalContext——「记住」可记性（rememberable）纯派生、**不进协议**，
+   command 前缀匹配启发式全删：read 帧（本就不带 `subKind`）按
+   `kind + needsUnlock` 派生（M2.9 读规则）；write put 帧按
+   `subKind + writeAction + needsUnlock` 派生（`writeAction` 缺失/畸形宁可不
+   记，不超发授权）；export / delete / 锁态一体化（临时 vault 不可持久化规则）
+   不提供；write 帧缺 `subKind`/`writeAction`（旧帧信号）下「记住」按钮不渲染
+   （spec 唯一行为修正）；决策回调收结构化 ApprovalResolution。
 - **`approval.result` 扩展**：可选 `masterPassword`——仅 `needs_unlock` 待审
   条目 + `allowed` 决策时使用并校验；守护进程以其做**临时解锁**（AuthGuard
   限流照常），错误主密码计失败计数并以错误响应退回弹窗（条目保留可重试）。

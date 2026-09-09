@@ -65,7 +65,8 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   [data-model.md](data-model.md) §6）。
 - **按项目目录绑定**：每条规则绑定一个项目目录（路径匹配，支持通配/祖先匹配），
   如 `~/work/proj-a`；规则只在该目录下生效。
-- **规则字段**：
+- **规则字段**（完整 schema 见 [write-gate.md](write-gate.md) §4 /
+  [identity-binding.md](identity-binding.md) §4）：
   ```jsonc
   {
     "id": "<uuid>",
@@ -73,7 +74,10 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
     "name": "publish",
     "command": "npm publish",              // 具名命令（可 glob）
     "keys": ["NPM_TOKEN"],                  // 授权注入的 key 名（最小集合）
-    "created": "<ISO-8601>"
+    "created": "<ISO-8601>",
+    "capability": "inject",                 // inject（缺省）| read | write（M2.9/M2.97）
+    "actions": ["create", "update"],        // 仅 write 规则（serde 缺省 create+update）
+    "fingerprint": null                     // 可选程序指纹（M2.98，注入绑定）
   }
   ```
 - **两条写入路径**（D8，唯一合法路径）：
@@ -115,8 +119,9 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
 - **用户一次性完成**：输入主密码（临时解锁）+ 点 Allow/Deny（本次授权）。
 - **守护进程侧**：
   1. `approval.result`（allowed）须携带 `masterPassword`——先做**临时解锁**
-     （`UnlockedVault::unlock`，AuthGuard 限流照常生效，审计 `vault.unlock`
-     channel=desktop / via=inject-gui）；主密码错误 → `ERR_VAULT_INVALID`（统一
+     （`UnlockedVault::unlock`，AuthGuard 限流照常生效，审计 `vault.unlock`，
+     starter/channel 取 desktop——#66 桌面直调归因）；主密码错误 →
+     `ERR_VAULT_INVALID`（统一
      文案防探测），条目保留、弹窗停留可在倒计时内重试（AuthGuard 记失败计数）。
   2. 解锁成功才 `resolve(Allowed)`；finalize 时在**临时 vault** 上跑完整三层
      （锁态 begin 无法预载规则/解析 key）+ 解析 env + 审计 `lk inject`
@@ -375,7 +380,8 @@ Agent（AI 编码助手等）在工作目录执行命令时，可能请求访问
   加性新增。
 - **边界**：同步应用远端变更不受门（BYO 信任模型维持）；真相源投毒
   （写规则静默改写 secret 值 → 后续合法读/注入拿污染值）= 已知限制（文档
-  明示）；exe+哈希身份绑定为整体可选加固，不随本规格。
+  明示）；exe+哈希身份绑定已随 M2.98 落地（注入路径，见 §11 /
+  [identity-binding.md](identity-binding.md)）。
 
 ## 11. 规则程序指纹绑定（identity binding，M2.98，已实现）
 

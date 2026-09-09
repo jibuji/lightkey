@@ -255,7 +255,7 @@ CLI/daemon/审计/测试表面翻倍。保留单 `M_ITEM_PUT`：
      不命中）/ 重名全盖 / 跨命名空间 `wsl://` 归一化两侧一致 / 能力不互授
      （write 不授权 read/inject，反之亦然）；delete 不参与匹配；
    - `ApprovalKind::Write` serde（`"write"`）。
-2. 集成（lk-daemon，`tests/write_gate.rs`，先红）：
+2. 集成（lk-daemon，`crates/lk-daemon/src/tests/write_gate.rs`，先红）：
    - `strategy_of(M_ITEM_PUT / M_ITEM_DELETE)` → `ApprovalDeferred`；
    - desktop 直调 put/delete → 直返，不登记审批；
    - socket + 写规则命中 → 静默放行 + 审计 allowed（create / update 两形态）；

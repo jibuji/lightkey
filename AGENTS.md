@@ -57,6 +57,10 @@
 - 功能分支开发，开 PR 由 GitHub CI 自动跑质量门禁（见「常用命令」CI 条目），
   全绿后合并；不直接推默认分支。本地 no-mistakes 闸门已于 2026-08-29 移除
   （补充拍板 #21），不再跑 `/no-mistakes`。
+- PR finish（合并，或确认不再重开的关闭）后即时清理该 PR 的残留分支：
+  删远端 head 分支（`git push origin --delete <head>` 或 GitHub 界面删分支）、
+  本地 `git fetch --prune` + `git branch -d <head>`，该 PR 用完的 worktree 一并移除；
+  关闭的 PR 若打算重开可保留分支，但须在 PR 评论里留说明。
 - 测试 fixture 密钥不进仓库（testing.md）。
 - 前端设计评审用 agent_browser 对
   `docs/design/prototype/`（零构建原型）截图；评审流程见
@@ -165,8 +169,9 @@
   规则可选绑定可执行文件身份（canonical 路径 + SHA-256 + 固化时大小；注入
   绑定被注入命令二进制、读/写调用方链按 spec §12 仅字段预留限独立工具
   二进制场景）；失配视同未命中走弹窗（明示「指纹不符」+ 路径 + 8 位摘要 +
-  「以新指纹重新授权」→ 规则门 finalize 侧重算指纹落盘）/ headless 统一
-  `authz.denied`；大文件内存指纹缓存 + 元信息失效 + 64 MiB 阈值 + size 快速
+  「以新指纹重新授权」→ 以 `rule.add` 追加绑定新指纹的规则，规则门
+  finalize 侧重算指纹落盘，旧规则保留）/ headless 注入门 `allowed:false
+  reason=no_ui`（与未命中同形）；大文件内存指纹缓存 + 元信息失效 + 64 MiB 阈值 + size 快速
   失配门；解析在 daemon 侧（Linux procfs / Windows PEB / macOS KERN_PROCARGS2，
   macOS 失败 fail-closed）；防「冒充」而「就地改写授权二进制」仍属 #15/#20
   边界外。前端 `authz.request` 帧带 `fingerprintMismatch`（resolvedExePath +
