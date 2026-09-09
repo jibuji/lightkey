@@ -101,6 +101,19 @@
 - **修复方向**：从 `runs/<n>/*.jsonl` 尾部抽该行 → 走 `post_needs_human` 并带原文。
 - **回归**：假 pi 输出含 `NEEDS-HUMAN:` → 必须进 `needs-human` 且评论含原文。
 
+#### A20（评审新增，已实测）· 服务端无 required status checks → `gh pr merge --auto` 不等待 CI
+
+- **现象**：PR #193 在 CI 运行开始 **18 秒后**即被 squash 合并（`mergedAt=12:44:13Z`，
+  对应 run `created=12:43:55Z` 且仍在 `in_progress`）。`main` 无 branch protection
+  （API 404）、无 rulesets（`[]`），因此**没有任何 required status checks**；
+  `gh pr merge --auto` 在「无必需检查」的仓库里只要 PR 可合并就立即合并。
+- **影响**：交付纪律与 autopilot 的核心承诺「CI 全绿即自动合并」**并未被服务端强制** ——
+  自动合并实际是「PR 可合并即合并」。一个 CI 未跑完/会变红的 autopilot PR 可以先
+  进 `main`（denylist 仍拦，但 CI 不拦）。
+- **修复方向**：`main` ruleset 配置 required status checks（三个 build job）+ 要求分支最新；
+  这是决策 #32 第 1 层（服务端）的一部分。
+- **回归**：配置后，CI 未完成时 `gh pr merge --auto` 必须**挂起**而非合并（人工验证一次）。
+
 ### P1 — 静默失败 / 可观测性 / 并发
 
 - **A8 `restore_phase` 不检查 inflight**（`poll.sh:368-397` 与 `:529`）：存在遗留
@@ -180,8 +193,11 @@
 ### Phase 0 · 已执行 / 立即
 
 - 已由 OWNER 合入 #194（refs/pull）、#195（认领槽）。
-- 人工处置被误伤的 #171/#172（PR #192/#193 CI 全绿）：squash 合并 + 清标签/分支/worktree。
-- 模型 ID `-expires-on-0910` 将于 2026-09-10 失效 → 换 `deepseek-v4-flash`（已验凭据 ready）。
+- **已完成**：被误伤的 #171/#172 已人工处置 —— PR #192 合入；#193 与 #192 冲突，已在
+  `autopilot/172` 上 rebase 解冲突（152 tests + `tsc --noEmit` 绿）后合入；两 issue 关闭、
+  `needs-human` 摘除、分支/worktree 清理。
+- **已完成**：模型 ID `-expires-on-0910` 换为 `deepseek-v4-flash`（`host.toml`，凭据已验 ready）。
+- **新发现 A20**（合并 #193 时实测）：服务端无 required status checks，`--auto` 不等 CI。
 
 ### Phase 1 · P0 代码修复（每项独立 PR + 离线回归）
 
@@ -190,7 +206,8 @@
 2. **泄漏判定改用子进程活性**（A2/A11，issue #196）：`child.pid` + `kill -0` 为第一判据，时间戳兜底。
 3. **attempt 计数**（A4，issue #198）：认领时递增并写入戳。
 4. **CI 状态判据**（A3，issue #197）：大写闭集匹配。
-5. **ref 护栏重做**（A5/A14，issue #199）：服务端保护 + 推送时 hook + 事后审计（决策 #32）。
+5. **ref 护栏重做**（A5/A14，issue #199）：服务端保护 + 推送时 hook + 事后审计（决策 #32）；
+   其中服务端部分含 A20（required status checks，issue #205）。
 6. **标签回滚**（A6，issue #200）：按 diff 精确撤销/补齐。
 7. **NEEDS-HUMAN 升级**（A7，issue #201）：解析 agent 终局输出。
 8. **A19**（issue #202）：`scripts/autopilot/**` 入 denylist + 三个 `.t.sh` 入 CI（待拍板）。
