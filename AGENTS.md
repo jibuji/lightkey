@@ -68,11 +68,11 @@
 - 功能分支开发，开 PR 由 GitHub CI 自动跑质量门禁（见「常用命令」CI 条目），
   全绿后**由人合并**；不直接推默认分支。本地 no-mistakes 闸门已于 2026-08-29 移除
   （补充拍板 #21），不再跑 `/no-mistakes`。
-- **例外（补充拍板 #29）**：`issue-autopilot` 循环产出的 `autopilot/<n>` PR 在 CI 全绿后
+- **例外（补充拍板 #29，护栏闭集经 #30 修订）**：`issue-autopilot` 循环产出的 `autopilot/<n>` PR 在 CI 全绿后
   **自动 squash 合并**（替代本条前半的「由人合并」）；但 PR diff 命中 **denylist**
-  （`.github/**`、`crates/lk-app/**`、版本号、lockfile、`docs/decisions.md` /
+  （`.github/**` / `workflows/**`、版本号、lockfile、`docs/decisions.md` /
   `CONTEXT.md` / `docs/adr/**` / `AGENTS.md` / 规格权威文档）即不得自动合并，转
-  `needs-human`。完整状态机与约束（含「分诊永不 `wontfix`/关闭/标 duplicate」）见
+  `needs-human`；`crates/lk-app/**` 已放开（Windows CI 真编译桌面包，#30）。完整状态机与约束（含「分诊永不 `wontfix`/关闭/标 duplicate」）见
   [workflows/issue-autopilot.md](workflows/issue-autopilot.md)（唯一出处）。
 - PR finish（合并，或确认不再重开的关闭）后即时清理该 PR 的残留分支：
   删远端 head 分支（`git push origin --delete <head>` 或 GitHub 界面删分支）、

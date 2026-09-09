@@ -243,7 +243,8 @@ L1 是**唯一允许的非构建/非发布 `schedule` workflow**（补充拍板 
 - **auto-merge = CI 全绿即自动合并（`gh pr merge --auto --squash`）**，但两道独立闸：
   1. **分诊前置**：改动面可能命中 denylist 的需求不进 `ready-for-agent`。
   2. **合并闸门**：PR diff 命中 denylist → **不开** auto-merge，评论说明命中项 + 打 `needs-human`。
-  denylist（路径闭集）：`.github/**`（agent 改 CI = 自己放宽规则，token 有 `workflow` scope）、`crates/lk-app/**`（本机无法完整验证的部分仍需人看）、`Cargo.toml` 的 `[workspace.package] version`（#34：bump 属发版）、`Cargo.lock` 大改、`frontend/package-lock.json`、`docs/decisions.md`、`CONTEXT.md`、`docs/adr/**`、`AGENTS.md`、`docs/**` 的任何规格权威文件（规格是唯一权威，不许 agent 自己盖章）。
+  denylist（路径闭集）：`.github/**`（agent 改 CI = 自己放宽规则，token 有 `workflow` scope）、`workflows/**`（循环自身规格，同上——它就是 agent 合并权限的出处）、`Cargo.toml` 的 `[workspace.package] version`（#34：bump 属发版）、`Cargo.lock` 大改、`frontend/package-lock.json`、`docs/decisions.md`、`CONTEXT.md`、`docs/adr/**`、`AGENTS.md`、`docs/**` 的任何规格权威文件（规格是唯一权威，不许 agent 自己盖章）。
+  闭集只挡「CI 绿根本覆盖不到」的三类：护栏自身、规格权威文档、发版面。**`crates/lk-app/**` 已于补充拍板 #30 移出闭集**：桌面包在 Windows build job 里随 PR 一起真编译（`cargo tauri build`），CI 绿即代表它能编过，本机不可验的部分改由 PR 正文「本机验证结果」段与事后 revert 承载。
 - PR 未合并期间 `agent-working` **不摘**（否则你会以为它还在跑）。
 
 ## 11. 预算与上限
@@ -319,7 +320,7 @@ pi 的解析优先级：`--provider` / `--model` / `--thinking` 旗标 **>** `.p
 - **真相源投毒**：已合并的错误代码 = 新基线；auto-merge（OWNER 决策）把这个风险的窗口缩到 CI 时长，缓解只有 denylist + squash 易 revert。
 - **规则/授权门类改动**（`docs/authorization-gate.md` 等）是安全关键，CI 绿 ≠ 正确；建议这类 issue 由你手工落 `ready-for-human`，别指望分诊 agent 判定「安全重要度」。
 - **Windows 侧**：不装 cron，能力（`tauri-shell` on Windows、`wsl2-desktop-e2e`、`release-build`）实际长期为 false → 那类 issue 会稳定走 §6 的 7 天降级路径。
-- **本地未验证即提 PR**：`lk-app` 改动被 denylist 挡住 auto-merge，但 agent 仍可能「写了没验证的 Rust」—— PR 正文的「本机验证结果」段是你唯一抓手。
+- **本地未验证即提 PR**：agent 仍可能「写了没验证的 Rust」—— PR 正文的「本机验证结果」段是你唯一抓手。`lk-app`（桌面壳）已从 denylist 移出（补充拍板 #30）：它能编过 Windows CI，但**运行时行为（托盘/锁屏/通知/审批窗）CI 不覆盖**，那部分现在也靠自动合并 + 事后看异常。
 
 ## 15. Definition of done（实现验收）
 
