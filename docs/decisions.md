@@ -772,4 +772,34 @@ needs-decision，不得自行变更。
       现敲 `ctl.sh start` 会因缺 `poll.sh` 响亮报错（exit 2）而非静默空转；实现按 §13
       前置动作开 issue 后进行。
 
+30. **issue-autopilot denylist 修订：`crates/lk-app/**` 移出闭集、补上
+    `workflows/**`（2026-09-09 拍板 · 来源：OWNER 直接指令「CI 全绿即可由 agent
+    合并」，范用推荐方案；部分反转 #29 的护栏清单）**：
+    - OWNER 诉求 = 只要 GitHub CI 全绿就允许 agent 自行合并。事实澄清：#29 本来
+      就是「CI 全绿即自动 squash 合并」，denylist 只是其上第二道闸；故本次改的
+      实质是「放宽闭集」而非「新增自动合并」。裁定 = 闭集只保留「CI 绿根本
+      覆盖不到」的三类，其余全部放行：
+      - 保留：`.github/**`（护栏自身 + token 带 `workflow` scope）、`docs/**` 规格
+        权威文件、`docs/decisions.md`、`CONTEXT.md`、`docs/adr/**`、`AGENTS.md`、
+        `Cargo.toml [workspace.package] version`（#34 bump 属发版）、`Cargo.lock` 大改、
+        `frontend/package-lock.json`；
+      - 新增：`workflows/**`（循环自身规格 = agent 合并权限的出处，原闭集漏了它，
+        与 AGENTS.md 「规格权威文档」表述不一致，本轮一并补齐）；
+      - 移出：`crates/lk-app/**`——桌面包在 Windows build job 里随 PR 真编译
+        （`cargo tauri build`），「本机无法验证」的前提只对运行时行为成立，
+        而这一点对其他 crate 同样成立，不再是独属于 lk-app 的闸门理由。
+    - **被否选项**：
+      | 选项 | 否因 |
+      |------|------|
+      | 清空 denylist（任何 PR CI 绿即合） | agent 可自改 CI 与自身规则书（token 带 `workflow` scope）= 自己放宽自己的规则，护栏形同虚设；且可给自己盖章改规格/顺手 bump 版本误发 Release |
+      | 只保留 `.github/**`（docs / 版本 / lock 全放） | 规格是唯一权威与发版闸门都不是 CI 能验的，与本次诉求无关 |
+    - **残留风险（不自欺）**：lk-app 运行时行为（托盘 / 锁屏 WTS 桥 / 通知 / 审批窗）
+      CI 不覆盖，现在也走自动合并；抓手只剩 PR 正文「本机验证结果」段与 squash
+      易 revert。规则/授权门类 issue 仍由人手工落 `ready-for-human`（§14）。
+    - **落点**：`scripts/autopilot/lib/pr.sh`（路径闭集）、
+      `scripts/autopilot/tests/poll.t.sh`（钉住闭集的断言）、
+      [../workflows/issue-autopilot.md](../workflows/issue-autopilot.md) §10/§14（唯一出处）、
+      `AGENTS.md` 交付纪律。本修订自身（命中 `docs/decisions.md` / `AGENTS.md` /
+      `workflows/**`）仍走「功能分支 + 人合并」，合并后才生效。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

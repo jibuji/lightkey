@@ -65,7 +65,8 @@ teq "redact sk- key" 'key=sk-REDACTED' \
 
 # ---- 4. denylist 路径闭集（pr.sh，§10） -------------------------------------------
 teq "denylist .github" ".github/**" "$(printf '.github/workflows/x.yml\n' | ap_denylist_path_hits)"
-teq "denylist lk-app" "crates/lk-app/**" "$(printf 'crates/lk-app/src/main.rs\n' | ap_denylist_path_hits)"
+teq "denylist 自身规格 workflows" "workflows/**(循环自身规格)" "$(printf 'workflows/issue-autopilot.md\n' | ap_denylist_path_hits)"
+teq "denylist lk-app 已放开（#30）" "" "$(printf 'crates/lk-app/src/main.rs\n' | ap_denylist_path_hits)"
 teq "denylist docs 全树保守禁" "docs/**(规格权威文件,保守全禁)" "$(printf 'docs/sync.md\n' | ap_denylist_path_hits)"
 teq "denylist decisions" "docs/decisions.md" "$(printf 'docs/decisions.md\n' | ap_denylist_path_hits)"
 teq "denylist 版本闸门候选" "Cargo.toml[workspace.package].version" "$(printf 'Cargo.toml\n' | ap_denylist_path_hits)"

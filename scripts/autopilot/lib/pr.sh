@@ -3,6 +3,12 @@
 #
 # denylist 路径闭集 + 版本闸门 + lockfile 大改阈值 + ref 白名单，纯逻辑可离线回归
 # （tests/poll.t.sh）；gh/git 包装仅薄封装。
+#
+# 闭集语义（规格 §10）：只挡「CI 绿覆盖不到」的三类自扩权——护栏自身
+# （`.github/**` / `workflows/**`）、规格权威文档（`docs/**`、`CONTEXT.md`、
+# `AGENTS.md`）、发版面（workspace version / lockfile）。
+# `crates/lk-app/**` 已于补充拍板 #30 从闭集移除（本机不可验改由 PR 正文
+# 「本机验证结果」段承载，不再作为合并闸门）。
 # shellcheck shell=bash disable=SC2317
 
 source_once() { [[ "$(type -t "$1" 2>/dev/null)" == function ]] || source "$2"; }
@@ -22,7 +28,7 @@ ap_denylist_path_hits() {
     [[ -n "$p" ]] || continue
     case "$p" in
       .github/*|.github)                                    echo ".github/**" ;;
-      crates/lk-app/*)                                      echo "crates/lk-app/**" ;;
+      workflows/*|workflows)                         echo "workflows/**(循环自身规格)" ;;
       Cargo.toml)                 echo "Cargo.toml[workspace.package].version" ;;
       Cargo.lock)                        echo "Cargo.lock(大改候选:再看行数)" ;;
       frontend/package-lock.json)  echo "frontend/package-lock.json" ;;
