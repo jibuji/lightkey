@@ -43,7 +43,8 @@
   push / workflow_dispatch（2026-08-27 裁定：非 PR 的提交不触发）。
   构建/发布 workflow 只有 `.github/workflows/release.yml`（原 `ci.yml` 已删除），
   另有 `.github/workflows/autopilot-watchdog.yml`（补充拍板 #29：`schedule` 触发的
-  issue-autopilot 心跳看门狗，不构建不发布、权限只 `issues: write` + `actions: read`；
+  issue-autopilot 心跳看门狗，不构建不发布、权限只 `issues: write`（Variable 经
+  runner `vars` 上下文注入）；
   它是循环「是否还活着」的**唯一外部见证**（本机层 = `scripts/autopilot/status.sh`），
   判定逻辑见 [workflows/issue-autopilot.md](workflows/issue-autopilot.md) §9.1）；
   全部质量检查（Windows：
