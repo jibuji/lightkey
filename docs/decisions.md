@@ -730,8 +730,9 @@ needs-decision，不得自行变更。
       机器关机时看门狗和病人一起倒）。分两层：L1 = `.github/workflows/
       autopilot-watchdog.yml`（`*/30` 读 tracking issue 正文的 `- last-ok: <ISO8601>`
       契约行，>45 分无心跳 → 自建/打 `heartbeat-stale` 标签 + 评论一次，恢复自动摘；
-      `[PAUSED]` 不报警；权限只 `issues: write` + `actions: read`（读仓库 Variable
-      `AUTOPILOT_TRACKING_ISSUE`），不装工具链、不构建不发布）= 唯一外部见证；
+      `[PAUSED]` 不报警；权限只 `issues: write`（仓库 Variable
+      `AUTOPILOT_TRACKING_ISSUE` 经 runner `vars` 上下文注入，不走 REST），
+      不装工具链、不构建不发布）= 唯一外部见证；
       L2 = `scripts/autopilot/status.sh`（本机一眼看全：心跳年龄 + L1 自己最近一次
       运行与结论 + 轮次锁 + 配额 + 在跑 issue；退出码 0/1/2）。这是**唯一允许的非
       构建/非发布 `schedule` workflow**（2026-08-27「非 PR 提交不触发构建」裁定不属

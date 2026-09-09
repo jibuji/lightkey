@@ -17,9 +17,9 @@ on:
 
 permissions:
   issues: write
-  # 读仓库 Variable AUTOPILOT_TRACKING_ISSUE 需要 actions: read（缺它 = 403，
-  # 看门狗自己静默失灵，比循环死了更糟）
-  actions: read
+  # 仓库 Variable 经 runner 的 `vars` 上下文注入（见下方 step env）：不走 REST——
+  # GITHUB_TOKEN 即便带 actions:read 也调不动 actions variables API（实测 403 被
+  # catch 吞成「未配置」），vars 上下文零 API 调用、零额外权限
 
 concurrency:
   group: autopilot-watchdog
@@ -31,6 +31,9 @@ jobs:
     timeout-minutes: 5
     env:
       STALE_MINUTES: '45'
+      # runner 的 vars 上下文注入仓库 Variable（Settings → Secrets and variables
+      # → Actions → Variables）；未配置时下方 fail loudly，不静默通过
+      AUTOPILOT_TRACKING_ISSUE: ${{ vars.AUTOPILOT_TRACKING_ISSUE }}
     steps:
       - name: Check autopilot heartbeat
         uses: actions/github-script@v7
@@ -39,13 +42,10 @@ jobs:
             const staleMinutes = parseInt(process.env.STALE_MINUTES || '45', 10);
             const labelName = 'heartbeat-stale';
 
-            // tracking issue 号存在仓库 Variables（Settings → Secrets and variables →
-            // Actions → Variables）。没配 = 看门狗自己没装好，必须响亮报错，不能静默通过。
-            const raw = (await github.rest.actions.getRepoVariable({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              name: 'AUTOPILOT_TRACKING_ISSUE',
-            }).then(r => r.value).catch(() => null)) || '';
+            // 仓库 Variable 经 runner 的 `vars` 上下文注入（不走 API：GITHUB_TOKEN
+            // 即便带 actions:read 也调不动 actions variables REST，实测 403 →
+            // 旧实现被 catch 吞成「未配置」）
+            const raw = process.env.AUTOPILOT_TRACKING_ISSUE || '';
             const issueNumber = parseInt(raw.trim(), 10);
             if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
               core.setFailed(

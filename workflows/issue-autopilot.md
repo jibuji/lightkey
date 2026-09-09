@@ -221,10 +221,10 @@ skipped #173 host=linux-ws1 missing=tauri-shell at=…
 
 | 层 | 载体 | 能看到什么死法 | 看不到什么 |
 | --- | --- | --- | --- |
-| **L1 GitHub 侧**（外部见证） | `.github/workflows/autopilot-watchdog.yml`（**已落地**；`*/30` + dispatch，权限 = `issues: write` + `actions: read`，不装工具链） | 宿主关机、cron 没装/停了、子进程卡死、轮次持续崩、`last-ok:` 行丢失 → 打 `heartbeat-stale` + 一次评论（已含该标签则不重复评论），恢复后自动摘；`[PAUSED]` 视为人主动停，不报警 | 「循环活着但活干错了」（只能靠 PR 评审 + revert）；Actions 自己长期不调度（私有库 60 天无活动会被 GitHub 停 schedule → 靠 `status.sh` 的看门狗年龄检查发现） |
+| **L1 GitHub 侧**（外部见证） | `.github/workflows/autopilot-watchdog.yml`（**已落地**；`*/30` + dispatch，权限 = `issues: write`，Variable 经 runner `vars` 上下文注入，不装工具链） | 宿主关机、cron 没装/停了、子进程卡死、轮次持续崩、`last-ok:` 行丢失 → 打 `heartbeat-stale` + 一次评论（已含该标签则不重复评论），恢复后自动摘；`[PAUSED]` 视为人主动停，不报警 | 「循环活着但活干错了」（只能靠 PR 评审 + revert）；Actions 自己长期不调度（私有库 60 天无活动会被 GitHub 停 schedule → 靠 `status.sh` 的看门狗年龄检查发现） |
 | **L2 本机一眼** | `bash scripts/autopilot/status.sh [--json]`（verdict/退出码：`ALIVE` 0 / `SUSPECT` 1 / `PAUSED` 0 / `BROKEN` 2） | 心跳年龄、`heartbeat-stale` 是否在（**在即判死**，哪怕本机心跳看着新）、**L1 自己最近一次运行与结论**、轮次锁持有者、今日配额、在跑 issue、日志尾、`host.toml`/`gh` 可用性 | 机器整个关机时你自己就不在这台机器上（所以必须有 L1） |
 
-L1 是**唯一允许的非构建/非发布 `schedule` workflow**（补充拍板 #29，2026-08-27「非 PR 提交不触发构建」裁定不变）。它需要仓库 Variable `AUTOPILOT_TRACKING_ISSUE=<issue 号>`（故 workflow 权限 = `issues: write` + **`actions: read`**，少了后者就是 403 → 看门狗自己静默失灵，比循环死了更糟）；未配置时 L1 **fail loudly**（`core.setFailed`），不静默通过。
+L1 是**唯一允许的非构建/非发布 `schedule` workflow**（补充拍板 #29，2026-08-27「非 PR 提交不触发构建」裁定不变）。它需要仓库 Variable `AUTOPILOT_TRACKING_ISSUE=<issue 号>`，经 runner 的 `vars` 上下文注入（不走 REST：GITHUB_TOKEN 即便带 `actions: read` 也调不动 actions variables API，实测 403 被 catch 吞成「未配置」）；未配置时 L1 **fail loudly**（`core.setFailed`），不静默通过。
 
 **看门狗自身的心跳校验（严格形状）**：`last-ok:` 的值必须是 `YYYY-MM-DDThh:mm[:ss]` + `Z`/偏移量。宽松解析会出两类**假装活着**的假错：`date -d ""` 返回今日零点，无时区的 `2026-09-09T03:12` 在 JS 里按本地时区解析（可偏差数小时）。两种均归为「无心跳」。
 
@@ -334,7 +334,7 @@ pi 的解析优先级：`--provider` / `--model` / `--thinking` 旗标 **>** `.p
 | `scripts/autopilot/status.sh` | **已落地**：§9.1 L2 一眼看活（人用） |
 | `scripts/autopilot/ctl.sh` | **已落地**：§4.1 启动层（start/stop/run-once/install + 单实例幂等） |
 | `scripts/autopilot/tests/ctl.t.sh` | **已落地**：§4.1 回归 18 例（并发 start 单实例 / 锁 fd 继承 / stop 真停 / 缺 poll.sh 响亮报错） |
-| `.github/workflows/autopilot-watchdog.yml` | **已落地**：§9.1 L1 外部见证（`schedule`，权限 `issues: write` + `actions: read`） |
+| `.github/workflows/autopilot-watchdog.yml` | **已落地**：§9.1 L1 外部见证（`schedule`，权限 `issues: write`；Variable 经 `vars` 上下文注入） |
 | `scripts/autopilot/lib/labels.sh` | 标签读写 + §5 权限白名单校验 + 回滚 |
 | `scripts/autopilot/lib/pi-run.sh` | **唯一允许出现模型参数处**：`host.toml` → `--provider/--model/--thinking` + `timeout` + `usage` 预算守护 + `runs/` 落盘（§11.1） |
 | `scripts/autopilot/lib/heartbeat.sh` | §9 正文重写（保留 `<!-- human -->` 区）+ 看门狗/webhook |
