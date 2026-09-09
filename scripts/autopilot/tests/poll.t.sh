@@ -107,6 +107,15 @@ teq "越权 ref：main 被改 + 新 feature-x" \
 refs/heads/main" \
   "$(printf '%s\n' "$viol" | awk '{print $2}' | sort | paste -sd'
 ' -)"
+# refs/pull/* 是 gh pr create 的合法产物（GitHub 自动生成），必须当干净
+printf '%s\n' '0000000000000000000000000000000000000001 refs/heads/main' \
+             '0000000000000000000000000000000000000002 refs/heads/autopilot/192' > "$AP_TMP/rb2"
+printf '%s\n' '0000000000000000000000000000000000000001 refs/heads/main' \
+             '0000000000000000000000000000000000000002 refs/heads/autopilot/192' \
+             '0000000000000000000000000000000000000006 refs/pull/192/head' \
+             '0000000000000000000000000000000000000007 refs/pull/192/merge' > "$AP_TMP/ra2"
+viol2=$(ap_refs_violations "$AP_TMP/rb2" "$AP_TMP/ra2")
+teq "refs/pull/* 放行（PR 合法产物）" "" "$viol2"
 
 # ---- 7. PR 正文契约（pr.sh，§10） --------------------------------------------------
 teq "Closes 解析" "170" "$(ap_pr_closes_target 'Closes #170
