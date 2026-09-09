@@ -6,9 +6,13 @@
 
 - **Issue tracker**: GitHub Issues `github.com/jibuji/lightkey`，`gh` CLI 操作
   （见 `docs/agents/issue-tracker.md`）。**PR 不作为请求面**（no）。
-- `#fact` `gh auth status`：账号 `jibuji`，token scopes `repo` + `workflow`，
-  **缺 `read:org`**（影响：列 org 成员/判定 OWNER 之外的协作者要靠
-  `authorAssociation` 字段，不能查 org 团队）。
+- `#fact` `gh auth status`（2026-09-09 复核）：账号 `jibuji`，token scopes
+  `manage_runners:org` + `read:org` + `repo` + `workflow`（早先缺 `read:org` 已补；
+  判 OWNER 仍优先靠 `authorAssociation` 字段，不依赖 org 查询）。
+- `#fact`（2026-09-09 实测）GITHUB_TOKEN 在 workflow 里**调不动** actions
+  variables REST（`actions.getRepoVariable`，即便 `permissions.actions: read`
+  也是 403 被 catch 吞）→ 仓库 Variable 必须经 runner `vars` 上下文注入
+  （PR #185）。
 - `#fact` CI：唯一 workflow `.github/workflows/release.yml`，
   `pull_request`（opened/synchronize/reopened）为门禁触发面；
   不自动合并、不推 main（交付纪律：功能分支 + PR + CI 全绿）。

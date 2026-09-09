@@ -11,7 +11,12 @@ cat > "$T/bin/gh" <<'GH'
 case "$*" in
   *"--json body,title,labels"*)
     [[ -n "${FAKE_GH_FAIL:-}" ]] && exit 1
-    printf '%s\t%s\t- last-ok: %s\n' "${FAKE_TITLE:-hb}" "${FAKE_LABELS:-}" "${FAKE_LASTOK:-}" ;;
+    if [[ -n "${FAKE_TSV:-}" ]]; then
+      # 真实 gh 的 @tsv 形状：正文字面 \\n 转义、单行输出
+      printf '%s\t%s\t- last-ok: %s\\n- 阈值 45m\n' "${FAKE_TITLE:-hb}" "${FAKE_LABELS:-}" "${FAKE_LASTOK:-}"
+    else
+      printf '%s\t%s\t- last-ok: %s\n' "${FAKE_TITLE:-hb}" "${FAKE_LABELS:-}" "${FAKE_LASTOK:-}"
+    fi ;;
   *"run list"*) [[ -n "${FAKE_WD:-}" ]] && printf 'completed\t%s\t%s\tautopilot-watchdog\n' "${FAKE_CONCL:-success}" "$FAKE_WD" ;;
   *"agent-working"*) printf '#173 在做的活\n' ;;
   *) printf '\n' ;;
@@ -37,6 +42,7 @@ t() { # <用例名> <期望退出码> <期望 verdict> [env=...]...
 
 echo "=== status.sh 回归（心跳契约 + 看门狗健康 + 退出码） ==="
 t "新鲜心跳 → ALIVE"            0 ALIVE   FAKE_LASTOK="$(iso '-10 minutes')" FAKE_WD="$(iso '-10 minutes')"
+t "@tsv 转义体也解析 → ALIVE"   0 ALIVE   FAKE_TSV=1 FAKE_LASTOK="$(iso '-10 minutes')" FAKE_WD="$(iso '-10 minutes')"
 t "心跳 90 分 → SUSPECT"         1 SUSPECT FAKE_LASTOK="$(iso '-90 minutes')" FAKE_WD="$(iso '-10 minutes')"
 t "看门狗 3h 没跑 → SUSPECT"     1 SUSPECT FAKE_LASTOK="$(iso '-10 minutes')" FAKE_WD="$(iso '-180 minutes')"
 t "无 last-ok 行 → SUSPECT"      1 SUSPECT FAKE_LASTOK=""                     FAKE_WD="$(iso '-10 minutes')"

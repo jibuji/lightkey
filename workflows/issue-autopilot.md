@@ -329,18 +329,19 @@ pi 的解析优先级：`--provider` / `--model` / `--thinking` 旗标 **>** `.p
 
 | 文件 | 职责 |
 | --- | --- |
-| `scripts/autopilot/poll.sh` | **待实现**：§4 阶段编排 + §11 配额 + §12 校验；开头必抢 `poll.lock`（§4.1） |
-| `scripts/autopilot/probe-capabilities.sh` | §7 JSON 契约，fail-closed |
+| `scripts/autopilot/poll.sh` | **已落地（待 PR）**：§4 阶段编排 + §11 配额 + §12 校验；开头必抢 `poll.lock`（§4.1）；DRY_RUN=1 验收模式（只分诊分析 + 跳账 + 心跳，不动标签不开 PR 不认领，§15） |
+| `scripts/autopilot/probe-capabilities.sh` | **已落地（待 PR）**：§7 JSON 契约，fail-closed；运行时不引 jq/python（Windows Git Bash 同形，A14） |
+| `scripts/autopilot/lib/common.sh` | **已落地（待 PR）**：host.toml 解析 / 状态目录 / 每日配额计数器 / runs gc / 脱敏（§12.6）|
 | `scripts/autopilot/status.sh` | **已落地**：§9.1 L2 一眼看活（人用） |
 | `scripts/autopilot/ctl.sh` | **已落地**：§4.1 启动层（start/stop/run-once/install + 单实例幂等） |
 | `scripts/autopilot/tests/ctl.t.sh` | **已落地**：§4.1 回归 18 例（并发 start 单实例 / 锁 fd 继承 / stop 真停 / 缺 poll.sh 响亮报错） |
 | `.github/workflows/autopilot-watchdog.yml` | **已落地**：§9.1 L1 外部见证（`schedule`，权限 `issues: write`；Variable 经 `vars` 上下文注入） |
-| `scripts/autopilot/lib/labels.sh` | 标签读写 + §5 权限白名单校验 + 回滚 |
-| `scripts/autopilot/lib/pi-run.sh` | **唯一允许出现模型参数处**：`host.toml` → `--provider/--model/--thinking` + `timeout` + `usage` 预算守护 + `runs/` 落盘（§11.1） |
-| `scripts/autopilot/lib/heartbeat.sh` | §9 正文重写（保留 `<!-- human -->` 区）+ 看门狗/webhook |
-| `scripts/autopilot/lib/pr.sh` | §10 denylist 判定、PR 正文渲染、`gh pr merge --auto --squash` |
-| `scripts/autopilot/prompts/{triage,implement,resume}.md` | 投喂模板：issue 号 + brief 全文 + `AUTOPILOT:` 回复原文 + §12 禁令全文 |
-| `scripts/autopilot/tests/*.bats` | denylist、能力词表、状态机迁移、跳账降级、配额的纯逻辑回归（待实现） |
+| `scripts/autopilot/lib/labels.sh` | **已落地（待 PR）**：标签读写 + §5 权限白名单校验 + 回滚 + 戳/OWNER 回复/mine 解析（纯函数） |
+| `scripts/autopilot/lib/pi-run.sh` | **已落地（待 PR）**：**唯一允许出现模型参数处**：`host.toml` → `--provider/--model/--thinking` + `timeout` + `usage` 预算守护 + `runs/` 落盘 + child.pid（泄漏按组杀）（§11.1） |
+| `scripts/autopilot/lib/heartbeat.sh` | **已落地（待 PR）**：§9 正文重写（保留 `<!-- human -->` 区）+ last-ok 契约行 + 跳账台账/降级素材 |
+| `scripts/autopilot/lib/pr.sh` | **已落地（待 PR）**：§10 denylist 判定、PR 正文模板、ref 白名单 diff、`gh pr merge --auto --squash` |
+| `scripts/autopilot/prompts/{triage,implement,resume}.md` | **已落地（待 PR）**：投喂模板：issue 号 + brief 全文 + `AUTOPILOT:` 回复原文 + §12 禁令全文 |
+| `scripts/autopilot/tests/poll.t.sh` | **已落地（待 PR）**：denylist、版本闸门、ref 白名单、标签白名单/越权、戳解析/OWNER 回复/mine、跳账台账去重与降级素材、配额、脱敏的纯逻辑回归（离线，沿用 .t.sh 风格而非 bats：零额外依赖，与 status.t.sh/ctl.t.sh 同构） |
 | `scripts/autopilot/tests/status.t.sh` | **已落地**：§9.1 两层看活的离线回归（12 例） |
 
 prompt 投喂用「调度器拼全文」而非「让 agent 自己 `gh issue view`」：禁令与 brief 必须在 prompt 里，不靠 agent 自觉；代码再校验一遍，双闸。
