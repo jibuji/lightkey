@@ -807,4 +807,66 @@ needs-decision，不得自行变更。
       `AGENTS.md` 交付纪律。本修订自身（命中 `docs/decisions.md` / `AGENTS.md` /
       `workflows/**`）仍走「功能分支 + 人合并」，合并后才生效。
 
+31. **autopilot 本地 run 租约状态（2026-09-09 拍板 · 来源：机制评审
+    [`docs/reviews/2026-09-09-issue-autopilot.md`](reviews/2026-09-09-issue-autopilot.md)
+    开放问题 1；OWNER 裁定「不提交即可」）**：
+    - 背景：纯标签状态机做不了原子认领/回收 —— 认领中途失败会留下 `agent-working`
+      假占位（评审 A1，已由 #195 部分修复），带戳泄漏的回收路径不可达（A2）。
+    - 裁定：允许在**本机 state 目录**（`~/.local/state/lightkey-autopilot/claims/<issue>`）
+      留一份**本宿主租约**：issue / host / run-id / branch / worktree / phase / attempt /
+      child_pid / started / state。**绝不进仓库、绝不进 GitHub**，故天然按宿主隔离，
+      不影响其他电脑的认领与运行。
+    - 语义边界（防误抢）：本地租约只对本宿主是租约；**跨机真相仍是标签 + 认领戳的
+      `last-heartbeat`**（§1 跨机不加锁、由人 arbiter 不变）。本机租约缺失 + 戳很新
+      → 尊重标签不碰；本机租约缺失 + 无戳 + 超时 → 才判泄漏。机器坏了丢文件走
+      fail-closed 对账（宁可停手报 needs-human，也不并发跑）。
+    - 修订 §9「本地除配额计数器/日志外不留任何状态」的措辞：本地状态是**本宿主的
+      租约缓存**，真相仍是标签；丢失只影响本机，不产生跨机不一致。
+    - **被否选项**：把租约提交到 GitHub（会干扰其他宿主的认领与运行）；纯标签做租约
+      （A1/A2 已证不可行）；跨机分布式锁（#29 已否）。
+    - **落点**：`scripts/autopilot/lib/common.sh` + `poll.sh`（认领/释放/对账）、
+      `status.sh`（展示 claim 表）、`workflows/issue-autopilot.md` §9。
+
+32. **autopilot ref 护栏 = 服务端保护 + 推送时阻断 + 事后审计（2026-09-09 拍板 ·
+    来源：机制评审 A5；推翻 §10「子进程结束后 `git ls-remote` diff 新 ref」的归因方式）**：
+    - 背景：ref 护栏是 A5「CI 绿即 auto-merge」的配套爆炸半径控制（agent 持有可推
+      main、可推 `v*` tag 的 token；tag push 会**立即**触发 `release.yml`）。现行实现用
+      「整轮前后全量 ref 差集」归因，无法区分 agent 与并发的人类/其他轮次/GitHub
+      `refs/pull/*` —— 实测已把 `#171`/`#172` 两个 CI 全绿的工作误停为 `needs-human`。
+    - 裁定（三层，按不可绕过性排序）：
+      1. **服务端（唯一不可绕过）**：`main` ruleset（禁 direct/force push、禁删除、
+         要求 PR + 必需状态检查）；`v*` tag ruleset 仅 OWNER 可推；token 最小化
+         （`contents`/`issues`/`pull_requests` 写，**不给 `workflow`**）。当前实测
+         `main` 无 branch protection、无 ruleset、无 tag 保护 —— 这是最大暴露面。
+      2. **推送时（精确归因）**：worktree 注入 `pre-push` hook，只放行
+         `refs/heads/autopilot/<n>`（拒绝 tag / 删除 / force / 他人分支）；
+         `core.hooksPath` 指向 state dir（防工作区篡改）。诚实标注：`--no-verify`
+         可绕过，故它是 tripwire 不是墙，墙在第 1 层。
+      3. **事后审计**：hook 落实际 refspec；调度器只校验「审计里出现的、白名单外的
+         ref」，忽略 `refs/pull/*` 与「sha 在 before 已存在/非本 host 产生」。
+    - 连带修订 §10「禁止 `--force`」为「禁止 force-push 非自己分支 / `main`」；
+      允许对自己 `autopilot/<n>` 用 `--force-with-lease`（与「恰好一个 squash 提交」
+      在续跑时的 amend 需求相容）。
+    - **被否选项**：继续用全局 ref 差集（归因错，已实证误伤）；只修 `refs/pull/*`
+      （#194 已做，但 `main`/他人分支误伤仍在）。
+    - **落点**：`scripts/autopilot/lib/pr.sh`（白名单/审计）、`poll.sh`（ref 校验段）、
+      `workflows/issue-autopilot.md` §10/§12.2/§12.7、仓库 Settings（rulesets）。
+
+33. **autopilot L1 看活加固：死信开关 + schedule/dispatch 区分 + 阈值修订（2026-09-09
+    拍板 · 来源：机制评审 A12）**：
+    - 背景：L1（`.github/workflows/autopilot-watchdog.yml`）是「循环还活着吗」的**唯一
+      外部见证**，但实测 07:26Z 上线后 **schedule 触发 0 次**（仅 3 次手工 dispatch），
+      至 12:26Z 才首次以 schedule 成功运行 —— 期间「外部见证」实际缺位。另：阈值 45m
+      < 单轮墙钟上限 60m，长轮次会被误报失联。
+    - 裁定：① 保留 GitHub schedule，但**不再作为唯一保障**；② 增加**死信开关**
+      （dead-man's switch）：每轮向外部 ping URL 发一次极简心跳（只 ping、不带 payload），
+      对方 N 分钟收不到即告警 —— 这是唯一不依赖「被观测系统同一调度器」的方案；
+      ③ `status.sh` 区分 schedule / dispatch 运行（手工 dispatch 会掩盖 schedule 停摆），
+      最近 6h 无 schedule 运行 → BROKEN；④ 阈值改为 > 轮次上限 + 间隔（如 90m）
+      或长轮次中途刷新 `last-ok`。
+    - **被否选项**：只等 GitHub schedule 恢复（不可控）；第二台机器兜底（Windows 侧不常开，
+      可作可选加固而非主方案）。
+    - **落点**：`scripts/autopilot/lib/heartbeat.sh`（ping + 阈值）、`poll.sh`、
+      `status.sh`、`workflows/issue-autopilot.md` §9/§9.1。
+
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。
