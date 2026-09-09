@@ -1,0 +1,152 @@
+# autopilot 心跳看门狗（补充拍板 #29 · 规格 workflows/issue-autopilot.md §9）
+#
+# 为什么在 GitHub 侧而不是本机：判定「循环是否还活着」的逻辑如果也跑在本机，
+# 那么机器关机 / cron 挂了 / 循环卡死时，看门狗和病人一起倒下 = 没有看门狗。
+# 这个 workflow 是仓库里唯一允许的**非构建、非发布**的 schedule 触发面
+# （2026-08-27 裁定「非 PR 的提交不触发构建」仍然成立）。
+#
+# 它只做三件事：读 tracking issue 正文的 `last-ok:` 时间戳 → 超阈值打
+# `heartbeat-stale` 标签 + 评论一次 → 恢复后摘标签。不装工具链、不构建、不发布。
+name: autopilot-watchdog
+
+on:
+  schedule:
+    # 每 30 分钟；比阈值（默认 45 分钟 = 3 个 15 分钟轮次）更密，确保至少两次命中
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  # 读仓库 Variable AUTOPILOT_TRACKING_ISSUE 需要 actions: read（缺它 = 403，
+  # 看门狗自己静默失灵，比循环死了更糟）
+  actions: read
+
+concurrency:
+  group: autopilot-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      STALE_MINUTES: '45'
+    steps:
+      - name: Check autopilot heartbeat
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const staleMinutes = parseInt(process.env.STALE_MINUTES || '45', 10);
+            const labelName = 'heartbeat-stale';
+
+            // tracking issue 号存在仓库 Variables（Settings → Secrets and variables →
+            // Actions → Variables）。没配 = 看门狗自己没装好，必须响亮报错，不能静默通过。
+            const raw = (await github.rest.actions.getRepoVariable({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'AUTOPILOT_TRACKING_ISSUE',
+            }).then(r => r.value).catch(() => null)) || '';
+            const issueNumber = parseInt(raw.trim(), 10);
+            if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+              core.setFailed(
+                '仓库 Variable AUTOPILOT_TRACKING_ISSUE 未设置或不是正整数；' +
+                '看门狗无法判定心跳（参见 docs/decisions.md 补充拍板 #29 与 workflows/issue-autopilot.md §9）'
+              );
+              return;
+            }
+
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+            if (issue.pull_request) {
+              core.setFailed(`#${issueNumber} 是 PR 不是 issue，Variable 配错了`);
+              return;
+            }
+
+            // 契约：正文中必须有一行 `last-ok: <ISO-8601>`（poll.sh 每轮**最先**写它，
+            // 成功或失败都写；缺失本身就等于「循环没在跑」）。
+            const m = (issue.body || '').match(/^\s*[-*]?\s*last-ok:\s*(\S+)/im);
+            let ageMinutes = null;
+            let lastOk = null;
+            let missing = !m;
+            // 严格形状校验：宽松解析会把怪形串当成某个时间（= 假装循环还活着）
+            const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})$/;
+            if (m) {
+              if (!ISO.test(m[1])) {
+                missing = true;
+                core.warning(`last-ok 不是合法 ISO-8601：${m[1]}，视为无心跳`);
+              } else {
+                const ts = Date.parse(m[1]);
+                if (Number.isNaN(ts)) {
+                  missing = true;
+                } else {
+                  lastOk = m[1];
+                  ageMinutes = (Date.now() - ts) / 60000;
+                }
+              }
+            }
+
+            // `[PAUSED]` 在标题里 = 人主动停的，不算死（规格 §4 步骤 0）
+            const paused = /\[PAUSED\]/i.test(issue.title || '');
+            const stale = !paused && (missing || ageMinutes > staleMinutes);
+
+            core.info(`tracking issue #${issueNumber}  paused=${paused}  ` +
+                      `last-ok=${lastOk || 'MISSING'}  age=${ageMinutes === null ? 'n/a' : ageMinutes.toFixed(1) + 'm'}  ` +
+                      `threshold=${staleMinutes}m  stale=${stale}`);
+
+            const hasLabel = (issue.labels || [])
+              .map(l => (typeof l === 'string' ? l : l.name))
+              .includes(labelName);
+
+            if (stale && !hasLabel) {
+              // 标签不存在时 addLabels 会 422 → 自建（需 issues: write），否则看门狗
+              // 在预建标签缺位的仓库里会默默失败（= 看门狗自己静默失灵）
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issueNumber, labels: [labelName],
+                });
+              } catch (e) {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  name: labelName, color: 'e99695',
+                  description: 'issue-autopilot 心跳失联（由 autopilot-watchdog 打）',
+                });
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issueNumber, labels: [labelName],
+                });
+              }
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: [
+                  '> *This was generated by AI during triage.*',
+                  '',
+                  `**autopilot 心跳失联**（阈值 ${staleMinutes} 分钟）`,
+                  '',
+                  missing
+                    ? '- 判据：tracking issue 正文里找不到合法的 `last-ok:` 时间戳 —— 循环从未跑过，或心跳写入路径坏了。'
+                    : `- 判据：上次心跳 ${lastOk}，距今 ${ageMinutes.toFixed(0)} 分钟。`,
+                  '- 可能原因：宿主关机 / cron 或 timer 未装或停了 / 一轮实现子进程卡住超过 60 分钟 / 磁盘写满。',
+                  '- 本机自查：`bash scripts/autopilot/status.sh`（锁、配额、探测、日志一次看全）。',
+                  '- 注意：本判定**不含**「循环还在跑但活干错了」，那只可能来自 PR 评审与 squash revert。',
+                ].join('\n'),
+              });
+            } else if (!stale && hasLabel) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                name: labelName,
+              });
+            } else if (stale && hasLabel) {
+              core.warning(`仍然 stale（age=${ageMinutes === null ? 'missing' : ageMinutes.toFixed(0) + 'm'}），标签已在，不重复评论`);
+            }
+
+            if (stale) {
+              core.setFailed(`autopilot heartbeat stale (last-ok=${lastOk || 'MISSING'}, threshold=${staleMinutes}m)`);
+            }
