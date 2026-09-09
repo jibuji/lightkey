@@ -59,13 +59,16 @@ ap_version_changed() { # <old-toml-file> <new-toml-file>
 # stdin = `git ls-remote origin` 原文 → "sha ref" 行集
 ap_refs_parse() { grep -E '^[0-9a-f]{40}[[:space:]]+refs/' | tr '\t' ' ' | awk '{print $1, $2}'; }
 
-# 新增/变更的 ref 里凡不在 autopilot/<n> 命名空间 → 输出违规 "sha ref" 行（空=干净）
+# 新增/变更的 ref 里凡不在 autopilot/<n> 命名空间的 → 输出违规 "sha ref" 行（空=干净）
+# 白名单同时放行 refs/pull/*：那是 gh pr create 时 GitHub 自动生成的 PR 内部 ref
+# （refs/pull/<n>/head · merge），非 agent push；不开 PR 循环不可能把活交付出去。
 ap_refs_violations() { # <before-stdin> <after-stdin>   （两个参数都是文件路径）
+  local allow='autopilot/[0-9]+$|refs/pull/'
   sort -k2 "$1" -o "$1.sort"; sort -k2 "$2" -o "$2.sort"
   join -j 2 -o 0,1.1,2.1 "$1.sort" "$2.sort" 2>/dev/null | awk '
-    $2 != $3 { print $3, $1 }' | grep -vE 'autopilot/[0-9]+$' || true
+    $2 != $3 { print $3, $1 }' | grep -vE "$allow" || true
   awk 'NR==FNR{b[$2]=1;next} !($2 in b){print $1, $2}' "$1.sort" "$2.sort" \
-    | grep -vE 'autopilot/[0-9]+$' || true
+    | grep -vE "$allow" || true
   rm -f "$1.sort" "$2.sort"
 }
 
