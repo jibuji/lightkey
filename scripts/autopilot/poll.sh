@@ -112,9 +112,9 @@ HOST_ID=$(ap_conf_get host_id) || { ap_log "host.toml 缺 host_id —— 循环�
 TRACKING=$(ap_conf_get tracking_issue)
 [[ "$TRACKING" =~ ^[0-9]+$ ]] || { ap_log "host.toml 缺 tracking_issue —— 无法写心跳"; exit 2; }
 HB_HOST="$HOST_ID"; HB_WEBHOOK=$([[ -n "$(ap_conf_get alert_webhook || true)" ]] && echo on || echo off)
+cd "$REPO"   # 先进仓：gh 隐式仓参数（repo view 等）依赖 cwd 在仓内（systemd 单元 cwd=/，实测暴露）
 REPO_PATH=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) \
   || { ap_log "gh 不可用（repo view 失败）"; exit 2; }
-cd "$REPO"
 
 # ---- 1. 轮次锁（§4.1） ----------------------------------------------------------
 
