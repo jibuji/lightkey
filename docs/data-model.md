@@ -16,53 +16,52 @@
 | 对象 | 文件 | 加密 | 说明 |
 |------|------|------|------|
 | 条目 item | `{uuid}.item.lk` | K_data | 见 §3 |
-| 索引 index | `index.lk` | K_data | vault 对象清单，覆盖条目与规则（id、revisionDate、type 等最小可索引字段，全部在密文内，见 §6） |
+| 索引 index | `index.lk` | K_data | vault 对象清单，覆盖条目与规则（id、revision、type 等最小可索引字段，全部在密文内，见 §6） |
 | 墓碑 tombstone | `{uuid}.tomb.lk` | K_data | 软删除标记，含删除时间 |
 | 附件元数据 | `{uuid}.attach.lk` | K_data | 附件清单 + 每附件密钥（**加密的**）与分块引用 |
 | 附件分块 | `{uuid}.{i}.chunk.lk` | 每附件独立密钥 | 1 MiB/块（见 §5） |
-| 规则 rule | `{uuid}.rule.lk` | K_data | 授权门规则（M2：inject 白名单；M2.9 增 `capability=read` 读规则，schema 见 value-disclosure.md §4；**M2.97 已增 `capability=write` + `actions` 写规则**——actions 为 create/update 子集、serde 缺省 `["create","update"]`，delete 不存在于 actions，schema 见 [write-gate.md](write-gate.md) §4；**M2.98 已增可选 `fingerprint`**——`exePath`/`sha256`/`size`（canonical 路径 + SHA-256 + 固化时大小），serde 缺省 None、旧规则零迁移，指纹随规则对象同路径同步（指纹更新 = 规则更新，revision bump、CAS），schema 见 [identity-binding.md](identity-binding.md) §4） |
+| 规则 rule | `{uuid}.rule.lk` | K_data | 授权门规则（M2：inject 白名单；M2.9 增 `capability=read` 读规则，schema 见 value-disclosure.md §4；**M2.97 已增 `capability=write` + `actions` 写规则**——actions 为 create/update 子集、serde 缺省 `["create","update"]`，delete 不存在于 actions，schema 见 [write-gate.md](write-gate.md) §4；**M2.98 已增可选 `fingerprint`**——`exePath`/`sha256`/`size`（canonical 路径 + SHA-256 + 固化时大小），serde 缺省 None、旧规则零迁移，指纹随规则对象同路径同步（重新授权以**新增规则**承载，不做原位更新，见 [identity-binding.md](identity-binding.md) §4/§7），schema 见 [identity-binding.md](identity-binding.md) §4） |
 | 恢复信封 | `recovery.envelope` | K_recovery | 主密钥副本（见 recovery.md） |
 
-- 文件名中的对象 id 为 UUID v4；**无时间戳后缀**——同步排序依据加密索引内 `revisionDate`（文件名带时间戳会向存储端泄漏修改时间，违反 D6 零知识彻底）。
+- 文件名中的对象 id 为 UUID v4；**无时间戳后缀**——同步排序依据加密索引内 `revision`（文件名带时间戳会向存储端泄漏修改时间，违反 D6 零知识彻底）。
 
 ## 3. 条目 schema（四类存储类型定案 v2，见 [design/spec.md](design/spec.md) §4）
 
 条目密文内部为 JSON（JSON-RPC 同款 serde），`type` 决定字段集；四类类型
-**一律真加密存储**（零知识，含笔记、文件），字段集与 spec §4 一致：
+**一律真加密存储**（零知识，含笔记、文件），字段集与 spec §4 一致。
+serde 形状为**扁平 tagged enum**（`#[serde(tag = "type", rename_all =
+"camelCase")]`）：`type` 与各类型字段全部平铺在顶层，无嵌套子对象。
+落盘字段名为 `revision`（文档他处的「revisionDate」为概念名，两者同指）。
 
 ```jsonc
+// 以 type=login 为例：
 {
   "id": "<uuid>",
-  "type": "login | note | secret | file",  // 四类存储类型（v2，见 design/spec.md §4）
+  "type": "login",                        // 四类存储类型 login | note | secret | file（v2，见 design/spec.md §4）
   "name": "示例",
-  "revisionDate": "<ISO-8601>",
+  "revision": "<ISO-8601>",               // 落盘字段名 revision（= revisionDate 语义，CAS 依据）
   "deleted": false,                       // true = 墓碑态（见 §4）
-  "login": {                              // type=login 时
-    "username": "user@example.com",
-    "password": "s3cr3t",                 // 条目密文内，明文字段仅存在于解密态
-    "uris": ["https://example.com"]      // 可多个
-  },
-  "note": { "content": "## Markdown" },  // type=note 时（Markdown 文本；轻量编辑+语法高亮，无预览）
-  "secret": {                             // type=secret 时
-    "value": "sk-live-...",              // 明文短文本（key / API key / token）
-    "purpose": "生产环境 API key",        // 用途/备注，可选
-    "expiresAt": null                     // 可选过期时间；V1 不实现到期校验，字段保留 null
-  },
-  "file": {                               // type=file 时
-    "note": "备注",                       // 备注，可选
-    "size": 12345678,                     // 大小（字节）
-    "fileType": "application/pdf"        // MIME 类型
-  },
-  "customFields": [ { "name": "...", "value": "...", "hidden": true } ],
-  "attachments": [ /* 附件元数据引用；file 类型对应一个加密附件，见 §5 */ ]
+  "username": "user@example.com",         // 以下类型字段平铺在顶层（无 login/… 嵌套子对象）
+  "password": "s3cr3t",                   // 条目密文内，明文字段仅存在于解密态
+  "uris": ["https://example.com"],        // 可多个
+  "custom": [ { "name": "...", "value": "...", "hidden": true } ]  // 自定义字段（仅 login）
 }
 ```
+
+其他类型的平铺字段集（共享 `id`/`type`/`name`/`revision`/`deleted`）：
+
+- `note`：`content`（Markdown 文本；轻量编辑+语法高亮，无预览）
+- `secret`：`value`（明文短文本 key / API key / token）+ `purpose`（用途/备注，
+  可选）+ `expiresAt`（可选过期时间；V1 不实现到期校验）
+- `file`：`note`（备注，可选）+ `size`（大小，字节）+ `fileType`（MIME 类型）
+  + `attachment`（附件文件名，展示用）+ `attachmentId`（uuid，内部关联
+  `{attach_id}.attach.lk` 与分块，见 §5）
 
 - **已砍字段**：原「收藏 favorite」已随存储类型定案 v2 移除（用途模糊，V1 不提供）。
 - **映射依据**：四类字段集直接对应 spec §4 定案（登录=账号+密码+网址；
   笔记=名称+Markdown；密钥=值+用途+可选过期；文件=元数据+加密附件）。
   不再参照 Bitwarden login/secureNote 两类型映射。
-- 自定义字段（customFields）保留，hidden 字段在 UI 中遮罩。
+- 自定义字段（`custom`，仅 login 类型）保留，hidden 字段在 UI 中遮罩。
 
 ## 4. 修订、墓碑与并发（D5）
 
@@ -102,7 +101,7 @@
 ## 6. 加密索引
 
 - `index.lk` 整体加密（K_data），内容为 **vault 对象最小索引，覆盖条目与规则**：
-  `id`、`revisionDate`、`type`（`type ∈ item/rule`）；`deleted` 覆盖条目与规则
+  `id`、`revision`、`type`（`type ∈ item/rule`）；`deleted` 覆盖条目与规则
   （供列表/增量/墓碑判断；规则体不含 `deleted`/`revision` 字段，删除态由索引
   自描述并以墓碑文件承载）。
 - 规则对象经**同一索引/轮询路径**发现与增量同步（与条目同路径，见

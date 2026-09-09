@@ -165,8 +165,9 @@
   规则可选绑定可执行文件身份（canonical 路径 + SHA-256 + 固化时大小；注入
   绑定被注入命令二进制、读/写调用方链按 spec §12 仅字段预留限独立工具
   二进制场景）；失配视同未命中走弹窗（明示「指纹不符」+ 路径 + 8 位摘要 +
-  「以新指纹重新授权」→ 规则门 finalize 侧重算指纹落盘）/ headless 统一
-  `authz.denied`；大文件内存指纹缓存 + 元信息失效 + 64 MiB 阈值 + size 快速
+  「以新指纹重新授权」→ 以 `rule.add` 追加绑定新指纹的规则，规则门
+  finalize 侧重算指纹落盘，旧规则保留）/ headless 注入门 `allowed:false
+  reason=no_ui`（与未命中同形）；大文件内存指纹缓存 + 元信息失效 + 64 MiB 阈值 + size 快速
   失配门；解析在 daemon 侧（Linux procfs / Windows PEB / macOS KERN_PROCARGS2，
   macOS 失败 fail-closed）；防「冒充」而「就地改写授权二进制」仍属 #15/#20
   边界外。前端 `authz.request` 帧带 `fingerprintMismatch`（resolvedExePath +

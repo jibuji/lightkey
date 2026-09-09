@@ -173,8 +173,8 @@ Windows 主机上的 LightKey 桌面守护实例——查看条目、请求授�
   允许锁态订阅。
 - 前端：approval 插件 `needsUnlock` 弹窗（主密码输入栏 + 解锁并允许 + 错误
   停留可重试）；`ensureSubscribed` 启动即订阅；mock 适配器支持锁态一体化。
-- 审计两条：`vault.unlock`（channel=desktop / via=inject-gui）+ `lk inject`
-  （channel=approval），用临时 vault 的 K_audit 签名。
+- 审计两条：`vault.unlock`（starter/channel 取 desktop——#66 桌面直调归因）
+  + `lk inject`（channel=approval），用临时 vault 的 K_audit 签名。
 - 锁态一体化**不签发会话令牌 / 不写 session.token / 不置 shared.vault**——
   临时解锁材料只服务本次注入，不产生 item.* 全量读能力（#65 配套）。
 

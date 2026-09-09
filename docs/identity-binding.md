@@ -58,15 +58,17 @@ canonical 路径 + 内容哈希。
 |------|------|------------------|----------|
 | 任意 | 全部 | **未绑定**（fingerprint=None） | 现状语义（目录+形态/条目名），零变化 |
 | socket（持令牌，解锁态） | `inject`（绑定规则命中） | 路径 == exePath **且** SHA-256 == exeSha256 | 静默放行 + 审计 |
-| socket | `inject` | 路径 ≠ exePath，或 size 不符，或哈希不符 | **视同未命中** → 弹窗（GUI 在场）→ allow/deny·timeout；headless → `authz.denied` |
-| socket | `inject` | 失配且弹窗批准 | 本次放行；「以新指纹重新授权」→ 规则指纹更新（走规则门） |
+| socket | `inject` | 路径 ≠ exePath，或 size 不符，或哈希不符 | **视同未命中** → 弹窗（GUI 在场）→ allow/deny·timeout；headless → `allowed:false, reason=no_ui`（与未命中同形） |
+| socket | `inject` | 失配且弹窗批准 | 本次放行；「以新指纹重新授权」→ 以 `rule.add` 追加一条绑定新指纹的注入规则（旧规则保留，见 §7） |
 | socket（**锁定态**） | — | — | `session.invalid` 先行（规则在加密库内；与 inject/读/写门同口径）。**桌面 GUI 在场**走锁定态一体化（#67）：解锁后 finalize 在临时 vault 上**补指纹裁决**（issue #140，对端 env 随 `PendingAuthz` 存留）——命中 → 静默放行；失配/不可解析 → 视同未命中 → 转二次审批（needsUnlock 帧携带 `fingerprintMismatch`，弹窗明示「指纹不符」）；二次批准 = 本次允许 |
 | desktop（内嵌直调） | — | 不查（受信豁免；注入通道桌面直调也无豁免——指纹随注入路径整体裁决，不单独豁免） | 放行 |
 
 - 启动者未知 / cwd 不可得 → 第 1 层 fail-closed 拒绝（与 inject 同口径，
   先于指纹比对）。
-- 指纹失配**不引入新错误码**：与"未命中"完全同路径，headless 统一
-  `authz.denied`（防探测——不给攻击者"规则存在但指纹不符"的枚举信号）；
+- 指纹失配**不引入新错误码**：与"未命中"完全同路径——注入门 headless 返回
+  `allowed:false, reason=no_ui`（与未命中同形，不打 RPC 错误码；读/写/规则门
+  的 headless fail-closed 才是 `-32017 authz.denied`），防探测——不给攻击者
+  "规则存在但指纹不符"的枚举信号；
   弹窗主题明示"程序指纹与规则不符（可能已更新）"，给人决策依据。
 
 ## 4. 规则 schema（可选扩展）
@@ -109,7 +111,9 @@ pub struct ProgramFingerprint {
   未绑定规则匹配函数路径零变化（`rule_matches` / `read_rule_matches` /
   写规则匹配在 fingerprint=None 时直接按现行逻辑短路）。
 - **存储形态**：指纹存规则密文内（K_data），随规则对象同路径同步
-  （`{uuid}.rule.lk`），指纹更新 = 规则更新（revision bump、CAS），无新机制。
+  （`{uuid}.rule.lk`），无新机制；「以新指纹重新授权」以**新增规则**承载
+  （`rule.add`，daemon finalize 侧重算固化；不做原位 CAS 更新——绑定规则集
+  任一匹配即放行，旧规则保留无副作用）。
 
 ## 5. 解析与比对（daemon 侧，信 daemon 不信客户端）
 
@@ -118,8 +122,8 @@ pub struct ProgramFingerprint {
 - daemon 读 IPC 对端**真实 env** 的 PATH（客户端自报一律视为不可信输入，
   与 starter/cwd 同原则）：
   - Linux：`/proc/<pid>/environ`（同用户可读）；
-  - Windows：PEB `ProcessParameters.Environment`（复用 `starter.rs`
-    已有 PEB 读取基建，同款偏移表 + 长度 sanity check）；
+  - Windows：PEB `ProcessParameters.Environment`（复用 `lk_core::peb`
+    共享 PEB 读取原语——与 starter 共用唯一一份偏移表 + 长度 sanity check）；
   - macOS：`sysctl KERN_PROCARGS2`（实现期验证权限与可达性；失败 →
     fail-closed，机制与 `resolve_peer_cwd` 现状同口径）。
 - 按 PATH 序解析 `command[0]`（第一个命中项即候选）+ 对端真实 cwd 兜底
@@ -195,7 +199,8 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
    那正是要防的冒充；缓存只活在 daemon 内存、随守护进程会话生命周期。
 2. **阈值 64 MiB（可配置）**：只决定**预计算时机**，不改变安全语义——
    ≤ 64 MiB：规则创建/审批 finalize 时**立即预计算**（锁内一次性，人在场
-   可接受）；> 64 MiB：同样预计算，或惰性到首次命中（配置可选）；daemon
+   可接受）；> 64 MiB：**一律惰性**到首次命中（固化哈希仍现算、缓存不预热；
+   可配置的只有阈值本身，`0` = 全部惰性，见 §6-1）；daemon
    重启后的首次缓存冷态 = 一次全量哈希（文档声明为一次性可接受阻塞，且
    Windows/Linux 下流式读 100 MiB 级二进制为百毫秒级，不引入 G1 违例的
    新路径——必要时把冷态哈希移到 `ApprovalDeferred` 的锁外等待窗口，列为
@@ -212,7 +217,7 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
 ### 6-1. 阈值实现注记（issue #138）
 
 - **配置字段**：`config.json` 的 `fingerprintPrecomputeThresholdBytes`
-  （serde 缺省 = 64 MiB，出处 `lk_daemon::identity::FINGERPRINT_PRECOMPUTE_THRESHOLD`；
+  （serde 缺省 = 64 MiB，出处 `lk_daemon::exe_resolve::FINGERPRINT_PRECOMPUTE_THRESHOLD`；
   畸形配置随整个 config.json 解析失败回退缺省——与既有字段同口径）；
   守护进程热读（与 `approvalTimeoutSecs` 同级）。
 - **语义**：固化指纹（规则创建 / 审批 finalize，`rule_op_exec` →
@@ -224,14 +229,17 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
 
 ## 7. 指纹失配 UX（拍板：视同未命中 + 弹窗重新授权）
 
-- **失配 = 未命中**：走与注入/读/写门一致的裁决路径——GUI 在场弹窗、
-  headless `authz.denied`；**不新增错误码**（防探测：攻击者无法区分
-  "无规则"与"规则存在但指纹不符"）。
+- **失配 = 未命中**：走与注入门一致的裁决路径——GUI 在场弹窗、headless
+  `allowed:false, reason=no_ui`（与未命中同形）；**不新增错误码**（防探测：
+  攻击者无法区分"无规则"与"规则存在但指纹不符"）。
 - 弹窗主题：明示「程序指纹与规则不符（可能已更新）」+ 展示当前解析到的
   路径与哈希摘要（8 位前缀，不展示完整值）；按钮：
   - 「本次允许」（一次性放行，与普通审批一致）；
-  - 「**以新指纹重新授权**」（追加指纹更新请求 → 规则管理审批门 →
-    daemon finalize 侧重算指纹并落盘，审计 command=`rule.add/update`）；
+  - 「**以新指纹重新授权**」（桌面端构造一条绑定新指纹的注入规则——
+    name/command=exe basename、keys 沿用、`fingerprint={exePath}`——经
+    `rule.add` 落库：desktop 直调受信豁免直执行，daemon finalize 侧重算
+    指纹并落盘，审计 command=`rule.add <name>`；旧规则保留，绑定规则集
+    任一匹配即放行）；
   - 「拒绝」/ 超时默认拒绝。
 - 升级/重装后的体验 = 一次弹窗交互重新授权，无命令级侧写变化。
 - 「记住」按钮若用于读/写规则（均有「允许并为此项目记住」先例），记住的
@@ -269,15 +277,18 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
    候选 4 删除该零生产调用、与 daemon 缓存感知版重复的纯函数后，比对序的
    唯一实现与测试归属反转至 lk-daemon `binding::adjudicate_binding`，见
    §10.2 首条。）
-2. 集成（lk-daemon，`tests/identity_binding.rs` + `binding.rs` 单测，先红）：
+2. 集成（lk-daemon，`crates/lk-daemon/src/tests/identity_binding.rs` +
+   `binding.rs` 单测，先红）：
    - 比对序（拍板 #28 候选 4 归属反转自 §10.1，缓存感知版白盒断言）：路径
      不符免哈希 / size 不符免哈希 / 哈希一致命中 / 不一致失配；未绑定短路
      放行；候选不可解析 fail-closed——「决策免哈希」用哈希恒失败源探针
      钉住（哈希不可用时决策仍作出）；
    - 绑定规则命中 → 静默放行 + 审计；失配 → NeedsApproval 路径 + 弹窗主题
-     「指纹不符」；headless 失配 → `authz.denied`（与未命中同码断言）；
-   - 「以新指纹重新授权」→ 规则门弹窗批准 → 落盘新指纹 + 审计（command=
-     rule.add/update）；
+     「指纹不符」；headless 失配 → result 形态 `allowed:false, reason=no_ui`
+     （与未命中同形断言，不打 RPC 错误码）；
+   - 「以新指纹重新授权」→ `rule.add` 追加绑定新指纹的规则（socket 通道走
+     规则门弹窗；桌面直调豁免直执行）→ 落盘新指纹 + 审计（command=
+     `rule.add <name>`）；
    - 缓存：元信息一致复用（stat 计数断言）；内容改 + mtime 变 → 重算 → 失配；
      内容改 + size/mtime 恢复 → 重算 → 失配（size 同长场景）；
    - macOS 平台 env 读取失败 → fail-closed（cfg 门测试）；
@@ -300,8 +311,9 @@ SHA-256 对任意大小文件都只能**全量读一次**——优化空间在"�
 2. **PR B（lk-daemon，#124）**：对端 env PATH 读取（Linux/Windows 本期，
    macOS fail-closed）+ 内存指纹缓存/元信息失效 + 审批 finalize 侧指纹
    计算 + 失配路径/弹窗主题 + 集成测试（§10.2）；
-3. **PR C（lk-cli + E2E，#125）**：`lk rule add --fingerprint <exePath>`（与
-   `--read`/`--write` 同款省略 command，命令由可执行文件 basename 推导）、
+3. **PR C（lk-cli + E2E，#125）**：`lk rule add --inject --fingerprint <exePath>`
+   （`--fingerprint` 必须配合 `--inject`；与 `--read`/`--write` 同款省略
+   command，命令由可执行文件 basename 推导）、
    失配文案、脚本扩展（§10.3）；
 4. **PR D（前端 + 收尾，#126）**：弹窗指纹主题 + 重新授权按钮 + vitest +
    文档收口（authorization-gate §11 状态翻转「已实现」、ipc/cli/agent-cli/
