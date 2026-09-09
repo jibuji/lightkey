@@ -18,13 +18,14 @@ use lk_core::ipc::*;
 use lk_core::model::{ItemDraft, Rule, RuleDraft};
 use lk_core::recovery::RecoveryCode;
 use lk_core::session::SessionManager;
-use lk_core::starter::{self, UNKNOWN_STARTER};
+use lk_core::starter::UNKNOWN_STARTER;
 use lk_core::vault::{self, UnlockedVault};
 use lk_core::{Error, Result};
 use serde_json::{json, Value};
 use sha2::Digest;
 
 use crate::config::{Config, SyncRuntime};
+use crate::identity::PeerIdentity;
 use crate::notifier::Notifier;
 use crate::router::{run_deferred, strategy_of, ExecutionStrategy};
 use crate::transport::{PeerInfo, PeerOrigin, PushHub};
@@ -154,8 +155,9 @@ pub(crate) struct PendingAuthz {
     request: AuthzRequest,
     /// IPC 对端身份（issue #140）：锁定态一体化 finalize 在临时 vault 上补
     /// 指纹裁决时需要（对端进程在审批等待期间仍存活，env 按 pid 可重读；
-    /// desktop 直调 pid=0 → 受信豁免）。解锁态 begin 已裁决完，仅随结构
-    /// 携带不使用。
+    /// pid=0 对端在 begin 第 1 层 `unknown_starter` 已拒，不会入待审——
+    /// 注入通道桌面直调无豁免，identity-binding.md §3）。解锁态 begin 已
+    /// 裁决完，仅随结构携带不使用。
     peer: PeerInfo,
 }
 
@@ -411,8 +413,8 @@ impl Daemon {
 
         // 调用方归因（#66）：Inline 方法派生一次，供写审计的处理器复用
         // （非审计方法不消费；CLI 单发进程语义下多一次进程链回溯成本可
-        // 忽略，desktop 直调短路为常量）。
-        let caller = CallerId::of(peer);
+        // 忽略，desktop 直调短路为常量）。经对端身份面单点产出（#28 候选 4）。
+        let caller = CallerId::of(self.peer_env.as_ref(), peer);
 
         let resp = match method.as_str() {
             M_VAULT_STATUS => self.vault_status(id.clone()),
@@ -574,15 +576,6 @@ impl Daemon {
 // 装配辅助（分发与授权门共用）
 // -------------------------------------------------------------------------
 
-/// 启动者判定（守护进程侧）：对端 PID → 进程链回溯；失败 → fail-closed
-/// `unknown`（授权门第 1 层拒绝）。客户端自报 starter 一律不信任。
-fn derive_starter(peer: &PeerInfo) -> String {
-    if peer.pid == 0 || !starter::peer_session_ok(peer.pid) {
-        return UNKNOWN_STARTER.to_string();
-    }
-    starter::resolve_starter(peer.pid, starter::platform_table().as_ref())
-}
-
 /// 单次请求的调用方归因（#66：审计 starter/channel 不再硬编码 "lk"/cli）。
 /// dispatch 层派生一次，各命令处理器写入审计事件复用：
 ///
@@ -590,20 +583,24 @@ fn derive_starter(peer: &PeerInfo) -> String {
 ///   （bridge 对端回溯出 interop 链顶层，可区分本地 CLI 与桥接调用），
 ///   回溯失败如实记 `unknown`；channel = cli；
 /// - 桌面内嵌直调（lk-app command 桥，无 IPC 对端）：starter/channel =
-///   `desktop`（授权路径不看这里——authz.evaluate 仍走 derive_starter，
+///   `desktop`（授权路径不看这里——authz.evaluate 走同一身份解析，
 ///   desktop 对端 pid=0 照样 fail-closed）。
+///
+/// 归因经对端身份面单点产出（拍板 #28 候选 4：[`crate::identity::resolve`]，
+/// 与四门 begin 同一解析，无第二条 inline 推导路径）。
 pub(crate) struct CallerId {
     pub starter: String,
     pub channel: AuditChannel,
 }
 
 impl CallerId {
-    /// 按对端来源派生调用方归因。
-    fn of(peer: &PeerInfo) -> CallerId {
+    /// 按对端来源派生调用方归因（对端身份面单点；审计归因无命令串可归属，
+    /// 不解析 exe）。
+    fn of(peer_env: &dyn crate::peer_env::PeerEnv, peer: &PeerInfo) -> CallerId {
         match peer.origin {
             crate::transport::PeerOrigin::Desktop => CallerId::desktop_self(),
             crate::transport::PeerOrigin::Socket => CallerId {
-                starter: derive_starter(peer),
+                starter: crate::identity::resolve(peer_env, peer, None).starter,
                 channel: peer_channel(peer),
             },
         }

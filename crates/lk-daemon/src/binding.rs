@@ -1,9 +1,13 @@
 //! 绑定裁决（M2.98，identity-binding.md §5.2/§5.3/§6；identity 三拆之一，
 //! issue #152）：
 //!
-//! - **绑定裁决比对序**（[`adjudicate_binding`]，§5.2）：先比路径（免
-//!   stat/hash）、再比 size（先 stat，免 hash）、一致才哈希比对（走缓存，
-//!   元信息一致复用 = O(stat)）；
+//! - **绑定裁决比对序**（[`adjudicate_binding`]，§5.2）：在已解析出候选路径
+//!   的前提下，先比路径（免 stat/hash）、再比 size（先 stat，免 hash）、
+//!   一致才哈希比对（走缓存，元信息一致复用 = O(stat)）。候选路径由对端
+//!   身份面产出（[`crate::identity::resolve`] 的 `exe_path`，PATH 序解析的
+//!   canonical 路径）——比对序纯函数 + 测试的归属自拍板 #28 候选 4 起归
+//!   daemon 本模块（原 core `fingerprint_matches` 重复件已删，缓存感知版
+//!   为唯一实现）；
 //! - **审批 finalize 侧重算指纹**（[`recompute_fingerprint`]，§5.3「以新
 //!   指纹重新授权」）：不信任客户端上报值，重新 canonicalize + stat +
 //!   流式 SHA-256。
@@ -15,7 +19,7 @@
 //! 修复面收敛一处。
 //!
 //! 姊妹模块：[`crate::peer_env`]（对端环境读取）、[`crate::exe_resolve`]
-//! （可执行解析 + 指纹缓存）。
+//! （可执行解析 + 指纹缓存）、[`crate::identity`]（对端身份门面）。
 
 use std::path::Path;
 
@@ -23,7 +27,6 @@ use lk_core::authz::FingerprintMismatch;
 use lk_core::model::ProgramFingerprint;
 
 use crate::exe_resolve::FingerprintCache;
-use crate::peer_env::PeerEnv;
 
 /// 绑定裁决结果（调用方据此决定放行 / 转审批）。
 pub enum BindingOutcome {
@@ -37,7 +40,8 @@ pub enum BindingOutcome {
     Unresolved,
 }
 
-/// 绑定规则比对（§5.2 比对序），在已解析出候选路径的前提下裁决：
+/// 绑定规则比对（§5.2 比对序），消费对端身份面解析出的候选路径（None =
+/// 不可解析 → [`BindingOutcome::Unresolved`]）：
 ///
 /// 1. **路径**：候选 canonical 路径与绑定规则 `exe_path` 不一致 → 失配（免
 ///    stat/hash，§5.1「PATH 前置假程序」场景）；
@@ -51,41 +55,35 @@ pub enum BindingOutcome {
 /// 花销一次 stat + 一次 hash 的上界（hash 仅在路径与 size 都通过后发生，且
 /// 元信息一致时复用缓存哈希）。
 pub fn adjudicate_binding(
-    peer_env: &dyn PeerEnv,
-    pid: u32,
-    cwd: &str,
-    command: &str,
+    candidate: Option<&Path>,
     bound_fps: &[ProgramFingerprint],
     cache: &mut FingerprintCache,
 ) -> BindingOutcome {
     if bound_fps.is_empty() {
         return BindingOutcome::Allowed; // 未绑定 → 现状语义
     }
-    let Some(path) = crate::exe_resolve::resolve_exe_path(peer_env, pid, cwd, command) else {
+    let Some(path) = candidate else {
         return BindingOutcome::Unresolved;
     };
     // 1. 路径：候选与任一绑定规则路径一致？（Path 平台无关等值）
-    if !bound_fps
-        .iter()
-        .any(|fp| Path::new(&path) == Path::new(&fp.exe_path))
-    {
+    if !bound_fps.iter().any(|fp| path == Path::new(&fp.exe_path)) {
         // 失配展示：当前解析路径 + 8 位哈希摘要（哈希仅为展示而算，属失配
         // 罕见的人机路径，不违背「决策免哈希」——决策在第 1 步已免哈希判失配）。
-        return BindingOutcome::Mismatch(mismatch_info(&path, cache));
+        return BindingOutcome::Mismatch(mismatch_info(path, cache));
     }
     // 2. size：stat 候选（缓存计数），与任一绑定规则 size 一致？
-    let Some(meta) = cache.stat(&path) else {
+    let Some(meta) = cache.stat(path) else {
         return BindingOutcome::Unresolved; // stat 失败（候选消失/不可读）→ fail-closed
     };
     if !bound_fps.iter().any(|fp| fp.size == meta.size) {
-        return BindingOutcome::Mismatch(mismatch_info(&path, cache));
+        return BindingOutcome::Mismatch(mismatch_info(path, cache));
     }
     // 3. hash：流式 SHA-256（缓存；元信息一致复用），与任一绑定规则一致？
-    let Some(sha256) = cache.sha256(&path, meta) else {
+    let Some(sha256) = cache.sha256(path, meta) else {
         return BindingOutcome::Unresolved; // 读取失败 → fail-closed
     };
     if !bound_fps.iter().any(|fp| fp.sha256 == sha256) {
-        return BindingOutcome::Mismatch(mismatch_info(&path, cache));
+        return BindingOutcome::Mismatch(mismatch_info(path, cache));
     }
     BindingOutcome::Allowed
 }
@@ -305,5 +303,168 @@ mod tests {
             None,
             "> 阈值 hash 失败 → None"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 比对序（§5.2；拍板 #28 候选 4 归属反转：自 core `fingerprint_matches`
+    // 单测迁入本模块缓存感知版——决策免哈希/免 stat 用「哈希恒失败源」探针
+    // 钉住：哈希不可用时决策仍可作出，即决策未走哈希比对）。
+    // ------------------------------------------------------------------
+
+    /// stat 成功、哈希恒失败的源（「决策免哈希」探针）。
+    struct HashUnavailableSource {
+        meta: MetaSnapshot,
+    }
+    impl crate::exe_resolve::FingerprintSource for HashUnavailableSource {
+        fn stat(&self, _path: &Path) -> Option<MetaSnapshot> {
+            Some(self.meta)
+        }
+        fn hash(&self, _path: &Path) -> lk_core::Result<String> {
+            Err(lk_core::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "hash unavailable",
+            )))
+        }
+    }
+
+    fn fp(exe: &str, sha: &str, size: u64) -> ProgramFingerprint {
+        ProgramFingerprint {
+            exe_path: exe.into(),
+            sha256: sha.into(),
+            size,
+        }
+    }
+
+    /// 未绑定（空绑定规则集）→ 现状语义短路 Allowed（零 stat/零哈希）。
+    #[test]
+    fn comparison_order_unbound_rules_short_circuit_allow() {
+        let mut cache = FingerprintCache::with_source(Box::new(UnreadableSource));
+        assert!(matches!(
+            adjudicate_binding(Some(Path::new("/any/pgm")), &[], &mut cache),
+            BindingOutcome::Allowed
+        ));
+        assert_eq!(cache.stat_calls(), 0, "未绑定免一切比对 IO");
+        assert_eq!(cache.hash_calls(), 0);
+    }
+
+    /// 路径失配 → 免 stat/哈希**决策**（哈希恒失败探针：决策仍作出 = 决策
+    /// 未消费哈希；stat 仅失配展示摘要取样）。§5.1「PATH 前置假程序」场景。
+    #[test]
+    fn comparison_order_path_mismatch_decides_without_hash() {
+        let mut cache = FingerprintCache::with_source(Box::new(HashUnavailableSource {
+            meta: MetaSnapshot {
+                size: 100,
+                mtime_nanos: 1,
+                file_id: 1,
+            },
+        }));
+        let rule = fp("/usr/bin/node", &sha64('a'), 100);
+        // 候选路径 ≠ 规则 exePath → Mismatch（即使源端哈希本会一致也轮不到比）
+        assert!(matches!(
+            adjudicate_binding(Some(Path::new("/usr/bin/custom-node")), &[rule], &mut cache),
+            BindingOutcome::Mismatch(_)
+        ));
+        // 哈希不可用（决策免哈希）；size 比对未发生（第 1 步已失配，
+        // stat 仅失配展示取样一次）
+        assert_eq!(cache.hash_calls(), 0, "决策未走哈希（源恒失败仍判失配）");
+        assert_eq!(cache.stat_calls(), 1, "仅失配展示摘要 stat 一次");
+    }
+
+    /// size 失配 → 免哈希**决策**（同款探针）；stat 已发生（第 2 步依据）。
+    #[test]
+    fn comparison_order_size_mismatch_decides_without_hash() {
+        let mut cache = FingerprintCache::with_source(Box::new(HashUnavailableSource {
+            meta: MetaSnapshot {
+                size: 101,
+                mtime_nanos: 1,
+                file_id: 1,
+            },
+        }));
+        let rule = fp("/usr/bin/node", &sha64('a'), 100);
+        assert!(matches!(
+            adjudicate_binding(Some(Path::new("/usr/bin/node")), &[rule], &mut cache),
+            BindingOutcome::Mismatch(_)
+        ));
+        assert_eq!(cache.hash_calls(), 0, "size 失配决策免哈希");
+    }
+
+    /// 路径 + size 一致 → 哈希比对决定命中/失配（size 同长覆盖场景由哈希
+    /// 兜底）；哈希确实被消费（计数 ≥ 决策一次）。
+    #[test]
+    fn comparison_order_hash_decides_when_path_and_size_match() {
+        // 哈希一致 → Allowed
+        let mut cache = FingerprintCache::with_source(Box::new(FakeSource {
+            meta: MetaSnapshot {
+                size: 100,
+                mtime_nanos: 1,
+                file_id: 1,
+            },
+            sha: sha64('a'),
+        }));
+        let rule = fp("/usr/bin/node", &sha64('a'), 100);
+        assert!(matches!(
+            adjudicate_binding(
+                Some(Path::new("/usr/bin/node")),
+                std::slice::from_ref(&rule),
+                &mut cache
+            ),
+            BindingOutcome::Allowed
+        ));
+        assert!(cache.hash_calls() >= 1, "哈希步被消费");
+        // 同路径同 size、哈希不一致 → Mismatch（重算后同款缓存计数）
+        let mut cache = FingerprintCache::with_source(Box::new(FakeSource {
+            meta: MetaSnapshot {
+                size: 100,
+                mtime_nanos: 1,
+                file_id: 1,
+            },
+            sha: sha64('b'),
+        }));
+        assert!(matches!(
+            adjudicate_binding(Some(Path::new("/usr/bin/node")), &[rule], &mut cache),
+            BindingOutcome::Mismatch(_)
+        ));
+    }
+
+    /// 候选不可解析（对端身份面 exe_path = None）→ Unresolved（fail-closed
+    /// 转审批，不携带失配展示）。
+    #[test]
+    fn comparison_order_unresolved_candidate_fails_closed() {
+        let mut cache = FingerprintCache::with_source(Box::new(FakeSource {
+            meta: MetaSnapshot {
+                size: 100,
+                mtime_nanos: 1,
+                file_id: 1,
+            },
+            sha: sha64('a'),
+        }));
+        let rule = fp("/usr/bin/node", &sha64('a'), 100);
+        assert!(matches!(
+            adjudicate_binding(None, &[rule], &mut cache),
+            BindingOutcome::Unresolved
+        ));
+        assert_eq!(cache.stat_calls(), 0, "无候选即无比对 IO");
+        assert_eq!(cache.hash_calls(), 0);
+    }
+
+    /// 多条绑定规则任一匹配即放行（§5.2：本命令由匹配的那条裁定）。
+    #[test]
+    fn comparison_order_any_matching_bound_rule_allows() {
+        let mut cache = FingerprintCache::with_source(Box::new(FakeSource {
+            meta: MetaSnapshot {
+                size: 100,
+                mtime_nanos: 1,
+                file_id: 1,
+            },
+            sha: sha64('a'),
+        }));
+        let rules = [
+            fp("/other/bin/tool", &sha64('z'), 999),
+            fp("/usr/bin/node", &sha64('a'), 100),
+        ];
+        assert!(matches!(
+            adjudicate_binding(Some(Path::new("/usr/bin/node")), &rules, &mut cache),
+            BindingOutcome::Allowed
+        ));
     }
 }

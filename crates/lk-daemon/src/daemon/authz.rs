@@ -41,16 +41,17 @@ impl Daemon {
             return GateBegin::Final(invalid_params(id, Some(e)));
         }
         let channel = client_channel(p.channel.as_deref(), peer_channel(peer));
-        // 启动者判定：守护进程侧从 IPC 对端 PID 回溯（客户端自报字段不信任）
-        let starter = derive_starter(peer);
-        // cwd 以对端真实 cwd（canonical）为准；客户端自报 cwd 仅作提示（忽略）。
-        // 跨命名空间归一化（cross-subsystem.md §7.4，两侧同函数）：WSL UNC /
-        // verbatim 形态折算为 `wsl://<distro>/<rest>` 规范形后再做祖先匹配，
-        // 与 rule.add 入库基准一致——伪造 cwd 写法变体不得绕过或漏配。
-        let cwd = lk_core::path_ns::canonical_project_dir(&peer.cwd.clone().unwrap_or_default());
+        // 对端身份单点解析（拍板 #28 候选 4）：starter/cwd 一律取 daemon 侧
+        // 从 IPC 对端观测的真实值（进程链回溯 / 对端真实 cwd；客户端自报字段
+        // 不信任、仅作提示）；cwd 跨命名空间归一化（cross-subsystem.md §7.4，
+        // 两侧同函数）——WSL UNC / verbatim 形态折算为 `wsl://<distro>/<rest>`
+        // 规范形后再做祖先匹配，与 rule.add 入库基准一致，伪造 cwd 写法变体
+        // 不得绕过或漏配。exe_path 按对端真实 PATH 解析（指纹裁决消费）。
+        let identity =
+            crate::identity::resolve(self.peer_env.as_ref(), peer, Some(p.command.as_str()));
         let req = AuthzRequest {
-            starter,
-            cwd,
+            starter: identity.starter.clone(),
+            cwd: identity.canonical_cwd.clone(),
             command: p.command,
             keys: p.keys,
         };
@@ -107,7 +108,7 @@ impl Daemon {
             .evaluate_layers(&req, &VaultRuleView { vault: v, secrets });
         // M2.98 程序指纹绑定：第 2 层命中但绑定规则指纹失配 → 视同未命中
         // （identity-binding.md §3/§5）。需在 vault 读锁内判定（规则在库内）。
-        let fp_verdict = self.fingerprint_adjudicate(&req, peer, v);
+        let fp_verdict = self.fingerprint_adjudicate(&identity, &req.command, v);
         drop(vault);
         match result {
             LayerResult::Allowed { keys } => {
@@ -149,28 +150,27 @@ impl Daemon {
 
     /// M2.98 程序指纹裁决（绑定规则命中命令形态但指纹不符 → 视同未命中，
     /// identity-binding.md §3/§5.2）。在 vault 读锁内调用（规则在库内）。
+    /// 消费对端身份面解析出的候选路径（`identity.exe_path`，拍板 #28 候选 4）；
+    /// 注入通道桌面直调**无豁免**（identity-binding §3 desktop 行指读/写门
+    /// 整门豁免；pid=0 对端经第 1 层 `unknown_starter` 必拒，裁决结果不消费）。
     ///
-    /// - **desktop 内嵌直调受信豁免**（§3：`pid=0` → 不查指纹）；
     /// - 无绑定规则命中 → NotApplicable（沿现状语义放行）；
-    /// - 候选解析失败（对端 env 不可读 / PATH+cwd 未命中 / stat/hash 失败）→
-    ///   NeedsApproval(None)（视同未命中 + 无可解析路径展示）。
+    /// - 候选不可解析（对端身份面 exe_path=None：env 不可读 / PATH+cwd 未
+    ///   命中）或 stat/hash 失败 → NeedsApproval(None)（视同未命中 + 无可
+    ///   解析路径展示）。
     fn fingerprint_adjudicate(
         &mut self,
-        req: &AuthzRequest,
-        peer: &PeerInfo,
+        identity: &PeerIdentity,
+        command: &str,
         v: &UnlockedVault,
     ) -> FingerprintVerdict {
-        // desktop 内嵌直调：pid=0，无对端 env 可读 → 受信豁免不查指纹。
-        if peer.pid == 0 {
-            return FingerprintVerdict::NotApplicable;
-        }
         // 命中命令形态的绑定 inject 规则（capability=inject + 项目祖先 + command 形态）。
         let bound: Vec<lk_core::model::ProgramFingerprint> = match v.list_rules() {
             Ok(rules) => rules
                 .into_iter()
                 .filter(|r| {
                     r.fingerprint.is_some()
-                        && lk_core::authz::rule_matches(r, &req.cwd, &req.command)
+                        && lk_core::authz::rule_matches(r, &identity.canonical_cwd, command)
                 })
                 .map(|r| r.fingerprint.unwrap())
                 .collect(),
@@ -179,13 +179,8 @@ impl Daemon {
         if bound.is_empty() {
             return FingerprintVerdict::NotApplicable;
         }
-        // 对端真实 cwd 兜底（peer.cwd 已是真实值；绝对命令免 PATH 解析）。
-        let cwd = peer.cwd.clone().unwrap_or_else(|| req.cwd.clone());
         match crate::binding::adjudicate_binding(
-            self.peer_env.as_ref(),
-            peer.pid,
-            &cwd,
-            &req.command,
+            identity.exe_path.as_deref(),
             &bound,
             &mut self.fingerprint_cache,
         ) {
@@ -353,7 +348,16 @@ impl Daemon {
                 // 走（issue #150）：已裁决的工作区不再裁决——弹窗批准即
                 // 「本次允许」。
                 if !workspace.fingerprint_adjudicated() {
-                    let verdict = self.fingerprint_adjudicate(req, &peer, workspace.vault());
+                    // 补裁决用**裁决时刻**的重新解析（issue #140：对端 env 按
+                    // PendingAuthz 存留的 peer 重读——等待期间 exe 可能已变，
+                    // 不复用 begin 期产物；单次裁决 gating 由工作区单发状态承载）。
+                    let identity = crate::identity::resolve(
+                        self.peer_env.as_ref(),
+                        &peer,
+                        Some(req.command.as_str()),
+                    );
+                    let verdict =
+                        self.fingerprint_adjudicate(&identity, &req.command, workspace.vault());
                     if let FingerprintVerdict::NeedsApproval(mismatch) = verdict {
                         return self.authz_finalize_reopen(id, req, peer, workspace, mismatch);
                     }
