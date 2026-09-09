@@ -37,3 +37,6 @@ desktop.ini
 # 船员 checkpoint / scratch（本地工作产物，勿提交）
 .scratch/
 .workbuddy/
+
+# issue-autopilot worktree 现场（认领时 git worktree add 产物，见 workflows/issue-autopilot.md §8）
+.autopilot/

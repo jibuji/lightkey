@@ -91,10 +91,13 @@ last_ok="" age_min="n/a" stale_label="-" title="" paused=0 labels=""
 if [[ -n "${tracking:-}" && "$tracking" =~ ^[0-9]+$ ]]; then
   body=$(gh issue view "$tracking" --json body,title,labels --jq '[.title,(.labels|map(.name)|join(",")),.body] | @tsv' 2>/dev/null | tail -1)
   if [[ -n "$body" ]]; then
+    # gh 的 @tsv 会把正文换行转义成字面 \n（首遇真实心跳时实测暴露：grep 跨
+    # 「行」咬到 `Z\n-` → 解析失败假报 SUSPECT）→ 先反转义回真实多行
+    issue_body=$(printf '%s' "$body" | cut -f3- | sed 's/\\n/\n/g')
     title=$(printf '%s' "$body" | cut -f1)
     labels=$(printf '%s' "$body" | cut -f2)
     case "$title" in *"[PAUSED]"*) paused=1;; esac
-    raw=$(printf '%s' "$body" | cut -f3- | grep -oE 'last-ok:[[:space:]]*[^ ",]+' | head -1 | sed 's/.*last-ok:[[:space:]]*//')
+    raw=$(printf '%s' "$issue_body" | grep -oE 'last-ok:[[:space:]]*[^ ",]+' | head -1 | sed 's/.*last-ok:[[:space:]]*//')
     last_ok="$raw"
     # 严格形状校验：`date -d ""` 会返回今日零点（= 假装“4 小时前还活着”），必须是 ISO 形状才算
     if [[ -n "$raw" && ! "$raw" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2} ]]; then

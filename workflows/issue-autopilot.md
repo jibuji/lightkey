@@ -243,7 +243,8 @@ L1 是**唯一允许的非构建/非发布 `schedule` workflow**（补充拍板 
 - **auto-merge = CI 全绿即自动合并（`gh pr merge --auto --squash`）**，但两道独立闸：
   1. **分诊前置**：改动面可能命中 denylist 的需求不进 `ready-for-agent`。
   2. **合并闸门**：PR diff 命中 denylist → **不开** auto-merge，评论说明命中项 + 打 `needs-human`。
-  denylist（路径闭集）：`.github/**`（agent 改 CI = 自己放宽规则，token 有 `workflow` scope）、`crates/lk-app/**`（本机无法完整验证的部分仍需人看）、`Cargo.toml` 的 `[workspace.package] version`（#34：bump 属发版）、`Cargo.lock` 大改、`frontend/package-lock.json`、`docs/decisions.md`、`CONTEXT.md`、`docs/adr/**`、`AGENTS.md`、`docs/**` 的任何规格权威文件（规格是唯一权威，不许 agent 自己盖章）。
+  denylist（路径闭集）：`.github/**`（agent 改 CI = 自己放宽规则，token 有 `workflow` scope）、`workflows/**`（循环自身规格，同上——它就是 agent 合并权限的出处）、`Cargo.toml` 的 `[workspace.package] version`（#34：bump 属发版）、`Cargo.lock` 大改、`frontend/package-lock.json`、`docs/decisions.md`、`CONTEXT.md`、`docs/adr/**`、`AGENTS.md`、`docs/**` 的任何规格权威文件（规格是唯一权威，不许 agent 自己盖章）。
+  闭集只挡「CI 绿根本覆盖不到」的三类：护栏自身、规格权威文档、发版面。**`crates/lk-app/**` 已于补充拍板 #30 移出闭集**：桌面包在 Windows build job 里随 PR 一起真编译（`cargo tauri build`），CI 绿即代表它能编过，本机不可验的部分改由 PR 正文「本机验证结果」段与事后 revert 承载。
 - PR 未合并期间 `agent-working` **不摘**（否则你会以为它还在跑）。
 
 ## 11. 预算与上限
@@ -319,7 +320,7 @@ pi 的解析优先级：`--provider` / `--model` / `--thinking` 旗标 **>** `.p
 - **真相源投毒**：已合并的错误代码 = 新基线；auto-merge（OWNER 决策）把这个风险的窗口缩到 CI 时长，缓解只有 denylist + squash 易 revert。
 - **规则/授权门类改动**（`docs/authorization-gate.md` 等）是安全关键，CI 绿 ≠ 正确；建议这类 issue 由你手工落 `ready-for-human`，别指望分诊 agent 判定「安全重要度」。
 - **Windows 侧**：不装 cron，能力（`tauri-shell` on Windows、`wsl2-desktop-e2e`、`release-build`）实际长期为 false → 那类 issue 会稳定走 §6 的 7 天降级路径。
-- **本地未验证即提 PR**：`lk-app` 改动被 denylist 挡住 auto-merge，但 agent 仍可能「写了没验证的 Rust」—— PR 正文的「本机验证结果」段是你唯一抓手。
+- **本地未验证即提 PR**：agent 仍可能「写了没验证的 Rust」—— PR 正文的「本机验证结果」段是你唯一抓手。`lk-app`（桌面壳）已从 denylist 移出（补充拍板 #30）：它能编过 Windows CI，但**运行时行为（托盘/锁屏/通知/审批窗）CI 不覆盖**，那部分现在也靠自动合并 + 事后看异常。
 
 ## 15. Definition of done（实现验收）
 
@@ -329,18 +330,19 @@ pi 的解析优先级：`--provider` / `--model` / `--thinking` 旗标 **>** `.p
 
 | 文件 | 职责 |
 | --- | --- |
-| `scripts/autopilot/poll.sh` | **待实现**：§4 阶段编排 + §11 配额 + §12 校验；开头必抢 `poll.lock`（§4.1） |
-| `scripts/autopilot/probe-capabilities.sh` | §7 JSON 契约，fail-closed |
+| `scripts/autopilot/poll.sh` | **已落地（待 PR）**：§4 阶段编排 + §11 配额 + §12 校验；开头必抢 `poll.lock`（§4.1）；DRY_RUN=1 验收模式（只分诊分析 + 跳账 + 心跳，不动标签不开 PR 不认领，§15） |
+| `scripts/autopilot/probe-capabilities.sh` | **已落地（待 PR）**：§7 JSON 契约，fail-closed；运行时不引 jq/python（Windows Git Bash 同形，A14） |
+| `scripts/autopilot/lib/common.sh` | **已落地（待 PR）**：host.toml 解析 / 状态目录 / 每日配额计数器 / runs gc / 脱敏（§12.6）|
 | `scripts/autopilot/status.sh` | **已落地**：§9.1 L2 一眼看活（人用） |
 | `scripts/autopilot/ctl.sh` | **已落地**：§4.1 启动层（start/stop/run-once/install + 单实例幂等） |
 | `scripts/autopilot/tests/ctl.t.sh` | **已落地**：§4.1 回归 18 例（并发 start 单实例 / 锁 fd 继承 / stop 真停 / 缺 poll.sh 响亮报错） |
 | `.github/workflows/autopilot-watchdog.yml` | **已落地**：§9.1 L1 外部见证（`schedule`，权限 `issues: write`；Variable 经 `vars` 上下文注入） |
-| `scripts/autopilot/lib/labels.sh` | 标签读写 + §5 权限白名单校验 + 回滚 |
-| `scripts/autopilot/lib/pi-run.sh` | **唯一允许出现模型参数处**：`host.toml` → `--provider/--model/--thinking` + `timeout` + `usage` 预算守护 + `runs/` 落盘（§11.1） |
-| `scripts/autopilot/lib/heartbeat.sh` | §9 正文重写（保留 `<!-- human -->` 区）+ 看门狗/webhook |
-| `scripts/autopilot/lib/pr.sh` | §10 denylist 判定、PR 正文渲染、`gh pr merge --auto --squash` |
-| `scripts/autopilot/prompts/{triage,implement,resume}.md` | 投喂模板：issue 号 + brief 全文 + `AUTOPILOT:` 回复原文 + §12 禁令全文 |
-| `scripts/autopilot/tests/*.bats` | denylist、能力词表、状态机迁移、跳账降级、配额的纯逻辑回归（待实现） |
+| `scripts/autopilot/lib/labels.sh` | **已落地（待 PR）**：标签读写 + §5 权限白名单校验 + 回滚 + 戳/OWNER 回复/mine 解析（纯函数） |
+| `scripts/autopilot/lib/pi-run.sh` | **已落地（待 PR）**：**唯一允许出现模型参数处**：`host.toml` → `--provider/--model/--thinking` + `timeout` + `usage` 预算守护 + `runs/` 落盘 + child.pid（泄漏按组杀）（§11.1） |
+| `scripts/autopilot/lib/heartbeat.sh` | **已落地（待 PR）**：§9 正文重写（保留 `<!-- human -->` 区）+ last-ok 契约行 + 跳账台账/降级素材 |
+| `scripts/autopilot/lib/pr.sh` | **已落地（待 PR）**：§10 denylist 判定、PR 正文模板、ref 白名单 diff、`gh pr merge --auto --squash` |
+| `scripts/autopilot/prompts/{triage,implement,resume}.md` | **已落地（待 PR）**：投喂模板：issue 号 + brief 全文 + `AUTOPILOT:` 回复原文 + §12 禁令全文 |
+| `scripts/autopilot/tests/poll.t.sh` | **已落地（待 PR）**：denylist、版本闸门、ref 白名单、标签白名单/越权、戳解析/OWNER 回复/mine、跳账台账去重与降级素材、配额、脱敏的纯逻辑回归（离线，沿用 .t.sh 风格而非 bats：零额外依赖，与 status.t.sh/ctl.t.sh 同构） |
 | `scripts/autopilot/tests/status.t.sh` | **已落地**：§9.1 两层看活的离线回归（12 例） |
 
 prompt 投喂用「调度器拼全文」而非「让 agent 自己 `gh issue view`」：禁令与 brief 必须在 prompt 里，不靠 agent 自觉；代码再校验一遍，双闸。

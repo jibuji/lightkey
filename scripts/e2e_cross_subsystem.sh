@@ -39,9 +39,13 @@ set -o pipefail   # 管道中 lk 失败不得被 awk/grep 吞掉（断言真实�
 # ---------------------------------------------------------------- 参数解析
 LK=""
 AUTO=0
+PREFLIGHT_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --auto-approve) AUTO=1 ;;
+    # 只跑前置检测不动 E2E 本体（issue-autopilot 能力探测 §7 用：
+    # scripts/autopilot/probe-capabilities.sh 判「前置不 SKIP」）
+    --preflight-only) PREFLIGHT_ONLY=1 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) if [ -z "$LK" ]; then LK="$arg"; else echo "多余参数：$arg" >&2; exit 2; fi ;;
   esac
@@ -120,6 +124,10 @@ printf '%s' "$BRIDGE_NOTE" | grep -q "bridge" \
   || skip "Linux lk 尚未实现 bridge 后端（status 无「经 bridge」提示，M2.75 待合入）"
 
 echo "== 0. 前置就绪 =="
+if [ "$PREFLIGHT_ONLY" = 1 ]; then
+  echo "PREFLIGHT-OK: 前置全部满足（--preflight-only，不执行 E2E 本体）"
+  exit 0
+fi
 ok "WSL2 宿主 + WSLInterop 已启用"
 ok "Windows 侧数据目录：$WIN_HOME"
 ok "bridge 中继：$RELAY"
