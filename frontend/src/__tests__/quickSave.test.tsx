@@ -15,7 +15,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Context } from "@cordisjs/core";
-import { act } from "react";
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { ipcBridge } from "../plugins/ipc-bridge";
 import { preferenceStore } from "../plugins/preference-store";
 import { toast } from "../plugins/toast";
@@ -24,6 +25,8 @@ import {
   suggestSecretName,
   uiQuickSave,
 } from "../plugins/ui-quick-save";
+import { uiVault } from "../plugins/ui-vault";
+import { SlotRegistry, type SlotEntry } from "../host/slots";
 import { MockAdapter } from "../ipc/mockAdapter";
 
 /** 快存面板 portal 挂载标记（ui-quick-save 自挂 root 的 data-portal）。 */
@@ -35,15 +38,24 @@ const PORTAL_SELECTOR = '[data-portal="quick-save"]';
  *  context 响应下一个测试的派发、开出自己的面板污染 DOM。 */
 let activeDisposers: Array<() => void> = [];
 
+/** VaultPage 渲染容器（issue #171 选中断言用；afterEach 卸载清 DOM）。 */
+let vaultRoots: Array<{ root: Root; container: HTMLDivElement }> = [];
+
 beforeEach(() => {
   vi.useFakeTimers();
   localStorage.clear();
   activeDisposers = [];
+  vaultRoots = [];
 });
 
 afterEach(() => {
   for (const dispose of activeDisposers) dispose();
   activeDisposers = [];
+  for (const { root, container } of vaultRoots) {
+    act(() => root.unmount());
+    container.remove();
+  }
+  vaultRoots = [];
   // 兜底清理：dispose 之外可能残留的 portal 容器与 Modal overlay
   for (const el of Array.from(
     document.body.querySelectorAll(`${PORTAL_SELECTOR}, .modal-overlay`),
@@ -118,6 +130,34 @@ function formSubmit() {
   act(() => {
     form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
   });
+}
+
+/* ================= issue #171：保存成功后选中新条目（VaultPage 侧装配） ================= */
+
+/** 在快存 ctx 上补挂 ui-vault 插件（槽位注册；组件不渲染——真实装配里 ui-vault
+ *  常驻，但 VaultPage 随页面切换/锁态卸载）。返回 content 槽位 entry，用于
+ *  按需渲染 VaultPage。 */
+async function mountUiVault(ctx: Context): Promise<SlotEntry> {
+  ctx.provide("slots", new SlotRegistry());
+  const fiber = await ctx.plugin(uiVault, {});
+  activeDisposers.push(fiber.dispose);
+  const entry = ctx.slots.page("vault");
+  if (!entry) throw new Error("ui-vault content slot not registered");
+  return entry;
+}
+
+/** 渲染 ui-vault 槽位组件（VaultPage）到独立容器（recorded 便于 afterEach 清理）。
+ *  与宿主 Skeleton 的同款接线：`entry.component` 即 `VaultPage`（携带插件层
+ *  selectTargetRef）。 */
+function renderVaultComponent(entry: SlotEntry): HTMLDivElement {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  act(() => {
+    root.render(createElement(entry.component));
+  });
+  vaultRoots.push({ root, container });
+  return container;
 }
 
 describe("suggestSecretName —— 启发建议名纯函数（quick-capture.md §4.3）", () => {
@@ -310,6 +350,100 @@ describe("保存闭环", () => {
     const afterP = ctx.ipc.list();
     await flush();
     expect((await afterP).length).toBe(before);
+  });
+});
+
+describe("保存成功后选中新条目（issue #171 —— quick-capture.md §3.1 步骤 4）", () => {
+  it("保存成功 → vault.select 携带新条目 id（载荷零密钥值，只有 id）", async () => {
+    const { ctx, mock } = await mountQuickSave();
+    await unlock(ctx);
+    mock.setClipboardText("sk-select-event");
+    fireShellQuickSave();
+    await flush();
+
+    const payloads: string[] = [];
+    ctx.on("vault.select", (p) => payloads.push(p.itemId));
+    formSubmit();
+    await flush();
+
+    const listP = ctx.ipc.list();
+    await flush();
+    const created = (await listP).find((i) => i.name === "api_key");
+    expect(created).toBeDefined();
+    // 载荷 = 刚创建条目的 id（ui-vault 据此选中）
+    expect(payloads).toEqual([created!.id]);
+  });
+
+  it("保存成功（vault 页已挂载）→ 列表选中新条目 + 详情展示", async () => {
+    const { ctx, mock } = await mountQuickSave();
+    const entry = await mountUiVault(ctx);
+    await unlock(ctx);
+    const container = renderVaultComponent(entry);
+    await flush(700); // VaultPage 初始加载（list 300 + get×N 300）
+
+    mock.setClipboardText("sk-select-mounted");
+    fireShellQuickSave();
+    await flush();
+    formSubmit();
+    // create 300 + 其 item.changed 触发的重载 300 + vault.select 选中
+    await flush(700);
+
+    expect(container.querySelector(".item.selected .item-name")?.textContent).toBe("api_key");
+    expect(container.querySelector(".detail-title")?.textContent).toBe("api_key");
+  });
+
+  it("保存成功（vault 页未挂载，如从设置页发起）→ 插件层 pending 兜底，随后挂载即选中", async () => {
+    const { ctx, mock } = await mountQuickSave();
+    // ui-vault 插件常驻挂载（pending 捕获就位）；VaultPage 组件不渲染
+    // （当前页不是 vault）——事件无人接收，靠插件层暂存
+    const entry = await mountUiVault(ctx);
+    await unlock(ctx);
+    mock.setClipboardText("sk-select-pending");
+    fireShellQuickSave();
+    await flush();
+    formSubmit();
+    await flush(); // create 完成 → vault.select → ui-vault 插件层 pending
+
+    const container = renderVaultComponent(entry);
+    await flush(700); // 挂载后首次加载 → 消费 pending → 选中
+    expect(container.querySelector(".item.selected .item-name")?.textContent).toBe("api_key");
+  });
+
+  it("pending 消费后不残留：其后手动选其它条目 + item.changed 刷新 → 选中保持（防劫持）", async () => {
+    const { ctx, mock } = await mountQuickSave();
+    const entry = await mountUiVault(ctx);
+    await unlock(ctx);
+    const container = renderVaultComponent(entry);
+    await flush(700);
+
+    mock.setClipboardText("sk-select-hijack");
+    fireShellQuickSave();
+    await flush();
+    formSubmit();
+    await flush(700);
+    expect(container.querySelector(".item.selected .item-name")?.textContent).toBe("api_key");
+
+    // 手动选 fixture 条目 NPM_TOKEN
+    const other = Array.from(container.querySelectorAll(".item")).find((el) =>
+      el.textContent?.includes("NPM_TOKEN"),
+    ) as HTMLButtonElement;
+    act(() => other.click());
+    expect(container.querySelector(".item.selected .item-name")?.textContent).toBe("NPM_TOKEN");
+
+    // 任意 item.changed 刷新：选中必须保持（vault.select 的 pending 已消费，
+    // 不得跳回 api_key）。须包 act：事件处理器内同步 reload -> 状态更新被
+    // React 合并，effect 的 loadItems 定时器才能在本轮 flush 内触发——
+    // 否则更新被推迟到 act 收尾（定时器已推进完），列表卡在加载态。
+    act(() => {
+      mock.simulateItemChanged({
+        itemId: "github",
+        revisionDate: "2026-08-16T00:00:01Z",
+        type: "login",
+        deleted: false,
+      });
+    });
+    await flush(700);
+    expect(container.querySelector(".item.selected .item-name")?.textContent).toBe("NPM_TOKEN");
   });
 });
 
