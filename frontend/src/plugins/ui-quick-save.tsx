@@ -17,8 +17,9 @@
  *   合法，data-model 无唯一约束）、可选「用途」+「保存后清空剪贴板」勾选
  *   （**默认关**——外部复制内容非 LightKey 所有，不自动清，quick-capture.md
  *   §5）；保存 = `ctx.ipc.create`（secret 类型，desktop 通道写门受信豁免）
- *   → toast + 切到 vault 页（列表经 `item.changed` 既有刷新路径，无需跨
- *   插件消息）；
+ *   → toast + 切到 vault 页（列表经 `item.changed` 既有刷新路径自动可见；
+ *   新条目**选中**经 `vault.select` 本地事件交给 ui-vault，§3.1 步骤 4，
+ *   issue #171）；
  * - **锁态** → 只 toast「解锁后即可快速保存」+ 置 pending，**不读剪贴板、
  *   不留值**（锁态 fail-closed 同向，§5）；`session.unlocked` → flush 自动
  *   重冒面板（拍板点 ②：锁定不清 pending，消费后清）；
@@ -128,7 +129,7 @@ function QuickSavePanel({
     setBusy(true);
     setError("");
     try {
-      await ctx.ipc.create({
+      const created = await ctx.ipc.create({
         type: "secret",
         name: nm,
         value: val,
@@ -143,6 +144,11 @@ function QuickSavePanel({
         }
       }
       toast.show("已保存到 LightKey");
+      // 选中新条目（quick-capture.md §3.1 步骤 4）：把 created.id 经
+      // vault.select（TS 内事件，载荷只有 id，零密钥值）交给 ui-vault；
+      // VaultPage 未挂载（如从设置页发起）时由 ui-vault 插件层 pending
+      // 兜底，挂载后的任一次加载消费。
+      ctx.emit("vault.select", { itemId: created.id });
       onClose();
       // 切到条目页：列表经 item.changed 既有刷新路径自动可见
       ctx.nav.go("vault");

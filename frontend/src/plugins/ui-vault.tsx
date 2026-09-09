@@ -73,8 +73,18 @@ type ItemsLoadState =
   | { phase: "ready"; items: Item[] }
   | { phase: "error"; error: unknown };
 
-/** 条目页本体（content 槽位，page=vault）。 */
-export function VaultPage({ ctx }: { ctx: Context }) {
+/** 条目页本体（content 槽位，page=vault）。
+ *  `selectTargetRef`（可选，宿主 uiVault 插件工厂注入，issue #171）：快存
+ *  保存成功后要选中的新条目 id——`vault.select` 事件可能发生在本组件未
+ *  挂载时（页面切换/锁态整页都会卸载本组件），事件无人接收即丢；插件层
+ *  把 id 暂存进该 ref，本组件任一次加载消费（命中才清，保证窗口内不丢）。 */
+export function VaultPage({
+  ctx,
+  selectTargetRef,
+}: {
+  ctx: Context;
+  selectTargetRef?: { current: string | null };
+}) {
   const toast = ctx.toast;
 
   const [filter, setFilter] = useState<FilterValue>("all");
@@ -107,7 +117,22 @@ export function VaultPage({ ctx }: { ctx: Context }) {
       if (!alive) return;
       if (res.ok) {
         setLoad({ phase: "ready", items: res.items });
-        setSelectedId((prev) => resolveSelection(res.items, prev));
+        setSelectedId((prev) => {
+          // issue #171（quick-capture.md §3.1 步骤 4）：快存保存成功后选中
+          // 新条目。pending 命中（新条目已在结果中）→ 选中并消费；未命中
+          // （通知竞态，条目尚未加载到）→ 保留 pending 等下一次加载再试；
+          // 无 pending → 既有保持语义。
+          const target = selectTargetRef?.current ?? null;
+          if (target) {
+            const found = res.items.some((it) => it.id === target);
+            if (found) {
+              selectTargetRef!.current = null;
+              return target;
+            }
+            return prev;
+          }
+          return resolveSelection(res.items, prev);
+        });
       } else {
         setLoad({ phase: "error", error: res.error });
       }
@@ -124,6 +149,25 @@ export function VaultPage({ ctx }: { ctx: Context }) {
       off();
     };
   }, [ctx, reload]);
+  // issue #171：快存保存成功后选中新条目（quick-capture.md §3.1 步骤 4）。
+  // 挂载态直接选中（无需等下一次加载；与 selectItem 同款关闭值披露）——未
+  // 命中当前 items（通知竞态，新条目尚未加载到）时由插件层 pending 兜底
+  // （loading 消费），这里仅在命中时清 pending（防残留覆盖用户后续手选）。
+  useEffect(() => {
+    const off = ctx.on("vault.select", (p) => {
+      setSelectedId(p.itemId);
+      setRevealed(false);
+      if (
+        selectTargetRef?.current === p.itemId &&
+        items?.some((it) => it.id === p.itemId)
+      ) {
+        selectTargetRef.current = null;
+      }
+    });
+    return () => {
+      off();
+    };
+  }, [ctx, items, selectTargetRef]);
   // topbar 搜索（300ms 防抖在搜索组件侧；此处直接消费）
   useEffect(() => {
     const off = ctx.on("vault.search", (p) => setSearch(p.query));
@@ -918,12 +962,21 @@ function ItemForm({
 /** 插件工厂：注册 content 槽位组件（page=vault）。 */
 export const uiVault: Plugin.Function<Context, SlotComponentConfig> = Object.assign(
   (ctx: Context, config: SlotComponentConfig) => {
+    // issue #171（quick-capture.md §3.1 步骤 4）：快存保存成功后选中新条目。
+    // `vault.select` 事件可能发生在本槽位组件未挂载时（页面切换/锁态整页
+    // 都卸载 VaultPage）——事件无人接收即丢，故在此持久化 pending；挂载
+    // 后的任一次加载消费（命中才清，未命中保留重试，见 VaultPage 加载编排）。
+    const selectTargetRef: { current: string | null } = { current: null };
+    ctx.on("vault.select", (p) => {
+      selectTargetRef.current = p.itemId;
+    });
+
     ctx.slots.register({
       name: "ui-vault",
       slot: config.slot ?? "content",
       order: config.order ?? 10,
       component: (() => {
-        const Comp = () => <VaultPage ctx={ctx} />;
+        const Comp = () => <VaultPage ctx={ctx} selectTargetRef={selectTargetRef} />;
         Comp.slot = "content";
         return Comp as ComponentType<Record<string, unknown>>;
       })(),

@@ -16,6 +16,7 @@
  * | `vault.search-enter` | `{ query }` | topbar 搜索框回车（TS 内 emit） | ui-vault（空态引导新建） |
  * | `vault.initialized` | `{ initialized }` | ipc-bridge（守护进程 `vault.status` 探测结果，TS 内 emit，不跨进程） | 宿主（锁态整页互斥门控：无库→onboarding / 有库→unlock） |
  * | `quick.save-request` | 无负载（零密钥值） | 壳（托盘「快速保存剪贴板…」→ Tauri `lk-shell-quick-save` 本地事件 → ipc-bridge 翻译，TS 内 emit，不跨进程） | 快存面板（ui-quick-save 服务插件） |
+ * | `vault.select` | `{ itemId }`（零密钥值） | ui-quick-save 保存成功后（TS 内 emit，不跨进程） | ui-vault（选中新条目，quick-capture.md §3.1 步骤 4） |
  *
  * 分发语义：`emit`（观察广播，fire-and-forget）；`authz.request` 的审批结果
  * 经 IPC 方法 `approval.result` 回传（跨进程无同步事件返回值，§5.3）。
@@ -114,6 +115,12 @@ export interface VaultSearchPayload {
   query: string;
 }
 
+/** `vault.select` 负载：快存保存成功后要选中的新条目（quick-capture.md §3.1
+ *  步骤 4）。只有条目 id——零密钥值、零明文，不跨进程（TS 内事件）。 */
+export interface VaultSelectPayload {
+  itemId: string;
+}
+
 declare module "@cordisjs/core" {
   interface Events {
     "item.changed"(payload: ItemChangedPayload): void;
@@ -135,6 +142,13 @@ declare module "@cordisjs/core" {
      *  事件由 ipc-bridge 单独翻译（tauri 监听 `lk-shell-quick-save`；
      *  mock 监听同名 DOM CustomEvent，QA 钩子模拟同一条路径）。 */
     "quick.save-request"(): void;
+    /** 保存成功后选中新条目（issue #171 / quick-capture.md §3.1 步骤 4）：
+     *  ui-quick-save 成功 `item.put`（item.create）后携带新条目 id 本地
+     *  emit（TS 内事件，不跨进程、不进守护进程通知协议；载荷只有 id，
+     *  零密钥值）。ui-vault 收到后选中该条目——VaultPage 随页面切换/锁态
+     *  会卸载，事件可能发生在未挂载时，ui-vault 插件层把 id 暂存为
+     *  pending，任一次加载（挂载/刷新）消费。 */
+    "vault.select"(payload: VaultSelectPayload): void;
   }
 }
 
