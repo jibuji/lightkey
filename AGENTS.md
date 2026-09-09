@@ -57,6 +57,10 @@
 - 功能分支开发，开 PR 由 GitHub CI 自动跑质量门禁（见「常用命令」CI 条目），
   全绿后合并；不直接推默认分支。本地 no-mistakes 闸门已于 2026-08-29 移除
   （补充拍板 #21），不再跑 `/no-mistakes`。
+- PR finish（合并，或确认不再重开的关闭）后即时清理该 PR 的残留分支：
+  删远端 head 分支（`git push origin --delete <head>` 或 GitHub 界面删分支）、
+  本地 `git fetch --prune` + `git branch -d <head>`，该 PR 用完的 worktree 一并移除；
+  关闭的 PR 若打算重开可保留分支，但须在 PR 评论里留说明。
 - 测试 fixture 密钥不进仓库（testing.md）。
 - 前端设计评审用 agent_browser 对
   `docs/design/prototype/`（零构建原型）截图；评审流程见
