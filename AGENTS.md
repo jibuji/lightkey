@@ -57,6 +57,18 @@
 - 功能分支开发，开 PR 由 GitHub CI 自动跑质量门禁（见「常用命令」CI 条目），
   全绿后**由人合并**；不直接推默认分支。本地 no-mistakes 闸门已于 2026-08-29 移除
   （补充拍板 #21），不再跑 `/no-mistakes`。
+- **例外：GitHub Pilot 无人值守循环**（2026-09-10 起接管本仓的 issue 流水线）。引擎是
+  独立仓库 [`jibuji/github_pilot`](https://github.com/jibuji/github_pilot)（本仓自建的
+  `issue-autopilot` 已于 #206 移除）。它认领的 issue，其 PR 经该循环自己的 reviewer 评审通过后
+  **自动 squash-merge**，不等人在场；合并前它会复查 issue 是否被人工改过、控制面是否被叫停。
+  - **进池条件**：issue 是 open 且带 `triaged` + 与本机匹配的 `env:*`，且没有
+    `needs-human` / `needs-info` / `wontfix` / `do-not-automate` / `in-progress` / `done` / `blocked`。
+  - **拦下一张票**：打 `do-not-automate`。**全局停**：在任一目标仓库开一张带 `bot-paused` 的
+    open issue；或在 github_pilot 仓库跑 `ops/pilot-ctl.sh stop`（默认停 12h，`status` 看当前模式）。
+  - **它的闸门只有两样**：循环自带的 reviewer + 它在本机真跑的命令（`cargo fmt/test/clippy`、
+    前端 `npm test` 等）。它**不等** `release.yml` 的 PR 运行结果就合并，所以合并后 PR 上仍可能
+    出现 CI 结论（Windows 侧的 `lk-app` 门禁尤其如此）。
+  - 机器人跑的 PR 由机器人合并；**人开的 PR 不受影响**，仍按上一条「全绿后由人合并」。
 - PR finish（合并，或确认不再重开的关闭）后即时清理该 PR 的残留分支：
   删远端 head 分支（`git push origin --delete <head>` 或 GitHub 界面删分支）、
   本地 `git fetch --prune` + `git branch -d <head>`，该 PR 用完的 worktree 一并移除；
