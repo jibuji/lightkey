@@ -37,6 +37,10 @@ import type { Context, Plugin } from "@cordisjs/core";
 import { Modal } from "../components/Modal";
 import { SessionInvalidError } from "../ipc";
 import type { ItemDraft } from "../types";
+import {
+  SECRET_PURPOSE_PLACEHOLDER,
+  validateSecretName,
+} from "../items/form";
 
 /** 名称建议偏好键（preference-store；"0" = 关闭，其余 = 开启，默认开）。
  *  非敏感 UI 偏好，localStorage 落盘，不进加密库/config.json。 */
@@ -122,8 +126,9 @@ function QuickSavePanel({
     if (busy) return;
     const nm = name.trim();
     const val = value.trim();
-    if (!nm) {
-      setError("请填写名称");
+    const nameError = validateSecretName(name);
+    if (nameError) {
+      setError(nameError);
       return;
     }
     if (!val) {
@@ -210,7 +215,7 @@ function QuickSavePanel({
           <span className="input-wrap">
             <input
               value={purpose}
-              placeholder="例如：发布 npm 包（仅白名单命令注入）"
+              placeholder={SECRET_PURPOSE_PLACEHOLDER}
               onChange={(e) => setPurpose(e.target.value)}
             />
           </span>

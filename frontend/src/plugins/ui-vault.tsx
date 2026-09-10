@@ -40,6 +40,10 @@ import {
   stashConflict,
   type ItemFilterValue,
 } from "../items/collection";
+import {
+  SECRET_PURPOSE_PLACEHOLDER,
+  validateSecretName,
+} from "../items/form";
 
 export type FilterValue = ItemFilterValue;
 
@@ -678,8 +682,9 @@ function ItemForm({
   const save = async () => {
     if (busy) return;
     const trimmed = name.trim();
-    if (!trimmed) {
-      setError("请填写名称");
+    const nameError = validateSecretName(name);
+    if (nameError) {
+      setError(nameError);
       return;
     }
     setError("");
@@ -893,7 +898,7 @@ function ItemForm({
               <span className="input-wrap">
                 <input
                   value={purpose}
-                  placeholder="例如：发布 npm 包（仅白名单命令注入）"
+                  placeholder={SECRET_PURPOSE_PLACEHOLDER}
                   onChange={(e) => setPurpose(e.target.value)}
                 />
               </span>
