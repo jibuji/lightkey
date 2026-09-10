@@ -24,9 +24,8 @@
 
 `#fact` 已存在：`bug` `enhancement` `documentation` `duplicate` `question`
 `invalid` `wontfix` `help wanted` `good first issue` `accessibility`
-`needs-triage` `ready-for-agent` `ready-for-human`。
-**尚不存在**：`needs-info`、任何「正在跑 / 已认领」状态标签、任何 `needs-human`。
-→ /triage 的五状态标签映射见 `docs/agents/triage-labels.md`（映射表右列需补齐）。
+`needs-triage` `needs-info` `ready-for-agent` `ready-for-human`。
+→ /triage 的五状态标签映射见 `docs/agents/triage-labels.md`。
 
 ## 验证能力（本机 = Linux 容器，决定哪些 issue 可委派）
 
@@ -38,19 +37,14 @@
   （需 WSL2 + Windows 桌面包；前置不满足会 SKIP exit 0）。
 - 故「CI 绿」是本仓库唯一的完整门禁（CI 在 Windows runner 上跑三 crate + 前端）。
 
-## Windows 宿主事实（autopilot 第二台宿主，2026-09-09 登记）
+## Windows 宿主事实
 
-- OWNER 日常前门 = **PowerShell**（工作习惯，agent 任务都在里面跑）；autopilot 在
-  Windows 侧的运行时钉死为「PowerShell 前门 + Git Bash 引擎」（A14）。
-- `#fact`（OWNER 实测回传）Git Bash 引擎可用：`bash -lc 'command -v flock'` →
-  `/usr/bin/flock`；`pi` 在该机已用过。
-- 凭据未逐模型验（401 坑与平台无关），登记时按 workflows/issue-autopilot.md
-  §13.4 逐模型验。
-- 引擎选 Git Bash 而非 WSL 的理由：Git Bash 里看到的 `cargo`/`node` 即 Windows
-  原生工具链，§7 探测如实反映 Windows 环境；WSL 引擎会把宿主退化成第二台
-  Linux 机（`tauri-shell` 因缺 webkit2gtk 恒 false），§6 两机互补落空。
+- OWNER 日常前门 = **PowerShell**（工作习惯，agent 任务都在里面跑）。
+- `#fact`（OWNER 实测回传）Git Bash 可用：`bash -lc 'command -v flock'` →
+  `/usr/bin/flock`；`pi` 在该机已用过。Git Bash 里看到的 `cargo`/`node` 即
+  Windows 原生工具链。
 
-## 本机宿主事实（autopilot 相关）
+## 本机宿主事实（pi 非交互相关）
 
 - `#fact` 嵌套 `pi -p` 用**默认 provider 会 401**（继承到的 `OPENAI_API_KEY` 无效）；
   必须显式 `--provider bailian-plan-personal --model …`。实测可用。
@@ -59,33 +53,6 @@
   `disable-model-invocation: true`，只能靠 slash 显式调用）。
 - `#fact` 会话日志：`~/.pi/agent/sessions/<slug>/<ts>_<uuid>.jsonl`；`--session-dir` 可指定。
 - `#fact` 主仓 `target/` 已 6.9 GiB；`git worktree list` 当前只有主仓。
-- `#fact` 现有 8 个 open issue 已带 `ready-for-agent`（#170–#177），其中 #173/#171/#175
-  改动面含 `crates/lk-app`（本机无法编译验证）→ 能力词表与跳账机制的真实用例。
-
-## 用词（已锐化，见 workflows/issue-autopilot.md §2）
-
-- **跳账 (skipped-on-host)**：某宿主因能力不足跳过，只在 tracking issue 记账，
-  **绝不改标签** —— 「本机做不了」是宿主属性，「需要哪些能力」才是 issue 属性。
-- **NEEDS-HUMAN 评论协议**：用户在需求里造的词 —— agent 卡住时在 issue 上发一条
-  以固定标记开头的评论 + 打 `needs-human` 标签；OWNER 回复后循环自动恢复。
-  与 /triage 的 canonical `needs-info`（等**报告人**补信息）不是同一角色：
-  前者等**维护者裁决**，后者等外部输入。待锐化。
-- **pinned tracking issue 心跳**：状态面 = 标签（机器可读真相）+ 一个置顶
-  tracking issue 上的人可读心跳/流水。细节待 grill。
-
-## 看活（2026-09-09 补，回应「至少一种方式查看循环是否还活着」）
-
-- **L1 外部见证** = `.github/workflows/autopilot-watchdog.yml`（GitHub 侧 `schedule`，
-  每 30 分钟读 tracking issue 的 `last-ok:` 行，>45 分钟 → 打 `heartbeat-stale` + 评论一次）。
-  **必须不在本机**：判定逻辑若也跑本机，机器关机时看门狗和病人一起倒。
-- **L2 本机一眼** = `bash scripts/autopilot/status.sh`（退出码 0 活 / 1 可疑 / 2 坏了）；
-  它同时检查 L1 自己的最近运行（>120 分钟没跑 = 看门狗可疑）。
-- **心跳契约**：正文一行 `- last-ok: <ISO-8601 UTC>`；`poll.sh` 每轮**最先**写它。
-  严格形状校验（`date -d ""` 返回今日零点、无时区串被 JS 按本地时区解析 = 两类
-  「假装活着」的假象，已实测并堵掉）。
-
-- `status.sh` verdict 四态：`ALIVE`(0) / `PAUSED`(0，人主动停) / `SUSPECT`(1) / `BROKEN`(2)；
-  回归 12 例：`scripts/autopilot/tests/status.t.sh`（假 gh + 假 HOME，离线）。
 
 ## 模型 / 推理档位配置面（2026-09-09 实测）
 
@@ -101,15 +68,3 @@
 - 验凭据：`pi auth check --provider <p> --model <m> --json` → `{"status":"ready","authType":"api_key"}`；
   枚举：`pi --list-models <关键词>`（本机可用：qwen3.8-flash 900K、qwen3.8-max 1M/128K out、
   deepseek-v4-pro、glm-5.2）。
-- autopilot 层：只认 `host.toml` 的 `model_*` / `thinking_*` / `budget_implement_tokens`
-  （spec §11.1），不读全局默认值。
-
-## 启动层（2026-09-09 已落地：`scripts/autopilot/ctl.sh`）
-
-- 船长定的实现档：`qwen3.8-flash` + `thinking=max`（分诊 flash+low）。
-- 单实例的真相 = 内核 flock（`loop.lock` 常驻实例锁 / `poll.lock` 单轮锁），
-  pid 文件仅人读提示；硬闸门在子进程 `flock -n`，父进程检查只为提示语。
-- 回归 `scripts/autopilot/tests/ctl.t.sh` 18 例抓到两个真 bug：
-  (1) 子进程继承持锁 fd → `fuser` 报一堆 PID → 看活层误判多实例（须 `9>&-`）；
-  (2) `stop` 里删仍被人持有的锁文件 → 下个 start 能再起一个实例。
-- 本机环境实测：pid1=systemd、`systemctl --user` 可用、cron 在跑、`flock`/`setsid`/`fuser` 齐备。

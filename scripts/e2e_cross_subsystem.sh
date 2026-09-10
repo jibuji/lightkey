@@ -43,8 +43,7 @@ PREFLIGHT_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --auto-approve) AUTO=1 ;;
-    # 只跑前置检测不动 E2E 本体（issue-autopilot 能力探测 §7 用：
-    # scripts/autopilot/probe-capabilities.sh 判「前置不 SKIP」）
+    # 只跑前置检测不动 E2E 本体（供自动化探查环境是否具备前置条件）
     --preflight-only) PREFLIGHT_ONLY=1 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) if [ -z "$LK" ]; then LK="$arg"; else echo "多余参数：$arg" >&2; exit 2; fi ;;
