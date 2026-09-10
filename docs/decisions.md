@@ -693,118 +693,20 @@ needs-decision，不得自行变更。
       `e2e_cross_subsystem.sh` 两条 E2E 验收；记录修正（落点四词条、候选 2 直接
       删、CONTEXT 门声明六步、文件表 daemon/ 子目录路径）。
 
-29. **issue-autopilot：无人值守分诊/实现循环 + CI 绿自动合并例外 + 心跳看门狗
-    （2026-09-09 拍板 · 来源：`/loop-me` grilling，规格
-    [../workflows/issue-autopilot.md](../workflows/issue-autopilot.md) 为唯一出处）**：
-    目标 = 新 issue → `/triage` 打 canonical 标签 → 从 `ready-for-agent` 认领（独立
-    worktree）→ `pi -p "/skill:implement"` → 开 PR；卡住走 NEEDS-HUMAN 协议、人回复后
-    自动续跑。裁定：
-    - **交付纪律修订（反转 `AGENTS.md` 交付纪律第一条的默认路径：原「PR 全绿后
-      合并」= 由人合并）**：
-      autopilot 产出的 `autopilot/<n>` PR **CI 全绿即自动 squash 合并**（`gh pr merge
-      --auto --squash`），人可事后看；理由 = 把人的注意力从「逐个 gate」移到「看
-      异常」。安全不靠默认全盘，靠 **denylist 双闸**：（1）分诊前置——可能改到护栏
-      路径的需求不进 `ready-for-agent`；（2）合并闸门——PR diff 命中
-      `.github/**`（agent 改 CI = 自扩权，token 带 `workflow` scope）、
-      `crates/lk-app/**`（本机不可验）、`Cargo.toml` 的 `[workspace.package] version`
-      （#34：bump 属发版）、`Cargo.lock` 大改、`frontend/package-lock.json`、
-      `docs/decisions.md`、`CONTEXT.md`、`docs/adr/**`、`AGENTS.md`、`docs/**` 规格
-      权威文件 → **不开 auto-merge** + `needs-human`。未命中护栏的代码类 PR 才自动合。
-    - **分诊权限边界**：autopilot 里的 `/triage` **只推进不终结**——可写
-      `needs-triage`/`needs-info`/`ready-for-agent`/`ready-for-human` 与评论/brief；
-      **永不** `wontfix`/关闭/`duplicate`/写 `.out-of-scope/`（拒绝与判死是不可逆的
-      维护者价值判断）。终结类需求一律落 `ready-for-human` + 说明。
-    - **标签面**：新建四个——`needs-info`（等**报告人**，属 /triage 五角色；实测仓库里
-      没有）、`needs-human`（等**维护者裁决**，autopilot 专属，与 `needs-info` 恢复
-      条件不同不可合并）、`agent-working`（已被认领，autopilot 专属）、
-      `heartbeat-stale`（心跳超时；看门狗首次判失活时会自建，手动建可选）。
-      真相只在 GitHub 标签 + PR；本地不留隐藏状态（机器坏了可完全重建）。
-      `docs/agents/triage-labels.md` 已补「非分诊标签」表。
-    - **跨机能力判定（船长明确提出）**：船长另有一台 Windows 机（仅人为主动触发，
-      不装 cron）。“本机做不了”是**宿主属性**，不是 issue 属性：
-      （a）分诊阶段在 brief 写绝对需求行 `Needs: <能力标签…>`（闭集词表：
-      `rust-workspace`/`frontend-vitest`/`tauri-shell`/`windows-cross-check`/
-      `wsl2-desktop-e2e`/`release-build`），**绝不写机器名**；（b）宿主不满足时
-      **标签一动不动**（保留 `ready-for-agent`），只在 tracking issue 记一行
-      `skipped #<n> host=<id> missing=<cap>`——防止另一台机读到
-      `ready-for-human` 而误判为“agent 干不了”；（c）只有「全在册宿主都跳过 +
-      无人认领 + `ready-for-agent` 停留 > 7 天」才降级 `ready-for-human`，且评论必须
-      列出缺哪台机器。能力判定 = `host.toml` 静态**候选** + 每轮**主动探测**
-      （只验不声明），探测失败/超时/JSON 不合法 → 一切能力视为 false（fail-closed）。
-    - **看门狗（本拍板的新触发面，2026-09-09）**：存活判定**不得只跑在本机**（否则
-      机器关机时看门狗和病人一起倒）。分两层：L1 = `.github/workflows/
-      autopilot-watchdog.yml`（`*/30` 读 tracking issue 正文的 `- last-ok: <ISO8601>`
-      契约行，>45 分无心跳 → 自建/打 `heartbeat-stale` 标签 + 评论一次，恢复自动摘；
-      `[PAUSED]` 不报警；权限只 `issues: write`（仓库 Variable
-      `AUTOPILOT_TRACKING_ISSUE` 经 runner `vars` 上下文注入，不走 REST），
-      不装工具链、不构建不发布）= 唯一外部见证；
-      L2 = `scripts/autopilot/status.sh`（本机一眼看全：心跳年龄 + L1 自己最近一次
-      运行与结论 + 轮次锁 + 配额 + 在跑 issue；退出码 0/1/2）。这是**唯一允许的非
-      构建/非发布 `schedule` workflow**（2026-08-27「非 PR 提交不触发构建」裁定不属
-      构建路径，仍成立）。不再加“看门狗的看门狗”（无穷回归），L1 自身健康由 L2 兑。
-    - **模型与推理档位 = 单一入口 `host.toml`**（实测优先级：`--provider/--model/--thinking`
-      旗标 > `.pi/settings.json`（项目，需 trust）> `~/.pi/agent/settings.json`（全局）；
-      `PI_MODEL`/`PI_REASONING_LEVEL` **是输出不是输入**，cron 里设它们选不出模型）。
-      裁定值：分诊 `qwen3.8-flash` + `thinking=low`，实现与续跑 **`qwen3.8-flash` +
-      `thinking=max`**（不换模型、档位拉满；实测该模型 900K 上下文 / 900K 输出上限，
-      而 `qwen3.8-max` 输出仅 128K，写大 diff 更易被截断）。循环**不读** `defaultModel`：
-      那是交互时随手改的，夜里批处理跟着它漂 = 不可复现。
-    - **启动层 = 单实例幂等**（`scripts/autopilot/ctl.sh`）：重复 `start` 不重开循环。
-      真相用内核 flock（`loop.lock` 实例锁 + `poll.lock` 单轮锁），**不用 pid 文件**
-      （TOCTOU + SIGKILL 残留谎报在跑 + pid 复用谎报没跑）；硬闸门在子进程 `flock -n`，
-      父进程检查只为人话提示。常驻循环在轮次间不持 `poll.lock`，故人工 `run-once` /
-      timer 与循环是排队而非互斥误判。驱动方式二选一：`ctl.sh start` 或
-      `ctl.sh install` + systemd user timer（推荐：重启自动续）。
-    - **上限**：并发 1、每 issue 自动重试 2（`needs-human` 续跑不重置）、每日
-      implement 启动 3、单轮墙钟 60 分（超时 kill 并打回 `ready-for-agent`：超时是
-      宿主问题不是活的问题）、磁盘 <15 GiB 不启动。总开关 = tracking issue 标题含
-      `[PAUSED]`（比环境变量可靠：手机上一句话可停）。
-    - **被否选项**：
-      | 选项 | 否因 |
-      |------|------|
-      | 循环跑在 GitHub Actions （schedule 起 agent） | 需把整套开发环境+模型凭据塞进 secrets，worktree 跨 run 无落点，续跑没有现场 |
-      | 一个 LLM agent 全程负责（读写标签、起 worktree、写码） | 状态机是确定性逻辑；硬约束（永不关 issue、只推自己 ref）必须是代码而不是模型判断 |
-      | 本机做不了就摘 `ready-for-agent` 打 `ready-for-human` | 全局终结性判定，另一台能干活的宿主会误读为“agent 不可委派”→ 这活永远没人干 |
-      | 本地锁文件/SQLite 作状态真相 | 崩机即状态全灭，且人不可见 |
-      | 跨机分布式认领锁 | 只会多造死锁与孤儿锁；Windows 侧由人主动触发，人就是互斥的 arbiter |
-      | 开 draft PR 不进 CI | draft 使 CI 门禁形同虚设（与自动合并相互依存） |
-    - **落点**：[../workflows/issue-autopilot.md](../workflows/issue-autopilot.md)（
-      唯一出处：能力词表 / 状态机 / NEEDS-HUMAN 协议 / denylist / 心跳与看门狗 /
-      实现清单）；`.github/workflows/autopilot-watchdog.yml`（已落）、
-      `scripts/autopilot/{status.sh,ctl.sh}` 与 `scripts/autopilot/tests/{status.t.sh,ctl.t.sh}`
-      （已落，离线回归 12 + 18 例全过）、本文件与 AGENTS.md。本轮只改文档 + 看活/启动层；
-      循环本体（`poll.sh` / `probe-capabilities.sh` / `lib/*`，spec §16 清单）**未实现** ——
-      现敲 `ctl.sh start` 会因缺 `poll.sh` 响亮报错（exit 2）而非静默空转；实现按 §13
-      前置动作开 issue 后进行。
-
-30. **issue-autopilot denylist 修订：`crates/lk-app/**` 移出闭集、补上
-    `workflows/**`（2026-09-09 拍板 · 来源：OWNER 直接指令「CI 全绿即可由 agent
-    合并」，范用推荐方案；部分反转 #29 的护栏清单）**：
-    - OWNER 诉求 = 只要 GitHub CI 全绿就允许 agent 自行合并。事实澄清：#29 本来
-      就是「CI 全绿即自动 squash 合并」，denylist 只是其上第二道闸；故本次改的
-      实质是「放宽闭集」而非「新增自动合并」。裁定 = 闭集只保留「CI 绿根本
-      覆盖不到」的三类，其余全部放行：
-      - 保留：`.github/**`（护栏自身 + token 带 `workflow` scope）、`docs/**` 规格
-        权威文件、`docs/decisions.md`、`CONTEXT.md`、`docs/adr/**`、`AGENTS.md`、
-        `Cargo.toml [workspace.package] version`（#34 bump 属发版）、`Cargo.lock` 大改、
-        `frontend/package-lock.json`；
-      - 新增：`workflows/**`（循环自身规格 = agent 合并权限的出处，原闭集漏了它，
-        与 AGENTS.md 「规格权威文档」表述不一致，本轮一并补齐）；
-      - 移出：`crates/lk-app/**`——桌面包在 Windows build job 里随 PR 真编译
-        （`cargo tauri build`），「本机无法验证」的前提只对运行时行为成立，
-        而这一点对其他 crate 同样成立，不再是独属于 lk-app 的闸门理由。
-    - **被否选项**：
-      | 选项 | 否因 |
-      |------|------|
-      | 清空 denylist（任何 PR CI 绿即合） | agent 可自改 CI 与自身规则书（token 带 `workflow` scope）= 自己放宽自己的规则，护栏形同虚设；且可给自己盖章改规格/顺手 bump 版本误发 Release |
-      | 只保留 `.github/**`（docs / 版本 / lock 全放） | 规格是唯一权威与发版闸门都不是 CI 能验的，与本次诉求无关 |
-    - **残留风险（不自欺）**：lk-app 运行时行为（托盘 / 锁屏 WTS 桥 / 通知 / 审批窗）
-      CI 不覆盖，现在也走自动合并；抓手只剩 PR 正文「本机验证结果」段与 squash
-      易 revert。规则/授权门类 issue 仍由人手工落 `ready-for-human`（§14）。
-    - **落点**：`scripts/autopilot/lib/pr.sh`（路径闭集）、
-      `scripts/autopilot/tests/poll.t.sh`（钉住闭集的断言）、
-      [../workflows/issue-autopilot.md](../workflows/issue-autopilot.md) §10/§14（唯一出处）、
-      `AGENTS.md` 交付纪律。本修订自身（命中 `docs/decisions.md` / `AGENTS.md` /
-      `workflows/**`）仍走「功能分支 + 人合并」，合并后才生效。
+29. **issue-autopilot 退场：删除本仓自建 autopilot，改用通用 GitHub Pilot
+    （2026-09-10 拍板 · 来源：OWNER 直接指令）**：本仓自建的 issue-autopilot
+    （分诊 / 认领 / 实现循环 + 心跳看门狗 + `autopilot/<n>` PR CI 绿自动合并例外）
+    整体移除，OWNER 将改用独立通用工具
+    [github_pilot](https://github.com/jibuji/github_pilot)。裁定：
+    - **移除面**：`scripts/autopilot/**`、
+      `.github/workflows/autopilot-watchdog.yml`、`workflows/issue-autopilot.md`、
+      `docs/agents/triage-labels.md` 的「非分诊标签」一节，以及 `AGENTS.md` /
+      `NOTES.md` / `docs/README.md` / `.gitignore` 的相关条目；仓库 Variable
+      `AUTOPILOT_TRACKING_ISSUE` 与 `agent-working` / `needs-human` 标签一并清理。
+    - **交付纪律复原**：`autopilot/<n>` PR 的「CI 全绿自动 squash 合并」例外撤销，
+      回到「功能分支 + PR + CI 全绿 + **由人合并**」（原 #29/#30 的 denylist 护栏
+      随之失效，不再维护）。项目自主拥有的 host/loop 状态机不再是本仓维护面。
+    - 历史：本文件原 #29 / #30（2026-09-09，issue-autopilot 与 denylist 修订）已随
+      功能移除；编号不复用，回溯见 git 历史。
 
 > 约定：如实现中发现新的规格空白或矛盾，在本节登记并上报 needs-decision，不擅改。

@@ -26,12 +26,6 @@
   （都用 `file://` 本地模拟存储，无需凭据）；跨子系统 E2E（M2.75，
   WSL2+Windows 桌面包前置不满足则 SKIP exit 0）：
   `bash scripts/e2e_cross_subsystem.sh [lk-binary-path] [--auto-approve]`。
-- issue-autopilot 启动与存活（两条要记）：`bash scripts/autopilot/ctl.sh start|stop|run-once|install`
-  （单实例幂等：重复 start 只会提示「已在运行」退出 0，真相是 `loop.lock` 上的 flock 不是 pid
-  文件，规格 §4.1）；`bash scripts/autopilot/status.sh`（退出码 0 活 / 1 可疑 / 2 坏了；看心跳年龄
-  + `heartbeat-stale` + 看门狗运行结论 + 常驻实例/本轮锁 + 配额 + 在跑 issue）；
-  机器整个关机那种死法只能由 GitHub 侧 `.github/workflows/autopilot-watchdog.yml` 发现（§9.1）。
-  回归：`bash scripts/autopilot/tests/ctl.t.sh`、`.../status.t.sh`（离线，不碰凭据）。
 - 前端：`cd frontend && npm install && npm run build`（Vite 端口 1420 与
   `crates/lk-app/tauri.conf.json` 的 devUrl 一致）；D 层单测 `npm test`
   （vitest；事件总线契约/装配/宿主渲染/审批弹窗/条目域纯函数）。
@@ -41,12 +35,7 @@
 - CI 触发面 = pull_request（opened/synchronize/reopened，2026-08-29 裁定：
   提交 PR 或 PR 更新自动跑门禁；PR 运行不传 artifact、不发布）+ tag `v*`
   push / workflow_dispatch（2026-08-27 裁定：非 PR 的提交不触发）。
-  构建/发布 workflow 只有 `.github/workflows/release.yml`（原 `ci.yml` 已删除），
-  另有 `.github/workflows/autopilot-watchdog.yml`（补充拍板 #29：`schedule` 触发的
-  issue-autopilot 心跳看门狗，不构建不发布、权限只 `issues: write`（Variable 经
-  runner `vars` 上下文注入）；
-  它是循环「是否还活着」的**唯一外部见证**（本机层 = `scripts/autopilot/status.sh`），
-  判定逻辑见 [workflows/issue-autopilot.md](workflows/issue-autopilot.md) §9.1）；
+  构建/发布 workflow 只有 `.github/workflows/release.yml`（原 `ci.yml` 已删除）；
   全部质量检查（Windows：
   fmt/clippy/test 三 crate + 前端 npm test；Linux：lk-cli clippy/test）
   作为**构建前置门禁**内嵌在 build job 里
@@ -68,12 +57,6 @@
 - 功能分支开发，开 PR 由 GitHub CI 自动跑质量门禁（见「常用命令」CI 条目），
   全绿后**由人合并**；不直接推默认分支。本地 no-mistakes 闸门已于 2026-08-29 移除
   （补充拍板 #21），不再跑 `/no-mistakes`。
-- **例外（补充拍板 #29，护栏闭集经 #30 修订）**：`issue-autopilot` 循环产出的 `autopilot/<n>` PR 在 CI 全绿后
-  **自动 squash 合并**（替代本条前半的「由人合并」）；但 PR diff 命中 **denylist**
-  （`.github/**` / `workflows/**`、版本号、lockfile、`docs/decisions.md` /
-  `CONTEXT.md` / `docs/adr/**` / `AGENTS.md` / 规格权威文档）即不得自动合并，转
-  `needs-human`；`crates/lk-app/**` 已放开（Windows CI 真编译桌面包，#30）。完整状态机与约束（含「分诊永不 `wontfix`/关闭/标 duplicate」）见
-  [workflows/issue-autopilot.md](workflows/issue-autopilot.md)（唯一出处）。
 - PR finish（合并，或确认不再重开的关闭）后即时清理该 PR 的残留分支：
   删远端 head 分支（`git push origin --delete <head>` 或 GitHub 界面删分支）、
   本地 `git fetch --prune` + `git branch -d <head>`，该 PR 用完的 worktree 一并移除；
