@@ -168,8 +168,9 @@ describe("suggestSecretName —— 启发建议名纯函数（quick-capture.md �
     expect(suggestSecretName("sk-ant-0123456789abcdef")).toBe("api_key");
     expect(suggestSecretName("ghp_abcdefghijklmnopqrstuvwxyz")).toBe("github_token");
     expect(suggestSecretName("github_pat_11ABCDEF00_xxxxxxxx")).toBe("github_token");
-    expect(suggestSecretName("glpat-xxxxxxxxxxxx")).toBe("gitlab_token");
-    expect(suggestSecretName("AKIAIOSFODNN7EXAMPLE")).toBe("aws_access_key_id");
+    // glpat- 不在规格 §4.3 前缀表内（已按规格移除）→ 不命中任何条目
+    expect(suggestSecretName("glpat-xxxxxxxxxxxx")).toBeNull();
+    expect(suggestSecretName("AKIAIOSFODNN7EXAMPLE")).toBe("aws_access_key");
     expect(suggestSecretName("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.")).toBe("jwt_token");
     expect(suggestSecretName("xoxb-123456789-abcdefgh")).toBe("slack_token");
     expect(suggestSecretName("hello world")).toBeNull();
