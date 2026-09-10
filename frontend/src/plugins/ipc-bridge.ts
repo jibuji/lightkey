@@ -19,7 +19,7 @@
  */
 
 import type { Context, Plugin } from "@cordisjs/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AuthzRequestPayload, ItemChangedPayload } from "../events";
 import { createIpc } from "../ipc";
 import type { LightKeyIpc, NotificationFrame } from "../ipc/types";
@@ -162,17 +162,42 @@ export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assig
     // tauri：监听 Rust 壳 emit 的 `lk-shell-quick-save`；mock：监听同名
     // DOM CustomEvent（QA 钩子 `simulateQuickSaveRequest` 走同一条路径）。
     let offShellQuickSave: (() => void) | null = null;
+    /** 卸载标志（issue #177）：dispose 后迟到的 listen resolve 立即退订——
+     *  防卸载发生在 resolve 前时，晚到的 resolve 注册的监听无人退订（泄漏）。 */
+    let shellQuickSaveDisposed = false;
     const onShellQuickSave = () => ctx.emit("quick.save-request");
     if (ipc.kind === "tauri") {
-      // 真实 Tauri 环境才有 window.__TAURI_INTERNALS__；伪 tauri 适配器
-      // （测试）下 @tauri-apps/api 的 listen 会同步抛错——静默降级
-      // （壳事件是增强通道，缺了只影响托盘入口，审批等主流程不受影响）
-      void listen("lk-shell-quick-save", onShellQuickSave)
+      // 失败分类（issue #177）：以 window.__TAURI_INTERNALS__ 是否在场区分
+      // 两种失败——伪 tauri 适配器（测试环境，运行时不在场）下
+      // @tauri-apps/api 的 listen 必然失败（sync 抛错/异步 reject 同源），
+      // 静默降级（壳事件是增强通道，缺了只影响托盘入口，审批等主流程不受
+      // 影响；判据与 createIpc 的 isTauriRuntime 一致）；真实 Tauri 运行时
+      // 里 listen 失败（invoke/IPC 错误）给 console.error：托盘通道失效
+      // 可被发现。
+      let shellListen: Promise<UnlistenFn>;
+      try {
+        shellListen = listen("lk-shell-quick-save", onShellQuickSave);
+      } catch (err) {
+        // 伪 tauri 适配器同步抛错：并入异步 reject 走同一分类
+        shellListen = Promise.reject(err);
+      }
+      void shellListen
         .then((u) => {
-          offShellQuickSave = u;
+          if (shellQuickSaveDisposed) {
+            // 卸载先于 resolve：迟到的 resolve 立即退订，不残留已注册监听
+            u();
+          } else {
+            offShellQuickSave = u;
+          }
         })
-        .catch(() => {
+        .catch((err: unknown) => {
           offShellQuickSave = null;
+          if ("__TAURI_INTERNALS__" in window) {
+            console.error(
+              "[ipc-bridge] listen lk-shell-quick-save 失败，托盘快速保存通道不可用",
+              err,
+            );
+          }
         });
     } else {
       window.addEventListener("lk-shell-quick-save", onShellQuickSave);
@@ -183,7 +208,9 @@ export const ipcBridge: Plugin.Function<Context, IpcBridgeConfig> = Object.assig
     // 可逆副作用：卸载时退订通知（Cordis 卸载自动撤销语义 §5.4）
     return () => {
       unsubscribe?.();
+      shellQuickSaveDisposed = true;
       offShellQuickSave?.();
+      offShellQuickSave = null;
     };
   },
 );
