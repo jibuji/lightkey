@@ -52,8 +52,7 @@ export const QUICK_SAVE_CLEAR_HINT_TOAST = "勾选保存后清空可避免明文
 const NAME_SUGGESTIONS: ReadonlyArray<{ re: RegExp; name: string }> = [
   { re: /^sk-/, name: "api_key" },
   { re: /^ghp_|^github_pat_/, name: "github_token" },
-  { re: /^glpat-/, name: "gitlab_token" },
-  { re: /^AKIA/, name: "aws_access_key_id" },
+  { re: /^AKIA/, name: "aws_access_key" },
   { re: /^eyJ/, name: "jwt_token" },
   { re: /^xox[baprs]-/, name: "slack_token" },
 ];
